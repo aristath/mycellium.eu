@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/messe-core", "crates/messe-directory", "crates/messe-cli"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Messe Team"]
+rust-version = "1.96"
+repository = "https://github.com/messe/messe"
+
+# The core is compiled for everything from microcontrollers to desktops, so we
+# keep release builds small and predictable. See docs/CONCEPT.md Layer 10.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
