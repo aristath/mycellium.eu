@@ -1,0 +1,28 @@
+[package]
+name = "messe-directory"
+version = "0.0.0"
+description = "The Messe directory: signed-record store, login, and rendezvous"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "messe-directory"
+path = "src/main.rs"
+
+[dependencies]
+messe-core = { path = "../messe-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+getrandom = "0.2"
+
+[dev-dependencies]
+ureq = { version = "2", features = ["json"] }
+
+[lints.rust]
+unsafe_code = "forbid"
