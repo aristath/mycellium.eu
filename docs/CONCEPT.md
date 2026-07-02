@@ -1,4 +1,4 @@
-# Messe
+# Mycellium
 
 *A living design document. We start at the highest level and zoom in only when the concept forces us to.*
 
@@ -6,7 +6,7 @@
 
 ## Layer 0 — The idea
 
-**Messe is a peer-to-peer messenger. Your message travels directly from your device to the other person's device. Nothing sits in the middle of your conversation.**
+**Mycellium is a peer-to-peer messenger. Your message travels directly from your device to the other person's device. Nothing sits in the middle of your conversation.**
 
 That is the whole idea. Everything else in this document exists to make that one sentence true in the real world.
 
@@ -16,7 +16,7 @@ That is the whole idea. Everything else in this document exists to make that one
 
 Ordinary messengers are shaped like a **hub**. Everyone connects to a company's servers; the servers hold the conversation and pass it along. Even when the content is encrypted, the hub is still *in the middle* — it decides who can talk, it sees the flow of messages, and it is the thing that must be trusted, paid for, and kept running.
 
-Messe is shaped like a **line between two people**. The two devices are the system. There is no hub that owns the conversation.
+Mycellium is shaped like a **line between two people**. The two devices are the system. There is no hub that owns the conversation.
 
 This is not primarily a privacy feature — privacy simply *falls out* of the shape. If no one is in the middle, there is no one in the middle to read, block, log, or monetize the conversation. The privacy is a side effect of the architecture, not a bolt-on.
 
@@ -30,7 +30,7 @@ Direct is easy to say and hard to do, because of a single stubborn fact:
 
 Phones and laptops sit behind home routers and mobile networks that block unsolicited incoming connections. Even when both people are online and willing, their devices have no obvious way to learn each other's address or open a direct line through those barriers.
 
-So the entire design of Messe is really the answer to one question:
+So the entire design of Mycellium is really the answer to one question:
 
 **How do two devices find each other and open a direct line, when nothing in the network is built to let them?**
 
@@ -40,7 +40,7 @@ Every piece of machinery we add later — discovery, the rendezvous, key exchang
 
 ## Layer 3 — The cast (who exists, and why)
 
-There are only three kinds of thing in Messe, in order of importance:
+There are only three kinds of thing in Mycellium, in order of importance:
 
 1. **You and your peer** — two devices. This is the system. This is where messages live, where they are encrypted, and where they are read.
 
@@ -75,7 +75,7 @@ This is deliberate: the direct line is the essence, so we build the essence firs
 
 ## Layer 5 — The private line (channel + identity are one thing)
 
-The rendezvous introduces two devices. But an introduction is not trust, and a connection is not privacy. The moment the line is open, Messe answers two questions *with a single act*:
+The rendezvous introduces two devices. But an introduction is not trust, and a connection is not privacy. The moment the line is open, Mycellium answers two questions *with a single act*:
 
 - **Is this line private?** — can anyone but the two of us read it?
 - **Is this really my peer?** — is the device on the other end who it claims to be?
@@ -107,7 +107,7 @@ Layer 6 shrinks this sharply: because each record is **signed by its owner's ide
 
 ## Layer 6 — The directory (the one thing that needs a home)
 
-Everything in Messe is peer-to-peer except one stubborn piece: *something* has to answer **"given the handle `mary`, what is her identity, and how do I start reaching her?"** You cannot derive that from nothing. This lookup is the single genuinely-hosted part of the system — and the whole art is making it need as little trust as possible.
+Everything in Mycellium is peer-to-peer except one stubborn piece: *something* has to answer **"given the handle `mary`, what is her identity, and how do I start reaching her?"** You cannot derive that from nothing. This lookup is the single genuinely-hosted part of the system — and the whole art is making it need as little trust as possible.
 
 **The move: store self-certifying records.** The directory does not store a value it *asserts*. It stores a record **signed by the owner's identity secret**:
 
@@ -136,9 +136,9 @@ ENS *is* this directory, decentralized. So the POC builds a thin signed-KV serve
 
 ## Layer 7 — The web3 substrate (the tech we lean on)
 
-Messe's concept — keypair identity, no hub, direct lines — is the web3 worldview already. We use web3 at the **edges** (identity, naming, auth, discovery) and keep the **line itself pure**: ciphertext only ever travels device-to-device, never through a relay network.
+Mycellium's concept — keypair identity, no hub, direct lines — is the web3 worldview already. We use web3 at the **edges** (identity, naming, auth, discovery) and keep the **line itself pure**: ciphertext only ever travels device-to-device, never through a relay network.
 
-| Messe piece | What we use | Why |
+| Mycellium piece | What we use | Why |
 |---|---|---|
 | **Identity secret / public identity** | Wallet keypair, expressed as a DID (`did:pkh`) | A wallet *is* an identity secret; the address is a natural public identity. |
 | **Handle** | Off-chain in the POC directory → **ENS** (`.eth`) later | ENS decentralizes the exact `handle → record` map we need. |
@@ -262,11 +262,11 @@ If you lose the seed **and** every device that holds the key, the identity goes 
 
 ## Layer 10 — The client (one core, everywhere)
 
-Messe must run across a six-orders-of-magnitude range — a microcontroller to a desktop. No single running binary crosses that, but a single *core* can. The whole strategy is one move: **separate the protocol from the platform.**
+Mycellium must run across a six-orders-of-magnitude range — a microcontroller to a desktop. No single running binary crosses that, but a single *core* can. The whole strategy is one move: **separate the protocol from the platform.**
 
 ### 10.1 The principle
 
-The protocol — identity, encryption, message format — is small, portable, and *identical* on every device. Everything that differs per device (networking, storage, UI, randomness, clock) hides behind interfaces the core calls into. Port Messe to a new platform by implementing those interfaces, never by touching the protocol.
+The protocol — identity, encryption, message format — is small, portable, and *identical* on every device. Everything that differs per device (networking, storage, UI, randomness, clock) hides behind interfaces the core calls into. Port Mycellium to a new platform by implementing those interfaces, never by touching the protocol.
 
 ```
    ┌──────────────── per-platform UI shell ────────────────┐
@@ -274,7 +274,7 @@ The protocol — identity, encryption, message format — is small, portable, an
    └───────────────────────────┬───────────────────────────┘
                                │  uniffi / FFI / wasm-bindgen
    ┌───────────────────────────▼───────────────────────────┐
-   │        MESSE CORE  —  portable Rust, no_std-capable    │
+   │      MYCELLIUM CORE  —  portable Rust, no_std-capable  │
    │  identity/keys · X3DH + Double Ratchet · record        │
    │  sign/verify · message format · session state machine  │
    └──────┬──────────────────┬───────────────────┬─────────┘
@@ -305,7 +305,7 @@ The core depends on *behaviours*, not implementations:
 | **Constrained** | ESP32, Cortex-M4/M7 | 256 KB–8 MB | Minimal Noise-over-TCP/UDP; dial a *known* peer/relay; little or no DHT | Real peer, reduced discovery |
 | **Minimal** | 8-bit AVR (Uno) | ~2 KB | Crypto only, over serial to a companion | **Not an independent peer** — a sensor behind a host |
 
-The floor for a **first-class, independent peer is the Constrained tier (ESP32 / Cortex-M).** Below it, an 8-bit chip can hold a key and encrypt, but needs a companion device to reach the network — which reintroduces a helper in the middle, so it is explicitly *not* a full Messe node. Constrained peers also accept a real limitation: with little or no DHT, they generally reach others through a *known* peer or relay rather than open discovery.
+The floor for a **first-class, independent peer is the Constrained tier (ESP32 / Cortex-M).** Below it, an 8-bit chip can hold a key and encrypt, but needs a companion device to reach the network — which reintroduces a helper in the middle, so it is explicitly *not* a full Mycellium node. Constrained peers also accept a real limitation: with little or no DHT, they generally reach others through a *known* peer or relay rather than open discovery.
 
 ### 10.5 The shells
 
@@ -321,8 +321,8 @@ Concept, wire, identity, and client architecture are now all specified end to en
 
 What remains is no longer concept — it's building and hardening:
 
-- **Build the POC** — ✅ *done.* The **Rust core** (`messe-core`: seed/keys, handle, record sign/verify, X3DH + Double Ratchet, wire codec, behind the Transport/Storage/Platform traits), the **directory service** (`messe-directory`: login + signed-KV + anti-rollback + permanent binding), and a **Full-tier shell** (`messe-cli`) that runs the whole flow — register → look up → direct connect → X3DH → ratchet → E2E messages — over a TCP transport. See [`../README.md`](../README.md) to run it.
-- **libp2p transport** — ✅ *done.* A `Transport` impl over rust-libp2p (TCP + Noise + Yamux, PeerId derived from the device key, a `/messe/1.0` byte-stream protocol) sits behind the same trait as the TCP transport; `messe-cli` selects it with `--libp2p` and auto-detects it from the peer's multiaddr. **NAT traversal** (DHT, relay, DCUtR) is the remaining increment — added in the swarm, with no change to the app above.
+- **Build the POC** — ✅ *done.* The **Rust core** (`mycellium-core`: seed/keys, handle, record sign/verify, X3DH + Double Ratchet, wire codec, behind the Transport/Storage/Platform traits), the **directory service** (`mycellium-directory`: login + signed-KV + anti-rollback + permanent binding), and a **Full-tier shell** (`mycellium-cli`) that runs the whole flow — register → look up → direct connect → X3DH → ratchet → E2E messages — over a TCP transport. See [`../README.md`](../README.md) to run it.
+- **libp2p transport** — ✅ *done.* A `Transport` impl over rust-libp2p (TCP + Noise + Yamux, PeerId derived from the device key, a `/mycellium/1.0` byte-stream protocol) sits behind the same trait as the TCP transport; `mycellium-cli` selects it with `--libp2p` and auto-detects it from the peer's multiaddr. **NAT traversal** (DHT, relay, DCUtR) is the remaining increment — added in the swarm, with no change to the app above.
 - **Live delivery with mailbox fallback** — ✅ *done.* A member runs `serve` to stay online (it announces presence). When sending (1:1, group, broadcast, forward), the client checks each recipient's presence and **pushes the message directly over a live connection if they're online**, falling back to the offline mailbox otherwise. Group messages therefore reach online members live and offline ones via their mailbox — one `deliver` path, verified by an e2e live-push test. (Full 1:1 *interactive* chat still uses the dedicated `chat`/`listen` ratchet path.)
 - **Conversations overview** — ✅ *done.* `conversations` lists every peer and group with a last-message preview (pruning expired).
 - **Full-duplex chat** — ✅ *done.* Live chat is bidirectional: the connection is split into read/write halves, the ratchet is shared under a mutex, and a reader thread prints incoming messages while the main thread sends. Works identically over TCP and libp2p (the responder starts replying once it has received the first message). A `--tui` flag gives a full-screen terminal interface.
@@ -331,14 +331,14 @@ What remains is no longer concept — it's building and hardening:
 - **Export / import backup** — ✅ *done.* `export` bundles the encrypted identity and the whole local store into one file; `import` restores it into a fresh device (refusing to overwrite an existing identity). Everything in the bundle is already encrypted at rest, so the backup needs no extra protection.
 - **Block list** — ✅ *done.* A local, encrypted block list (`block` / `unblock` / `blocked`): messages from blocked handles are silently dropped on the offline inbox (direct and group — no display, storage, or receipt), and live connection attempts from blocked peers are refused after the handshake reveals who they are.
 - **Client conveniences** — ✅ *done.* Beyond the core: `verify` (safety number out of band), `forward`, `broadcast` (one message to many), `group leave`/`info`, `draft` messages, `clear-history`, and `wipe` (erase all local data). All operate on the same encrypted local store and typed-message machinery.
-- **Contacts (with TOFU pinning)** — ✅ *done.* A local, encrypted address book (`contact add/list/remove`) maps nicknames to handles and **pins each contact's wallet on first add**. `send`/`chat` accept a nickname, and before connecting they check the looked-up record's wallet against the pin — a mismatch means the directory handed over a *different* identity, and Messe refuses. This turns the Layer 5 "dishonest directory" concern into an automatic trust-on-first-use guard.
-- **Typed messages** — ✅ *done.* The encrypted payload is a structured `AppMessage` (`messe-core::message`) with an id and a body of **text**, **reply** (references another message's id), **reaction** (emoji + target id), or **receipt**. Reading an offline message auto-returns a **read receipt** to the sender (receipts never receipt each other, so there's no loop); the sender sees the read status on their next inbox. A **file** body (`send --file`) carries an attachment end-to-end like any message (size-capped, saved to a downloads folder on receipt) — works for 1:1 and groups. **Edit** and **delete/unsend** bodies (`send --edit <id>` / `--delete <id>`) reference an earlier message by id and mutate the recipient's stored transcript (best-effort, like disappearing messages).
+- **Contacts (with TOFU pinning)** — ✅ *done.* A local, encrypted address book (`contact add/list/remove`) maps nicknames to handles and **pins each contact's wallet on first add**. `send`/`chat` accept a nickname, and before connecting they check the looked-up record's wallet against the pin — a mismatch means the directory handed over a *different* identity, and Mycellium refuses. This turns the Layer 5 "dishonest directory" concern into an automatic trust-on-first-use guard.
+- **Typed messages** — ✅ *done.* The encrypted payload is a structured `AppMessage` (`mycellium-core::message`) with an id and a body of **text**, **reply** (references another message's id), **reaction** (emoji + target id), or **receipt**. Reading an offline message auto-returns a **read receipt** to the sender (receipts never receipt each other, so there's no loop); the sender sees the read status on their next inbox. A **file** body (`send --file`) carries an attachment end-to-end like any message (size-capped, saved to a downloads folder on receipt) — works for 1:1 and groups. **Edit** and **delete/unsend** bodies (`send --edit <id>` / `--delete <id>`) reference an earlier message by id and mutate the recipient's stored transcript (best-effort, like disappearing messages).
 - **Disappearing messages** — ✅ *done.* Optional per-message TTL (`send --expire 1h`) plus a per-conversation default (`expire set/clear/show`). The expiry rides in the E2E `AppMessage`; a message already expired on arrival is dropped (no display/store/receipt), and stored transcripts are pruned lazily whenever history is loaded. Honestly best-effort, not enforced: our client deletes on schedule, but — like every messenger — a modified peer client could keep a copy. Every path — live, offline, group — carries it, message ids are shown on receipt, and `send`/`group send` take `--reply-to` and `--react/--to`. (Verified by an offline reply+reaction e2e test.)
 - **Local message history** — ✅ *done.* The `Storage` trait now has an implementation: an encrypted file-backed key-value store (key derived from the identity via HKDF). Transcripts are persisted per peer, encrypted at rest, replayed when a chat opens, and viewable with `history <peer>`. `search <query>` scans all local 1:1 and group transcripts (case-insensitive, pruning expired as it goes).
-- **Group messaging (core)** — ✅ *protocol done.* Groups use **sender keys** (the WhatsApp/Signal-groups design): each member has a per-group symmetric chain + Ed25519 signing key, distributed to the others *once* over the pairwise Double-Ratchet channel; thereafter a member encrypts each message **once** with its chain and signs it, and every holder of that sender key decrypts and verifies. This gives forward secrecy within a sender's chain and authenticates the true sender, at the cost of no post-compromise recovery and a re-key (fresh sender key) on membership change — the standard sender-keys trade-off, chosen so a group message is encrypted once rather than per-recipient. The `messe-core::group` module implements it (3-member flow, out-of-order, forgery/non-member rejection all tested), and the CLI wires it end to end over the offline mailbox: `group create` invites members (sender keys distributed inside pairwise E2E envelopes), `inbox` processes invites and does the mesh key exchange, and `group send` fans a single ciphertext out to every member. Verified by a 3-member e2e test. **Membership changes** are handled too: `group add` invites a newcomer and propagates the updated roster (existing members send it their keys); `group remove` drops the member, **rotates** every remaining member's sender key, and redistributes — so a removed member, who still holds the old keys, can read nothing further (verified by add/remove e2e tests). The directory sees only that someone deposits to several mailboxes (group membership is metadata it can observe — the same honest limit as 1:1); message content stays end-to-end.
+- **Group messaging (core)** — ✅ *protocol done.* Groups use **sender keys** (the WhatsApp/Signal-groups design): each member has a per-group symmetric chain + Ed25519 signing key, distributed to the others *once* over the pairwise Double-Ratchet channel; thereafter a member encrypts each message **once** with its chain and signs it, and every holder of that sender key decrypts and verifies. This gives forward secrecy within a sender's chain and authenticates the true sender, at the cost of no post-compromise recovery and a re-key (fresh sender key) on membership change — the standard sender-keys trade-off, chosen so a group message is encrypted once rather than per-recipient. The `mycellium-core::group` module implements it (3-member flow, out-of-order, forgery/non-member rejection all tested), and the CLI wires it end to end over the offline mailbox: `group create` invites members (sender keys distributed inside pairwise E2E envelopes), `inbox` processes invites and does the mesh key exchange, and `group send` fans a single ciphertext out to every member. Verified by a 3-member e2e test. **Membership changes** are handled too: `group add` invites a newcomer and propagates the updated roster (existing members send it their keys); `group remove` drops the member, **rotates** every remaining member's sender key, and redistributes — so a removed member, who still holds the old keys, can read nothing further (verified by add/remove e2e tests). The directory sees only that someone deposits to several mailboxes (group membership is metadata it can observe — the same honest limit as 1:1); message content stays end-to-end.
 - **Trust hardening** — ✅ *done.* Out-of-band **safety numbers** (Layer 5): a short code derived from both peers' wallet identities, shown after the handshake, that catches a dishonest directory.
 - **More recovery factors** — ✅ **social recovery** done: Shamir *t-of-n* guardian shares (`guardian-split` / `guardian-recover`) reconstruct a lost seed from a threshold of guardians, softening the 9.5 "words or nothing" limit; no single guardian can impersonate you. Phone/email as *combined* factors remain future. (Seed at rest is also encrypted — Argon2id + ChaCha20-Poly1305.)
-- **Offline** — ✅ *done.* Async X3DH (against the recipient's published `signedPreKey`) + a per-handle **mailbox** in the directory. The sender seals an [`Envelope`] the mailbox stores but cannot read; the recipient drains and decrypts it later. `messe-cli send` / `inbox`.
+- **Offline** — ✅ *done.* Async X3DH (against the recipient's published `signedPreKey`) + a per-handle **mailbox** in the directory. The sender seals an [`Envelope`] the mailbox stores but cannot read; the recipient drains and decrypts it later. `mycellium-cli send` / `inbox`.
 
   **A deliberate, documented softening of Layer 3.** Offline delivery is the one place the directory *holds* a message rather than merely brokering discovery. We keep it honest: it stores only opaque, end-to-end-encrypted envelopes (it can't read them), any authenticated sender may deposit, and only the handle's owner may collect. This is the trade-off Layer 4 deferred, now made explicit — the directory is still not a hub that owns your conversation, but it does briefly *carry* sealed messages for peers who aren't online.
 
@@ -349,4 +349,4 @@ What remains is no longer concept — it's building and hardening:
 - **No multi-device sync** — because keys are deterministic from the seed, importing it onto a second device makes it the *same* cryptographic identity (both can decrypt). But the mailbox *drains* on fetch, so two devices don't both see every message. Proper linked-device sync (per-device fetch cursors, non-draining reads, or per-device sub-keys) is a genuine distributed-systems extension, out of scope for this POC.
 - **Reactions/edits are best-effort and flattened in history** — they mutate the stored transcript rather than being aggregated onto their target in a structured UI.
 
-(The wallet key now uses standard **BIP-44** (`m/44'/60'/0'/0/0`), verified against a known vector, so a Messe seed imports into external wallets. Device/messaging keys stay on HKDF, as X25519 has no external HD standard.)
+(The wallet key now uses standard **BIP-44** (`m/44'/60'/0'/0/0`), verified against a known vector, so a Mycellium seed imports into external wallets. Device/messaging keys stay on HKDF, as X25519 has no external HD standard.)

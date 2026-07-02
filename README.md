@@ -1,4 +1,4 @@
-# Messe
+# Mycellium
 
 A peer-to-peer messenger where your message travels directly from your device to
 the other person's — nothing sits in the middle of your conversation. The design
@@ -9,12 +9,12 @@ the proof of concept.
 
 ```
 crates/
-  messe-core/       portable, no_std-capable protocol core
+  mycellium-core/       portable, no_std-capable protocol core
                     identity (24-word seed → 3 keys), self-signed records,
                     X3DH + Double Ratchet, group sender keys, wire codec,
                     Shamir, host traits
-  messe-directory/  the one hosted piece: login + signed-record store + mailbox
-  messe-cli/        Full-tier client: identity, register, chat (TCP & libp2p,
+  mycellium-directory/  the one hosted piece: login + signed-record store + mailbox
+  mycellium-cli/        Full-tier client: identity, register, chat (TCP & libp2p,
                     line or --tui), live serve + offline send/inbox, groups,
                     typed messages, contacts, search, backup, recovery, history
 ```
@@ -30,13 +30,13 @@ traversal (DHT/relay) is the remaining libp2p increment.
 
 ```sh
 cargo test --workspace          # unit + real end-to-end tests
-cargo test -p messe-cli --test e2e   # 2-account e2e: offline + live chat (TCP & libp2p)
+cargo test -p mycellium-cli --test e2e   # 2-account e2e: offline + live chat (TCP & libp2p)
 cargo build --release           # optimized binaries
-cargo build -p messe-core --no-default-features   # the no_std core, for embedded
+cargo build -p mycellium-core --no-default-features   # the no_std core, for embedded
 ```
 
 The `e2e` suite spins up a real directory in-process and drives the actual
-`messe-cli` binary through the whole flow — two accounts creating identities,
+`mycellium-cli` binary through the whole flow — two accounts creating identities,
 registering, and exchanging messages — asserting on the decrypted output, over
 both transports and the offline mailbox. A separate `robustness` suite fuzzes
 the wire decoders with garbage/truncated/bit-flipped bytes (never panics, never
@@ -54,36 +54,36 @@ direct connection, brokered only by the directory.
 
 ```sh
 # 1. Start the directory (login + lookup; never sees message content)
-MESSE_DIRECTORY_ADDR=127.0.0.1:8078 cargo run -p messe-directory &
+MYCELLIUM_DIRECTORY_ADDR=127.0.0.1:8078 cargo run -p mycellium-directory &
 
 # The seed is encrypted at rest; set a passphrase (or you'll be prompted).
-export MESSE_PASSPHRASE="a strong passphrase"
+export MYCELLIUM_PASSPHRASE="a strong passphrase"
 
 # 2. Bob: create an identity, register a handle, and listen
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- identity-new
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- register bob --addr 127.0.0.1:9003 \
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- identity-new
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- register bob --addr 127.0.0.1:9003 \
                           --directory http://127.0.0.1:8078
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- listen --addr 127.0.0.1:9003 &
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- listen --addr 127.0.0.1:9003 &
 
 # 3. Alice: create an identity, look Bob up, connect, and type messages
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- identity-new
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- chat bob --as alice \
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- identity-new
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- chat bob --as alice \
                           --directory http://127.0.0.1:8078
 ```
 
 You can keep a local address book of nicknames (each pins the peer's identity —
-if their wallet later differs, Messe refuses, catching a swapped identity):
+if their wallet later differs, Mycellium refuses, catching a swapped identity):
 
 ```sh
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- contact add b bob   # then use "b" anywhere
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- chat b --as alice
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- contact add b bob   # then use "b" anywhere
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- chat b --as alice
 ```
 
 See who's online (announce yourself, then others can check):
 
 ```sh
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- announce --as bob --directory http://127.0.0.1:8078
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- presence bob --directory http://127.0.0.1:8078
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- announce --as bob --directory http://127.0.0.1:8078
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- presence bob --directory http://127.0.0.1:8078
 ```
 
 Stay online to receive messages **pushed live** (bypassing the mailbox). While
@@ -91,7 +91,7 @@ you run `serve`, senders deliver directly to you; when you're not serving, they
 fall back to your mailbox automatically — one delivery path, no config:
 
 ```sh
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- serve --addr 127.0.0.1:9003 --as bob \
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- serve --addr 127.0.0.1:9003 --as bob \
                           --directory http://127.0.0.1:8078
 # now `send`, `group send`, `broadcast`, and `forward` reach Bob live
 ```
@@ -99,14 +99,14 @@ MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- serve --addr 127.0.0.1:9003 --as
 Verify a peer's identity out of band any time (matching numbers = no impostor):
 
 ```sh
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- verify bob
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- verify bob
 ```
 
 Block a handle to drop its messages (and refuse its connections):
 
 ```sh
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- block spammer
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- blocked        # unblock with `unblock`
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- block spammer
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- blocked        # unblock with `unblock`
 ```
 
 The chat is **full-duplex**: both terminals can type and both see the other's
@@ -118,8 +118,8 @@ Add `--tui` to `chat` or `listen` for a **full-screen terminal interface**
 (scrolling transcript + input box, colored sender labels):
 
 ```sh
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- listen --addr 127.0.0.1:9003 --tui
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- chat bob --as alice --tui \
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- listen --addr 127.0.0.1:9003 --tui
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- chat bob --as alice --tui \
                           --directory http://127.0.0.1:8078
 ```
 
@@ -128,18 +128,18 @@ identity). A chat replays earlier messages on connect, and you can review them
 any time:
 
 ```sh
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- history bob
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- conversations   # all chats + last message
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- search harbor   # across all transcripts
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- clear-history bob
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- history bob
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- conversations   # all chats + last message
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- search harbor   # across all transcripts
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- clear-history bob
 ```
 
 Back up and restore everything (identity + local data) — already encrypted at
 rest, so the bundle is safe:
 
 ```sh
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- export ./messe-backup.bin
-MESSE_HOME=/tmp/new   cargo run -p messe-cli -- import ./messe-backup.bin   # into a fresh home
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- export ./mycellium-backup.bin
+MYCELLIUM_HOME=/tmp/new   cargo run -p mycellium-cli -- import ./mycellium-backup.bin   # into a fresh home
 ```
 
 ### Group messaging
@@ -150,32 +150,32 @@ out to everyone via their mailboxes.
 
 ```sh
 # Alice creates a group and invites Bob and Carol
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group create team \
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group create team \
                           --members bob,carol --as alice --directory http://127.0.0.1:8078
 
 # Bob and Carol pick up the invite (and each other's keys) from their inbox
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- inbox --as bob   --directory http://127.0.0.1:8078
-MESSE_HOME=/tmp/carol cargo run -p messe-cli -- inbox --as carol --directory http://127.0.0.1:8078
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- inbox --as bob   --directory http://127.0.0.1:8078
+MYCELLIUM_HOME=/tmp/carol cargo run -p mycellium-cli -- inbox --as carol --directory http://127.0.0.1:8078
 
 # Alice sends to the whole group; members read it from their inbox
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group send team --as alice \
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group send team --as alice \
                           --message "hello team" --directory http://127.0.0.1:8078
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- inbox --as bob --directory http://127.0.0.1:8078
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- inbox --as bob --directory http://127.0.0.1:8078
 
 # Membership changes (add invites + re-keys; remove excludes and re-keys):
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group add    team --member dave  --as alice ...
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group remove team --member carol --as alice ...
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- group leave team --as bob   # notifies + re-keys
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group info team
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group list
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- group history team   # local transcript
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group add    team --member dave  --as alice ...
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group remove team --member carol --as alice ...
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- group leave team --as bob   # notifies + re-keys
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group info team
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group list
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- group history team   # local transcript
 ```
 
 Housekeeping: save a **draft** per peer, or **wipe** all local data:
 
 ```sh
-messe draft set bob "half-written thought"   # show / clear too
-messe wipe --yes                             # erase identity + messages (irreversible)
+mycellium draft set bob "half-written thought"   # show / clear too
+mycellium wipe --yes                             # erase identity + messages (irreversible)
 ```
 
 Group transcripts, like 1:1 history, are saved encrypted at rest.
@@ -186,11 +186,11 @@ When the peer isn't online, queue a message and let them fetch it later:
 
 ```sh
 # Alice sends while Bob is offline (async X3DH against Bob's published keys)
-MESSE_HOME=/tmp/alice cargo run -p messe-cli -- send bob --as alice \
+MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- send bob --as alice \
                           --message "catch you later" --directory http://127.0.0.1:8078
 
 # Bob later drains and decrypts his mailbox
-MESSE_HOME=/tmp/bob   cargo run -p messe-cli -- inbox --as bob \
+MYCELLIUM_HOME=/tmp/bob   cargo run -p mycellium-cli -- inbox --as bob \
                           --directory http://127.0.0.1:8078
 ```
 
@@ -202,17 +202,17 @@ Messages carry an id, so you can **reply** or **react** to one (works for
 
 ```sh
 # Reply to message #ab12cd with text; or react to it with an emoji
-messe send alice --as bob --message "sure" --reply-to ab12cd
-messe send alice --as bob --react 👍 --to ab12cd
+mycellium send alice --as bob --message "sure" --reply-to ab12cd
+mycellium send alice --as bob --react 👍 --to ab12cd
 # Edit or unsend an earlier message; forward one to someone else
-messe send alice --as bob --edit ab12cd --message "typo fixed"
-messe send alice --as bob --delete ab12cd
-messe forward ab12cd --from alice --to carol --as bob
+mycellium send alice --as bob --edit ab12cd --message "typo fixed"
+mycellium send alice --as bob --delete ab12cd
+mycellium forward ab12cd --from alice --to carol --as bob
 # Send a file (saved to the recipient's downloads folder)
-messe send alice --as bob --file ./photo.png
+mycellium send alice --as bob --file ./photo.png
 # Disappearing messages: per-message, or a per-conversation default
-messe send alice --as bob --message "secret" --expire 10m
-messe expire set alice 1h     # new messages to alice default to 1h (clear/show too)
+mycellium send alice --as bob --message "secret" --expire 10m
+mycellium expire set alice 1h     # new messages to alice default to 1h (clear/show too)
 ```
 
 Disappearing messages are best-effort: our client deletes on schedule, but it
@@ -224,9 +224,9 @@ Split your identity across guardians so a lost seed can be reconstructed from a
 threshold of them:
 
 ```sh
-messe guardian-split --shares 3 --threshold 2      # hand one share to each guardian
+mycellium guardian-split --shares 3 --threshold 2      # hand one share to each guardian
 # ...later, on a new device, with any 2 of the 3 shares:
-messe guardian-recover --share <s1> --share <s2>   # restores and re-encrypts the identity
+mycellium guardian-recover --share <s1> --share <s2>   # restores and re-encrypts the identity
 ```
 
 No single guardian can impersonate you; any two together can restore you.

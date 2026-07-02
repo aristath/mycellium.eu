@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/messe-core", "crates/messe-directory", "crates/messe-cli"]
+members = ["crates/mycellium-core", "crates/mycellium-directory", "crates/mycellium-cli"]
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-authors = ["Messe Team"]
+authors = ["Mycellium Team"]
 rust-version = "1.96"
-repository = "https://github.com/messe/messe"
+repository = "https://github.com/aristath/mycellium.eu"
 
 # The core is compiled for everything from microcontrollers to desktops, so we
 # keep release builds small and predictable. See docs/CONCEPT.md Layer 10.
