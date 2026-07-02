@@ -1,0 +1,31 @@
+[package]
+name = "messe-cli"
+version = "0.0.0"
+description = "Messe Full-tier client shell (CLI)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+messe-core = { path = "../messe-core" }
+messe-directory = { path = "../messe-directory" }
+clap = { version = "4", features = ["derive"] }
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+getrandom = "0.2"
+# Encrypt the seed at rest: passphrase -> Argon2id -> ChaCha20-Poly1305.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+# libp2p transport (production direct line): tcp + noise + yamux + streams.
+libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "macros", "ed25519"] }
+libp2p-stream = "0.4.0-alpha"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures = "0.3"
+# Terminal UI for interactive chat (bundles crossterm).
+ratatui = "0.29"
+
+[lints.rust]
+unsafe_code = "forbid"
