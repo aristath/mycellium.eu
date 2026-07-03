@@ -284,7 +284,7 @@ mod tests {
     use super::*;
     use mycellium_core::identity::Identity;
     use mycellium_core::platform::Platform;
-    use mycellium_core::record::{Record, SignedPreKey};
+    use mycellium_core::record::{Device, Record, SignedPreKey};
 
     struct OsPlatform;
     impl Platform for OsPlatform {
@@ -300,9 +300,12 @@ mod tests {
         let record = Record {
             handle: Handle::new(handle).unwrap(),
             wallet: id.wallet_public(),
-            peer_id: id.peer_id(),
-            id_key: id.messaging_public(),
-            signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), id),
+            devices: vec![Device {
+                device_key: id.device_public(),
+                peer_id: id.peer_id(),
+                id_key: id.messaging_public(),
+                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), id),
+            }],
             seq,
         };
         SignedRecord::sign(record, id)

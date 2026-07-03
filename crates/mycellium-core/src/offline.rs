@@ -59,9 +59,12 @@ mod tests {
         let record = Record {
             handle: Handle::new(handle).unwrap(),
             wallet: id.wallet_public(),
-            peer_id: crate::identity::PeerId(alloc::vec![]),
-            id_key: id.messaging_public(),
-            signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), id),
+            devices: alloc::vec![crate::record::Device {
+                device_key: id.device_public(),
+                peer_id: crate::identity::PeerId(alloc::vec![]),
+                id_key: id.messaging_public(),
+                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), id),
+            }],
             seq: 1,
         };
         SignedRecord::sign(record, id)
@@ -87,11 +90,11 @@ mod tests {
         let initiated = x3dh::initiate(
             &mut p,
             &alice,
-            &bob_record.record.id_key,
-            &bob_record.record.signed_pre_key.public,
+            &bob_record.record.primary().id_key,
+            &bob_record.record.primary().signed_pre_key.public,
         );
         let mut ratchet =
-            Ratchet::new_initiator(&mut p, &initiated.shared_secret, &bob_record.record.signed_pre_key.public);
+            Ratchet::new_initiator(&mut p, &initiated.shared_secret, &bob_record.record.primary().signed_pre_key.public);
         let ad_bytes = ad(&alice, &bob);
         let message = ratchet.encrypt(b"see you tomorrow", &ad_bytes);
 
@@ -105,7 +108,7 @@ mod tests {
 
         // ... time passes, Bob comes online and opens the envelope.
         assert!(envelope.sender_record.verify().is_ok());
-        assert_eq!(envelope.init.initiator_ik, envelope.sender_record.record.id_key);
+        assert_eq!(envelope.init.initiator_ik, envelope.sender_record.record.primary().id_key);
 
         let shared = x3dh::respond(&bob, &envelope.init);
         let mut bob_ratchet = Ratchet::new_responder(&shared, &bob);

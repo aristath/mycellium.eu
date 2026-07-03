@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::identity::{
-    Handle, Identity, MessagingPublicKey, PeerId, Signature, WalletPublicKey,
+    DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId, Signature, WalletPublicKey,
 };
 
 /// A medium-term messaging key, signed by the wallet, that lets a peer start a
@@ -33,27 +33,52 @@ impl SignedPreKey {
     }
 }
 
+/// One device in an account's cluster (Layer 11).
+///
+/// Each device carries its **own** transport and messaging keys; the account's
+/// single wallet signature over the whole record is what vouches that every
+/// listed device belongs to the account. A new device adds itself to the set
+/// (the seed is the authority) rather than sharing seed-derived keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    /// This device's Ed25519 key — its stable identifier within the cluster.
+    pub device_key: DevicePublicKey,
+    /// Where to open the direct line to this device.
+    pub peer_id: PeerId,
+    /// Long-term messaging key for X3DH.
+    pub id_key: MessagingPublicKey,
+    /// Medium-term signed pre-key.
+    pub signed_pre_key: SignedPreKey,
+}
+
 /// The unsigned body of a directory record.
 ///
-/// Everything a peer needs to find you and open a session: your root identity,
-/// how to reach your device, and the keys the ratchet bootstraps from.
+/// Everything a peer needs to find you and open a session: your root identity
+/// and the set of devices (Layer 11) you can be reached and messaged on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// The public name this record is claimed under.
     pub handle: Handle,
     /// Root identity — the wallet that signs this record.
     pub wallet: WalletPublicKey,
-    /// Where to open the direct line (resolved to live addresses by libp2p).
-    pub peer_id: PeerId,
-    /// Long-term messaging key for X3DH.
-    pub id_key: MessagingPublicKey,
-    /// Medium-term signed pre-key.
-    pub signed_pre_key: SignedPreKey,
+    /// The account's devices. One entry today; a cluster once linking lands.
+    pub devices: Vec<Device>,
     /// Monotonic sequence number — freshness and anti-rollback (Layer 9.4).
     pub seq: u64,
 }
 
 impl Record {
+    /// The account's first (primary) device. Records always carry at least one
+    /// device — [`SignedRecord::verify`] rejects an empty set.
+    pub fn primary(&self) -> &Device {
+        &self.devices[0]
+    }
+
+    /// Find a device in the cluster by its key.
+    pub fn device(&self, key: &DevicePublicKey) -> Option<&Device> {
+        self.devices.iter().find(|d| &d.device_key == key)
+    }
+
     /// The canonical byte encoding that is signed and verified.
     ///
     /// Delegates to [`crate::wire::canonical`] so the exact same deterministic
@@ -90,10 +115,12 @@ impl SignedRecord {
     pub fn verify(&self) -> Result<(), Error> {
         let wallet = &self.record.wallet;
         wallet.verify(&self.record.signing_bytes(), &self.signature)?;
-        wallet.verify(
-            &self.record.signed_pre_key.public.0,
-            &self.record.signed_pre_key.signature,
-        )?;
+        if self.record.devices.is_empty() {
+            return Err(Error::Malformed);
+        }
+        for device in &self.record.devices {
+            wallet.verify(&device.signed_pre_key.public.0, &device.signed_pre_key.signature)?;
+        }
         Ok(())
     }
 }
@@ -121,12 +148,15 @@ mod tests {
         Record {
             handle: Handle::new("ari").unwrap(),
             wallet: WalletPublicKey([2u8; 33]),
-            peer_id: PeerId(alloc::vec![3u8; 34]),
-            id_key: MessagingPublicKey([4u8; 32]),
-            signed_pre_key: SignedPreKey {
-                public: MessagingPublicKey([5u8; 32]),
-                signature: Signature(alloc::vec![6u8; 64]),
-            },
+            devices: alloc::vec![Device {
+                device_key: DevicePublicKey([1u8; 32]),
+                peer_id: PeerId(alloc::vec![3u8; 34]),
+                id_key: MessagingPublicKey([4u8; 32]),
+                signed_pre_key: SignedPreKey {
+                    public: MessagingPublicKey([5u8; 32]),
+                    signature: Signature(alloc::vec![6u8; 64]),
+                },
+            }],
             seq,
         }
     }
@@ -170,9 +200,12 @@ mod tests {
         let record = Record {
             handle: Handle::new("ari").unwrap(),
             wallet: id.wallet_public(),
-            peer_id: id.peer_id(),
-            id_key: id.messaging_public(),
-            signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+            devices: alloc::vec![Device {
+                device_key: id.device_public(),
+                peer_id: id.peer_id(),
+                id_key: id.messaging_public(),
+                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+            }],
             seq: 1,
         };
         let signed = SignedRecord::sign(record, &id);
@@ -185,15 +218,64 @@ mod tests {
     }
 
     #[test]
+    fn record_with_two_devices_verifies() {
+        let mut p = TestPlatform;
+        let id = Identity::generate(&mut p).unwrap();
+
+        // A second device entry (distinct keys), still signed by the one wallet.
+        let dev2 = Device {
+            device_key: DevicePublicKey([9u8; 32]),
+            peer_id: PeerId(alloc::vec![8u8; 34]),
+            id_key: MessagingPublicKey([7u8; 32]),
+            signed_pre_key: SignedPreKey::create(MessagingPublicKey([7u8; 32]), &id),
+        };
+        let record = Record {
+            handle: Handle::new("ari").unwrap(),
+            wallet: id.wallet_public(),
+            devices: alloc::vec![
+                Device {
+                    device_key: id.device_public(),
+                    peer_id: id.peer_id(),
+                    id_key: id.messaging_public(),
+                    signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+                },
+                dev2.clone(),
+            ],
+            seq: 1,
+        };
+        let signed = SignedRecord::sign(record, &id);
+        assert!(signed.verify().is_ok(), "two-device record must verify");
+        assert_eq!(signed.record.devices.len(), 2);
+        assert_eq!(signed.record.primary().device_key, id.device_public());
+        assert_eq!(signed.record.device(&dev2.device_key), Some(&dev2));
+    }
+
+    #[test]
+    fn empty_device_set_is_rejected() {
+        let mut p = TestPlatform;
+        let id = Identity::generate(&mut p).unwrap();
+        let record = Record {
+            handle: Handle::new("ari").unwrap(),
+            wallet: id.wallet_public(),
+            devices: alloc::vec![],
+            seq: 1,
+        };
+        assert!(SignedRecord::sign(record, &id).verify().is_err());
+    }
+
+    #[test]
     fn signed_record_survives_wire_round_trip() {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
         let record = Record {
             handle: Handle::new("ari").unwrap(),
             wallet: id.wallet_public(),
-            peer_id: id.peer_id(),
-            id_key: id.messaging_public(),
-            signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+            devices: alloc::vec![Device {
+                device_key: id.device_public(),
+                peer_id: id.peer_id(),
+                id_key: id.messaging_public(),
+                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+            }],
             seq: 7,
         };
         let signed = SignedRecord::sign(record, &id);

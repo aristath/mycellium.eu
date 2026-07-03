@@ -32,7 +32,7 @@ use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::{Ratchet, RatchetMessage};
-use mycellium_core::record::{Record, SignedPreKey, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedPreKey, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::shamir::{self, Share};
 use mycellium_core::transport::Transport;
@@ -1048,7 +1048,7 @@ fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
         lookup_verified(&client, &fs, peer)?
     };
 
-    let location = String::from_utf8(peer_record.record.peer_id.0.clone())
+    let location = String::from_utf8(peer_record.record.primary().peer_id.0.clone())
         .context("peer record has no dialable address")?;
 
     // A leading '/' marks a libp2p multiaddr; anything else is a TCP host:port.
@@ -1065,7 +1065,7 @@ fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
     } else {
         let mut transport = TcpTransport::dialer();
         let mut conn = transport
-            .dial(&peer_record.record.peer_id)
+            .dial(&peer_record.record.primary().peer_id)
             .with_context(|| format!("could not connect to {location}"))?;
         let session = handshake_initiator(&mut conn, &identity, &me, &peer_handle, &peer_record, &location)?;
         let (reader, writer) = conn.split()?;
@@ -1104,8 +1104,8 @@ fn handshake_initiator(
     conn.send(&wire::encode(&my_record))?;
 
     let mut platform = OsPlatform;
-    let responder_ik = peer_record.record.id_key;
-    let responder_spk = peer_record.record.signed_pre_key.public;
+    let responder_ik = peer_record.record.primary().id_key;
+    let responder_spk = peer_record.record.primary().signed_pre_key.public;
     let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk);
     conn.send(&wire::encode(&initiated.init))?;
 
@@ -1282,8 +1282,8 @@ fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: &str
 /// Asynchronously X3DH-seal `plaintext` for `peer` (offline, one-shot session).
 fn seal_to(identity: &Identity, me: &Handle, peer_record: &SignedRecord, plaintext: &[u8]) -> Envelope {
     let mut platform = OsPlatform;
-    let responder_ik = peer_record.record.id_key;
-    let responder_spk = peer_record.record.signed_pre_key.public;
+    let responder_ik = peer_record.record.primary().id_key;
+    let responder_spk = peer_record.record.primary().signed_pre_key.public;
     let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk);
     let mut ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk);
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
@@ -1312,7 +1312,7 @@ fn deliver(
 ) -> bool {
     let online = client.presence(handle).unwrap_or(false);
     if online {
-        if let Ok(addr) = String::from_utf8(record.record.peer_id.0.clone()) {
+        if let Ok(addr) = String::from_utf8(record.record.primary().peer_id.0.clone()) {
             // Push over a plain TCP `serve` endpoint (a raw host:port).
             if !addr.is_empty() && !addr.starts_with('/') {
                 if let Ok(frame) = serde_json::to_vec(item) {
@@ -1498,7 +1498,7 @@ fn open_envelope(
     if env.sender_record.record.handle != env.from {
         bail!("sender handle does not match its record");
     }
-    if env.init.initiator_ik != env.sender_record.record.id_key {
+    if env.init.initiator_ik != env.sender_record.record.primary().id_key {
         bail!("handshake is not bound to the sender's identity");
     }
 
@@ -2019,12 +2019,21 @@ fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecor
     let record = Record {
         handle: handle.clone(),
         wallet: identity.wallet_public(),
-        peer_id: PeerId(addr.as_bytes().to_vec()),
-        id_key: identity.messaging_public(),
-        signed_pre_key: SignedPreKey::create(identity.signed_pre_key_public(), identity),
+        devices: vec![this_device(identity, addr)],
         seq: OsPlatform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)
+}
+
+/// This device's entry for a record: its transport address plus its own
+/// (currently seed-derived) messaging keys, signed by the account wallet.
+fn this_device(identity: &Identity, addr: &str) -> Device {
+    Device {
+        device_key: identity.device_public(),
+        peer_id: PeerId(addr.as_bytes().to_vec()),
+        id_key: identity.messaging_public(),
+        signed_pre_key: SignedPreKey::create(identity.signed_pre_key_public(), identity),
+    }
 }
 
 /// Bind both peers' messaging identities into the AEAD associated data, so a
