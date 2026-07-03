@@ -139,7 +139,8 @@ pub fn update_devices(
 ) -> Result<()> {
     let seq = prev_seq.saturating_add(1).max(OsPlatform.now_unix_secs());
     let record = Record {
-        handle: handle.clone(),
+        // The record binds the *id*, not the plaintext name (Layer 6).
+        handle: user_id(handle.as_str()),
         wallet: identity.wallet_public(),
         queue: own_queue(),
         devices,
@@ -241,7 +242,8 @@ pub fn revoke_device(handle: &str, device_id: &str, directory: &str) -> Result<(
 
 pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecord {
     let record = Record {
-        handle: handle.clone(),
+        // The record binds `user_id(name)`, so the directory never sees the name.
+        handle: user_id(handle.as_str()),
         wallet: identity.wallet_public(),
         queue: own_queue(),
         devices: vec![this_device(identity, addr)],

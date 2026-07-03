@@ -535,8 +535,10 @@ pub fn open_envelope(
     env.sender_record
         .verify()
         .map_err(|_| anyhow!("sender record failed verification"))?;
-    if env.sender_record.record.handle != env.from {
-        bail!("sender handle does not match its record");
+    // The envelope carries the sender's plaintext name for display; it's
+    // self-verifying — its id must equal the id in the wallet-signed record.
+    if user_id(env.from.as_str()) != env.sender_record.record.handle {
+        bail!("sender name does not match its record");
     }
     if env.init.initiator_ik != env.sender_record.record.primary().id_key {
         bail!("handshake is not bound to the sender's identity");

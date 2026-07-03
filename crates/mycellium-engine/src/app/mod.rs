@@ -15,6 +15,7 @@ use mycellium_core::record::{Device, Record, SignedPreKey, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::shamir::{self, Share};
 use mycellium_core::transport::Transport;
+use mycellium_core::userid::user_id;
 use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 

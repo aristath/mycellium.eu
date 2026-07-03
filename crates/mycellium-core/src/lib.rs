@@ -33,6 +33,7 @@ pub mod safety;
 pub mod shamir;
 pub mod storage;
 pub mod transport;
+pub mod userid;
 pub mod wire;
 pub mod x3dh;
 

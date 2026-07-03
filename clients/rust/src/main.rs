@@ -17,6 +17,9 @@ use tiny_http::{Header, Method, Request, Response, Server};
 pub struct State {
     /// Directory endpoint (names/records/presence + email-verified claims).
     pub directory: String,
+    /// In-flight signups: pending token → the plaintext username. The directory
+    /// only ever knows the hashed id, so the client keeps the name to finish.
+    pub pending: std::collections::HashMap<String, String>,
 }
 
 const DEFAULT_DIRECTORY: &str = "http://127.0.0.1:8080";
@@ -51,7 +54,7 @@ fn main() {
     // key kept in the data dir — no user password or seed phrase to manage.
     std::env::set_var("MYCELLIUM_PASSPHRASE", ensure_device_key(&data_dir));
 
-    let state = Mutex::new(State { directory });
+    let state = Mutex::new(State { directory, pending: std::collections::HashMap::new() });
     let addr = format!("127.0.0.1:{port}");
     let server = match Server::http(&addr) {
         Ok(s) => s,

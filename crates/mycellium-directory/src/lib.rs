@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use mycellium_core::identity::{Handle, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
+use sha2::{Digest, Sha256};
 
 mod http;
 pub use http::serve;
@@ -97,8 +98,15 @@ pub struct Directory {
     presence: HashMap<Handle, u64>,
     /// Username claims awaiting email verification: pending token → claim.
     pending: HashMap<String, Pending>,
-    /// Recovery emails for verified names: handle → email.
+    /// Recovery emails for verified names: handle → **keyed hash** of the email.
+    /// The plaintext is never stored — only held transiently in `pending` while a
+    /// code is outstanding. The hash lets recovery recognise the same email
+    /// without the directory ever holding a readable address.
     emails: HashMap<Handle, String>,
+    /// Per-server secret mixed into email hashes. A leaked directory reveals no
+    /// testable emails without this too. (In-memory today; persist it alongside
+    /// the store in a real deployment.)
+    pepper: [u8; 32],
 }
 
 /// A username claim awaiting one-tap email verification (Layer 6 auth).
@@ -118,9 +126,24 @@ pub const PRESENCE_TTL: u64 = 60;
 pub const VERIFY_TTL: u64 = 900;
 
 impl Directory {
-    /// A fresh, empty directory.
+    /// A fresh, empty directory with a random email-hash pepper.
     pub fn new() -> Self {
-        Self::default()
+        Self { pepper: random_bytes::<32>(), ..Default::default() }
+    }
+
+    /// A keyed, non-reversible hash of an email — the only email data we keep.
+    fn email_hash(&self, email: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.pepper);
+        hasher.update(b":");
+        hasher.update(email.trim().to_lowercase().as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for b in digest {
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+        }
+        out
     }
 
     /// The exact bytes a client signs to prove control of its wallet.
@@ -214,7 +237,7 @@ impl Directory {
             }
         }
         self.bindings.insert(username.clone(), wallet);
-        self.emails.insert(username.clone(), email);
+        self.emails.insert(username.clone(), self.email_hash(&email));
         Ok(username)
     }
 

@@ -5,10 +5,20 @@ use serde::{Deserialize, Serialize};
 
 use mycellium_core::identity::{Handle, Identity, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
+use mycellium_core::userid::user_id;
 
 /// Talks to a running `mycellium-directory` over HTTP.
+///
+/// This adapter is the single boundary where a **plaintext username becomes a
+/// directory id**: every handle is hashed with [`user_id`] before it goes on the
+/// wire, so the directory only ever sees and stores opaque ids — never a name.
 pub struct DirectoryClient {
     base: String,
+}
+
+/// The directory id (hash) for a plaintext handle.
+fn id(handle: &Handle) -> String {
+    user_id(handle.as_str()).as_str().to_string()
 }
 
 #[derive(Serialize)]
@@ -66,7 +76,7 @@ impl DirectoryClient {
 
     /// Publish a signed record under `handle` using a session `token`.
     pub fn publish(&self, token: &str, handle: &Handle, record: &SignedRecord) -> Result<()> {
-        ureq::request("PUT", &format!("{}/records/{}", self.base, handle.as_str()))
+        ureq::request("PUT", &format!("{}/records/{}", self.base, id(handle)))
             .set("Authorization", &format!("Bearer {token}"))
             .send_json(record)
             .context("publish request failed")?;
@@ -75,7 +85,7 @@ impl DirectoryClient {
 
     /// Look up the signed record for `handle`.
     pub fn lookup(&self, handle: &Handle) -> Result<SignedRecord> {
-        let record: SignedRecord = ureq::get(&format!("{}/records/{}", self.base, handle.as_str()))
+        let record: SignedRecord = ureq::get(&format!("{}/records/{}", self.base, id(handle)))
             .call()
             .map_err(|e| anyhow!("lookup failed: {e}"))?
             .into_json()?;
@@ -96,9 +106,11 @@ impl DirectoryClient {
             pending: String,
             dev_code: Option<String>,
         }
+        // The directory binds the *id*, never the plaintext username.
+        let uid = user_id(username);
         let resp: Resp = ureq::post(&format!("{}/auth/start", self.base))
             .set("Authorization", &format!("Bearer {token}"))
-            .send_json(Req { username, email })
+            .send_json(Req { username: uid.as_str(), email })
             .map_err(|e| anyhow!("auth start failed: {e}"))?
             .into_json()?;
         Ok((resp.pending, resp.dev_code))
@@ -143,7 +155,7 @@ impl DirectoryClient {
 
     /// Announce that we're online (heartbeat).
     pub fn announce(&self, token: &str, handle: &Handle) -> Result<()> {
-        ureq::post(&format!("{}/presence/{}", self.base, handle.as_str()))
+        ureq::post(&format!("{}/presence/{}", self.base, id(handle)))
             .set("Authorization", &format!("Bearer {token}"))
             .call()
             .context("presence heartbeat failed")?;
@@ -156,7 +168,7 @@ impl DirectoryClient {
         struct Presence {
             online: bool,
         }
-        let resp: Presence = ureq::get(&format!("{}/presence/{}", self.base, handle.as_str()))
+        let resp: Presence = ureq::get(&format!("{}/presence/{}", self.base, id(handle)))
             .call()
             .map_err(|e| anyhow!("presence query failed: {e}"))?
             .into_json()?;

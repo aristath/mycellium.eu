@@ -40,9 +40,9 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
 
     let result: anyhow::Result<Value> = match (method, segs.as_slice()) {
         (&Method::Get, ["status"]) => status(&directory),
-        (&Method::Post, ["signup"]) => signup(&req, &directory),
-        (&Method::Post, ["signup", "confirm"]) => signup_confirm(&req, &directory),
-        (&Method::Post, ["signup", "status"]) => signup_status(&req, &directory),
+        (&Method::Post, ["signup"]) => signup(state, &req, &directory),
+        (&Method::Post, ["signup", "confirm"]) => signup_confirm(state, &req, &directory),
+        (&Method::Post, ["signup", "status"]) => signup_status(state, &req, &directory),
 
         (&Method::Get, ["contacts"]) => contacts_list(),
         (&Method::Post, ["contacts"]) => contacts_add(&req, &directory),
@@ -98,9 +98,12 @@ fn status(directory: &str) -> anyhow::Result<Value> {
 }
 
 /// Step 1: silently ensure an identity, then start an email-verified claim.
-fn signup(req: &Value, directory: &str) -> anyhow::Result<Value> {
+/// The plaintext username is remembered locally, keyed by the pending token —
+/// the directory only ever learns the hashed id.
+fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let username = field(req, "username").ok_or_else(|| anyhow::anyhow!("pick a username"))?;
     let email = field(req, "email").ok_or_else(|| anyhow::anyhow!("enter an email"))?;
+    Handle::new(username).map_err(|_| anyhow::anyhow!("usernames are lowercase letters, digits, or _"))?;
     if !reachable(directory) {
         anyhow::bail!(
             "Can't reach the directory at {directory}. Start it first:  cargo run -p mycellium-server -- --addr 127.0.0.1:8080"
@@ -110,26 +113,36 @@ fn signup(req: &Value, directory: &str) -> anyhow::Result<Value> {
     let client = DirectoryClient::new(directory);
     let token = client.login(&identity)?;
     let (pending, dev_code) = client.auth_start(&token, username, email)?;
+    state.lock().unwrap().pending.insert(pending.clone(), username.to_string());
     Ok(json!({ "pending": pending, "dev_code": dev_code }))
 }
 
 /// Step 2 (code path): confirm the emailed code and finish setup.
-fn signup_confirm(req: &Value, directory: &str) -> anyhow::Result<Value> {
+fn signup_confirm(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let pending = field(req, "pending").ok_or_else(|| anyhow::anyhow!("missing pending token"))?;
     let code = field(req, "code").ok_or_else(|| anyhow::anyhow!("enter the code"))?;
+    let username = state
+        .lock()
+        .unwrap()
+        .pending
+        .get(pending)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("signup expired — start again"))?;
     let client = DirectoryClient::new(directory);
-    let username = client.auth_confirm(pending, code)?;
+    client.auth_confirm(pending, code)?;
     finalize(&client, &username)?;
     Ok(json!({ "handle": username }))
 }
 
 /// Step 2 (link path): poll whether the one-tap link was clicked; finish if so.
-fn signup_status(req: &Value, directory: &str) -> anyhow::Result<Value> {
+fn signup_status(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let pending = field(req, "pending").ok_or_else(|| anyhow::anyhow!("missing pending token"))?;
     let client = DirectoryClient::new(directory);
-    let (verified, username) = client.auth_status(pending)?;
+    let (verified, _) = client.auth_status(pending)?;
     if verified && read_handle().is_none() {
-        finalize(&client, &username)?;
+        if let Some(username) = state.lock().unwrap().pending.get(pending).cloned() {
+            finalize(&client, &username)?;
+        }
     }
     Ok(json!({ "verified": verified, "handle": read_handle() }))
 }
