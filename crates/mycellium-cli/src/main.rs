@@ -1487,7 +1487,7 @@ fn process_item(
     match item {
         MailItem::Direct(env) => handle_direct(identity, me, client, token, blocked, platform, fs, &env),
         MailItem::SelfSync { peer, envelope } => handle_self_sync(identity, platform, fs, &peer, &envelope),
-        MailItem::GroupSync(env) => handle_group_sync(identity, me, platform, fs, &env),
+        MailItem::GroupSync(env) => handle_group_sync(identity, me, client, token, platform, fs, &env),
         MailItem::GroupInvite(env) => handle_group_invite(identity, me, client, token, fs, platform, &env),
         MailItem::GroupText { group_id, message } => handle_group_text(blocked, fs, &group_id, &message),
         MailItem::GroupRemove { group_id, member } => {
@@ -1666,14 +1666,16 @@ fn group_create(name: &str, members: &[String], whoami: &str, directory: &str) -
     }
 
     let mut platform = OsPlatform;
-    let group = Group::new(&mut platform, me.as_str().as_bytes().to_vec());
-    let stored = StoredGroup {
+    let group = Group::new(&mut platform, my_group_id(&identity));
+    let mut stored = StoredGroup {
         id: group_id.clone(),
         name: name.to_string(),
         members: all.clone(),
         me: me.as_str().to_string(),
+        sender_handles: Vec::new(),
         state: group.export(),
     };
+    stored.note_sender(my_group_id(&identity), me.as_str());
     groups::save(&mut fs, &stored)?;
     distribute_key(&identity, &me, &client, &token, &stored, &group);
 
@@ -1690,13 +1692,9 @@ fn distribute_key(
     stored: &StoredGroup,
     group: &Group,
 ) {
-    let targets: Vec<String> = stored
-        .members
-        .iter()
-        .filter(|m| *m != me.as_str())
-        .cloned()
-        .collect();
-    distribute_key_to(identity, me, client, token, stored, group, &targets);
+    // Every member, including our own handle — `distribute_key_to` skips only
+    // this exact device, so our sibling devices still get our key (Layer 11).
+    distribute_key_to(identity, me, client, token, stored, group, &stored.members);
 }
 
 /// Send our sender-key distribution to a specific set of members.
@@ -1713,6 +1711,7 @@ fn distribute_key_to(
         group_id: stored.id.clone(),
         name: stored.name.clone(),
         members: stored.members.clone(),
+        sender_id: my_group_id(identity),
         distribution: group.distribution(),
     };
     let plaintext = match serde_json::to_vec(&payload) {
@@ -1720,9 +1719,6 @@ fn distribute_key_to(
         Err(_) => return,
     };
     for member in targets {
-        if member == me.as_str() {
-            continue;
-        }
         let handle = match Handle::new(member.clone()) {
             Ok(h) => h,
             Err(_) => continue,
@@ -1734,9 +1730,12 @@ fn distribute_key_to(
                 continue;
             }
         };
-        // Seal the sender key to every device in the member's cluster (Layer 11),
-        // so each device can decrypt the group.
+        // Seal the sender key to every device in the member's cluster (Layer 11) —
+        // including our *own* siblings, but never this device itself.
         for device in &record.record.devices {
+            if device.device_key == identity.device_public() {
+                continue;
+            }
             let env = seal_to(identity, me, device, &plaintext);
             deliver(client, token, &handle, device, &MailItem::GroupInvite(env));
         }
@@ -1755,13 +1754,16 @@ fn handle_group_invite(
     let (from, bytes) = open_envelope(identity, platform, env)?;
     let payload: GroupInvitePayload =
         serde_json::from_slice(&bytes).map_err(|_| anyhow!("malformed group invite"))?;
-    let sender_id = from.as_str().as_bytes().to_vec();
+    // Senders are keyed by their device id (Layer 11), carried in the payload;
+    // we remember which handle is behind it for display and block checks.
+    let sender_id = payload.sender_id.clone();
 
     match groups::load(fs, &payload.group_id)? {
         Some(mut stored) => {
             // Already in the group — learn this member's sender key.
             let mut group = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-            group.add_member(sender_id, &payload.distribution).map_err(|_| anyhow!("bad sender key"))?;
+            group.add_member(sender_id.clone(), &payload.distribution).map_err(|_| anyhow!("bad sender key"))?;
+            stored.note_sender(sender_id, from.as_str());
 
             // Learn any members we didn't know about, and send them our key.
             let newcomers: Vec<String> = payload
@@ -1782,15 +1784,18 @@ fn handle_group_invite(
         None => {
             // First time we hear of this group: join, and reply with our key.
             let mut own_platform = OsPlatform;
-            let mut group = Group::new(&mut own_platform, me.as_str().as_bytes().to_vec());
-            group.add_member(sender_id, &payload.distribution).map_err(|_| anyhow!("bad sender key"))?;
-            let stored = StoredGroup {
+            let mut group = Group::new(&mut own_platform, my_group_id(identity));
+            group.add_member(sender_id.clone(), &payload.distribution).map_err(|_| anyhow!("bad sender key"))?;
+            let mut stored = StoredGroup {
                 id: payload.group_id.clone(),
                 name: payload.name.clone(),
                 members: payload.members.clone(),
                 me: me.as_str().to_string(),
+                sender_handles: Vec::new(),
                 state: group.export(),
             };
+            stored.note_sender(sender_id, from.as_str());
+            stored.note_sender(my_group_id(identity), me.as_str());
             groups::save(fs, &stored)?;
             println!("joined group '{}' (invited by {})", stored.name, from.as_str());
             distribute_key(identity, me, client, token, &stored, &group);
@@ -1805,10 +1810,6 @@ fn handle_group_text(
     group_id: &str,
     message: &GroupMessage,
 ) -> Result<()> {
-    let sender = String::from_utf8_lossy(&message.sender).into_owned();
-    if blocklist::is_blocked(blocked, &sender) {
-        return Ok(()); // drop group messages from blocked members
-    }
     let mut stored = match groups::load(fs, group_id)? {
         Some(stored) => stored,
         None => {
@@ -1816,6 +1817,14 @@ fn handle_group_text(
             return Ok(());
         }
     };
+    // Map the device-keyed sender id back to a handle for display/block checks.
+    let sender = stored
+        .handle_of(&message.sender)
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
+    if blocklist::is_blocked(blocked, &sender) {
+        return Ok(()); // drop group messages from blocked members
+    }
     let mut group = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
     match group.decrypt(message, &group_ad(group_id)) {
         Ok(plaintext) => {
@@ -1898,9 +1907,14 @@ fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) -> Res
     }
     stored.members.retain(|m| m != member);
 
-    // Drop the removed member's key and re-key ourselves.
+    // Drop every device-sender of the removed handle, and re-key ourselves.
     let mut session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    session.remove_member(member.as_bytes());
+    for (id, handle) in &stored.sender_handles {
+        if handle == member {
+            session.remove_member(id);
+        }
+    }
+    stored.sender_handles.retain(|(_, h)| h != member);
     session.rotate(&mut OsPlatform);
     stored.state = session.export();
     groups::save(&mut fs, &stored)?;
@@ -1942,7 +1956,12 @@ fn handle_group_remove(
     }
     stored.members.retain(|m| m != member);
     let mut session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    session.remove_member(member.as_bytes());
+    for (id, handle) in &stored.sender_handles {
+        if handle == member {
+            session.remove_member(id);
+        }
+    }
+    stored.sender_handles.retain(|(_, h)| h != member);
     session.rotate(&mut OsPlatform);
     stored.state = session.export();
     groups::save(fs, &stored)?;
@@ -2084,13 +2103,14 @@ fn group_sync(whoami: &str, directory: &str) -> Result<()> {
         // Every key this device holds: the others' receiver keys, plus our own
         // distribution (so a sibling can decrypt what this device sends).
         let mut keys = group.known_keys();
-        keys.push((me.as_str().as_bytes().to_vec(), group.distribution()));
+        keys.push((my_group_id(&identity), group.distribution()));
 
         let payload = GroupSyncPayload {
             group_id: stored.id.clone(),
             name: stored.name.clone(),
             members: stored.members.clone(),
             keys,
+            sender_handles: stored.sender_handles.clone(),
         };
         let plaintext = match serde_json::to_vec(&payload) {
             Ok(b) => b,
@@ -2110,6 +2130,8 @@ fn group_sync(whoami: &str, directory: &str) -> Result<()> {
 fn handle_group_sync(
     identity: &Identity,
     me: &Handle,
+    client: &DirectoryClient,
+    token: &str,
     platform: &mut OsPlatform,
     fs: &mut FileStore,
     env: &Envelope,
@@ -2121,21 +2143,25 @@ fn handle_group_sync(
     if groups::load(fs, &payload.group_id)?.is_some() {
         return Ok(()); // already have this group
     }
-    // A fresh own sender key (this device would sign under it); import every
-    // sender key the cluster shared so we can *decrypt* current members.
-    let mut group = Group::new(platform, me.as_str().as_bytes().to_vec());
+    // A fresh own sender key (this device signs under its device id); import
+    // every sender key the cluster shared so we can decrypt current members.
+    let mut group = Group::new(platform, my_group_id(identity));
     for (id, dist) in &payload.keys {
         let _ = group.add_member(id.clone(), dist);
     }
-    let stored = StoredGroup {
+    let mut stored = StoredGroup {
         id: payload.group_id.clone(),
         name: payload.name.clone(),
         members: payload.members.clone(),
         me: me.as_str().to_string(),
+        sender_handles: payload.sender_handles.clone(),
         state: group.export(),
     };
+    stored.note_sender(my_group_id(identity), me.as_str());
     groups::save(fs, &stored)?;
-    println!("bootstrapped into group '{}' (receive-only on this device)", stored.name);
+    // Announce our own key to the members so this device can also *send*.
+    distribute_key(identity, me, client, token, &stored, &group);
+    println!("bootstrapped into group '{}'", stored.name);
     Ok(())
 }
 
@@ -2370,6 +2396,12 @@ fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecor
         seq: OsPlatform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)
+}
+
+/// This device's unique sender id inside any group (Layer 11): its device key,
+/// so two devices of one account are distinct senders and don't collide.
+fn my_group_id(identity: &Identity) -> Vec<u8> {
+    identity.device_public().0.to_vec()
 }
 
 /// This device's entry for a record: its transport address plus its own

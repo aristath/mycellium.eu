@@ -278,6 +278,52 @@ fn read_receipt_reaches_sender_cluster() {
 }
 
 #[test]
+fn bootstrapped_device_can_send_to_group() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let alice = account(&dir, "alice");
+
+    let mary_a = home("gsend-a");
+    let created = cli(&mary_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6601", "--directory", &dir]), "register");
+    ok(&cli(&alice, &["group", "create", "team", "--members", "mary", "--as", "alice", "--directory", &dir]), "create");
+    ok(&cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]), "mary-a invite");
+    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "alice mesh");
+
+    let mary_b = home("gsend-b");
+    ok(
+        &Command::new(CLI)
+            .args(["link-device", "mary", "--addr", "127.0.0.1:6602", "--directory", &dir])
+            .env("MYCELLIUM_HOME", &mary_b)
+            .env("MYCELLIUM_PASSPHRASE", PASS)
+            .env("MYCELLIUM_PHRASE", &phrase)
+            .stdin(Stdio::null())
+            .output()
+            .expect("link-device"),
+        "link-device",
+    );
+
+    // Sync groups to B; B bootstraps and announces its own key to the members.
+    ok(&cli(&mary_a, &["group", "sync", "--as", "mary", "--directory", &dir]), "group sync");
+    ok(&cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]), "mary-b bootstrap");
+    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "alice learns B key");
+    ok(&cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]), "mary-a learns B key");
+
+    // B sends to the group; both Alice and Mary's phone can read it.
+    ok(&cli(&mary_b, &["group", "send", "team", "--as", "mary", "--message", "sent from my laptop", "--directory", &dir]), "b group send");
+    let a = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&a.stdout).contains("sent from my laptop"), "alice can't read B's group message: {}", String::from_utf8_lossy(&a.stdout));
+    let ma = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&ma.stdout).contains("sent from my laptop"), "mary's phone can't read B's group message: {}", String::from_utf8_lossy(&ma.stdout));
+}
+
+#[test]
 fn new_device_bootstraps_into_group() {
     let _throttle = throttle();
     let dir = start_directory();

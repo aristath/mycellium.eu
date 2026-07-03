@@ -58,6 +58,9 @@ pub struct GroupInvitePayload {
     pub name: String,
     /// All member handles (including the sender and the recipient).
     pub members: Vec<String>,
+    /// The sender's device-unique group id (Layer 11), used as the map key.
+    #[serde(default)]
+    pub sender_id: Vec<u8>,
     /// The sender's sender-key distribution.
     pub distribution: SenderKeyDistribution,
 }
@@ -75,6 +78,8 @@ pub struct GroupSyncPayload {
     pub members: Vec<String>,
     /// Every sender key the cluster holds: `(sender id, distribution)`.
     pub keys: Vec<(Vec<u8>, SenderKeyDistribution)>,
+    /// Each sender's device id → handle, for display on the new device.
+    pub sender_handles: Vec<(Vec<u8>, String)>,
 }
 
 /// A member's persisted view of one group.
@@ -88,8 +93,29 @@ pub struct StoredGroup {
     pub members: Vec<String>,
     /// This device's own handle in the group.
     pub me: String,
+    /// Each sender's device id → their handle, for display and block checks
+    /// (Layer 11: senders are keyed by *device*, so two devices of one handle
+    /// don't collide).
+    #[serde(default)]
+    pub sender_handles: Vec<(Vec<u8>, String)>,
     /// The serialized core group session (secret — stored encrypted).
     pub state: GroupState,
+}
+
+impl StoredGroup {
+    /// Record (or update) the handle behind a sender's device id.
+    pub fn note_sender(&mut self, sender_id: Vec<u8>, handle: &str) {
+        if let Some(entry) = self.sender_handles.iter_mut().find(|(id, _)| *id == sender_id) {
+            entry.1 = handle.to_string();
+        } else {
+            self.sender_handles.push((sender_id, handle.to_string()));
+        }
+    }
+
+    /// The handle behind a sender's device id, if known.
+    pub fn handle_of(&self, sender_id: &[u8]) -> Option<&str> {
+        self.sender_handles.iter().find(|(id, _)| id == sender_id).map(|(_, h)| h.as_str())
+    }
 }
 
 fn group_key(id: &str) -> Vec<u8> {
@@ -171,6 +197,7 @@ mod tests {
             name: "team".into(),
             members: vec!["me".into(), "bob".into()],
             me: "me".into(),
+            sender_handles: Vec::new(),
             state: group.export(),
         }
     }

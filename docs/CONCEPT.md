@@ -394,13 +394,13 @@ sent before it joined. To carry history to a new device, move it explicitly with
 Groups are the one exception to "starts fresh": a device linked *after* you
 joined a group can be **bootstrapped** into it with `group sync`. An existing
 device hands each sibling the group roster plus every sender key it already holds
-(receiver keys only — never a private signing key), so the new device can
-**receive** the group immediately, and the sender's own messages are mirrored to
-the cluster too. This is deliberately **receive-only** on the bootstrapped
-device: because the sender-keys protocol identifies a sender by *handle*, two
-devices sending under one handle would collide at the other members. Making a
-cluster a *first-class* multi-sender group (sender keys keyed by device) is the
-deeper refinement that would let every device send as well.
+(receiver keys only — never a private signing key). The new device imports those
+so it can decrypt current members, then announces **its own** sender key to the
+group. Because sender keys are keyed by **device**, not handle (Layer 11), the
+two devices of one account are distinct senders and don't collide — so the
+bootstrapped device can **send as well as receive**. A small per-group map from
+each sender's device id back to its handle drives display and block checks.
+Every device of an account thus participates fully in the group.
 
 ### 11.6 The honest trade-off
 
@@ -436,7 +436,7 @@ What remains is no longer concept — it's building and hardening:
 - **Build the POC** — ✅ *done.* The **Rust core** (`mycellium-core`: seed/keys, handle, record sign/verify, X3DH + Double Ratchet, wire codec, behind the Transport/Storage/Platform traits), the **directory service** (`mycellium-directory`: login + signed-KV + anti-rollback + permanent binding), and a **Full-tier shell** (`mycellium-cli`) that runs the whole flow — register → look up → direct connect → X3DH → ratchet → E2E messages — over a TCP transport. See [`../README.md`](../README.md) to run it.
 - **libp2p transport** — ✅ *done.* A `Transport` impl over rust-libp2p (TCP + Noise + Yamux, PeerId derived from the device key, a `/mycellium/1.0` byte-stream protocol) sits behind the same trait as the TCP transport; `mycellium-cli` selects it with `--libp2p` and auto-detects it from the peer's multiaddr. **NAT traversal** (DHT, relay, DCUtR) is the remaining increment — added in the swarm, with no change to the app above.
 - **Live delivery with mailbox fallback** — ✅ *done.* A member runs `serve` to stay online (it announces presence). When sending (1:1, group, broadcast, forward), the client checks each recipient's presence and **pushes the message directly over a live connection if they're online**, falling back to the offline mailbox otherwise. Group messages therefore reach online members live and offline ones via their mailbox — one `deliver` path, verified by an e2e live-push test. (Full 1:1 *interactive* chat still uses the dedicated `chat`/`listen` ratchet path.)
-- **Multi-device (device clusters)** — ✅ *done.* An account (seed/wallet) runs on many devices, each with its own message keys, all wallet-signed into one record (Layer 11). `link-device` adds a device with just the seed — no ceremony; `devices` / `revoke-device` manage the cluster. A message is sealed and delivered per recipient device, mirrored to your own other devices, and group messages/invites fan out to each member's devices — so *add a device and your messages show up there*. A device linked *after* you joined a group is bootstrapped into it (receive-only) with `group sync`. Verified by seven multi-device e2e tests (link/revoke, recipient fan-out, self-sync, group fan-out, receipts, revocation, group bootstrap).
+- **Multi-device (device clusters)** — ✅ *done.* An account (seed/wallet) runs on many devices, each with its own message keys, all wallet-signed into one record (Layer 11). `link-device` adds a device with just the seed — no ceremony; `devices` / `revoke-device` manage the cluster. A message is sealed and delivered per recipient device, mirrored to your own other devices, and group messages/invites fan out to each member's devices — so *add a device and your messages show up there*. A device linked *after* you joined a group is bootstrapped into it (send *and* receive — sender keys are keyed by device) with `group sync`. Verified by eight multi-device e2e tests (link/revoke, recipient fan-out, self-sync, group fan-out, receipts, revocation, group bootstrap, second-device group send).
 - **Conversations overview** — ✅ *done.* `conversations` lists every peer and group with a last-message preview (pruning expired).
 - **Full-duplex chat** — ✅ *done.* Live chat is bidirectional: the connection is split into read/write halves, the ratchet is shared under a mutex, and a reader thread prints incoming messages while the main thread sends. Works identically over TCP and libp2p (the responder starts replying once it has received the first message). A `--tui` flag gives a full-screen terminal interface.
 - **Directory rate limiting** — ✅ *done.* Mailbox deposits are capped per authenticated wallet in a fixed time window (anti-spam), returning `429` when exceeded — a first abuse control on the one hosted piece.
