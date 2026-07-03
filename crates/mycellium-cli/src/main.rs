@@ -5,13 +5,6 @@
 //! create/restore an identity, register a handle, look a peer up, open a direct
 //! line, run X3DH + Double Ratchet, and exchange end-to-end-encrypted messages.
 
-mod blocklist;
-mod contacts;
-mod draft;
-mod expiry;
-mod groups;
-mod history;
-mod platform;
 mod tui;
 
 use std::io::BufRead;
@@ -34,15 +27,18 @@ use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 
 use mycellium_directory_client::DirectoryClient;
-use contacts::Contact;
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
-use groups::{GroupInvitePayload, GroupSyncPayload, MailItem, StoredGroup};
-use history::{GroupStoredMessage, StoredMessage};
+use mycellium_engine::blocklist;
+use mycellium_engine::contacts::{self, Contact};
+use mycellium_engine::draft;
+use mycellium_engine::expiry;
+use mycellium_engine::groups::{self, GroupInvitePayload, GroupSyncPayload, MailItem, StoredGroup};
+use mycellium_engine::history::{self, GroupStoredMessage, StoredMessage};
+use mycellium_engine::platform::OsPlatform;
 use mycellium_transport::libp2p_net::{self, Libp2pNode};
 use mycellium_transport::link::{FrameReader, FrameWriter, Wire};
 use mycellium_transport::net::{self, TcpTransport};
-use platform::OsPlatform;
 
 const DEFAULT_DIRECTORY: &str = "http://127.0.0.1:8080";
 

@@ -24,9 +24,9 @@ use mycellium_core::ratchet::RatchetMessage;
 use mycellium_core::wire;
 
 use mycellium_storage::filestore::FileStore;
-use crate::history::{self, StoredMessage};
+use mycellium_engine::history::{self, StoredMessage};
 use mycellium_transport::link::{FrameReader, FrameWriter};
-use crate::platform::OsPlatform;
+use mycellium_engine::platform::OsPlatform;
 use crate::Session;
 
 /// Who authored a line in the transcript.
