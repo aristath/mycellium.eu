@@ -193,6 +193,44 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+fn read_receipt_reaches_sender_cluster() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let john = account(&dir, "john");
+
+    // Mary: device A registers, device B links.
+    let mary_a = home("rcpt-a");
+    let created = cli(&mary_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6301", "--directory", &dir]), "register");
+    let mary_b = home("rcpt-b");
+    ok(
+        &Command::new(CLI)
+            .args(["link-device", "mary", "--addr", "127.0.0.1:6302", "--directory", &dir])
+            .env("MYCELLIUM_HOME", &mary_b)
+            .env("MYCELLIUM_PASSPHRASE", PASS)
+            .env("MYCELLIUM_PHRASE", &phrase)
+            .stdin(Stdio::null())
+            .output()
+            .expect("link-device"),
+        "link-device",
+    );
+
+    // Mary sends from device A; John reads it, returning a receipt to the cluster.
+    ok(&cli(&mary_a, &["send", "john", "--as", "mary", "--message", "did you get this", "--directory", &dir]), "send");
+    ok(&cli(&john, &["inbox", "--as", "john", "--directory", &dir]), "john inbox");
+
+    // Device A (which sent) sees the read receipt.
+    let a = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&a.stdout).contains("read your message"), "sender device missed receipt: {}", String::from_utf8_lossy(&a.stdout));
+}
+
+#[test]
 fn group_reaches_all_member_devices() {
     let _throttle = throttle();
     let dir = start_directory();

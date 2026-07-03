@@ -1594,8 +1594,13 @@ fn send_receipt(identity: &Identity, me: &Handle, client: &DirectoryClient, toke
         expires_at: None,
         body: Body::Receipt { message_id: message_id.to_string(), read: true },
     };
-    let env = seal_to(identity, me, record.record.primary(), &receipt.encode());
-    let _ = deposit_item(client, token, to, ACCOUNT_SLOT, &MailItem::Direct(env));
+    // Fan the receipt out to every device of the original sender (Layer 11), so
+    // whichever device they sent from sees the read status.
+    let encoded = receipt.encode();
+    for device in &record.record.devices {
+        let env = seal_to(identity, me, device, &encoded);
+        deliver(client, token, to, device, &MailItem::Direct(env));
+    }
 }
 
 /// Authenticate the sender and decrypt one offline envelope to raw bytes.
