@@ -23,6 +23,7 @@ mod cipher;
 pub mod error;
 pub mod group;
 pub mod identity;
+pub mod login;
 pub mod message;
 pub mod offline;
 pub mod platform;

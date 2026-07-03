@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 mycellium-core = { path = "../mycellium-core" }
-mycellium-directory = { path = "../mycellium-directory" }
 clap = { version = "4", features = ["derive"] }
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +25,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 futures = "0.3"
 # Terminal UI for interactive chat (bundles crossterm).
 ratatui = "0.29"
+
+[dev-dependencies]
+# Tests spin up an in-process directory; the client itself never depends on it.
+mycellium-directory = { path = "../mycellium-directory" }
 
 [lints.rust]
 unsafe_code = "forbid"

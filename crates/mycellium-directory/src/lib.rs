@@ -124,10 +124,9 @@ impl Directory {
     }
 
     /// The exact bytes a client signs to prove control of its wallet.
+    /// Delegates to the shared [`mycellium_core::login`] contract.
     pub fn challenge_message(nonce: &str) -> Vec<u8> {
-        let mut msg = b"mycellium-login:".to_vec();
-        msg.extend_from_slice(nonce.as_bytes());
-        msg
+        mycellium_core::login::challenge_message(nonce)
     }
 
     /// Step 1 of login: issue a challenge nonce for `wallet`.

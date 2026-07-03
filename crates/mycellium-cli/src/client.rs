@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use mycellium_core::identity::{Handle, Identity, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
-use mycellium_directory::Directory;
 
 /// Talks to a running `mycellium-directory` over HTTP.
 pub struct DirectoryClient {
@@ -51,7 +50,7 @@ impl DirectoryClient {
             .context("challenge request failed")?
             .into_json()?;
 
-        let signature = identity.sign(&Directory::challenge_message(&challenge.nonce));
+        let signature = identity.sign(&mycellium_core::login::challenge_message(&challenge.nonce));
 
         let verified: VerifyResp = ureq::post(&format!("{}/login/verify", self.base))
             .send_json(VerifyReq {
