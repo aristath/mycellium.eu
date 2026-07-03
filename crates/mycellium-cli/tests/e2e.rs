@@ -193,6 +193,48 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+fn group_reaches_all_member_devices() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let alice = account(&dir, "alice");
+
+    // Bob: device A registers, device B links.
+    let bob_a = home("grp-a");
+    let created = cli(&bob_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&bob_a, &["register", "bob", "--addr", "127.0.0.1:6201", "--directory", &dir]), "register");
+    let bob_b = home("grp-b");
+    ok(
+        &Command::new(CLI)
+            .args(["link-device", "bob", "--addr", "127.0.0.1:6202", "--directory", &dir])
+            .env("MYCELLIUM_HOME", &bob_b)
+            .env("MYCELLIUM_PASSPHRASE", PASS)
+            .env("MYCELLIUM_PHRASE", &phrase)
+            .stdin(Stdio::null())
+            .output()
+            .expect("link-device"),
+        "link-device",
+    );
+
+    // Alice creates the group; both Bob devices pick up the sender key.
+    ok(&cli(&alice, &["group", "create", "team", "--members", "bob", "--as", "alice", "--directory", &dir]), "group create");
+    ok(&cli(&bob_a, &["inbox", "--as", "bob", "--directory", &dir]), "bob-a invite");
+    ok(&cli(&bob_b, &["inbox", "--as", "bob", "--directory", &dir]), "bob-b invite");
+
+    // Alice sends to the group; both of Bob's devices receive it.
+    ok(&cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "hello team", "--directory", &dir]), "group send");
+    let a = cli(&bob_a, &["inbox", "--as", "bob", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&a.stdout).contains("hello team"), "device A missed group msg: {}", String::from_utf8_lossy(&a.stdout));
+    let b = cli(&bob_b, &["inbox", "--as", "bob", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&b.stdout).contains("hello team"), "device B missed group msg: {}", String::from_utf8_lossy(&b.stdout));
+}
+
+#[test]
 fn sent_messages_sync_to_own_devices() {
     let _throttle = throttle();
     let dir = start_directory();

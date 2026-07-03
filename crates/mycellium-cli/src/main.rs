@@ -1387,6 +1387,22 @@ fn deliver(
     deposit_item(client, token, handle, &slot, item).is_ok()
 }
 
+/// Deliver the *same* item to every device in a handle's cluster (Layer 11).
+/// Used for cluster-uniform items (group text/control); falls back to the
+/// account slot if the record can't be fetched.
+fn deliver_to_cluster(client: &DirectoryClient, token: &str, handle: &Handle, item: &MailItem) {
+    match client.lookup(handle) {
+        Ok(rec) if rec.verify().is_ok() => {
+            for device in &rec.record.devices {
+                deliver(client, token, handle, device, item);
+            }
+        }
+        _ => {
+            let _ = deposit_item(client, token, handle, ACCOUNT_SLOT, item);
+        }
+    }
+}
+
 /// Accept live-pushed items from peers and process them (the `serve` receiver).
 fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -1702,8 +1718,12 @@ fn distribute_key_to(
                 continue;
             }
         };
-        let env = seal_to(identity, me, record.record.primary(), &plaintext);
-        let _ = deposit_item(client, token, &handle, ACCOUNT_SLOT, &MailItem::GroupInvite(env));
+        // Seal the sender key to every device in the member's cluster (Layer 11),
+        // so each device can decrypt the group.
+        for device in &record.record.devices {
+            let env = seal_to(identity, me, device, &plaintext);
+            deliver(client, token, &handle, device, &MailItem::GroupInvite(env));
+        }
     }
 }
 
@@ -1880,7 +1900,7 @@ fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) -> Res
             continue;
         }
         if let Ok(handle) = Handle::new(m.clone()) {
-            let _ = deposit_item(&client, &token, &handle, ACCOUNT_SLOT, &control);
+            deliver_to_cluster(&client, &token, &handle, &control);
         }
     }
     println!("removed '{member}' from '{}' (re-keyed)", stored.name);
@@ -1959,15 +1979,8 @@ fn group_send(
             Ok(h) => h,
             Err(_) => continue,
         };
-        // Deliver live to online members, mailbox otherwise.
-        match client.lookup(&handle) {
-            Ok(rec) if rec.verify().is_ok() => {
-                deliver(&client, &token, &handle, rec.record.primary(), &item);
-            }
-            _ => {
-                let _ = deposit_item(&client, &token, &handle, ACCOUNT_SLOT, &item);
-            }
-        }
+        // Fan the one ciphertext out to every device in the member's cluster.
+        deliver_to_cluster(&client, &token, &handle, &item);
     }
 
     // Record our own message in the group transcript (edits/deletes already
@@ -2029,7 +2042,7 @@ fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
             continue;
         }
         if let Ok(handle) = Handle::new(member.clone()) {
-            let _ = deposit_item(&client, &token, &handle, ACCOUNT_SLOT, &control);
+            deliver_to_cluster(&client, &token, &handle, &control);
         }
     }
     groups::remove(&mut fs, &stored.id)?;
