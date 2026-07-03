@@ -193,6 +193,52 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+fn link_device_joins_and_revoke_removes() {
+    let _throttle = throttle();
+    let dir = start_directory();
+
+    // Device A: create the account and register it.
+    let dev_a = home("dev-a");
+    let created = cli(&dev_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let mnemonic = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("24-word mnemonic in output");
+    ok(&cli(&dev_a, &["register", "ari", "--addr", "127.0.0.1:5551", "--directory", &dir]), "register");
+
+    // Device B (fresh home): link to the same account via the seed phrase.
+    let dev_b = home("dev-b");
+    let linked = Command::new(CLI)
+        .args(["link-device", "ari", "--addr", "127.0.0.1:5552", "--directory", &dir])
+        .env("MYCELLIUM_HOME", &dev_b)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_PHRASE", &mnemonic)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run link-device");
+    ok(&linked, "link-device");
+
+    // The cluster now has both devices.
+    let devs = cli(&dev_a, &["devices", "ari", "--directory", &dir]);
+    let text = String::from_utf8_lossy(&devs.stdout);
+    assert!(text.contains("5551") && text.contains("5552"), "both devices should be listed: {text}");
+
+    // Revoke device B (by its short id) and confirm it's gone.
+    let b_id = text
+        .lines()
+        .find(|l| l.contains("5552"))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("device B id")
+        .to_string();
+    ok(&cli(&dev_a, &["revoke-device", "ari", &b_id, "--directory", &dir]), "revoke-device");
+    let after = cli(&dev_a, &["devices", "ari", "--directory", &dir]);
+    let after = String::from_utf8_lossy(&after.stdout);
+    assert!(after.contains("5551") && !after.contains("5552"), "B should be revoked: {after}");
+}
+
+#[test]
 fn offline_send_and_receive() {
     let _throttle = throttle();
     let dir = start_directory();

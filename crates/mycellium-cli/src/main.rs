@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use mycellium_core::group::{Group, GroupMessage};
-use mycellium_core::identity::{Handle, Identity, MessagingPublicKey, PeerId};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
@@ -74,6 +74,38 @@ enum Command {
         /// Advertise a libp2p multiaddr instead of a raw TCP address.
         #[arg(long)]
         libp2p: bool,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
+    /// Link this (fresh) device to an existing account (Layer 11).
+    ///
+    /// Reads your 24-word phrase from `MYCELLIUM_PHRASE` or stdin, adopts the
+    /// account with fresh device keys, and adds this device to your record.
+    LinkDevice {
+        /// Your handle.
+        handle: String,
+        /// Address other peers dial to reach this device.
+        #[arg(long)]
+        addr: String,
+        /// Advertise a libp2p multiaddr instead of a raw TCP address.
+        #[arg(long)]
+        libp2p: bool,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
+    /// List the devices in an account's cluster.
+    Devices {
+        /// The handle to inspect.
+        handle: String,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
+    /// Remove a device from your cluster (by short id).
+    RevokeDevice {
+        /// Your handle.
+        handle: String,
+        /// The short device id (from `devices`).
+        device_id: String,
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
@@ -453,6 +485,13 @@ enum GroupAction {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::IdentityNew => identity_new(),
+        Command::LinkDevice { handle, addr, libp2p, directory } => {
+            link_device(&handle, &addr, libp2p, &directory)
+        }
+        Command::Devices { handle, directory } => list_devices(&handle, &directory),
+        Command::RevokeDevice { handle, device_id, directory } => {
+            revoke_device(&handle, &device_id, &directory)
+        }
         Command::IdentityShow => identity_show(),
         Command::Register { handle, addr, libp2p, directory } => {
             register(&handle, &addr, libp2p, &directory)
@@ -2014,6 +2053,120 @@ fn guardian_recover(share_strs: &[String]) -> Result<()> {
 }
 
 // ---- helpers ----------------------------------------------------------------
+
+/// A short, human-usable id for a device: the first 4 bytes of its key, in hex.
+fn short_device_id(key: &DevicePublicKey) -> String {
+    hex(&key.0[..4])
+}
+
+/// Read the account's seed phrase from `MYCELLIUM_PHRASE` or stdin.
+fn read_phrase() -> Result<String> {
+    if let Ok(p) = std::env::var("MYCELLIUM_PHRASE") {
+        return Ok(p);
+    }
+    eprint!("Enter your 24-word seed phrase: ");
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// Re-sign and publish a record with a new device set (seq bumped past `prev`).
+fn update_devices(
+    client: &DirectoryClient,
+    token: &str,
+    identity: &Identity,
+    handle: &Handle,
+    devices: Vec<Device>,
+    prev_seq: u64,
+) -> Result<()> {
+    let seq = prev_seq.saturating_add(1).max(OsPlatform.now_unix_secs());
+    let record = Record { handle: handle.clone(), wallet: identity.wallet_public(), devices, seq };
+    let signed = SignedRecord::sign(record, identity);
+    client.publish(token, handle, &signed)
+}
+
+fn link_device(handle: &str, addr: &str, libp2p: bool, directory: &str) -> Result<()> {
+    if store::exists() {
+        bail!("an identity already exists here — link-device runs on a fresh device (a new MYCELLIUM_HOME)");
+    }
+    let phrase = read_phrase()?;
+    let identity =
+        Identity::from_phrase(phrase.trim(), &mut OsPlatform).map_err(|_| anyhow!("invalid seed phrase"))?;
+    store::save_identity(&identity)?;
+
+    let me = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let location = if libp2p {
+        libp2p_net::advertised_multiaddr(addr, identity.device_secret())?
+    } else {
+        addr.to_string()
+    };
+    let client = DirectoryClient::new(directory);
+    let token = client.login(&identity)?;
+    let current = client
+        .lookup(&me)
+        .map_err(|_| anyhow!("no record for '{handle}' — register it on your first device first"))?;
+    current.verify().map_err(|_| anyhow!("existing record failed verification"))?;
+    if current.record.wallet != identity.wallet_public() {
+        bail!("'{handle}' belongs to a different account (wallet mismatch)");
+    }
+
+    let mut devices = current.record.devices.clone();
+    let mine = this_device(&identity, &location);
+    if devices.iter().any(|d| d.device_key == mine.device_key) {
+        println!("this device is already linked to '{handle}'");
+        return Ok(());
+    }
+    devices.push(mine);
+    let count = devices.len();
+    update_devices(&client, &token, &identity, &me, devices, current.record.seq)?;
+    println!("linked this device to '{handle}' — cluster now has {count} device(s)");
+    Ok(())
+}
+
+fn list_devices(handle: &str, directory: &str) -> Result<()> {
+    let me = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let client = DirectoryClient::new(directory);
+    let record = client.lookup(&me)?;
+    record.verify().map_err(|_| anyhow!("record failed verification"))?;
+    println!("devices for '{handle}':");
+    for d in &record.record.devices {
+        println!("  {}  {}", short_device_id(&d.device_key), String::from_utf8_lossy(&d.peer_id.0));
+    }
+    Ok(())
+}
+
+fn revoke_device(handle: &str, device_id: &str, directory: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let client = DirectoryClient::new(directory);
+    let token = client.login(&identity)?;
+    let current = client.lookup(&me)?;
+    current.verify().map_err(|_| anyhow!("record failed verification"))?;
+    if current.record.wallet != identity.wallet_public() {
+        bail!("'{handle}' is not your account");
+    }
+
+    let wanted = device_id.to_lowercase();
+    let before = current.record.devices.len();
+    let devices: Vec<Device> = current
+        .record
+        .devices
+        .iter()
+        .filter(|d| !short_device_id(&d.device_key).starts_with(&wanted))
+        .cloned()
+        .collect();
+    if devices.len() == before {
+        bail!("no device matching '{device_id}'");
+    }
+    if devices.is_empty() {
+        bail!("cannot revoke the last device in the cluster");
+    }
+    let removed = before - devices.len();
+    update_devices(&client, &token, &identity, &me, devices, current.record.seq)?;
+    println!("revoked {removed} device(s) from '{handle}'");
+    Ok(())
+}
 
 fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecord {
     let record = Record {
