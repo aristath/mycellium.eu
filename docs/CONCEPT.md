@@ -399,13 +399,16 @@ sender-keys cost: **forward secrecy yes** (symmetric chain), **weaker
 per-message post-compromise security** than the DH ratchet. Mitigation: periodic
 **sender-key rotation** (already in `group`) restores PCS at chosen intervals,
 and every membership change forces a re-key. Trust inside a cluster is mutual —
-your devices trust each other (all wallet-authorized); a compromised device
-reads the conversation until revoked, the same limit every messenger has.
-Revocation cleanly stops **1:1** delivery to the removed device (senders re-read
-your record and skip it); propagating a revoke into **group** sender keys (so a
-removed device's group key is superseded everywhere) is a deeper hardening still
-to come — today a revoked device stops *receiving* but its old group keys aren't
-force-rotated. The
+your devices trust each other (all wallet-authorized). **`revoke-device` is
+cluster *management*, not a kill-switch**: it removes a device from your
+published record so honest senders stop fanning out to it (verified for 1:1 by
+an e2e test). But a device still *holds the seed*, so it remains cryptographically
+*you* — it can authenticate to the directory and pull mailbox slots regardless of
+the record. Truly cutting off a **stolen** device is the same hard limit as the
+rest of the model: a device with the seed is you, and the only real remedy is
+rotating the identity itself, which the permanent handle binding (9.2) forbids.
+Treat the seed as the crown jewel; revocation tidies your cluster, it doesn't
+contain a compromise. The
 directory still sees the *shape* (who has how many devices, who talks to whom) —
 the same metadata honesty as Layers 6/8 — but never the content.
 
