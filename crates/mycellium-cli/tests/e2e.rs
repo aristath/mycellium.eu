@@ -428,6 +428,16 @@ fn link_device_joins_and_revoke_removes() {
     let text = String::from_utf8_lossy(&devs.stdout);
     assert!(text.contains("5551") && text.contains("5552"), "both devices should be listed: {text}");
 
+    // `identity-show` on device B reports a device-id that appears in the list.
+    let b_show = cli(&dev_b, &["identity-show"]);
+    let b_show_out = String::from_utf8_lossy(&b_show.stdout);
+    let b_self_id = b_show_out
+        .lines()
+        .find(|l| l.trim_start().starts_with("device-id:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .expect("device-id line");
+    assert!(text.contains(b_self_id), "device B's own id not in the listing: {b_self_id}");
+
     // Revoke device B (by its short id) and confirm it's gone.
     let b_id = text
         .lines()

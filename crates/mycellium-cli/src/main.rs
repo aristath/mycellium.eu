@@ -996,6 +996,7 @@ fn identity_show() -> Result<()> {
     let identity = store::load_identity()?;
     println!("wallet:      {}", hex(&identity.wallet_public().0));
     println!("device:      {}", hex(&identity.device_public().0));
+    println!("device-id:   {}  (this device, as shown by `devices`)", short_device_id(&identity.device_public()));
     println!("messaging:   {}", hex(&identity.messaging_public().0));
     println!("signed-pk:   {}", hex(&identity.signed_pre_key_public().0));
     Ok(())
