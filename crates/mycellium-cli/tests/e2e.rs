@@ -278,6 +278,55 @@ fn read_receipt_reaches_sender_cluster() {
 }
 
 #[test]
+fn new_device_bootstraps_into_group() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let alice = account(&dir, "alice");
+
+    // Mary device A creates her account and joins Alice's group.
+    let mary_a = home("gsync-a");
+    let created = cli(&mary_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6501", "--directory", &dir]), "register");
+    ok(&cli(&alice, &["group", "create", "team", "--members", "mary", "--as", "alice", "--directory", &dir]), "create");
+    ok(&cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]), "mary-a invite");
+    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "alice mesh");
+
+    // Link device B *after* the group exists — it has no group state yet.
+    let mary_b = home("gsync-b");
+    ok(
+        &Command::new(CLI)
+            .args(["link-device", "mary", "--addr", "127.0.0.1:6502", "--directory", &dir])
+            .env("MYCELLIUM_HOME", &mary_b)
+            .env("MYCELLIUM_PASSPHRASE", PASS)
+            .env("MYCELLIUM_PHRASE", &phrase)
+            .stdin(Stdio::null())
+            .output()
+            .expect("link-device"),
+        "link-device",
+    );
+
+    // Sync groups from A to the cluster; B bootstraps into "team".
+    ok(&cli(&mary_a, &["group", "sync", "--as", "mary", "--directory", &dir]), "group sync");
+    ok(&cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]), "mary-b bootstrap");
+
+    // Alice's later group message is readable on the newly-linked device B.
+    ok(&cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "seen on laptop", "--directory", &dir]), "alice send");
+    let b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&b.stdout).contains("seen on laptop"), "device B can't read group after sync: {}", String::from_utf8_lossy(&b.stdout));
+
+    // And a message from Mary's own phone (device A) also shows on B.
+    ok(&cli(&mary_a, &["group", "send", "team", "--as", "mary", "--message", "from my phone", "--directory", &dir]), "mary-a send");
+    let b2 = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&b2.stdout).contains("from my phone"), "device B can't read own cluster's msg: {}", String::from_utf8_lossy(&b2.stdout));
+}
+
+#[test]
 fn group_reaches_all_member_devices() {
     let _throttle = throttle();
     let dir = start_directory();

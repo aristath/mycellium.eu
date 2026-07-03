@@ -42,7 +42,7 @@ use mycellium_core::x3dh::{self, HandshakeInit};
 use client::DirectoryClient;
 use contacts::Contact;
 use filestore::FileStore;
-use groups::{GroupInvitePayload, MailItem, StoredGroup};
+use groups::{GroupInvitePayload, GroupSyncPayload, MailItem, StoredGroup};
 use history::{GroupStoredMessage, StoredMessage};
 use libp2p_net::Libp2pNode;
 use link::{FrameReader, FrameWriter, Wire};
@@ -478,6 +478,14 @@ enum GroupAction {
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
+    /// Bootstrap your other devices into your groups (Layer 11, receive-only).
+    Sync {
+        /// Your own handle.
+        #[arg(long = "as")]
+        whoami: String,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
     /// List the groups this device knows about.
     List,
 }
@@ -555,6 +563,7 @@ fn main() -> Result<()> {
             GroupAction::History { group } => group_history(&group),
             GroupAction::Info { group } => group_info(&group),
             GroupAction::Leave { group, whoami, directory } => group_leave(&group, &whoami, &directory),
+            GroupAction::Sync { whoami, directory } => group_sync(&whoami, &directory),
             GroupAction::List => group_list(),
         },
         Command::Contact { action } => match action {
@@ -1478,6 +1487,7 @@ fn process_item(
     match item {
         MailItem::Direct(env) => handle_direct(identity, me, client, token, blocked, platform, fs, &env),
         MailItem::SelfSync { peer, envelope } => handle_self_sync(identity, platform, fs, &peer, &envelope),
+        MailItem::GroupSync(env) => handle_group_sync(identity, me, platform, fs, &env),
         MailItem::GroupInvite(env) => handle_group_invite(identity, me, client, token, fs, platform, &env),
         MailItem::GroupText { group_id, message } => handle_group_text(blocked, fs, &group_id, &message),
         MailItem::GroupRemove { group_id, member } => {
@@ -1978,13 +1988,22 @@ fn group_send(
 
     let item = MailItem::GroupText { group_id: stored.id.clone(), message: gm };
     for member in &stored.members {
-        if member == me.as_str() {
-            continue;
-        }
         let handle = match Handle::new(member.clone()) {
             Ok(h) => h,
             Err(_) => continue,
         };
+        if member == me.as_str() {
+            // Mirror to my *own* other devices (they hold my key from `group
+            // sync`), so the group reads consistently across my cluster.
+            if let Ok(my_rec) = client.lookup(&me) {
+                for device in &my_rec.record.devices {
+                    if device.device_key != identity.device_public() {
+                        deliver(&client, &token, &me, device, &item);
+                    }
+                }
+            }
+            continue;
+        }
         // Fan the one ciphertext out to every device in the member's cluster.
         deliver_to_cluster(&client, &token, &handle, &item);
     }
@@ -2027,6 +2046,96 @@ fn group_info(group: &str) -> Result<()> {
     let stored = resolve_group(&fs, group)?;
     println!("{} ({})", stored.name, stored.id);
     println!("members: {}", stored.members.join(", "));
+    Ok(())
+}
+
+fn group_sync(whoami: &str, directory: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let client = DirectoryClient::new(directory);
+    let token = client.login(&identity)?;
+    let fs = open_history(&identity)?;
+
+    // My sibling devices (everything in my cluster except this one).
+    let my_record = client.lookup(&me)?;
+    let my_key = identity.device_public();
+    let siblings: Vec<Device> = my_record
+        .record
+        .devices
+        .iter()
+        .filter(|d| d.device_key != my_key)
+        .cloned()
+        .collect();
+    if siblings.is_empty() {
+        println!("no other devices to sync to");
+        return Ok(());
+    }
+
+    let mut synced = 0;
+    for id in groups::list(&fs)? {
+        let stored = match groups::load(&fs, &id)? {
+            Some(s) => s,
+            None => continue,
+        };
+        let group = match Group::import(stored.state.clone()) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        // Every key this device holds: the others' receiver keys, plus our own
+        // distribution (so a sibling can decrypt what this device sends).
+        let mut keys = group.known_keys();
+        keys.push((me.as_str().as_bytes().to_vec(), group.distribution()));
+
+        let payload = GroupSyncPayload {
+            group_id: stored.id.clone(),
+            name: stored.name.clone(),
+            members: stored.members.clone(),
+            keys,
+        };
+        let plaintext = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        for device in &siblings {
+            let env = seal_to(&identity, &me, device, &plaintext);
+            deliver(&client, &token, &me, device, &MailItem::GroupSync(env));
+        }
+        synced += 1;
+    }
+    println!("synced {synced} group(s) to {} other device(s)", siblings.len());
+    Ok(())
+}
+
+/// Bootstrap this device into a group from a sibling's [`GroupSyncPayload`].
+fn handle_group_sync(
+    identity: &Identity,
+    me: &Handle,
+    platform: &mut OsPlatform,
+    fs: &mut FileStore,
+    env: &Envelope,
+) -> Result<()> {
+    let (_from, bytes) = open_envelope(identity, platform, env)?;
+    let payload: GroupSyncPayload =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("malformed group sync"))?;
+
+    if groups::load(fs, &payload.group_id)?.is_some() {
+        return Ok(()); // already have this group
+    }
+    // A fresh own sender key (this device would sign under it); import every
+    // sender key the cluster shared so we can *decrypt* current members.
+    let mut group = Group::new(platform, me.as_str().as_bytes().to_vec());
+    for (id, dist) in &payload.keys {
+        let _ = group.add_member(id.clone(), dist);
+    }
+    let stored = StoredGroup {
+        id: payload.group_id.clone(),
+        name: payload.name.clone(),
+        members: payload.members.clone(),
+        me: me.as_str().to_string(),
+        state: group.export(),
+    };
+    groups::save(fs, &stored)?;
+    println!("bootstrapped into group '{}' (receive-only on this device)", stored.name);
     Ok(())
 }
 

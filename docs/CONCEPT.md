@@ -391,13 +391,16 @@ hold years of history) and is *also* better for secrecy: it cannot read anything
 sent before it joined. To carry history to a new device, move it explicitly with
 `export` / `import`.
 
-The same "starts fresh" rule has one sharp edge today: **groups you joined
-*before* linking a device aren't automatically available on the new device.**
-1:1 works immediately (senders read your record and fan out to the new device),
-but group *state* — the roster and per-sender keys — lives per-device, and a
-freshly linked device holds none of it. Bootstrapping a new device into your
-existing groups (A shares the roster to B; B announces its own sender key; the
-mesh returns the others') is a clean but non-trivial follow-up, deferred for now.
+Groups are the one exception to "starts fresh": a device linked *after* you
+joined a group can be **bootstrapped** into it with `group sync`. An existing
+device hands each sibling the group roster plus every sender key it already holds
+(receiver keys only — never a private signing key), so the new device can
+**receive** the group immediately, and the sender's own messages are mirrored to
+the cluster too. This is deliberately **receive-only** on the bootstrapped
+device: because the sender-keys protocol identifies a sender by *handle*, two
+devices sending under one handle would collide at the other members. Making a
+cluster a *first-class* multi-sender group (sender keys keyed by device) is the
+deeper refinement that would let every device send as well.
 
 ### 11.6 The honest trade-off
 

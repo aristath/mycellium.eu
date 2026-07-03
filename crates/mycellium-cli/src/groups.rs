@@ -25,6 +25,10 @@ pub enum MailItem {
         /// The message, sealed from the sending device to this one.
         envelope: Envelope,
     },
+    /// Bootstrap a sibling device into an existing group (Layer 11): the envelope
+    /// (sealed device→device) decrypts to a [`GroupSyncPayload`] of every sender
+    /// key this cluster holds — enough for the new device to *receive*.
+    GroupSync(Envelope),
     /// A group invite / sender-key share (its envelope decrypts to a
     /// [`GroupInvitePayload`]).
     GroupInvite(Envelope),
@@ -56,6 +60,21 @@ pub struct GroupInvitePayload {
     pub members: Vec<String>,
     /// The sender's sender-key distribution.
     pub distribution: SenderKeyDistribution,
+}
+
+/// Handed to a sibling device to bootstrap it into an existing group (Layer 11):
+/// the roster plus every sender key the cluster already holds, so the new device
+/// can decrypt current members' messages. Receive-only (no private signing key).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupSyncPayload {
+    /// Stable group identifier.
+    pub group_id: String,
+    /// Human-readable group name.
+    pub name: String,
+    /// All member handles.
+    pub members: Vec<String>,
+    /// Every sender key the cluster holds: `(sender id, distribution)`.
+    pub keys: Vec<(Vec<u8>, SenderKeyDistribution)>,
 }
 
 /// A member's persisted view of one group.

@@ -201,6 +201,26 @@ impl Group {
         Ok(())
     }
 
+    /// The sender keys this group holds for *other* senders, as `(id,
+    /// distribution)` pairs. Used to hand a sibling device the same ability to
+    /// decrypt (Layer 11 cluster bootstrap) — receive-only, since these are
+    /// receiver keys, not the private signing key.
+    pub fn known_keys(&self) -> Vec<(Vec<u8>, SenderKeyDistribution)> {
+        self.members
+            .iter()
+            .map(|(id, rk)| {
+                (
+                    id.clone(),
+                    SenderKeyDistribution {
+                        iteration: rk.iteration,
+                        chain_key: rk.chain_key,
+                        signing_public: rk.signing_public.to_bytes(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Replace our sender key with a fresh one (re-key).
     ///
     /// Used on membership changes: after rotating, we distribute the new key to
@@ -357,6 +377,21 @@ mod tests {
         let from_c = c.encrypt(b"carol too", AD);
         assert_eq!(a.decrypt(&from_c, AD).unwrap(), b"carol too");
         assert_eq!(b.decrypt(&from_c, AD).unwrap(), b"carol too");
+    }
+
+    #[test]
+    fn known_keys_bootstrap_a_new_receiver() {
+        // Alice holds bob's and carol's keys; a fresh device gets them via
+        // `known_keys` and can then decrypt bob's and carol's messages (Layer 11).
+        let (a, mut b, mut c) = three_members();
+        let mut newcomer = Group::new(&mut SeededPlatform(200), b"dave".to_vec());
+        for (id, dist) in a.known_keys() {
+            newcomer.add_member(id, &dist).unwrap();
+        }
+        let from_b = b.encrypt(b"bob speaks", AD);
+        let from_c = c.encrypt(b"carol too", AD);
+        assert_eq!(newcomer.decrypt(&from_b, AD).unwrap(), b"bob speaks");
+        assert_eq!(newcomer.decrypt(&from_c, AD).unwrap(), b"carol too");
     }
 
     #[test]
