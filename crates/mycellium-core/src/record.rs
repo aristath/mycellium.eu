@@ -182,14 +182,16 @@ mod tests {
     }
 
     #[test]
-    fn identity_from_seed_is_deterministic() {
+    fn recovery_preserves_the_account_wallet() {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
-        // Restoring from the same phrase yields the same keys (Layer 9.4).
-        let restored = Identity::from_phrase(id.mnemonic()).unwrap();
-        assert_eq!(id.wallet_public(), restored.wallet_public());
-        assert_eq!(id.device_public(), restored.device_public());
-        assert_eq!(id.messaging_public(), restored.messaging_public());
+        // Recovering from the phrase preserves the account (wallet); the device
+        // keys are fresh per device (Layer 11), so only the wallet must match.
+        let recovered = Identity::from_phrase(id.mnemonic(), &mut p).unwrap();
+        assert_eq!(id.wallet_public(), recovered.wallet_public());
+        // Reloading *this* device from its seed reproduces its device keys.
+        let same = Identity::restore(id.mnemonic(), id.device_seed()).unwrap();
+        assert_eq!(id.device_public(), same.device_public());
     }
 
     #[test]

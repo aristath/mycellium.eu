@@ -2004,11 +2004,11 @@ fn guardian_recover(share_strs: &[String]) -> Result<()> {
 
     let secret = shamir::combine(&shares).map_err(|_| anyhow!("could not combine shares"))?;
     let phrase = String::from_utf8(secret).map_err(|_| anyhow!("recovered data is not text"))?;
-    let identity = Identity::from_phrase(phrase.trim())
+    let identity = Identity::from_phrase(phrase.trim(), &mut OsPlatform)
         .map_err(|_| anyhow!("recovered phrase is invalid — wrong shares, or fewer than the threshold"))?;
 
     store::save_identity(&identity)?;
-    println!("identity recovered and stored.");
+    println!("identity recovered on this device (a fresh device in your cluster).");
     println!("wallet: {}", hex(&identity.wallet_public().0));
     Ok(())
 }

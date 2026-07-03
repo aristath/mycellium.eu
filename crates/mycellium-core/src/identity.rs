@@ -125,6 +125,7 @@ pub struct Signature(pub Vec<u8>);
 /// run the handshake. It intentionally does not implement `Debug` or `Clone`.
 pub struct Identity {
     mnemonic: String,
+    device_seed: [u8; 32],
     wallet: WalletSigningKey,
     device: DeviceSigningKey,
     messaging: StaticSecret,
@@ -134,24 +135,41 @@ pub struct Identity {
 impl Identity {
     /// Create a brand-new identity from fresh entropy (Layer 9.1).
     ///
-    /// 32 bytes of host CSPRNG entropy become a 24-word BIP-39 mnemonic, which
-    /// derives all three keys.
+    /// 32 bytes of host CSPRNG entropy become a 24-word BIP-39 mnemonic (the
+    /// account/wallet), and a second, independent 32 bytes seed this device's
+    /// own message keys (Layer 11 — device-local, never derived from the seed).
     pub fn generate<P: Platform>(platform: &mut P) -> Result<Self, Error> {
         let mut entropy = [0u8; 32];
         platform.fill_random(&mut entropy);
         let mnemonic = bip39::Mnemonic::from_entropy(&entropy).map_err(|_| Error::Malformed)?;
         entropy.zeroize();
-        Self::derive(mnemonic)
+        let mut device_seed = [0u8; 32];
+        platform.fill_random(&mut device_seed);
+        Self::build(mnemonic, device_seed)
     }
 
-    /// Restore an identity from an existing 24-word phrase (Layer 9.4).
-    pub fn from_phrase(phrase: &str) -> Result<Self, Error> {
+    /// Adopt an existing account (24-word phrase) on a **new device** (Layer 11).
+    ///
+    /// The wallet is recovered from the phrase, but a fresh device seed is drawn,
+    /// so the new device joins the cluster with its own keys — it does not
+    /// inherit another device's message keys (that is what keeps past traffic
+    /// safe). Use [`Identity::restore`] to reload *this* device from storage.
+    pub fn from_phrase<P: Platform>(phrase: &str, platform: &mut P) -> Result<Self, Error> {
         let mnemonic =
             bip39::Mnemonic::parse_normalized(phrase).map_err(|_| Error::Malformed)?;
-        Self::derive(mnemonic)
+        let mut device_seed = [0u8; 32];
+        platform.fill_random(&mut device_seed);
+        Self::build(mnemonic, device_seed)
     }
 
-    fn derive(mnemonic: bip39::Mnemonic) -> Result<Self, Error> {
+    /// Reload a device from its persisted phrase + device seed (same device).
+    pub fn restore(phrase: &str, device_seed: [u8; 32]) -> Result<Self, Error> {
+        let mnemonic =
+            bip39::Mnemonic::parse_normalized(phrase).map_err(|_| Error::Malformed)?;
+        Self::build(mnemonic, device_seed)
+    }
+
+    fn build(mnemonic: bip39::Mnemonic, device_seed: [u8; 32]) -> Result<Self, Error> {
         let mut seed = mnemonic.to_seed("");
 
         // Wallet key: standard BIP-44 Ethereum path, so the same seed imports
@@ -159,20 +177,28 @@ impl Identity {
         let path: DerivationPath = "m/44'/60'/0'/0/0".parse().map_err(|_| Error::Malformed)?;
         let xprv = XPrv::derive_from_path(seed, &path).map_err(|_| Error::Malformed)?;
         let wallet = WalletSigningKey::from_slice(&xprv.to_bytes()).map_err(|_| Error::Malformed)?;
-
-        // Device and messaging keys are Mycellium-internal (no external HD standard
-        // for X25519), so they stay on domain-separated HKDF from the same seed.
-        let device = DeviceSigningKey::from_bytes(&derive_key(&seed, b"mycellium:device:ed25519:v1"));
-        let messaging = StaticSecret::from(derive_key(&seed, b"mycellium:messaging:x25519:v1"));
-        let signed_pre_key = StaticSecret::from(derive_key(&seed, b"mycellium:spk:x25519:v1:0"));
         seed.zeroize();
+
+        // Device and messaging keys come from the **device seed** (random, held
+        // only by this device) — not the mnemonic — so a seed leak can authorize
+        // a new device but never retroactively decrypt this device's traffic.
+        let device = DeviceSigningKey::from_bytes(&derive_key(&device_seed, b"mycellium:device:ed25519:v1"));
+        let messaging = StaticSecret::from(derive_key(&device_seed, b"mycellium:messaging:x25519:v1"));
+        let signed_pre_key = StaticSecret::from(derive_key(&device_seed, b"mycellium:spk:x25519:v1:0"));
         Ok(Self {
             mnemonic: mnemonic.to_string(),
+            device_seed,
             wallet,
             device,
             messaging,
             signed_pre_key,
         })
+    }
+
+    /// This device's random seed, to persist so the device can be reloaded with
+    /// [`Identity::restore`]. Handle with the same care as the mnemonic.
+    pub fn device_seed(&self) -> [u8; 32] {
+        self.device_seed
     }
 
     /// The 24-word phrase, to show the user for backup. Handle with care.
@@ -266,16 +292,18 @@ impl Identity {
 impl Drop for Identity {
     fn drop(&mut self) {
         self.mnemonic.zeroize();
+        self.device_seed.zeroize();
         // The dalek and k256 key types zeroize their own secret material.
     }
 }
 
-/// HKDF-SHA512 domain-separated derivation of a 32-byte key from the seed.
+/// HKDF-SHA512 domain-separated derivation of a 32-byte key from `ikm`.
 ///
-/// Used for the Mycellium-internal device and messaging keys. The wallet key uses
-/// standard BIP-44 instead (see [`Identity::derive`]) for external-wallet interop.
-fn derive_key(seed: &[u8; 64], info: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha512>::new(None, seed);
+/// Used for this device's Ed25519/X25519 keys, keyed on the random device seed
+/// (see [`Identity::build`]). The wallet key uses standard BIP-44 instead, from
+/// the mnemonic seed, for external-wallet interop.
+fn derive_key(ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha512>::new(None, ikm);
     let mut okm = [0u8; 32];
     hk.expand(info, &mut okm)
         .expect("32 is a valid HKDF-SHA512 output length");
@@ -301,14 +329,25 @@ mod tests {
     }
 
     #[test]
-    fn storage_key_is_deterministic_and_unique() {
+    fn storage_key_is_per_device() {
         let a = Identity::generate(&mut SeededPlatform(1)).unwrap();
-        let a_restored = Identity::from_phrase(a.mnemonic()).unwrap();
+        let a_reloaded = Identity::restore(a.mnemonic(), a.device_seed()).unwrap();
         let b = Identity::generate(&mut SeededPlatform(200)).unwrap();
 
-        // Same identity -> same storage key; different identity -> different.
-        assert_eq!(a.storage_key(), a_restored.storage_key());
+        // Reloading the *same* device (same device seed) -> same storage key.
+        assert_eq!(a.storage_key(), a_reloaded.storage_key());
+        // A different device (even same account) -> different storage key.
         assert_ne!(a.storage_key(), b.storage_key());
+    }
+
+    #[test]
+    fn a_new_device_shares_the_wallet_but_not_message_keys() {
+        let a = Identity::generate(&mut SeededPlatform(1)).unwrap();
+        // Adopting the account on a new device: same wallet, fresh device keys.
+        let b = Identity::from_phrase(a.mnemonic(), &mut SeededPlatform(200)).unwrap();
+        assert_eq!(a.wallet_public(), b.wallet_public(), "same account");
+        assert_ne!(a.device_public(), b.device_public(), "new device key");
+        assert_ne!(a.messaging_public(), b.messaging_public(), "new message key");
     }
 
     fn from_hex_32(s: &str) -> [u8; 32] {
@@ -326,6 +365,7 @@ mod tests {
         // is standard BIP-44 and imports into external wallets.
         let id = Identity::from_phrase(
             "test test test test test test test test test test test junk",
+            &mut SeededPlatform(0),
         )
         .unwrap();
         assert_eq!(

@@ -28,6 +28,14 @@ struct Sealed {
     ciphertext: Vec<u8>,
 }
 
+/// The secret material sealed inside [`Sealed`]: the account phrase plus this
+/// device's own seed (Layer 11), so reloading reproduces the *same* device.
+#[derive(Serialize, Deserialize)]
+struct Secret {
+    mnemonic: String,
+    device_seed: Vec<u8>,
+}
+
 /// The data directory (`MYCELLIUM_HOME`, default `.mycellium`).
 fn home() -> PathBuf {
     std::env::var("MYCELLIUM_HOME")
@@ -62,8 +70,13 @@ pub fn save_identity(identity: &Identity) -> Result<()> {
     let key = derive_key(&passphrase, &salt)?;
     let key_ga: Key = key.into();
     let nonce_ga: Nonce = nonce.into();
+    let secret = Secret {
+        mnemonic: identity.mnemonic().to_string(),
+        device_seed: identity.device_seed().to_vec(),
+    };
+    let plaintext = serde_json::to_vec(&secret)?;
     let ciphertext = ChaCha20Poly1305::new(&key_ga)
-        .encrypt(&nonce_ga, identity.mnemonic().as_bytes())
+        .encrypt(&nonce_ga, plaintext.as_ref())
         .map_err(|_| anyhow!("failed to encrypt identity"))?;
 
     let sealed = Sealed {
@@ -98,9 +111,16 @@ pub fn load_identity() -> Result<Identity> {
     let plaintext = ChaCha20Poly1305::new(&key_ga)
         .decrypt(&nonce_ga, sealed.ciphertext.as_ref())
         .map_err(|_| anyhow!("wrong passphrase or corrupt identity"))?;
-    let phrase = String::from_utf8(plaintext).context("decrypted seed is not valid text")?;
+    let secret: Secret =
+        serde_json::from_slice(&plaintext).context("decrypted identity is corrupt")?;
+    let device_seed: [u8; 32] = secret
+        .device_seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("identity file has a malformed device seed"))?;
 
-    Identity::from_phrase(phrase.trim()).map_err(|_| anyhow!("stored seed phrase is invalid"))
+    Identity::restore(secret.mnemonic.trim(), device_seed)
+        .map_err(|_| anyhow!("stored seed phrase is invalid"))
 }
 
 /// Derive a 32-byte key from a passphrase and salt with Argon2id.
