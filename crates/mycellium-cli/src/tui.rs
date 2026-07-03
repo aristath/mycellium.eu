@@ -25,7 +25,7 @@ use mycellium_core::wire;
 
 use crate::filestore::FileStore;
 use crate::history::{self, StoredMessage};
-use crate::link::{FrameReader, FrameWriter};
+use mycellium_transport::link::{FrameReader, FrameWriter};
 use crate::platform::OsPlatform;
 use crate::Session;
 

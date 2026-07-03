@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/mycellium-core", "crates/mycellium-directory", "crates/mycellium-cli"]
+members = [
+    "crates/mycellium-core",
+    "crates/mycellium-directory",
+    "crates/mycellium-transport",
+    "crates/mycellium-cli",
+]
 
 [workspace.package]
 edition = "2021"
