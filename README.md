@@ -1,9 +1,13 @@
 # Mycellium
 
 A peer-to-peer messenger where your message travels directly from your device to
-the other person's — nothing sits in the middle of your conversation. The design
-is in [`docs/CONCEPT.md`](docs/CONCEPT.md); this README is how to build and run
-the proof of concept.
+the other person's — nothing sits in the middle of your conversation.
+
+- **Design & rationale:** [`docs/CONCEPT.md`](docs/CONCEPT.md)
+- **How it's built:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Per-crate docs:** each crate has its own `README.md` (linked below)
+
+This README is how to build and run it.
 
 ## What's here
 
@@ -15,19 +19,33 @@ crates/
                                 X3DH + Double Ratchet, group sender keys, wire,
                                 login challenge, and the host-port *traits*
                                 (Transport / Storage / Platform). no_std-capable.
-  mycellium-directory/          the one hosted piece (library): login + signed
-                                record store + mailbox + presence
-  mycellium-server/             the deployable server: a thin shell over the
-                                directory library (args now; TLS/persistence later)
-  ── adapters (implement the core ports; swapped per platform) ──
+  ── services (untrusted; hold only data they can't forge or read) ──
+  mycellium-directory/          the name registry (library): login + signed
+                                record store + presence
+  mycellium-server/             deployable binary that serves the directory
+  mycellium-queue/              per-recipient store-and-forward mailbox, keyed
+                                by wallet, decoupled from the directory (lib+bin)
+  ── adapters (implement the core ports / talk to the services) ──
   mycellium-transport/          Transport ports: framed TCP + libp2p (feature-gated)
   mycellium-storage/            Storage port: encrypted file KV + at-rest identity
-  mycellium-directory-client/   client of the directory contract
+  mycellium-directory-client/   HTTP client of the directory
+  mycellium-queue-client/       HTTP client of the queue
   ── engine + shell ──
   mycellium-engine/             the headless peer: conversations, groups,
-                                multi-device delivery, contacts, presence
+                                multi-device delivery, outbox retry, contacts
   mycellium-cli/                a shell: clap arg-parsing + terminal UI
 ```
+
+Every crate links its own README: [core](crates/mycellium-core/README.md) ·
+[directory](crates/mycellium-directory/README.md) ·
+[server](crates/mycellium-server/README.md) ·
+[queue](crates/mycellium-queue/README.md) ·
+[transport](crates/mycellium-transport/README.md) ·
+[storage](crates/mycellium-storage/README.md) ·
+[directory-client](crates/mycellium-directory-client/README.md) ·
+[queue-client](crates/mycellium-queue-client/README.md) ·
+[engine](crates/mycellium-engine/README.md) ·
+[cli](crates/mycellium-cli/README.md).
 
 The core depends only on the `Transport`, `Storage`, and `Platform` traits, so
 the same protocol runs from a microcontroller to a desktop. The CLI ships two
