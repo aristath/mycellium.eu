@@ -7,16 +7,24 @@ the proof of concept.
 
 ## What's here
 
+Split by responsibility (ports-and-adapters), so one engine can back many shells:
+
 ```
 crates/
-  mycellium-core/       portable, no_std-capable protocol core
-                    identity (24-word seed → 3 keys), self-signed records,
-                    X3DH + Double Ratchet, group sender keys, wire codec,
-                    Shamir, host traits
-  mycellium-directory/  the one hosted piece: login + signed-record store + mailbox
-  mycellium-cli/        Full-tier client: identity, register, chat (TCP & libp2p,
-                    line or --tui), live serve + offline send/inbox, groups,
-                    typed messages, contacts, search, backup, recovery, history
+  mycellium-core/               the contract: identity (seed → keys), records,
+                                X3DH + Double Ratchet, group sender keys, wire,
+                                login challenge, and the host-port *traits*
+                                (Transport / Storage / Platform). no_std-capable.
+  mycellium-directory/          the one hosted piece (server): login + signed
+                                record store + mailbox + presence
+  ── adapters (implement the core ports; swapped per platform) ──
+  mycellium-transport/          Transport ports: framed TCP + libp2p (feature-gated)
+  mycellium-storage/            Storage port: encrypted file KV + at-rest identity
+  mycellium-directory-client/   client of the directory contract
+  ── engine + shell ──
+  mycellium-engine/             the headless peer: conversations, groups,
+                                multi-device delivery, contacts, presence
+  mycellium-cli/                a shell: clap arg-parsing + terminal UI
 ```
 
 The core depends only on the `Transport`, `Storage`, and `Platform` traits, so
