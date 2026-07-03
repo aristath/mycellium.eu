@@ -24,14 +24,17 @@ fn main() {
 
 /// Resolve the bind address: `--addr HOST:PORT`, then the env var, then default.
 fn resolve_addr() -> String {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut addr: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--addr" => {
-                return args.next().unwrap_or_else(|| {
+                i += 1;
+                addr = Some(args.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--addr requires a HOST:PORT value");
                     exit(2);
-                })
+                }));
             }
             "--help" | "-h" => {
                 print_help();
@@ -47,8 +50,10 @@ fn resolve_addr() -> String {
                 exit(2);
             }
         }
+        i += 1;
     }
-    std::env::var("MYCELLIUM_DIRECTORY_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.into())
+    addr.or_else(|| std::env::var("MYCELLIUM_DIRECTORY_ADDR").ok())
+        .unwrap_or_else(|| DEFAULT_ADDR.into())
 }
 
 fn print_help() {
