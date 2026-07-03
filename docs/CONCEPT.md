@@ -391,6 +391,14 @@ hold years of history) and is *also* better for secrecy: it cannot read anything
 sent before it joined. To carry history to a new device, move it explicitly with
 `export` / `import`.
 
+The same "starts fresh" rule has one sharp edge today: **groups you joined
+*before* linking a device aren't automatically available on the new device.**
+1:1 works immediately (senders read your record and fan out to the new device),
+but group *state* — the roster and per-sender keys — lives per-device, and a
+freshly linked device holds none of it. Bootstrapping a new device into your
+existing groups (A shares the roster to B; B announces its own sender key; the
+mesh returns the others') is a clean but non-trivial follow-up, deferred for now.
+
 ### 11.6 The honest trade-off
 
 Using sender keys for the cluster (instead of a pairwise Double Ratchet per
