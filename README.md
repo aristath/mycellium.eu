@@ -159,6 +159,9 @@ MYCELLIUM_HOME=/tmp/mary-laptop cargo run -p mycellium-cli -- \
 # See and manage the cluster:
 MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- devices mary
 MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- revoke-device mary <short-id>
+
+# Bring a newly linked device into groups you already joined (receive-only):
+MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- group sync --as mary
 ```
 
 A newly linked device starts fresh (no back-history) and has its **own** message
