@@ -27,7 +27,7 @@ use mycellium_storage::filestore::FileStore;
 use mycellium_engine::history::{self, StoredMessage};
 use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_engine::platform::OsPlatform;
-use crate::Session;
+use mycellium_engine::app::Session;
 
 /// Who authored a line in the transcript.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -9,6 +9,7 @@
 //! The domain-state modules below are generic over `mycellium_core::storage`;
 //! the orchestration is being consolidated here from the CLI shell.
 
+pub mod app;
 pub mod blocklist;
 pub mod contacts;
 pub mod draft;
