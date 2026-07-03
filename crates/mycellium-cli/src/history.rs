@@ -1,7 +1,7 @@
 //! Per-peer chat transcripts, persisted through the [`Storage`] trait.
 //!
 //! Generic over `Storage`, so it's exercised in tests with an in-memory store
-//! and in production with the encrypted [`crate::filestore::FileStore`].
+//! and in production with the encrypted the encrypted `FileStore`.
 
 use serde::{Deserialize, Serialize};
 

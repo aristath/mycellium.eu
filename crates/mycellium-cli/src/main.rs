@@ -10,11 +10,9 @@ mod client;
 mod contacts;
 mod draft;
 mod expiry;
-mod filestore;
 mod groups;
 mod history;
 mod platform;
-mod store;
 mod tui;
 
 use std::io::BufRead;
@@ -38,7 +36,8 @@ use mycellium_core::x3dh::{self, HandshakeInit};
 
 use client::DirectoryClient;
 use contacts::Contact;
-use filestore::FileStore;
+use mycellium_storage::filestore::FileStore;
+use mycellium_storage::store;
 use groups::{GroupInvitePayload, GroupSyncPayload, MailItem, StoredGroup};
 use history::{GroupStoredMessage, StoredMessage};
 use mycellium_transport::libp2p_net::{self, Libp2pNode};

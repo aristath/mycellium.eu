@@ -23,7 +23,7 @@ use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::RatchetMessage;
 use mycellium_core::wire;
 
-use crate::filestore::FileStore;
+use mycellium_storage::filestore::FileStore;
 use crate::history::{self, StoredMessage};
 use mycellium_transport::link::{FrameReader, FrameWriter};
 use crate::platform::OsPlatform;
