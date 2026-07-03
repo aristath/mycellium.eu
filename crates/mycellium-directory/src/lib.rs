@@ -352,6 +352,7 @@ mod tests {
     fn record_for(id: &Identity, handle: &str, seq: u64) -> SignedRecord {
         let record = Record {
             handle: Handle::new(handle).unwrap(),
+            name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
             devices: vec![Device {

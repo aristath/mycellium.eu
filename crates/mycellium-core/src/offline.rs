@@ -58,6 +58,7 @@ mod tests {
     fn record_for(id: &Identity, handle: &str) -> SignedRecord {
         let record = Record {
             handle: Handle::new(handle).unwrap(),
+            name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
             devices: alloc::vec![crate::record::Device {

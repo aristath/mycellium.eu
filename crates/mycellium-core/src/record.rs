@@ -58,8 +58,12 @@ pub struct Device {
 /// and the set of devices (Layer 11) you can be reached and messaged on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// The public name this record is claimed under.
+    /// The account's stable **id** — `user_id(email)`, a hash, never the email.
+    /// This is what the directory keys on and what peers pin.
     pub handle: Handle,
+    /// Free-form **display name** (e.g. "Mary"). Non-unique — many accounts can
+    /// share one; the `handle` above is what actually distinguishes them.
+    pub name: String,
     /// Root identity — the wallet that signs this record.
     pub wallet: WalletPublicKey,
     /// This account's message-queue endpoint — where senders deposit offline
@@ -151,6 +155,7 @@ mod tests {
     fn sample_record(seq: u64) -> Record {
         Record {
             handle: Handle::new("ari").unwrap(),
+            name: String::new(),
             wallet: WalletPublicKey([2u8; 33]),
             queue: String::new(),
             devices: alloc::vec![Device {
@@ -206,6 +211,7 @@ mod tests {
 
         let record = Record {
             handle: Handle::new("ari").unwrap(),
+            name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
             devices: alloc::vec![Device {
@@ -239,6 +245,7 @@ mod tests {
         };
         let record = Record {
             handle: Handle::new("ari").unwrap(),
+            name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
             devices: alloc::vec![
@@ -265,6 +272,7 @@ mod tests {
         let id = Identity::generate(&mut p).unwrap();
         let record = Record {
             handle: Handle::new("ari").unwrap(),
+            name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
             devices: alloc::vec![],
@@ -279,6 +287,7 @@ mod tests {
         let id = Identity::generate(&mut p).unwrap();
         let record = Record {
             handle: Handle::new("ari").unwrap(),
+            name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
             devices: alloc::vec![Device {
