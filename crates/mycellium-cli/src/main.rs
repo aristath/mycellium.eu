@@ -1469,9 +1469,6 @@ fn process_item(
     }
 }
 
-/// Decrypt and act on a one-to-one offline message: display + persist real
-/// messages (and reply with a read receipt), or show an incoming receipt.
-#[allow(clippy::too_many_arguments)]
 /// Process a mirror of a message *this account* sent from another device: record
 /// it in the peer's transcript as our own outgoing message (Layer 11 self-sync).
 fn handle_self_sync(
@@ -1505,6 +1502,9 @@ fn handle_self_sync(
     Ok(())
 }
 
+/// Decrypt and act on a one-to-one offline message: display + persist real
+/// messages (and reply with a read receipt), or show an incoming receipt.
+#[allow(clippy::too_many_arguments)]
 fn handle_direct(
     identity: &Identity,
     me: &Handle,
