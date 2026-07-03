@@ -83,6 +83,7 @@ impl DirectoryClient {
     }
 
     /// Deposit an opaque envelope blob into `handle`'s offline mailbox.
+    /// (Transitional: the mailbox is moving to `mycellium-queue`.)
     pub fn deposit(&self, token: &str, handle: &Handle, slot: &str, blob: &str) -> Result<()> {
         ureq::post(&format!("{}/mailbox/{}/{}", self.base, handle.as_str(), slot))
             .set("Authorization", &format!("Bearer {token}"))
@@ -114,6 +115,7 @@ impl DirectoryClient {
     }
 
     /// Drain one slot of this identity's offline mailbox.
+    /// (Transitional: the mailbox is moving to `mycellium-queue`.)
     pub fn collect(&self, token: &str, handle: &Handle, slot: &str) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct Messages {

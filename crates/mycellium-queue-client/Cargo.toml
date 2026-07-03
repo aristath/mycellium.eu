@@ -1,0 +1,17 @@
+[package]
+name = "mycellium-queue-client"
+version = "0.0.0"
+description = "Client of the Mycellium message queue (wallet-keyed deposit/collect)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mycellium-core = { path = "../mycellium-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+ureq = { version = "2", features = ["json"] }
+
+[lints.rust]
+unsafe_code = "forbid"
