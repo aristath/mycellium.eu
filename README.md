@@ -142,6 +142,29 @@ MYCELLIUM_HOME=/tmp/alice cargo run -p mycellium-cli -- export ./mycellium-backu
 MYCELLIUM_HOME=/tmp/new   cargo run -p mycellium-cli -- import ./mycellium-backup.bin   # into a fresh home
 ```
 
+### Multiple devices
+
+Your seed is your account; add as many devices as you like. On a **fresh**
+device home, `link-device` adopts the account with the seed (no ceremony — the
+seed is the authority) and adds itself to your record. From then on, messages
+fan out to every device, and what you send from one device shows up on the rest.
+
+```sh
+# On your first device you already ran `identity-new` + `register mary ...`.
+# On a new device (fresh MYCELLIUM_HOME), link it with the same seed:
+MYCELLIUM_PHRASE="<your 24 words>" \
+MYCELLIUM_HOME=/tmp/mary-laptop cargo run -p mycellium-cli -- \
+    link-device mary --addr 127.0.0.1:9101 --directory http://127.0.0.1:8078
+
+# See and manage the cluster:
+MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- devices mary
+MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- revoke-device mary <short-id>
+```
+
+A newly linked device starts fresh (no back-history) and has its **own** message
+keys — so a seed leak lets someone add a device going forward, but never
+decrypts your past traffic.
+
 ### Group messaging
 
 Groups use **sender keys**: create a group and each member gets your key over
@@ -252,7 +275,8 @@ broadcast); disappearing messages; encrypted history with search / conversations
 list; drafts; encrypted-at-rest seed (Argon2id + ChaCha20-Poly1305); export /
 import backup; `wipe`; and **social recovery** (`guardian-split` / `-recover`).
 
-**Designed, not yet built (see `docs/CONCEPT.md` Layer 11):** multi-device —
-device clusters with per-device keys, seed self-authorizes a new device,
-encrypt-once via sender keys, blind directory delivery, new devices start fresh.
-**Deferred frontier:** NAT traversal (DHT/relay) and phone/email recovery factors.
+**Multi-device** (Layer 11) is implemented: an account runs on many devices,
+each with its own keys, wallet-signed into one record. `link-device` adds a
+device with just the seed; a message fans out per recipient device and mirrors
+to your own devices; groups fan out to each member's devices. **Deferred
+frontier:** NAT traversal (DHT/relay) and phone/email recovery factors.

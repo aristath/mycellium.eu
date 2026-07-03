@@ -315,7 +315,10 @@ One core, compiled and wrapped per platform: desktop (native, egui/Tauri or CLI)
 
 ## Layer 11 — Devices (a cluster is one identity)
 
-*Design for multi-device. Not yet implemented — this is the plan.*
+*Implemented.* Per-device keys, seed self-authorizes a new device, per-device
+mailbox delivery + cluster fan-out, and sent-message self-sync all work end to
+end (see the `link-device` / `devices` / `revoke-device` commands and the
+multi-device e2e tests). The remaining nuance is noted in 11.6.
 
 Your account is your seed/wallet. You may run it on several devices — phone,
 laptop, tablet. They form a **cluster** that looks like one identity to the
@@ -414,6 +417,7 @@ What remains is no longer concept — it's building and hardening:
 - **Build the POC** — ✅ *done.* The **Rust core** (`mycellium-core`: seed/keys, handle, record sign/verify, X3DH + Double Ratchet, wire codec, behind the Transport/Storage/Platform traits), the **directory service** (`mycellium-directory`: login + signed-KV + anti-rollback + permanent binding), and a **Full-tier shell** (`mycellium-cli`) that runs the whole flow — register → look up → direct connect → X3DH → ratchet → E2E messages — over a TCP transport. See [`../README.md`](../README.md) to run it.
 - **libp2p transport** — ✅ *done.* A `Transport` impl over rust-libp2p (TCP + Noise + Yamux, PeerId derived from the device key, a `/mycellium/1.0` byte-stream protocol) sits behind the same trait as the TCP transport; `mycellium-cli` selects it with `--libp2p` and auto-detects it from the peer's multiaddr. **NAT traversal** (DHT, relay, DCUtR) is the remaining increment — added in the swarm, with no change to the app above.
 - **Live delivery with mailbox fallback** — ✅ *done.* A member runs `serve` to stay online (it announces presence). When sending (1:1, group, broadcast, forward), the client checks each recipient's presence and **pushes the message directly over a live connection if they're online**, falling back to the offline mailbox otherwise. Group messages therefore reach online members live and offline ones via their mailbox — one `deliver` path, verified by an e2e live-push test. (Full 1:1 *interactive* chat still uses the dedicated `chat`/`listen` ratchet path.)
+- **Multi-device (device clusters)** — ✅ *done.* An account (seed/wallet) runs on many devices, each with its own message keys, all wallet-signed into one record (Layer 11). `link-device` adds a device with just the seed — no ceremony; `devices` / `revoke-device` manage the cluster. A message is sealed and delivered per recipient device, mirrored to your own other devices, and group messages/invites fan out to each member's devices — so *add a device and your messages show up there*. Verified by four multi-device e2e tests (link/revoke, recipient fan-out, self-sync, group fan-out).
 - **Conversations overview** — ✅ *done.* `conversations` lists every peer and group with a last-message preview (pruning expired).
 - **Full-duplex chat** — ✅ *done.* Live chat is bidirectional: the connection is split into read/write halves, the ratchet is shared under a mutex, and a reader thread prints incoming messages while the main thread sends. Works identically over TCP and libp2p (the responder starts replying once it has received the first message). A `--tui` flag gives a full-screen terminal interface.
 - **Directory rate limiting** — ✅ *done.* Mailbox deposits are capped per authenticated wallet in a fixed time window (anti-spam), returning `429` when exceeded — a first abuse control on the one hosted piece.
@@ -436,7 +440,7 @@ What remains is no longer concept — it's building and hardening:
 
 - **No NAT traversal yet** — the libp2p direct line works, but peers still reach each other by an address published in the record; DHT/relay/DCUtR is the next step.
 - **`PeerId` in the record is a location string** — the core carries the transport address (TCP `host:port` or a libp2p multiaddr) in the record's `peer_id` field; a cleaner split of identity vs. reachability is future work.
-- **Multi-device not yet built** — the design is settled (Layer 11: per-device keys, seed self-authorizes a device into the cluster, a conversation is a group of devices, encrypt-once via sender keys, blind directory delivery, new devices start fresh). Implementation — record-as-device-set, `link-device` / `revoke-device`, per-device delivery, and cluster fan-out — is the next build.
+- **Multi-device** — ✅ *done* (Layer 11). Record is a wallet-signed device set; device/messaging keys are per-device (the wallet stays seed-derived); `link-device` self-authorizes a new device via the seed; the mailbox is keyed per-device; `send` fans out one sealed copy per recipient device and mirrors to your own other devices (self-sync); group messages and invites fan out to each member's devices. Remaining nuance: 1:1 uses per-device X3DH rather than sender keys (simpler + stronger post-compromise security for small clusters); receipts still use the shared account slot.
 - **Reactions/edits are best-effort and flattened in history** — they mutate the stored transcript rather than being aggregated onto their target in a structured UI.
 
 (The wallet key now uses standard **BIP-44** (`m/44'/60'/0'/0/0`), verified against a known vector, so a Mycellium seed imports into external wallets. Device/messaging keys stay on HKDF, as X25519 has no external HD standard.)
