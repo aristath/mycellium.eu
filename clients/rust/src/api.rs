@@ -9,11 +9,12 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 use tiny_http::Method;
 
-use mycellium_core::identity::Identity;
+use mycellium_core::identity::{Handle, Identity};
+use mycellium_core::platform::Platform;
+use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::app;
 use mycellium_engine::platform::OsPlatform;
 use mycellium_engine::{contacts, groups, history};
-use mycellium_core::platform::Platform;
 use mycellium_storage::store;
 
 use crate::State;
@@ -24,25 +25,24 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
     let req = parse(body);
     let directory = state.lock().unwrap().directory.clone();
 
-    // Session/auth endpoints are always reachable; everything else needs unlock.
+    // Status + onboarding are always reachable; everything else needs a claimed
+    // handle (a finished account).
     let open = matches!(
         (method, segs.as_slice()),
         (&Method::Get, ["status"])
-            | (&Method::Post, ["identity"])
-            | (&Method::Post, ["restore"])
-            | (&Method::Post, ["unlock"])
+            | (&Method::Post, ["signup"])
+            | (&Method::Post, ["signup", "confirm"])
+            | (&Method::Post, ["signup", "status"])
     );
-    if !open && !state.lock().unwrap().unlocked {
-        return (401, err("locked — unlock or register first"));
+    if !open && read_handle().is_none() {
+        return (401, err("no account yet — sign up first"));
     }
 
     let result: anyhow::Result<Value> = match (method, segs.as_slice()) {
-        (&Method::Get, ["status"]) => status(state),
-        (&Method::Post, ["identity"]) => create_identity(state, &req),
-        (&Method::Post, ["restore"]) => restore(state, &req),
-        (&Method::Post, ["unlock"]) => unlock(state, &req),
-        (&Method::Post, ["lock"]) => lock(state),
-        (&Method::Post, ["register"]) => register(&req, &directory),
+        (&Method::Get, ["status"]) => status(&directory),
+        (&Method::Post, ["signup"]) => signup(&req, &directory),
+        (&Method::Post, ["signup", "confirm"]) => signup_confirm(&req, &directory),
+        (&Method::Post, ["signup", "status"]) => signup_status(&req, &directory),
 
         (&Method::Get, ["contacts"]) => contacts_list(),
         (&Method::Post, ["contacts"]) => contacts_add(&req, &directory),
@@ -68,83 +68,83 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
     }
 }
 
-// ---- session ----------------------------------------------------------------
+// ---- session / onboarding ---------------------------------------------------
 
-fn status(state: &Mutex<State>) -> anyhow::Result<Value> {
-    let unlocked = state.lock().unwrap().unlocked;
-    let directory = state.lock().unwrap().directory.clone();
-    let queue = std::env::var("MYCELLIUM_QUEUE").unwrap_or_default();
-    let wallet = if unlocked {
-        store::load_identity().ok().map(|id| hex(&id.wallet_public().0))
+/// Load the silent device identity, creating it on first use. No password or
+/// seed: it's encrypted at rest with the per-device key `main` sets.
+fn ensure_identity() -> anyhow::Result<Identity> {
+    if store::exists() {
+        store::load_identity().map_err(|_| anyhow::anyhow!("could not open the local identity"))
     } else {
-        None
-    };
+        let identity = Identity::generate(&mut OsPlatform)?;
+        store::save_identity(&identity)?;
+        Ok(identity)
+    }
+}
+
+fn status(directory: &str) -> anyhow::Result<Value> {
+    let queue = std::env::var("MYCELLIUM_QUEUE").unwrap_or_default();
+    let wallet = store::load_identity().ok().map(|id| hex(&id.wallet_public().0));
     Ok(json!({
-        // `has_identity` = an identity file exists; `handle` = a name was
-        // actually claimed. These are DIFFERENT — a failed register leaves the
-        // first true and the second null, so the UI must route on the handle.
-        "has_identity": store::exists(),
+        // `handle` is set only once the account is fully claimed (email verified
+        // + record published) — the UI routes on it.
         "handle": read_handle(),
-        "unlocked": unlocked,
         "wallet": wallet,
         "directory": directory,
         "queue": queue,
-        "directory_ok": reachable(&directory),
+        "directory_ok": reachable(directory),
         "queue_ok": reachable(&queue),
     }))
 }
 
-fn create_identity(state: &Mutex<State>, req: &Value) -> anyhow::Result<Value> {
-    let pass = field(req, "passphrase").ok_or_else(|| anyhow::anyhow!("passphrase required"))?;
-    if store::exists() {
-        anyhow::bail!("an identity already exists — unlock it instead");
-    }
-    std::env::set_var("MYCELLIUM_PASSPHRASE", pass);
-    let identity = Identity::generate(&mut OsPlatform)?;
-    store::save_identity(&identity)?;
-    state.lock().unwrap().unlocked = true;
-    Ok(json!({ "mnemonic": identity.mnemonic(), "wallet": hex(&identity.wallet_public().0) }))
-}
-
-fn restore(state: &Mutex<State>, req: &Value) -> anyhow::Result<Value> {
-    let phrase = field(req, "phrase").ok_or_else(|| anyhow::anyhow!("phrase required"))?;
-    let pass = field(req, "passphrase").ok_or_else(|| anyhow::anyhow!("passphrase required"))?;
-    std::env::set_var("MYCELLIUM_PASSPHRASE", pass);
-    let identity = Identity::from_phrase(phrase.trim(), &mut OsPlatform)
-        .map_err(|_| anyhow::anyhow!("invalid seed phrase"))?;
-    store::save_identity(&identity)?;
-    state.lock().unwrap().unlocked = true;
-    Ok(json!({ "wallet": hex(&identity.wallet_public().0) }))
-}
-
-fn unlock(state: &Mutex<State>, req: &Value) -> anyhow::Result<Value> {
-    let pass = field(req, "passphrase").ok_or_else(|| anyhow::anyhow!("passphrase required"))?;
-    std::env::set_var("MYCELLIUM_PASSPHRASE", pass);
-    let identity = store::load_identity().map_err(|_| anyhow::anyhow!("wrong passphrase or no identity"))?;
-    state.lock().unwrap().unlocked = true;
-    Ok(json!({ "wallet": hex(&identity.wallet_public().0), "handle": read_handle() }))
-}
-
-fn lock(state: &Mutex<State>) -> anyhow::Result<Value> {
-    std::env::remove_var("MYCELLIUM_PASSPHRASE");
-    state.lock().unwrap().unlocked = false;
-    Ok(json!({ "ok": true }))
-}
-
-fn register(req: &Value, directory: &str) -> anyhow::Result<Value> {
-    let handle = field(req, "handle").ok_or_else(|| anyhow::anyhow!("handle required"))?;
-    // Preflight: a clear message beats "challenge request failed" when the
-    // directory simply isn't running.
+/// Step 1: silently ensure an identity, then start an email-verified claim.
+fn signup(req: &Value, directory: &str) -> anyhow::Result<Value> {
+    let username = field(req, "username").ok_or_else(|| anyhow::anyhow!("pick a username"))?;
+    let email = field(req, "email").ok_or_else(|| anyhow::anyhow!("enter an email"))?;
     if !reachable(directory) {
         anyhow::bail!(
             "Can't reach the directory at {directory}. Start it first:  cargo run -p mycellium-server -- --addr 127.0.0.1:8080"
         );
     }
-    // A polling client isn't reachable for live push (empty addr) — delivery to
-    // it flows through its queue.
-    app::register(handle, "", false, directory)?;
-    write_handle(handle)?;
-    Ok(json!({ "handle": handle }))
+    let identity = ensure_identity()?;
+    let client = DirectoryClient::new(directory);
+    let token = client.login(&identity)?;
+    let (pending, dev_code) = client.auth_start(&token, username, email)?;
+    Ok(json!({ "pending": pending, "dev_code": dev_code }))
+}
+
+/// Step 2 (code path): confirm the emailed code and finish setup.
+fn signup_confirm(req: &Value, directory: &str) -> anyhow::Result<Value> {
+    let pending = field(req, "pending").ok_or_else(|| anyhow::anyhow!("missing pending token"))?;
+    let code = field(req, "code").ok_or_else(|| anyhow::anyhow!("enter the code"))?;
+    let client = DirectoryClient::new(directory);
+    let username = client.auth_confirm(pending, code)?;
+    finalize(&client, &username)?;
+    Ok(json!({ "handle": username }))
+}
+
+/// Step 2 (link path): poll whether the one-tap link was clicked; finish if so.
+fn signup_status(req: &Value, directory: &str) -> anyhow::Result<Value> {
+    let pending = field(req, "pending").ok_or_else(|| anyhow::anyhow!("missing pending token"))?;
+    let client = DirectoryClient::new(directory);
+    let (verified, username) = client.auth_status(pending)?;
+    if verified && read_handle().is_none() {
+        finalize(&client, &username)?;
+    }
+    Ok(json!({ "verified": verified, "handle": read_handle() }))
+}
+
+/// Publish our record under the verified username and remember it locally.
+fn finalize(client: &DirectoryClient, username: &str) -> anyhow::Result<()> {
+    let identity = ensure_identity()?;
+    let handle = Handle::new(username).map_err(|_| anyhow::anyhow!("invalid username"))?;
+    let token = client.login(&identity)?;
+    // Empty addr: a polling client isn't reachable for live push, so mail flows
+    // through its queue (endpoint baked into the record from MYCELLIUM_QUEUE).
+    let record = app::build_record(&identity, &handle, "");
+    client.publish(&token, &handle, &record)?;
+    write_handle(username)?;
+    Ok(())
 }
 
 // ---- contacts ---------------------------------------------------------------

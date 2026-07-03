@@ -32,7 +32,7 @@ async function refreshStatus() {
 // Poll: drain the queue into local history, then refresh the current view.
 async function tick() {
   await refreshStatus();
-  if (!state.status || !state.status.unlocked || !state.status.handle) return;
+  if (!state.status || !state.status.handle) return;
   try { await api.post('sync'); state.online = true; } catch { state.online = false; }
   renderBar();
   if (state.tab === 'threads' && state.open) return openThread(state.open, true);
@@ -42,10 +42,8 @@ async function tick() {
 
 function render() {
   const s = state.status;
-  if (!s || !s.has_identity) return renderRegister();  // no account yet
-  if (!s.unlocked) return renderLogin();               // account, needs unlock
-  if (!s.handle) return renderClaimHandle(null, s.wallet); // identity but no name claimed yet
-  renderApp();                                         // fully set up
+  if (!s || !s.handle) return renderSignup();  // no account yet → sign up
+  renderApp();                                 // fully set up
 }
 
 // A prominent warning when a required service isn't running, with the exact
@@ -63,123 +61,69 @@ function healthBanner(s) {
 }
 const hostOf = (url) => (url || '').replace(/^https?:\/\//, '');
 
-/* ---------------- auth ---------------- */
+/* ---------------- auth (username + email + one-tap verify) ---------------- */
 
-function renderRegister() {
+function renderSignup() {
   root.innerHTML = `
     <div class="auth">
       <h1><img src="/icon.svg" alt=""> Mycellium</h1>
-      <p class="sub muted">Create your account. Your seed phrase <b>is</b> your identity — it is generated on this device and never leaves it.</p>
-      ${healthBanner(state.status)}
-      <div class="card" id="step1">
-        <h2>1 — Choose a passphrase</h2>
-        <p class="muted" style="font-size:13px">Encrypts your identity at rest on this device.</p>
-        <label>Passphrase</label>
-        <input id="pass" type="password" placeholder="a strong passphrase" autocomplete="new-password" />
-        <div class="error" id="err"></div>
-        <div class="row" style="margin-top:12px"><button id="create">Generate identity</button></div>
-        <div style="margin-top:8px"><button class="link" id="toLogin">Already have an identity? Unlock it</button>
-        · <button class="link" id="toRestore">Restore from seed phrase</button></div>
-      </div>
-    </div>`;
-  byId('create').onclick = async () => {
-    const passphrase = byId('pass').value;
-    if (!passphrase) return setErr('err', 'passphrase required');
-    try {
-      const r = await api.post('identity', { passphrase });
-      await refreshStatus();
-      renderClaimHandle(r.mnemonic, r.wallet);
-    } catch (e) { setErr('err', e.message); }
-  };
-  byId('toLogin').onclick = renderLogin;
-  byId('toRestore').onclick = renderRestore;
-}
-
-// Fresh registration passes the mnemonic (shown once). The resume case (identity
-// exists but the name claim never completed — e.g. the directory was down) passes
-// null: no seed to show, just finish claiming the name.
-function renderClaimHandle(mnemonic, wallet) {
-  const seedCard = mnemonic
-    ? `<div class="card">
-        <h2>2 — Write down your seed phrase</h2>
-        <p class="muted" style="font-size:13px">These 24 words recover your account anywhere. Store them safely — anyone with them <b>is</b> you. There is no reset.</p>
-        <div class="mnemonic">${esc(mnemonic)}</div>
-      </div>`
-    : `<p class="sub muted">Your identity is ready${wallet ? ` (<code>${esc(wallet.slice(0, 10))}…</code>)` : ''}, but the last step didn't finish. Claim your name to continue.</p>`;
-  root.innerHTML = `
-    <div class="auth">
-      <h1><img src="/icon.svg" alt=""> Mycellium</h1>
-      ${healthBanner(state.status)}
-      ${seedCard}
-      <div class="card">
-        <h2>${mnemonic ? '3 — ' : ''}Claim your name</h2>
-        <label>Handle</label>
-        <input id="handle" placeholder="e.g. mary" autocomplete="off" />
-        <div class="error" id="err"></div>
-        <div class="row" style="margin-top:12px">
-          <button id="reg">Register &amp; enter</button>
-          ${mnemonic ? '' : '<button class="ghost" id="lock">Lock</button>'}
-        </div>
-      </div>
-    </div>`;
-  byId('reg').onclick = async () => {
-    const handle = byId('handle').value.trim();
-    if (!handle) return setErr('err', 'pick a handle');
-    setErr('err', '');
-    byId('reg').disabled = true;
-    try { await api.post('register', { handle }); await refreshStatus(); render(); }
-    catch (e) { setErr('err', e.message); byId('reg').disabled = false; }
-  };
-  if (byId('lock')) byId('lock').onclick = async () => { await api.post('lock').catch(() => {}); location.reload(); };
-}
-
-function renderLogin() {
-  root.innerHTML = `
-    <div class="auth">
-      <h1><img src="/icon.svg" alt=""> Mycellium</h1>
+      <p class="sub muted">Pick a name and confirm your email — that's it. No password, no seed phrase.</p>
       ${healthBanner(state.status)}
       <div class="card">
-        <h2>Unlock</h2>
-        <label>Passphrase</label>
-        <input id="pass" type="password" autocomplete="current-password" />
+        <h2>Create your account</h2>
+        <label>Username — how people find and message you</label>
+        <input id="username" placeholder="e.g. mary" autocomplete="off" />
+        <label>Email — private, only to verify it's you and recover your account</label>
+        <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
         <div class="error" id="err"></div>
-        <div class="row" style="margin-top:12px"><button id="go">Unlock</button></div>
-        <div style="margin-top:8px"><button class="link" id="toRestore">Restore from seed phrase</button></div>
+        <div class="row" style="margin-top:12px"><button id="go">Continue</button></div>
       </div>
     </div>`;
-  byId('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') byId('go').click(); });
   byId('go').onclick = async () => {
-    try { await api.post('unlock', { passphrase: byId('pass').value }); await refreshStatus(); render(); }
-    catch (e) { setErr('err', e.message); }
+    const username = byId('username').value.trim();
+    const email = byId('email').value.trim();
+    if (!username) return setErr('err', 'pick a username');
+    if (!email || !email.includes('@')) return setErr('err', 'enter a valid email');
+    if (state.status && !state.status.directory_ok) return setErr('err', "the directory isn't running — start it (see the warning above), then retry");
+    setErr('err', ''); byId('go').disabled = true;
+    try {
+      const r = await api.post('signup', { username, email });
+      renderVerify(r.pending, r.dev_code, email);
+    } catch (e) { setErr('err', e.message); byId('go').disabled = false; }
   };
-  byId('toRestore').onclick = renderRestore;
 }
 
-function renderRestore() {
+function renderVerify(pending, devCode, email) {
   root.innerHTML = `
     <div class="auth">
       <h1><img src="/icon.svg" alt=""> Mycellium</h1>
       <div class="card">
-        <h2>Restore from seed phrase</h2>
-        <label>24-word seed phrase</label>
-        <textarea id="phrase" rows="3" placeholder="word1 word2 …"></textarea>
-        <label>New passphrase (encrypts it on this device)</label>
-        <input id="pass" type="password" autocomplete="new-password" />
+        <h2>Check your email</h2>
+        <p class="sub muted">We sent a 6-digit code to <b>${esc(email)}</b>. Enter it to finish.</p>
+        ${devCode ? `<div class="banner-warn">Dev mode (no email server): your code is <b>${esc(devCode)}</b>.</div>` : ''}
+        <label>Verification code</label>
+        <input id="code" inputmode="numeric" placeholder="123456" autocomplete="one-time-code" value="${devCode ? esc(devCode) : ''}" />
         <div class="error" id="err"></div>
-        <div class="row" style="margin-top:12px"><button id="go">Restore</button><button class="ghost" id="back">Back</button></div>
+        <div class="row" style="margin-top:12px"><button id="verify">Verify &amp; enter</button><button class="ghost" id="back">Back</button></div>
       </div>
     </div>`;
-  byId('back').onclick = render;
-  byId('go').onclick = async () => {
-    try {
-      const r = await api.post('restore', { phrase: byId('phrase').value, passphrase: byId('pass').value });
-      await refreshStatus();
-      // After restore, they still need a handle on this device (register/link).
-      renderClaimHandle(null, (state.status && state.status.wallet) || r.wallet);
-    } catch (e) { setErr('err', e.message); }
+  byId('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') byId('verify').click(); });
+  byId('back').onclick = renderSignup;
+  byId('verify').onclick = async () => {
+    const code = byId('code').value.trim();
+    if (!code) return setErr('err', 'enter the code');
+    setErr('err', ''); byId('verify').disabled = true;
+    try { await api.post('signup/confirm', { pending, code }); await refreshStatus(); render(); }
+    catch (e) { setErr('err', e.message); byId('verify').disabled = false; }
   };
+  // One-tap email link: poll until the server marks the claim verified.
+  const poll = setInterval(async () => {
+    try {
+      const s = await api.post('signup/status', { pending });
+      if (s.verified) { clearInterval(poll); await refreshStatus(); render(); }
+    } catch {}
+  }, 2000);
 }
-
 /* ---------------- app ---------------- */
 
 function renderApp() {
@@ -188,7 +132,6 @@ function renderApp() {
       <div class="who" id="who"></div>
       <div class="spacer"></div>
       <span class="dot" id="dot" title="sync"></span>
-      <button class="link" id="lock">Lock</button>
     </header>
     <nav class="tabs">
       <button data-tab="threads">Chats</button>
@@ -200,7 +143,6 @@ function renderApp() {
   root.querySelectorAll('nav.tabs button').forEach((b) => {
     b.onclick = () => { state.tab = b.dataset.tab; state.open = null; renderContent(); renderBar(); };
   });
-  byId('lock').onclick = async () => { try { await api.post('lock'); } catch {} location.reload(); };
   renderBar();
   renderContent();
   tick();

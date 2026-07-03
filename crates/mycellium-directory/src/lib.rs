@@ -44,6 +44,8 @@ pub enum ApiError {
     NotFound,
     /// The caller is authenticated but not permitted (e.g. not the owner).
     Forbidden,
+    /// A malformed request (e.g. an invalid email).
+    BadRequest,
 }
 
 impl ApiError {
@@ -57,6 +59,7 @@ impl ApiError {
             ApiError::Stale => 409,
             ApiError::NotFound => 404,
             ApiError::Forbidden => 403,
+            ApiError::BadRequest => 400,
         }
     }
 
@@ -73,6 +76,7 @@ impl ApiError {
             ApiError::InvalidRecord => "record failed signature verification",
             ApiError::NotFound => "no such handle",
             ApiError::Forbidden => "not permitted",
+            ApiError::BadRequest => "malformed request",
         }
     }
 }
@@ -91,10 +95,27 @@ pub struct Directory {
     records: HashMap<Handle, SignedRecord>,
     /// Presence: handle → last-seen unix seconds.
     presence: HashMap<Handle, u64>,
+    /// Username claims awaiting email verification: pending token → claim.
+    pending: HashMap<String, Pending>,
+    /// Recovery emails for verified names: handle → email.
+    emails: HashMap<Handle, String>,
+}
+
+/// A username claim awaiting one-tap email verification (Layer 6 auth).
+struct Pending {
+    username: Handle,
+    email: String,
+    wallet: WalletPublicKey,
+    code: String,
+    verified: bool,
+    created: u64,
 }
 
 /// How long after its last heartbeat a handle is still considered online.
 pub const PRESENCE_TTL: u64 = 60;
+
+/// How long an email verification code / link stays valid (15 minutes).
+pub const VERIFY_TTL: u64 = 900;
 
 impl Directory {
     /// A fresh, empty directory.
@@ -135,6 +156,71 @@ impl Directory {
         let token = random_hex::<24>();
         self.tokens.insert(token.clone(), *wallet);
         Ok(token)
+    }
+
+    /// Begin an email-verified username claim for the logged-in wallet.
+    ///
+    /// Returns `(pending_token, code)`. The code is what the verification email
+    /// carries; the caller decides whether to also surface it (dev) or only mail
+    /// it (prod). A name already owned by a *different* wallet is rejected.
+    pub fn auth_start(
+        &mut self,
+        token: &str,
+        username: &Handle,
+        email: &str,
+        now: u64,
+    ) -> Result<(String, String), ApiError> {
+        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        if let Some(bound) = self.bindings.get(username) {
+            if *bound != wallet {
+                return Err(ApiError::HandleTaken);
+            }
+        }
+        if !email.contains('@') || email.len() < 3 {
+            return Err(ApiError::BadRequest);
+        }
+        let pending_token = random_hex::<24>();
+        let code = format!("{:06}", u32::from_le_bytes(random_bytes::<4>()) % 1_000_000);
+        deliver_email(email, username.as_str(), &code, &pending_token);
+        self.pending.insert(
+            pending_token.clone(),
+            Pending {
+                username: username.clone(),
+                email: email.to_string(),
+                wallet,
+                code: code.clone(),
+                verified: false,
+                created: now,
+            },
+        );
+        Ok((pending_token, code))
+    }
+
+    /// Confirm an email code (typed, or embedded in the one-tap link). On
+    /// success the name is bound to the wallet and the recovery email stored.
+    pub fn auth_confirm(&mut self, pending_token: &str, code: &str, now: u64) -> Result<Handle, ApiError> {
+        let p = self.pending.get_mut(pending_token).ok_or(ApiError::NotFound)?;
+        if now.saturating_sub(p.created) > VERIFY_TTL {
+            return Err(ApiError::Stale);
+        }
+        if p.code != code {
+            return Err(ApiError::BadSignature);
+        }
+        p.verified = true;
+        let (username, wallet, email) = (p.username.clone(), p.wallet, p.email.clone());
+        if let Some(bound) = self.bindings.get(&username) {
+            if *bound != wallet {
+                return Err(ApiError::HandleTaken);
+            }
+        }
+        self.bindings.insert(username.clone(), wallet);
+        self.emails.insert(username.clone(), email);
+        Ok(username)
+    }
+
+    /// Poll a pending claim: `(verified, username)`.
+    pub fn auth_status(&self, pending_token: &str) -> Option<(bool, String)> {
+        self.pending.get(pending_token).map(|p| (p.verified, p.username.as_str().to_string()))
     }
 
     /// Publish (or update) a signed record under `handle`.
@@ -207,6 +293,20 @@ fn random_hex<const N: usize>() -> String {
         out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
     }
     out
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
+    bytes
+}
+
+/// Deliver a verification email. Dev default: log it to the console. Production
+/// swaps this body for an SMTP send (self-hosted; never a US SMS/email gateway).
+fn deliver_email(email: &str, username: &str, code: &str, pending_token: &str) {
+    eprintln!(
+        "[mycellium-directory] verify '{username}' for {email}: code {code}  (pending {pending_token})"
+    );
 }
 
 #[cfg(test)]

@@ -15,10 +15,8 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Shared server state (the client is single-user: one identity per process).
 pub struct State {
-    /// Directory endpoint (names/records/presence).
+    /// Directory endpoint (names/records/presence + email-verified claims).
     pub directory: String,
-    /// Whether the on-disk identity is currently unlocked this session.
-    pub unlocked: bool,
 }
 
 const DEFAULT_DIRECTORY: &str = "http://127.0.0.1:8080";
@@ -49,8 +47,11 @@ fn main() {
     // The engine reads these from the environment; set them once for the process.
     std::env::set_var("MYCELLIUM_HOME", &data_dir);
     std::env::set_var("MYCELLIUM_QUEUE", &queue);
+    // Passwordless: the identity is encrypted at rest with a random per-device
+    // key kept in the data dir — no user password or seed phrase to manage.
+    std::env::set_var("MYCELLIUM_PASSPHRASE", ensure_device_key(&data_dir));
 
-    let state = Mutex::new(State { directory, unlocked: false });
+    let state = Mutex::new(State { directory });
     let addr = format!("127.0.0.1:{port}");
     let server = match Server::http(&addr) {
         Ok(s) => s,
@@ -102,6 +103,24 @@ fn handle(state: &Mutex<State>, mut request: Request) {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// The per-device secret that encrypts the identity at rest. Generated once and
+/// kept in the data dir — the user never sees or types it (no seed/password).
+fn ensure_device_key(data_dir: &str) -> String {
+    let path = std::path::Path::new(data_dir).join("device.key");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
+    let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = std::fs::create_dir_all(data_dir);
+    let _ = std::fs::write(&path, &key);
+    key
 }
 
 fn default_data_dir() -> String {

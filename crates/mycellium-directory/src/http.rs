@@ -48,6 +48,23 @@ struct Presence {
     online: bool,
 }
 
+#[derive(Deserialize)]
+struct AuthStartReq {
+    username: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct AuthConfirmReq {
+    pending: String,
+    code: String,
+}
+
+#[derive(Deserialize)]
+struct AuthStatusReq {
+    pending: String,
+}
+
 /// Current wall-clock time in whole seconds (for presence TTL).
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -125,6 +142,40 @@ fn route(
             match directory.lock().unwrap().lookup(&handle) {
                 Some(record) => Ok((200, to_json(record))),
                 None => Ok((404, error_json("no such handle"))),
+            }
+        }
+
+        // Email-verified username claim (one-tap onboarding).
+        (Method::Post, ["auth", "start"]) => {
+            let token = token.ok_or(ApiError::Unauthorized)?;
+            let req: AuthStartReq = parse(body)?;
+            let username = Handle::new(&req.username).map_err(|_| ApiError::BadRequest)?;
+            let (pending, code) =
+                directory.lock().unwrap().auth_start(token, &username, &req.email, now_secs())?;
+            // Dev mode (no SMTP configured) surfaces the code so the flow works
+            // locally; production emails it and returns only the pending token.
+            let dev = std::env::var("MYCELLIUM_DEV_EMAIL").map(|v| v != "0").unwrap_or(true);
+            let resp = if dev {
+                serde_json::json!({ "pending": pending, "dev_code": code })
+            } else {
+                serde_json::json!({ "pending": pending })
+            };
+            Ok((200, resp.to_string()))
+        }
+
+        (Method::Post, ["auth", "confirm"]) => {
+            let req: AuthConfirmReq = parse(body)?;
+            let username = directory.lock().unwrap().auth_confirm(&req.pending, &req.code, now_secs())?;
+            Ok((200, serde_json::json!({ "ok": true, "username": username.as_str() }).to_string()))
+        }
+
+        (Method::Post, ["auth", "status"]) => {
+            let req: AuthStatusReq = parse(body)?;
+            match directory.lock().unwrap().auth_status(&req.pending) {
+                Some((verified, username)) => {
+                    Ok((200, serde_json::json!({ "verified": verified, "username": username }).to_string()))
+                }
+                None => Err(ApiError::NotFound),
             }
         }
 

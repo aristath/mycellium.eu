@@ -82,6 +82,65 @@ impl DirectoryClient {
         Ok(record)
     }
 
+    /// Begin an email-verified username claim. Returns `(pending_token,
+    /// dev_code)` — `dev_code` is set only when the directory runs in dev mode
+    /// (no SMTP), so the local flow works without a real inbox.
+    pub fn auth_start(&self, token: &str, username: &str, email: &str) -> Result<(String, Option<String>)> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            username: &'a str,
+            email: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            pending: String,
+            dev_code: Option<String>,
+        }
+        let resp: Resp = ureq::post(&format!("{}/auth/start", self.base))
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(Req { username, email })
+            .map_err(|e| anyhow!("auth start failed: {e}"))?
+            .into_json()?;
+        Ok((resp.pending, resp.dev_code))
+    }
+
+    /// Confirm a verification code (typed or from the one-tap link). Returns the
+    /// verified username.
+    pub fn auth_confirm(&self, pending: &str, code: &str) -> Result<String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            pending: &'a str,
+            code: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            username: String,
+        }
+        let resp: Resp = ureq::post(&format!("{}/auth/confirm", self.base))
+            .send_json(Req { pending, code })
+            .map_err(|e| anyhow!("verification failed: {e}"))?
+            .into_json()?;
+        Ok(resp.username)
+    }
+
+    /// Poll a pending claim: `(verified, username)`.
+    pub fn auth_status(&self, pending: &str) -> Result<(bool, String)> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            pending: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            verified: bool,
+            username: String,
+        }
+        let resp: Resp = ureq::post(&format!("{}/auth/status", self.base))
+            .send_json(Req { pending })
+            .map_err(|e| anyhow!("status check failed: {e}"))?
+            .into_json()?;
+        Ok((resp.verified, resp.username))
+    }
+
     /// Announce that we're online (heartbeat).
     pub fn announce(&self, token: &str, handle: &Handle) -> Result<()> {
         ureq::post(&format!("{}/presence/{}", self.base, handle.as_str()))
