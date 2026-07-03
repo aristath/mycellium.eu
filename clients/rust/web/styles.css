@@ -50,6 +50,15 @@ button:disabled { opacity: .5; cursor: default; }
 .error { color: var(--danger); font-size: 13px; margin-top: 8px; min-height: 16px; }
 .muted { color: var(--muted); }
 
+.banner-warn {
+  background: #3a2416; border: 1px solid #7c4a1e; color: #fcd9b6;
+  border-radius: 10px; padding: 10px 12px; margin: 12px 0; font-size: 13px; line-height: 1.5;
+}
+.banner-warn code {
+  display: inline-block; margin-top: 4px; background: #0f1115; color: var(--accent);
+  padding: 3px 6px; border-radius: 6px; font-size: 12px; user-select: all;
+}
+
 /* ---- app chrome ---- */
 header.bar {
   display: flex; align-items: center; gap: 10px; padding: 10px 14px;

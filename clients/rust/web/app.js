@@ -31,20 +31,37 @@ async function refreshStatus() {
 
 // Poll: drain the queue into local history, then refresh the current view.
 async function tick() {
+  await refreshStatus();
   if (!state.status || !state.status.unlocked || !state.status.handle) return;
   try { await api.post('sync'); state.online = true; } catch { state.online = false; }
+  renderBar();
   if (state.tab === 'threads' && state.open) return openThread(state.open, true);
   if (state.tab === 'groups' && state.open) return openGroup(state.open, true);
   renderContent();
-  renderBar();
 }
 
 function render() {
   const s = state.status;
-  if (!s || !s.registered) return renderRegister();
-  if (!s.unlocked) return renderLogin();
-  renderApp();
+  if (!s || !s.has_identity) return renderRegister();  // no account yet
+  if (!s.unlocked) return renderLogin();               // account, needs unlock
+  if (!s.handle) return renderClaimHandle(null, s.wallet); // identity but no name claimed yet
+  renderApp();                                         // fully set up
 }
+
+// A prominent warning when a required service isn't running, with the exact
+// command to start it. This is what was missing when register "made no sense".
+function healthBanner(s) {
+  if (!s) return '';
+  const down = [];
+  if (!s.directory_ok) down.push(['directory', s.directory, 'mycellium-server', '8080']);
+  if (!s.queue_ok) down.push(['queue', s.queue, 'mycellium-queue', '8090']);
+  if (!down.length) return '';
+  return `<div class="banner-warn">
+    ⚠ Can't reach the <b>${down.map((d) => d[0]).join('</b> & <b>')}</b>. Registration and messaging need ${down.length > 1 ? 'them' : 'it'} running:
+    ${down.map((d) => `<div><code>cargo run -p ${d[2]} -- --addr ${hostOf(d[1]) || '127.0.0.1:' + d[3]}</code></div>`).join('')}
+  </div>`;
+}
+const hostOf = (url) => (url || '').replace(/^https?:\/\//, '');
 
 /* ---------------- auth ---------------- */
 
@@ -53,6 +70,7 @@ function renderRegister() {
     <div class="auth">
       <h1><img src="/icon.svg" alt=""> Mycellium</h1>
       <p class="sub muted">Create your account. Your seed phrase <b>is</b> your identity — it is generated on this device and never leaves it.</p>
+      ${healthBanner(state.status)}
       <div class="card" id="step1">
         <h2>1 — Choose a passphrase</h2>
         <p class="muted" style="font-size:13px">Encrypts your identity at rest on this device.</p>
@@ -73,39 +91,53 @@ function renderRegister() {
       renderClaimHandle(r.mnemonic, r.wallet);
     } catch (e) { setErr('err', e.message); }
   };
-  byId('toLogin').onclick = () => { state.status.registered = true; renderLogin(); };
+  byId('toLogin').onclick = renderLogin;
   byId('toRestore').onclick = renderRestore;
 }
 
+// Fresh registration passes the mnemonic (shown once). The resume case (identity
+// exists but the name claim never completed — e.g. the directory was down) passes
+// null: no seed to show, just finish claiming the name.
 function renderClaimHandle(mnemonic, wallet) {
-  root.innerHTML = `
-    <div class="auth">
-      <h1><img src="/icon.svg" alt=""> Mycellium</h1>
-      <div class="card">
+  const seedCard = mnemonic
+    ? `<div class="card">
         <h2>2 — Write down your seed phrase</h2>
         <p class="muted" style="font-size:13px">These 24 words recover your account anywhere. Store them safely — anyone with them <b>is</b> you. There is no reset.</p>
         <div class="mnemonic">${esc(mnemonic)}</div>
-      </div>
+      </div>`
+    : `<p class="sub muted">Your identity is ready${wallet ? ` (<code>${esc(wallet.slice(0, 10))}…</code>)` : ''}, but the last step didn't finish. Claim your name to continue.</p>`;
+  root.innerHTML = `
+    <div class="auth">
+      <h1><img src="/icon.svg" alt=""> Mycellium</h1>
+      ${healthBanner(state.status)}
+      ${seedCard}
       <div class="card">
-        <h2>3 — Claim your name</h2>
+        <h2>${mnemonic ? '3 — ' : ''}Claim your name</h2>
         <label>Handle</label>
         <input id="handle" placeholder="e.g. mary" autocomplete="off" />
         <div class="error" id="err"></div>
-        <div class="row" style="margin-top:12px"><button id="reg">Register &amp; enter</button></div>
+        <div class="row" style="margin-top:12px">
+          <button id="reg">Register &amp; enter</button>
+          ${mnemonic ? '' : '<button class="ghost" id="lock">Lock</button>'}
+        </div>
       </div>
     </div>`;
   byId('reg').onclick = async () => {
     const handle = byId('handle').value.trim();
     if (!handle) return setErr('err', 'pick a handle');
+    setErr('err', '');
+    byId('reg').disabled = true;
     try { await api.post('register', { handle }); await refreshStatus(); render(); }
-    catch (e) { setErr('err', e.message); }
+    catch (e) { setErr('err', e.message); byId('reg').disabled = false; }
   };
+  if (byId('lock')) byId('lock').onclick = async () => { await api.post('lock').catch(() => {}); location.reload(); };
 }
 
 function renderLogin() {
   root.innerHTML = `
     <div class="auth">
       <h1><img src="/icon.svg" alt=""> Mycellium</h1>
+      ${healthBanner(state.status)}
       <div class="card">
         <h2>Unlock</h2>
         <label>Passphrase</label>
@@ -140,10 +172,10 @@ function renderRestore() {
   byId('back').onclick = render;
   byId('go').onclick = async () => {
     try {
-      await api.post('restore', { phrase: byId('phrase').value, passphrase: byId('pass').value });
+      const r = await api.post('restore', { phrase: byId('phrase').value, passphrase: byId('pass').value });
       await refreshStatus();
       // After restore, they still need a handle on this device (register/link).
-      renderClaimHandle('(already recorded — this is your existing account)', state.status.wallet);
+      renderClaimHandle(null, (state.status && state.status.wallet) || r.wallet);
     } catch (e) { setErr('err', e.message); }
   };
 }
@@ -163,6 +195,7 @@ function renderApp() {
       <button data-tab="groups">Groups</button>
       <button data-tab="contacts">Contacts</button>
     </nav>
+    <div id="banner"></div>
     <main id="content"></main>`;
   root.querySelectorAll('nav.tabs button').forEach((b) => {
     b.onclick = () => { state.tab = b.dataset.tab; state.open = null; renderContent(); renderBar(); };
@@ -177,7 +210,8 @@ function renderBar() {
   const s = state.status || {};
   const who = byId('who'); if (who) who.innerHTML = `${esc(s.handle || '—')} <small>${(s.wallet || '').slice(0, 10)}…</small>`;
   const dot = byId('dot'); if (dot) dot.className = 'dot' + (state.online ? ' on' : '');
-  root.querySelectorAll('nav.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === state.tab));
+  const b = byId('banner'); if (b) b.innerHTML = healthBanner(state.status);
+  root.querySelectorAll('nav.tabs button').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === state.tab));
 }
 
 function renderContent() {

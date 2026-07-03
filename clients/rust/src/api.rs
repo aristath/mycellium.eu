@@ -72,18 +72,25 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
 
 fn status(state: &Mutex<State>) -> anyhow::Result<Value> {
     let unlocked = state.lock().unwrap().unlocked;
+    let directory = state.lock().unwrap().directory.clone();
+    let queue = std::env::var("MYCELLIUM_QUEUE").unwrap_or_default();
     let wallet = if unlocked {
         store::load_identity().ok().map(|id| hex(&id.wallet_public().0))
     } else {
         None
     };
     Ok(json!({
-        "registered": store::exists(),
-        "unlocked": unlocked,
+        // `has_identity` = an identity file exists; `handle` = a name was
+        // actually claimed. These are DIFFERENT — a failed register leaves the
+        // first true and the second null, so the UI must route on the handle.
+        "has_identity": store::exists(),
         "handle": read_handle(),
+        "unlocked": unlocked,
         "wallet": wallet,
-        "directory": state.lock().unwrap().directory,
-        "queue": std::env::var("MYCELLIUM_QUEUE").unwrap_or_default(),
+        "directory": directory,
+        "queue": queue,
+        "directory_ok": reachable(&directory),
+        "queue_ok": reachable(&queue),
     }))
 }
 
@@ -126,6 +133,13 @@ fn lock(state: &Mutex<State>) -> anyhow::Result<Value> {
 
 fn register(req: &Value, directory: &str) -> anyhow::Result<Value> {
     let handle = field(req, "handle").ok_or_else(|| anyhow::anyhow!("handle required"))?;
+    // Preflight: a clear message beats "challenge request failed" when the
+    // directory simply isn't running.
+    if !reachable(directory) {
+        anyhow::bail!(
+            "Can't reach the directory at {directory}. Start it first:  cargo run -p mycellium-server -- --addr 127.0.0.1:8080"
+        );
+    }
     // A polling client isn't reachable for live push (empty addr) — delivery to
     // it flows through its queue.
     app::register(handle, "", false, directory)?;
@@ -263,6 +277,27 @@ fn field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 
 fn err(msg: &str) -> String {
     json!({ "error": msg }).to_string()
+}
+
+/// Is a service URL currently accepting connections? A quick TCP probe so the
+/// UI can say "the directory isn't running" instead of failing mid-action.
+fn reachable(url: &str) -> bool {
+    match socket_addr(url) {
+        Some(addr) => {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).is_ok()
+        }
+        None => false,
+    }
+}
+
+fn socket_addr(url: &str) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let hostport = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()?;
+    hostport.to_socket_addrs().ok()?.next()
 }
 
 fn hex(bytes: &[u8]) -> String {
