@@ -252,5 +252,7 @@ broadcast); disappearing messages; encrypted history with search / conversations
 list; drafts; encrypted-at-rest seed (Argon2id + ChaCha20-Poly1305); export /
 import backup; `wipe`; and **social recovery** (`guardian-split` / `-recover`).
 
-**Deferred (honest frontier, see `docs/CONCEPT.md`):** NAT traversal (DHT/relay),
-multi-device sync (the mailbox drains on fetch), and phone/email recovery factors.
+**Designed, not yet built (see `docs/CONCEPT.md` Layer 11):** multi-device —
+device clusters with per-device keys, seed self-authorizes a new device,
+encrypt-once via sender keys, blind directory delivery, new devices start fresh.
+**Deferred frontier:** NAT traversal (DHT/relay) and phone/email recovery factors.

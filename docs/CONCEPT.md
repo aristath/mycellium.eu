@@ -313,6 +313,96 @@ One core, compiled and wrapped per platform: desktop (native, egui/Tauri or CLI)
 
 ---
 
+## Layer 11 — Devices (a cluster is one identity)
+
+*Design for multi-device. Not yet implemented — this is the plan.*
+
+Your account is your seed/wallet. You may run it on several devices — phone,
+laptop, tablet. They form a **cluster** that looks like one identity to the
+outside world, while each device holds its *own* message keys. The goal is the
+"normal app" feel — *add a device and my messages show up there* — without
+giving up end-to-end guarantees or bolting on a trusted server.
+
+### 11.1 A device, and joining the cluster
+
+The published record (Layer 8.2) stops being a single keyset and becomes a
+**wallet-signed set of devices**. Each entry is `{ device-id, device signing
+key, messaging + pre-keys }`, where the **device-id is derived from the device's
+own public key** (self-certifying, no central assignment). The wallet signature
+over the set is what proves every listed device belongs to the account.
+
+- **Adding a device needs no ceremony.** Install, enter the seed → the device
+  derives the wallet, generates its *own random* message keys, signs itself into
+  the record (the seed is the authority), and republishes (`seq++`). No QR scan
+  from an old phone — the seed *is* the permission, the same property that lets
+  it recover the identity (9.4).
+- **Removing a device** republishes the set without it (`seq++`). Anti-rollback
+  (9.4) already stops a dropped device from re-appearing with a stale record.
+- Per-device keys mean a **seed leak lets an attacker authorize a new device**
+  (identity compromise — revocable) **but never retroactively decrypts past
+  traffic**, because message keys are device-local, not seed-derived. Wallet =
+  authority; per-device keys = confidentiality.
+
+### 11.2 A conversation is a group of *devices*
+
+The unifying idea: **1:1, group, and multi-device are one mechanism.** A
+conversation's members are *devices*, not identities. John ↔ Mary is the device
+group `{John's devices} ∪ {Mary's devices}`; a group chat is the union across
+all members. Each device has its own **sender key** (the exact sender-keys
+machinery from group messaging), distributed once to every other device over the
+pairwise X3DH-sealed channel. This is *why* we built sender keys — multi-device
+falls out of them.
+
+### 11.3 Sending: encrypt once, the cluster reads it
+
+The message body is encrypted **once** with the sender's sender key. A single
+ciphertext goes to the conversation; every member device decrypts it with the
+sender key it already holds. Only the small **sender-key distribution** is
+per-device, and only once per membership change — never per message. (Treating
+the cluster like a group is the design, not a later optimization.)
+
+- **Sync-to-self is free.** Your own other devices are members of the
+  conversation, so they read the same ciphertext and show your sent messages
+  automatically — no separate sync channel.
+- Because the content ciphertext is **identical for the whole cluster**, the
+  directory can hold one blob the cluster reads (per-device read cursor,
+  non-draining) rather than one copy per device.
+
+### 11.4 Delivery: the directory is the blind server
+
+We are **not** bypassing a server here — the directory *is* the server for this,
+just blind. This is exactly how "normal" E2E apps work: in Signal / WhatsApp /
+iMessage the **sender's client** encrypts per recipient device, and the server
+only **routes** the already-encrypted blobs — it never sees plaintext and never
+fans out *crypto*, only *delivery*. The per-device encryption is the cost of
+end-to-end encryption itself, not a P2P tax. Our directory plays that same role:
+device **registry** (the set lives in the signed record), a blind **mailbox**,
+and **presence**. Online devices still take the direct `serve` fast-path;
+offline ones read the mailbox — the same `deliver` decision we already make.
+
+### 11.5 A new device starts fresh
+
+A device added at time *T* sees messages from *T* onward. **No history
+backfill** — which is what you want (a phone you just linked shouldn't suddenly
+hold years of history) and is *also* better for secrecy: it cannot read anything
+sent before it joined. To carry history to a new device, move it explicitly with
+`export` / `import`.
+
+### 11.6 The honest trade-off
+
+Using sender keys for the cluster (instead of a pairwise Double Ratchet per
+device) buys the encrypt-once efficiency and the unified model, at the standard
+sender-keys cost: **forward secrecy yes** (symmetric chain), **weaker
+per-message post-compromise security** than the DH ratchet. Mitigation: periodic
+**sender-key rotation** (already in `group`) restores PCS at chosen intervals,
+and every membership change forces a re-key. Trust inside a cluster is mutual —
+your devices trust each other (all wallet-authorized); a compromised device
+reads the conversation until revoked, the same limit every messenger has. The
+directory still sees the *shape* (who has how many devices, who talks to whom) —
+the same metadata honesty as Layers 6/8 — but never the content.
+
+---
+
 ## Where we zoom in next
 
 Concept, wire, identity, and client architecture are now all specified end to end:
@@ -346,7 +436,7 @@ What remains is no longer concept — it's building and hardening:
 
 - **No NAT traversal yet** — the libp2p direct line works, but peers still reach each other by an address published in the record; DHT/relay/DCUtR is the next step.
 - **`PeerId` in the record is a location string** — the core carries the transport address (TCP `host:port` or a libp2p multiaddr) in the record's `peer_id` field; a cleaner split of identity vs. reachability is future work.
-- **No multi-device sync** — because keys are deterministic from the seed, importing it onto a second device makes it the *same* cryptographic identity (both can decrypt). But the mailbox *drains* on fetch, so two devices don't both see every message. Proper linked-device sync (per-device fetch cursors, non-draining reads, or per-device sub-keys) is a genuine distributed-systems extension, out of scope for this POC.
+- **Multi-device not yet built** — the design is settled (Layer 11: per-device keys, seed self-authorizes a device into the cluster, a conversation is a group of devices, encrypt-once via sender keys, blind directory delivery, new devices start fresh). Implementation — record-as-device-set, `link-device` / `revoke-device`, per-device delivery, and cluster fan-out — is the next build.
 - **Reactions/edits are best-effort and flattened in history** — they mutate the stored transcript rather than being aggregated onto their target in a structured UI.
 
 (The wallet key now uses standard **BIP-44** (`m/44'/60'/0'/0/0`), verified against a known vector, so a Mycellium seed imports into external wallets. Device/messaging keys stay on HKDF, as X25519 has no external HD standard.)
