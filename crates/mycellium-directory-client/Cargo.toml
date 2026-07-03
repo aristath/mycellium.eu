@@ -1,0 +1,17 @@
+[package]
+name = "mycellium-directory-client"
+version = "0.0.0"
+description = "Client of the Mycellium directory contract (login, publish, lookup, mailbox, presence)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mycellium-core = { path = "../mycellium-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+ureq = { version = "2", features = ["json"] }
+
+[lints.rust]
+unsafe_code = "forbid"

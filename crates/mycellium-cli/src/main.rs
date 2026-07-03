@@ -6,7 +6,6 @@
 //! line, run X3DH + Double Ratchet, and exchange end-to-end-encrypted messages.
 
 mod blocklist;
-mod client;
 mod contacts;
 mod draft;
 mod expiry;
@@ -34,7 +33,7 @@ use mycellium_core::transport::Transport;
 use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 
-use client::DirectoryClient;
+use mycellium_directory_client::DirectoryClient;
 use contacts::Contact;
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;

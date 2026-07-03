@@ -5,6 +5,7 @@ members = [
     "crates/mycellium-directory",
     "crates/mycellium-transport",
     "crates/mycellium-storage",
+    "crates/mycellium-directory-client",
     "crates/mycellium-cli",
 ]
 
