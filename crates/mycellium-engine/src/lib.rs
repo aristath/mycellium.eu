@@ -6,8 +6,9 @@
 //! It carries no argument parsing and no terminal UI — those live in a shell
 //! crate (e.g. `mycellium-cli`), so the same engine can back a GUI or mobile app.
 //!
-//! The domain-state modules below are generic over `mycellium_core::storage`;
-//! the orchestration is being consolidated here from the CLI shell.
+//! [`app`] holds the orchestration (the commands a shell invokes); the other
+//! modules are the domain state it operates on, generic over
+//! `mycellium_core::storage`.
 
 pub mod app;
 pub mod blocklist;
