@@ -46,7 +46,9 @@ pub fn send(
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
 
     let client = DirectoryClient::new(directory);
-    let fs = open_history(&identity)?;
+    let mut fs = open_history(&identity)?;
+    // First, retry anything that got stuck on an earlier attempt.
+    let _ = flush_outbox(&identity, &client, &mut fs);
     let (peer_handle, peer_record) = lookup_verified(&client, &fs, peer)?;
 
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
@@ -54,17 +56,25 @@ pub fn send(
     let encoded = app.encode();
 
     // Fan out one sealed copy per recipient device (Layer 11) — each device has
-    // its own keys, so every device in the cluster receives it.
+    // its own keys, so every device in the cluster receives it. A device we
+    // can't reach (offline, no reachable queue) is parked in the outbox.
     let queue = QueueTarget::open(&identity, &peer_record.record);
+    let now = OsPlatform.now_unix_secs();
     let mut delivered = 0;
     for device in &peer_record.record.devices {
         let envelope = seal_to(&identity, &me, device, &encoded);
-        if deliver(&client, &peer_handle, queue.as_ref(), device, &MailItem::Direct(envelope)) {
+        let slot = device_slot(&device.device_key);
+        let item = MailItem::Direct(envelope);
+        if deliver(&client, &peer_handle, queue.as_ref(), device, &item) {
             delivered += 1;
+        } else {
+            let _ = outbox::enqueue(&mut fs, random_id(), peer_handle.as_str(), &slot, item, now);
         }
     }
     let total = peer_record.record.devices.len();
-    println!("sent to '{}' — {delivered}/{total} device(s) (#{})", peer_handle.as_str(), app.id);
+    let queued = total - delivered;
+    let note = if queued > 0 { format!(" — {queued} queued for retry") } else { String::new() };
+    println!("sent to '{}' — {delivered}/{total} device(s) (#{}){note}", peer_handle.as_str(), app.id);
 
     // Self-sync: mirror this message to my own other devices (Layer 11).
     if let Ok(my_record) = client.lookup(&me) {
@@ -203,6 +213,78 @@ pub fn deliver_to_cluster(dir: &DirectoryClient, identity: &Identity, handle: &H
 
 
 
+/// Retry every parked outbox item once: re-resolve the recipient, re-attempt
+/// live/queue delivery, drop the delivered and the expired, bump the rest.
+/// Returns `(delivered, still_waiting)`.
+pub fn flush_outbox(
+    identity: &Identity,
+    client: &DirectoryClient,
+    fs: &mut FileStore,
+) -> Result<(usize, usize)> {
+    let entries = outbox::load(fs)?;
+    if entries.is_empty() {
+        return Ok((0, 0));
+    }
+    let now = OsPlatform.now_unix_secs();
+    let mut delivered = 0;
+    let mut remaining: Vec<outbox::OutboxEntry> = Vec::new();
+    for mut entry in entries {
+        let handle = match Handle::new(entry.recipient.clone()) {
+            Ok(h) => h,
+            Err(_) => continue, // unparseable recipient — drop it
+        };
+        // Re-resolve the recipient's current record (queue/devices may have moved).
+        let record = match client.lookup(&handle) {
+            Ok(r) if r.verify().is_ok() => Some(r),
+            _ => None,
+        };
+        let delivered_now = record.as_ref().and_then(|record| {
+            // The device this copy was sealed for; if it's gone, we drop the entry.
+            let device = record.record.devices.iter().find(|d| device_slot(&d.device_key) == entry.slot)?;
+            let queue = QueueTarget::open(identity, &record.record);
+            Some(deliver(client, &handle, queue.as_ref(), device, &entry.item))
+        });
+        match delivered_now {
+            Some(true) => delivered += 1,
+            // The target device is gone — nothing to retry; drop the entry.
+            None if record.is_some() => {}
+            // Still undeliverable (or couldn't resolve): bump and keep unless spent.
+            _ => {
+                entry.attempts += 1;
+                if !entry.is_expired(now) {
+                    remaining.push(entry);
+                }
+            }
+        }
+    }
+    let waiting = remaining.len();
+    outbox::save(fs, &remaining)?;
+    Ok((delivered, waiting))
+}
+
+/// Show the outbox: retry what we can, then report what's still waiting.
+pub fn outbox_show(directory: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let client = DirectoryClient::new(directory);
+    let mut fs = open_history(&identity)?;
+    let (delivered, waiting) = flush_outbox(&identity, &client, &mut fs)?;
+    if delivered > 0 {
+        println!("delivered {delivered} previously-stuck message(s)");
+    }
+    let entries = outbox::load(&fs)?;
+    if entries.is_empty() {
+        println!("outbox empty ({waiting} waiting)");
+        return Ok(());
+    }
+    let now = OsPlatform.now_unix_secs();
+    println!("{} message(s) waiting to send:", entries.len());
+    for e in &entries {
+        let age = now.saturating_sub(e.created_at);
+        println!("  → {}  (device {}, {}s old, {} attempt(s))", e.recipient, &e.slot[..8.min(e.slot.len())], age, e.attempts);
+    }
+    Ok(())
+}
+
 /// Accept live-pushed items from peers and process them (the `serve` receiver).
 pub fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -251,6 +333,8 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     }
     let mut fs = open_history(&identity)?;
     let blocked = blocklist::load(&fs)?;
+    // Opportunistically retry anything stuck in our outbox while we're online.
+    let _ = flush_outbox(&identity, &client, &mut fs);
 
     if blobs.is_empty() {
         println!("no new messages");

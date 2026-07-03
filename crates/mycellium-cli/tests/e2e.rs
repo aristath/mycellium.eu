@@ -1305,3 +1305,70 @@ fn social_recovery_round_trip() {
     let recovered_wallet = field(&cli_pass(&recovered, "new-passphrase", &["identity-show"]).stdout, "wallet:");
     assert_eq!(original_wallet, recovered_wallet, "recovered identity must match the original");
 }
+
+#[test]
+fn outbox_parks_undeliverable_then_delivers_on_retry() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let alice = account(&dir, "alice");
+
+    // Carol registers a serve address but publishes NO queue (empty MYCELLIUM_QUEUE),
+    // and is offline — so there is nowhere for a message to land.
+    let carol_port = free_port();
+    let carol_addr = format!("127.0.0.1:{carol_port}");
+    let carol = home("carol-noq");
+    ok(&cli(&carol, &["identity-new"]), "carol id");
+    ok(
+        &Command::new(CLI)
+            .args(["register", "carol", "--addr", &carol_addr, "--directory", &dir])
+            .env("MYCELLIUM_HOME", &carol)
+            .env("MYCELLIUM_PASSPHRASE", PASS)
+            .env("MYCELLIUM_QUEUE", "") // no queue in her record
+            .stdin(Stdio::null())
+            .output()
+            .expect("carol register"),
+        "carol register",
+    );
+
+    // Undeliverable → parked in Alice's outbox.
+    let sent = cli(&alice, &["send", "carol", "--as", "alice", "--message", "ping later", "--directory", &dir]);
+    ok(&sent, "send");
+    assert!(
+        String::from_utf8_lossy(&sent.stdout).contains("queued for retry"),
+        "message should be queued: {}",
+        String::from_utf8_lossy(&sent.stdout),
+    );
+
+    // The outbox lists it as waiting for Carol.
+    let waiting = cli(&alice, &["outbox", "--directory", &dir]);
+    assert!(
+        String::from_utf8_lossy(&waiting.stdout).contains("carol"),
+        "outbox should list carol: {}",
+        String::from_utf8_lossy(&waiting.stdout),
+    );
+
+    // Carol comes online with `serve` (announces presence before it binds).
+    let mut carol_serve = Command::new(CLI)
+        .args(["serve", "--addr", &carol_addr, "--as", "carol", "--directory", &dir])
+        .env("MYCELLIUM_HOME", &carol)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_QUEUE", "")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn carol serve");
+    let carol_out = tail(carol_serve.stdout.take().unwrap());
+    wait_port(carol_port);
+
+    // Retrying the outbox now finds Carol online → live delivery.
+    let flushed = cli(&alice, &["outbox", "--directory", &dir]);
+    let got = wait_contains(&carol_out, "from alice: ping later", 20);
+
+    let _ = carol_serve.kill();
+    let _ = carol_serve.wait();
+    assert!(got, "carol's serve did not receive the retried message:\n{}", carol_out.lock().unwrap());
+    assert!(
+        String::from_utf8_lossy(&flushed.stdout).contains("delivered 1"),
+        "outbox should report a delivery: {}",
+        String::from_utf8_lossy(&flushed.stdout),
+    );
+}

@@ -176,6 +176,11 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
+    /// Retry undelivered messages and show what's still waiting to send.
+    Outbox {
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
     /// Stay online and receive live-pushed messages (announces presence).
     Serve {
         /// Address to bind (matching the one you registered).
@@ -516,6 +521,7 @@ fn main() -> Result<()> {
             broadcast(&to, &whoami, &message, &directory)
         }
         Command::Inbox { whoami, directory } => inbox(&whoami, &directory),
+        Command::Outbox { directory } => outbox_show(&directory),
         Command::Serve { addr, whoami, directory } => serve(&addr, &whoami, &directory),
         Command::GuardianSplit { shares, threshold } => guardian_split(shares, threshold),
         Command::GuardianRecover { shares } => guardian_recover(&shares),
