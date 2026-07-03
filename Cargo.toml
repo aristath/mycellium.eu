@@ -6,6 +6,7 @@ members = [
     "crates/mycellium-server",
     "crates/mycellium-queue",
     "crates/mycellium-queue-client",
+    "clients/rust",
     "crates/mycellium-transport",
     "crates/mycellium-storage",
     "crates/mycellium-directory-client",

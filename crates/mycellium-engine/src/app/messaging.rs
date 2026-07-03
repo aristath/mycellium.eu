@@ -76,6 +76,25 @@ pub fn send(
     let note = if queued > 0 { format!(" — {queued} queued for retry") } else { String::new() };
     println!("sent to '{}' — {delivered}/{total} device(s) (#{}){note}", peer_handle.as_str(), app.id);
 
+    // Record our own copy in this device's transcript, so the conversation shows
+    // what we sent (edits/deletes apply to it; other kinds append).
+    match &app.body {
+        Body::Edit { to, text } => history::edit(&mut fs, peer_handle.as_str(), to, text)?,
+        Body::Delete { to } => history::delete(&mut fs, peer_handle.as_str(), to)?,
+        Body::Receipt { .. } => {}
+        _ => history::append(
+            &mut fs,
+            peer_handle.as_str(),
+            StoredMessage {
+                id: app.id.clone(),
+                from_me: true,
+                text: app.summary(),
+                timestamp: now,
+                expires_at: app.expires_at,
+            },
+        )?,
+    }
+
     // Self-sync: mirror this message to my own other devices (Layer 11).
     if let Ok(my_record) = client.lookup(&me) {
         let my_queue = QueueTarget::open(&identity, &my_record.record);
