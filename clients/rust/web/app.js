@@ -67,27 +67,27 @@ function renderSignup() {
   root.innerHTML = `
     <div class="auth">
       <h1><img src="/icon.svg" alt=""> Mycellium</h1>
-      <p class="sub muted">Pick a name and confirm your email — that's it. No password, no seed phrase.</p>
+      <p class="sub muted">Pick a display name and confirm your email — that's it. No password, no seed phrase.</p>
       ${healthBanner(state.status)}
       <div class="card">
         <h2>Create your account</h2>
-        <label>Username — how people find and message you</label>
-        <input id="username" placeholder="e.g. mary" autocomplete="off" />
-        <label>Email — private, only to verify it's you and recover your account</label>
+        <label>Display name — what people see (can repeat, like a phonebook)</label>
+        <input id="name" placeholder="e.g. Mary" autocomplete="off" />
+        <label>Email — your unique address; this is how people add you</label>
         <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
         <div class="error" id="err"></div>
         <div class="row" style="margin-top:12px"><button id="go">Continue</button></div>
       </div>
     </div>`;
   byId('go').onclick = async () => {
-    const username = byId('username').value.trim();
+    const name = byId('name').value.trim();
     const email = byId('email').value.trim();
-    if (!username) return setErr('err', 'pick a username');
+    if (!name) return setErr('err', 'enter a display name');
     if (!email || !email.includes('@')) return setErr('err', 'enter a valid email');
     if (state.status && !state.status.directory_ok) return setErr('err', "the directory isn't running — start it (see the warning above), then retry");
     setErr('err', ''); byId('go').disabled = true;
     try {
-      const r = await api.post('signup', { username, email });
+      const r = await api.post('signup', { name, email });
       renderVerify(r.pending, r.dev_code, email);
     } catch (e) { setErr('err', e.message); byId('go').disabled = false; }
   };
@@ -150,7 +150,7 @@ function renderApp() {
 
 function renderBar() {
   const s = state.status || {};
-  const who = byId('who'); if (who) who.innerHTML = `${esc(s.handle || '—')} <small>${(s.wallet || '').slice(0, 10)}…</small>`;
+  const who = byId('who'); if (who) who.innerHTML = `${esc(s.name || '—')} <small>you</small>`;
   const dot = byId('dot'); if (dot) dot.className = 'dot' + (state.online ? ' on' : '');
   const b = byId('banner'); if (b) b.innerHTML = healthBanner(state.status);
   root.querySelectorAll('nav.tabs button').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === state.tab));
@@ -170,27 +170,29 @@ async function renderThreads() {
   try { threads = await api.get('threads'); } catch {}
   content().innerHTML = `
     <div class="list">${threads.length ? threads.map((t) => `
-      <button class="item" data-peer="${esc(t.peer)}">
-        <div class="avatar">${esc(initials(t.peer))}</div>
-        <div class="body"><div class="title">${esc(t.peer)}</div><div class="snippet">${esc(t.last || 'No messages yet')}</div></div>
+      <button class="item" data-peer="${esc(t.peer)}" data-name="${esc(t.name || t.peer)}">
+        <div class="avatar">${esc(initials(t.name || t.peer))}</div>
+        <div class="body"><div class="title">${esc(t.name || t.peer)}</div><div class="snippet">${esc(t.last || 'No messages yet')}</div></div>
         <div class="meta">${when(t.timestamp)}</div>
-      </button>`).join('') : `<div class="empty">No conversations yet.<br>Start one below.</div>`}
+      </button>`).join('') : `<div class="empty">No conversations yet.<br>Message someone by their email below.</div>`}
     </div>
     <div class="fab-row"><button id="newChat">New message</button></div>`;
-  content().querySelectorAll('.item').forEach((b) => (b.onclick = () => { state.open = b.dataset.peer; openThread(b.dataset.peer); }));
-  byId('newChat').onclick = () => promptModal('New message', 'Recipient handle', (h) => { if (h) { state.open = h.trim(); openThread(h.trim()); } });
+  content().querySelectorAll('.item').forEach((b) => (b.onclick = () => { state.open = b.dataset.peer; openThread(b.dataset.peer, false, b.dataset.name); }));
+  byId('newChat').onclick = () => promptModal('New message', "Their email", (e) => { if (e) { state.open = e.trim(); openThread(e.trim(), false, e.trim()); } });
 }
 
-async function openThread(peer, quiet) {
+async function openThread(peer, quiet, name) {
   state.open = peer;
+  if (name) state.openName = name;
+  const label = state.openName || peer;
   let msgs = [];
   try { msgs = await api.get('threads/' + encodeURIComponent(peer)); } catch {}
   const bubbles = msgs.map((m) => `<div class="bubble ${m.from_me ? 'me' : ''}"><div>${esc(m.text)}</div><div class="time">${when(m.timestamp)}</div></div>`).join('');
   content().innerHTML = `
     <div class="convo">
-      <div class="head"><button class="link" id="back">‹ Chats</button><div class="avatar">${esc(initials(peer))}</div><b>${esc(peer)}</b></div>
+      <div class="head"><button class="link" id="back">‹ Chats</button><div class="avatar">${esc(initials(label))}</div><b>${esc(label)}</b></div>
       <div class="messages" id="msgs">${bubbles || '<div class="empty">No messages yet. Say hello.</div>'}</div>
-      <div class="composer"><input id="msg" placeholder="Message ${esc(peer)}…" autocomplete="off" /><button id="send">Send</button></div>
+      <div class="composer"><input id="msg" placeholder="Message ${esc(label)}…" autocomplete="off" /><button id="send">Send</button></div>
     </div>`;
   byId('back').onclick = () => { state.open = null; renderThreads(); };
   const input = byId('msg');
@@ -273,7 +275,7 @@ async function renderContacts() {
     <div class="list">${list.length ? list.map((c) => `
       <div class="item" data-nick="${esc(c.nickname)}">
         <div class="avatar">${esc(initials(c.nickname))}</div>
-        <div class="body"><div class="title">${esc(c.nickname)}</div><div class="snippet">${esc(c.handle)} · ${(c.wallet || '').slice(0, 12)}…</div></div>
+        <div class="body"><div class="title">${esc(c.nickname)}</div><div class="snippet">verified · ${(c.wallet || '').slice(0, 12)}…</div></div>
         <button class="link danger" data-remove="${esc(c.nickname)}">Remove</button>
       </div>`).join('') : `<div class="empty">No contacts yet.</div>`}
     </div>
@@ -284,7 +286,7 @@ async function renderContacts() {
   }));
   content().querySelectorAll('.item').forEach((row) => (row.onclick = () => {
     const nick = row.dataset.nick, c = list.find((x) => x.nickname === nick);
-    if (c) { state.tab = 'threads'; state.open = c.handle; renderBar(); openThread(c.handle); }
+    if (c) { state.tab = 'threads'; state.open = c.handle; renderBar(); openThread(c.handle, false, c.nickname); }
   }));
   byId('addContact').onclick = addContactModal;
 }
@@ -292,14 +294,14 @@ async function renderContacts() {
 function addContactModal() {
   modal(`
     <h3>Add contact</h3>
-    <label>Handle</label><input id="chandle" placeholder="e.g. bob" />
-    <label>Nickname (optional)</label><input id="cnick" placeholder="Bob" />
+    <label>Their email</label><input id="cemail" placeholder="them@example.com" />
+    <label>Name (optional)</label><input id="cnick" placeholder="Bob" />
     <div class="error" id="err"></div>
     <div class="actions"><button class="ghost" data-close>Cancel</button><button id="add">Add</button></div>`, (close) => {
     byId('add').onclick = async () => {
-      const handle = byId('chandle').value.trim(); if (!handle) return setErr('err', 'handle required');
-      const nickname = byId('cnick').value.trim() || handle;
-      try { await api.post('contacts', { handle, nickname }); close(); renderContacts(); }
+      const email = byId('cemail').value.trim(); if (!email || !email.includes('@')) return setErr('err', 'enter a valid email');
+      const nickname = byId('cnick').value.trim() || email;
+      try { await api.post('contacts', { email, nickname }); close(); renderContacts(); }
       catch (e) { setErr('err', e.message); }
     };
   });

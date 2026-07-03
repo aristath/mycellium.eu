@@ -11,6 +11,7 @@ use tiny_http::Method;
 
 use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::platform::Platform;
+use mycellium_core::userid::user_id;
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::app;
 use mycellium_engine::platform::OsPlatform;
@@ -49,7 +50,7 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
         (&Method::Delete, ["contacts", nick]) => contacts_remove(nick),
 
         (&Method::Get, ["threads"]) => threads_list(),
-        (&Method::Get, ["threads", peer]) => thread_load(peer),
+        (&Method::Get, ["threads", peer]) => thread_load(peer, &directory),
         (&Method::Post, ["threads", peer]) => thread_send(peer, &req, &directory),
 
         (&Method::Get, ["groups"]) => groups_list(),
@@ -86,9 +87,10 @@ fn status(directory: &str) -> anyhow::Result<Value> {
     let queue = std::env::var("MYCELLIUM_QUEUE").unwrap_or_default();
     let wallet = store::load_identity().ok().map(|id| hex(&id.wallet_public().0));
     Ok(json!({
-        // `handle` is set only once the account is fully claimed (email verified
-        // + record published) — the UI routes on it.
+        // The account exists once `handle` (= the id) is set. `name` is the
+        // free-form display name; the UI shows the name, routes on the handle.
         "handle": read_handle(),
+        "name": read_name(),
         "wallet": wallet,
         "directory": directory,
         "queue": queue,
@@ -98,12 +100,14 @@ fn status(directory: &str) -> anyhow::Result<Value> {
 }
 
 /// Step 1: silently ensure an identity, then start an email-verified claim.
-/// The plaintext username is remembered locally, keyed by the pending token —
-/// the directory only ever learns the hashed id.
+/// **Identity = `user_id(email)`**; the display name is stored locally and the
+/// directory only ever sees the hashed id + a hashed recovery email.
 fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<Value> {
-    let username = field(req, "username").ok_or_else(|| anyhow::anyhow!("pick a username"))?;
+    let name = field(req, "name").ok_or_else(|| anyhow::anyhow!("enter a display name"))?;
     let email = field(req, "email").ok_or_else(|| anyhow::anyhow!("enter an email"))?;
-    Handle::new(username).map_err(|_| anyhow::anyhow!("usernames are lowercase letters, digits, or _"))?;
+    if !email.contains('@') {
+        anyhow::bail!("enter a valid email");
+    }
     if !reachable(directory) {
         anyhow::bail!(
             "Can't reach the directory at {directory}. Start it first:  cargo run -p mycellium-server -- --addr 127.0.0.1:8080"
@@ -112,8 +116,13 @@ fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<
     let identity = ensure_identity()?;
     let client = DirectoryClient::new(directory);
     let token = client.login(&identity)?;
-    let (pending, dev_code) = client.auth_start(&token, username, email)?;
-    state.lock().unwrap().pending.insert(pending.clone(), username.to_string());
+    // The id we thread everywhere is user_id(email) — the email never enters the
+    // engine or envelopes; only the id (a hash) and the code-send do.
+    let uid = user_id(email).as_str().to_string();
+    let (pending, dev_code) = client.auth_start(&token, &uid, email)?;
+    save_name(name)?;
+    // Remember both the id (to publish) and the name for this pending signup.
+    state.lock().unwrap().pending.insert(pending.clone(), uid);
     Ok(json!({ "pending": pending, "dev_code": dev_code }))
 }
 
@@ -121,7 +130,7 @@ fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<
 fn signup_confirm(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let pending = field(req, "pending").ok_or_else(|| anyhow::anyhow!("missing pending token"))?;
     let code = field(req, "code").ok_or_else(|| anyhow::anyhow!("enter the code"))?;
-    let username = state
+    let uid = state
         .lock()
         .unwrap()
         .pending
@@ -130,8 +139,8 @@ fn signup_confirm(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("signup expired — start again"))?;
     let client = DirectoryClient::new(directory);
     client.auth_confirm(pending, code)?;
-    finalize(&client, &username)?;
-    Ok(json!({ "handle": username }))
+    finalize(&client, &uid)?;
+    Ok(json!({ "handle": uid, "name": read_name() }))
 }
 
 /// Step 2 (link path): poll whether the one-tap link was clicked; finish if so.
@@ -140,23 +149,23 @@ fn signup_status(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::
     let client = DirectoryClient::new(directory);
     let (verified, _) = client.auth_status(pending)?;
     if verified && read_handle().is_none() {
-        if let Some(username) = state.lock().unwrap().pending.get(pending).cloned() {
-            finalize(&client, &username)?;
+        if let Some(uid) = state.lock().unwrap().pending.get(pending).cloned() {
+            finalize(&client, &uid)?;
         }
     }
     Ok(json!({ "verified": verified, "handle": read_handle() }))
 }
 
-/// Publish our record under the verified username and remember it locally.
-fn finalize(client: &DirectoryClient, username: &str) -> anyhow::Result<()> {
+/// Publish our record under the verified id and remember it locally.
+fn finalize(client: &DirectoryClient, uid: &str) -> anyhow::Result<()> {
     let identity = ensure_identity()?;
-    let handle = Handle::new(username).map_err(|_| anyhow::anyhow!("invalid username"))?;
+    let handle = Handle::new(uid).map_err(|_| anyhow::anyhow!("invalid id"))?;
     let token = client.login(&identity)?;
     // Empty addr: a polling client isn't reachable for live push, so mail flows
-    // through its queue (endpoint baked into the record from MYCELLIUM_QUEUE).
+    // through its queue. The record's name comes from MYCELLIUM_NAME (set above).
     let record = app::build_record(&identity, &handle, "");
     client.publish(&token, &handle, &record)?;
-    write_handle(username)?;
+    write_handle(uid)?;
     Ok(())
 }
 
@@ -171,10 +180,12 @@ fn contacts_list() -> anyhow::Result<Value> {
     Ok(Value::Array(list))
 }
 
+/// Add a contact by their **email** — we hash it to their id, pin their record.
 fn contacts_add(req: &Value, directory: &str) -> anyhow::Result<Value> {
-    let handle = field(req, "handle").ok_or_else(|| anyhow::anyhow!("handle required"))?;
-    let nickname = field(req, "nickname").unwrap_or(handle);
-    app::contact_add(nickname, handle, directory)?;
+    let email = field(req, "email").ok_or_else(|| anyhow::anyhow!("enter their email"))?;
+    let nickname = field(req, "nickname").unwrap_or(email);
+    let uid = to_uid(email);
+    app::contact_add(nickname, &uid, directory)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -188,12 +199,18 @@ fn contacts_remove(nick: &str) -> anyhow::Result<Value> {
 fn threads_list() -> anyhow::Result<Value> {
     let mut fs = open()?;
     let now = OsPlatform.now_unix_secs();
+    // Map each peer id to a contact nickname for display (falls back to the id).
+    let names: std::collections::HashMap<String, String> = contacts::list(&fs)?
+        .into_iter()
+        .map(|c| (c.handle, c.nickname))
+        .collect();
     let mut threads: Vec<Value> = Vec::new();
     for peer in history::peers(&fs)? {
         let msgs = history::load_active(&mut fs, &peer, now)?;
         let last = msgs.last();
         threads.push(json!({
             "peer": peer,
+            "name": names.get(&peer).cloned().unwrap_or_else(|| short(&peer)),
             "last": last.map(|m| m.text.clone()).unwrap_or_default(),
             "timestamp": last.map(|m| m.timestamp).unwrap_or(0),
             "count": msgs.len(),
@@ -202,10 +219,13 @@ fn threads_list() -> anyhow::Result<Value> {
     Ok(Value::Array(threads))
 }
 
-fn thread_load(peer: &str) -> anyhow::Result<Value> {
+fn thread_load(peer: &str, directory: &str) -> anyhow::Result<Value> {
+    let uid = to_uid(peer);
+    // Draining the queue may need the peer resolvable; harmless if offline.
+    let _ = directory;
     let mut fs = open()?;
     let now = OsPlatform.now_unix_secs();
-    let msgs: Vec<Value> = history::load_active(&mut fs, peer, now)?
+    let msgs: Vec<Value> = history::load_active(&mut fs, &uid, now)?
         .into_iter()
         .map(|m| json!({ "id": m.id, "from_me": m.from_me, "text": m.text, "timestamp": m.timestamp }))
         .collect();
@@ -214,8 +234,8 @@ fn thread_load(peer: &str) -> anyhow::Result<Value> {
 
 fn thread_send(peer: &str, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let message = field(req, "message").ok_or_else(|| anyhow::anyhow!("message required"))?;
-    let me = read_handle().ok_or_else(|| anyhow::anyhow!("register a handle first"))?;
-    app::send(peer, &me, Some(message), None, None, None, None, None, None, None, directory)?;
+    let me = read_handle().ok_or_else(|| anyhow::anyhow!("finish signing up first"))?;
+    app::send(&to_uid(peer), &me, Some(message), None, None, None, None, None, None, None, directory)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -234,10 +254,11 @@ fn groups_list() -> anyhow::Result<Value> {
 
 fn group_create(req: &Value, directory: &str) -> anyhow::Result<Value> {
     let name = field(req, "name").ok_or_else(|| anyhow::anyhow!("name required"))?;
+    // Members are given by email; hash each to its id.
     let members: Vec<String> = req
         .get("members")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(to_uid).collect())
         .unwrap_or_default();
     let me = read_handle().ok_or_else(|| anyhow::anyhow!("register a handle first"))?;
     app::group_create(name, &members, &me, directory)?;
@@ -313,6 +334,11 @@ fn socket_addr(url: &str) -> Option<std::net::SocketAddr> {
     hostport.to_socket_addrs().ok()?.next()
 }
 
+/// A short, readable stand-in for an unknown id (no contact name yet).
+fn short(id: &str) -> String {
+    format!("user-{}", &id[..6.min(id.len())])
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -328,6 +354,36 @@ fn handle_path() -> std::path::PathBuf {
 
 fn read_handle() -> Option<String> {
     std::fs::read_to_string(handle_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn name_path() -> std::path::PathBuf {
+    store::data_dir().join("name")
+}
+
+fn read_name() -> Option<String> {
+    std::fs::read_to_string(name_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Persist our display name and make it live immediately (the engine reads it
+/// from `MYCELLIUM_NAME` when building our record).
+fn save_name(name: &str) -> anyhow::Result<()> {
+    let path = name_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, name)?;
+    std::env::set_var("MYCELLIUM_NAME", name);
+    Ok(())
+}
+
+/// Resolve a user-supplied peer reference to an id. An email becomes
+/// `user_id(email)`; anything else is assumed to already be an id.
+fn to_uid(peer: &str) -> String {
+    if peer.contains('@') {
+        user_id(peer).as_str().to_string()
+    } else {
+        peer.to_string()
+    }
 }
 
 fn write_handle(handle: &str) -> anyhow::Result<()> {

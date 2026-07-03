@@ -53,6 +53,13 @@ fn main() {
     // Passwordless: the identity is encrypted at rest with a random per-device
     // key kept in the data dir — no user password or seed phrase to manage.
     std::env::set_var("MYCELLIUM_PASSPHRASE", ensure_device_key(&data_dir));
+    // The display name (set at signup) is what others see; the engine reads it
+    // from MYCELLIUM_NAME when building our record.
+    if let Ok(name) = std::fs::read_to_string(std::path::Path::new(&data_dir).join("name")) {
+        if !name.trim().is_empty() {
+            std::env::set_var("MYCELLIUM_NAME", name.trim());
+        }
+    }
 
     let state = Mutex::new(State { directory, pending: std::collections::HashMap::new() });
     let addr = format!("127.0.0.1:{port}");

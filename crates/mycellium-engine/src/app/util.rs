@@ -7,6 +7,24 @@ pub fn own_queue() -> String {
     std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
 }
 
+/// This account's own display name, from `MYCELLIUM_NAME`. When set (the email
+/// client sets it), it's the free-form name others see; when empty (the CLI),
+/// the identifier itself is used, preserving the old behaviour.
+pub fn own_name() -> String {
+    std::env::var("MYCELLIUM_NAME").unwrap_or_default()
+}
+
+/// The display name to publish in a record for `handle` — the account's set
+/// name if any, else the identifier string.
+pub fn display_name_for(handle: &Handle) -> String {
+    let name = own_name();
+    if name.is_empty() {
+        handle.as_str().to_string()
+    } else {
+        name
+    }
+}
+
 /// Open the encrypted local history store for this identity.
 pub fn open_history(identity: &Identity) -> Result<FileStore> {
     FileStore::open(store::data_dir().join("history"), identity.storage_key())

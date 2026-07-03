@@ -141,7 +141,7 @@ pub fn update_devices(
     let record = Record {
         // The record binds the *id*, not the plaintext name (Layer 6).
         handle: user_id(handle.as_str()),
-        name: handle.as_str().to_string(),
+        name: display_name_for(handle),
         wallet: identity.wallet_public(),
         queue: own_queue(),
         devices,
@@ -245,7 +245,7 @@ pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedR
     let record = Record {
         // The record binds `user_id(name)`, so the directory never sees the name.
         handle: user_id(handle.as_str()),
-        name: handle.as_str().to_string(),
+        name: display_name_for(handle),
         wallet: identity.wallet_public(),
         queue: own_queue(),
         devices: vec![this_device(identity, addr)],
