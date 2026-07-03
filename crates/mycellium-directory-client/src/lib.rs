@@ -82,16 +82,6 @@ impl DirectoryClient {
         Ok(record)
     }
 
-    /// Deposit an opaque envelope blob into `handle`'s offline mailbox.
-    /// (Transitional: the mailbox is moving to `mycellium-queue`.)
-    pub fn deposit(&self, token: &str, handle: &Handle, slot: &str, blob: &str) -> Result<()> {
-        ureq::post(&format!("{}/mailbox/{}/{}", self.base, handle.as_str(), slot))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_string(blob)
-            .context("deposit failed")?;
-        Ok(())
-    }
-
     /// Announce that we're online (heartbeat).
     pub fn announce(&self, token: &str, handle: &Handle) -> Result<()> {
         ureq::post(&format!("{}/presence/{}", self.base, handle.as_str()))
@@ -114,18 +104,4 @@ impl DirectoryClient {
         Ok(resp.online)
     }
 
-    /// Drain one slot of this identity's offline mailbox.
-    /// (Transitional: the mailbox is moving to `mycellium-queue`.)
-    pub fn collect(&self, token: &str, handle: &Handle, slot: &str) -> Result<Vec<String>> {
-        #[derive(Deserialize)]
-        struct Messages {
-            messages: Vec<String>,
-        }
-        let resp: Messages = ureq::get(&format!("{}/mailbox/{}/{}", self.base, handle.as_str(), slot))
-            .set("Authorization", &format!("Bearer {token}"))
-            .call()
-            .map_err(|e| anyhow!("collect failed: {e}"))?
-            .into_json()?;
-        Ok(resp.messages)
-    }
 }

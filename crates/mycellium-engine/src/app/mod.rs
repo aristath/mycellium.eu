@@ -19,6 +19,7 @@ use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 
 use mycellium_directory_client::DirectoryClient;
+use mycellium_queue_client::{wallet_hex, QueueClient};
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
 use crate::blocklist;

@@ -1,6 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
+/// This account's own message-queue endpoint, from `MYCELLIUM_QUEUE`
+/// (empty = no queue / pure P2P). Recorded in your record so senders find it.
+pub fn own_queue() -> String {
+    std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
+}
+
 /// Open the encrypted local history store for this identity.
 pub fn open_history(identity: &Identity) -> Result<FileStore> {
     FileStore::open(store::data_dir().join("history"), identity.storage_key())

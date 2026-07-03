@@ -44,10 +44,6 @@ pub enum ApiError {
     NotFound,
     /// The caller is authenticated but not permitted (e.g. not the owner).
     Forbidden,
-    /// The recipient's mailbox is full.
-    MailboxFull,
-    /// Too many requests in the rate-limit window.
-    RateLimited,
 }
 
 impl ApiError {
@@ -61,7 +57,6 @@ impl ApiError {
             ApiError::Stale => 409,
             ApiError::NotFound => 404,
             ApiError::Forbidden => 403,
-            ApiError::MailboxFull | ApiError::RateLimited => 429,
         }
     }
 
@@ -78,8 +73,6 @@ impl ApiError {
             ApiError::InvalidRecord => "record failed signature verification",
             ApiError::NotFound => "no such handle",
             ApiError::Forbidden => "not permitted",
-            ApiError::MailboxFull => "recipient mailbox is full",
-            ApiError::RateLimited => "rate limit exceeded",
         }
     }
 }
@@ -96,26 +89,12 @@ pub struct Directory {
     bindings: HashMap<Handle, WalletPublicKey>,
     /// The published records: handle → latest signed record.
     records: HashMap<Handle, SignedRecord>,
-    /// Offline mailboxes: (handle, device slot) → queued opaque envelopes.
-    /// The slot is a device id (targeted delivery) or `"account"` (cluster-wide).
-    mailboxes: HashMap<(Handle, String), Vec<String>>,
     /// Presence: handle → last-seen unix seconds.
     presence: HashMap<Handle, u64>,
-    /// Fixed-window rate counters: (wallet, action) → (window_start, count).
-    rate: HashMap<([u8; 33], &'static str), (u64, u32)>,
 }
-
-/// Maximum number of queued messages per mailbox.
-pub const MAX_MAILBOX: usize = 256;
 
 /// How long after its last heartbeat a handle is still considered online.
 pub const PRESENCE_TTL: u64 = 60;
-
-/// Mailbox deposits allowed per wallet per [`RATE_WINDOW`].
-pub const DEPOSIT_RATE_LIMIT: u32 = 30;
-
-/// The rate-limit window, in seconds.
-pub const RATE_WINDOW: u64 = 60;
 
 impl Directory {
     /// A fresh, empty directory.
@@ -199,46 +178,6 @@ impl Directory {
         self.records.get(handle)
     }
 
-    /// A fixed-window rate check for `(wallet, action)` at `now`.
-    fn allow(&mut self, wallet: [u8; 33], action: &'static str, now: u64, limit: u32) -> bool {
-        let entry = self.rate.entry((wallet, action)).or_insert((now, 0));
-        if now.saturating_sub(entry.0) >= RATE_WINDOW {
-            *entry = (now, 0);
-        }
-        if entry.1 >= limit {
-            return false;
-        }
-        entry.1 += 1;
-        true
-    }
-
-    /// Deposit an opaque encrypted envelope into `handle`'s mailbox.
-    ///
-    /// Any authenticated sender may deposit (rate-limited); the recipient must
-    /// be registered. The directory stores the blob without reading it (Layer 3).
-    pub fn deposit(
-        &mut self,
-        token: &str,
-        handle: &Handle,
-        slot: &str,
-        blob: String,
-        now: u64,
-    ) -> Result<(), ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
-        if !self.allow(wallet.0, "deposit", now, DEPOSIT_RATE_LIMIT) {
-            return Err(ApiError::RateLimited);
-        }
-        if !self.bindings.contains_key(handle) {
-            return Err(ApiError::NotFound);
-        }
-        let mailbox = self.mailboxes.entry((handle.clone(), slot.to_string())).or_default();
-        if mailbox.len() >= MAX_MAILBOX {
-            return Err(ApiError::MailboxFull);
-        }
-        mailbox.push(blob);
-        Ok(())
-    }
-
     /// Record a heartbeat: the authenticated owner of `handle` is online at `now`.
     pub fn heartbeat(&mut self, token: &str, handle: &Handle, now: u64) -> Result<(), ApiError> {
         let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
@@ -255,21 +194,6 @@ impl Directory {
         self.presence
             .get(handle)
             .is_some_and(|last| now.saturating_sub(*last) <= PRESENCE_TTL)
-    }
-
-    /// Drain one mailbox slot of `handle`. Only the handle's owner may collect.
-    pub fn collect(
-        &mut self,
-        token: &str,
-        handle: &Handle,
-        slot: &str,
-    ) -> Result<Vec<String>, ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
-        match self.bindings.get(handle) {
-            Some(owner) if *owner == wallet => {}
-            _ => return Err(ApiError::Forbidden),
-        }
-        Ok(self.mailboxes.remove(&(handle.clone(), slot.to_string())).unwrap_or_default())
     }
 }
 
@@ -306,6 +230,7 @@ mod tests {
         let record = Record {
             handle: Handle::new(handle).unwrap(),
             wallet: id.wallet_public(),
+            queue: String::new(),
             devices: vec![Device {
                 device_key: id.device_public(),
                 peer_id: id.peer_id(),
@@ -378,70 +303,6 @@ mod tests {
             dir.publish(&mal_token, &handle, record_for(&mallory, "ari", 2)),
             Err(ApiError::HandleTaken)
         );
-    }
-
-    #[test]
-    fn mailbox_deposit_and_owner_only_collect() {
-        let mut dir = Directory::new();
-        let bob = Identity::generate(&mut OsPlatform).unwrap();
-        let alice = Identity::generate(&mut OsPlatform).unwrap();
-        let bob_handle = Handle::new("bob").unwrap();
-
-        // Bob registers so his mailbox exists.
-        let bob_token = login(&mut dir, &bob);
-        dir.publish(&bob_token, &bob_handle, record_for(&bob, "bob", 1)).unwrap();
-
-        // Alice logs in and deposits a message for Bob.
-        let alice_token = login(&mut dir, &alice);
-        dir.deposit(&alice_token, &bob_handle, "s", "sealed-envelope".into(), 0).unwrap();
-
-        // Alice must NOT be able to read Bob's mailbox.
-        assert_eq!(dir.collect(&alice_token, &bob_handle, "s"), Err(ApiError::Forbidden));
-
-        // Bob drains his own mailbox, then it's empty.
-        assert_eq!(dir.collect(&bob_token, &bob_handle, "s").unwrap(), vec!["sealed-envelope".to_string()]);
-        assert_eq!(dir.collect(&bob_token, &bob_handle, "s").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn deposit_requires_auth_and_a_registered_recipient() {
-        let mut dir = Directory::new();
-        let alice = Identity::generate(&mut OsPlatform).unwrap();
-        let bob_handle = Handle::new("bob").unwrap();
-
-        assert_eq!(
-            dir.deposit("no-token", &bob_handle, "s", "x".into(), 0),
-            Err(ApiError::Unauthorized)
-        );
-        let alice_token = login(&mut dir, &alice);
-        // Bob never registered.
-        assert_eq!(
-            dir.deposit(&alice_token, &bob_handle, "s", "x".into(), 0),
-            Err(ApiError::NotFound)
-        );
-    }
-
-    #[test]
-    fn deposits_are_rate_limited_then_reset() {
-        let mut dir = Directory::new();
-        let bob = Identity::generate(&mut OsPlatform).unwrap();
-        let alice = Identity::generate(&mut OsPlatform).unwrap();
-        let bob_handle = Handle::new("bob").unwrap();
-        let bob_token = login(&mut dir, &bob);
-        dir.publish(&bob_token, &bob_handle, record_for(&bob, "bob", 1)).unwrap();
-        let alice_token = login(&mut dir, &alice);
-
-        // Up to the limit succeeds within one window (t=0).
-        for _ in 0..DEPOSIT_RATE_LIMIT {
-            dir.deposit(&alice_token, &bob_handle, "s", "x".into(), 0).unwrap();
-        }
-        // The next one is rejected.
-        assert_eq!(
-            dir.deposit(&alice_token, &bob_handle, "s", "x".into(), 0),
-            Err(ApiError::RateLimited)
-        );
-        // A later window resets the counter.
-        assert!(dir.deposit(&alice_token, &bob_handle, "s", "x".into(), RATE_WINDOW).is_ok());
     }
 
     #[test]

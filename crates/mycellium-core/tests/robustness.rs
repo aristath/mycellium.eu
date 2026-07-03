@@ -48,6 +48,7 @@ fn valid_signed_record(p: &mut SeededPlatform) -> SignedRecord {
     let record = Record {
         handle: Handle::new("ari").unwrap(),
         wallet: id.wallet_public(),
+        queue: String::new(),
         devices: vec![Device {
             device_key: id.device_public(),
             peer_id: PeerId(vec![1, 2, 3, 4]),

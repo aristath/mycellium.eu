@@ -5,9 +5,9 @@
 //! - `POST /login/verify`     `{wallet,nonce,signature}` → `{token}`
 //! - `PUT  /records/{handle}` (Bearer) `SignedRecord`    → 200
 //! - `GET  /records/{handle}`                            → `SignedRecord` | 404
-//! - `POST /mailbox/{handle}` (Bearer) `<envelope>`      → 200
-//! - `GET  /mailbox/{handle}` (Bearer)                   → `{messages}`
 //! - `GET  /health`                                      → `ok`
+//!
+//! The offline mailbox now lives in a separate service (`mycellium-queue`).
 //!
 //! Deliberately minimal: all real logic and rules live in [`Directory`].
 
@@ -41,11 +41,6 @@ struct VerifyReq {
 #[derive(Serialize)]
 struct VerifyResp {
     token: String,
-}
-
-#[derive(Serialize)]
-struct Messages {
-    messages: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -131,24 +126,6 @@ fn route(
                 Some(record) => Ok((200, to_json(record))),
                 None => Ok((404, error_json("no such handle"))),
             }
-        }
-
-        // Offline mailbox: deposit to a device slot, or drain your own slot.
-        (Method::Post, ["mailbox", handle, slot]) => {
-            let token = token.ok_or(ApiError::Unauthorized)?;
-            let handle = Handle::new(*handle).map_err(|_| ApiError::NotFound)?;
-            directory
-                .lock()
-                .unwrap()
-                .deposit(token, &handle, slot, body.to_string(), now_secs())?;
-            Ok((200, "\"ok\"".into()))
-        }
-
-        (Method::Get, ["mailbox", handle, slot]) => {
-            let token = token.ok_or(ApiError::Unauthorized)?;
-            let handle = Handle::new(*handle).map_err(|_| ApiError::NotFound)?;
-            let messages = directory.lock().unwrap().collect(token, &handle, slot)?;
-            Ok((200, to_json(&Messages { messages })))
         }
 
         // Presence: heartbeat (owner) or query (open).

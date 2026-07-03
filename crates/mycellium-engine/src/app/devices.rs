@@ -138,7 +138,13 @@ pub fn update_devices(
     prev_seq: u64,
 ) -> Result<()> {
     let seq = prev_seq.saturating_add(1).max(OsPlatform.now_unix_secs());
-    let record = Record { handle: handle.clone(), wallet: identity.wallet_public(), devices, seq };
+    let record = Record {
+        handle: handle.clone(),
+        wallet: identity.wallet_public(),
+        queue: own_queue(),
+        devices,
+        seq,
+    };
     let signed = SignedRecord::sign(record, identity);
     client.publish(token, handle, &signed)
 }
@@ -237,6 +243,7 @@ pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedR
     let record = Record {
         handle: handle.clone(),
         wallet: identity.wallet_public(),
+        queue: own_queue(),
         devices: vec![this_device(identity, addr)],
         seq: OsPlatform.now_unix_secs(),
     };

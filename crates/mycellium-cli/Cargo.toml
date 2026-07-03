@@ -22,8 +22,9 @@ getrandom = "0.2"
 ratatui = "0.29"
 
 [dev-dependencies]
-# Tests spin up an in-process directory; the client itself never depends on it.
+# Tests spin up an in-process directory + queue; the client depends on neither.
 mycellium-directory = { path = "../mycellium-directory" }
+mycellium-queue = { path = "../mycellium-queue" }
 
 [lints.rust]
 unsafe_code = "forbid"

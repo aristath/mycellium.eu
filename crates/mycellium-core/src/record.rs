@@ -5,6 +5,7 @@
 //! data they cannot forge — the worst a dishonest directory can do is withhold
 //! or serve a stale record, never impersonate anyone.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,9 @@ pub struct Record {
     pub handle: Handle,
     /// Root identity — the wallet that signs this record.
     pub wallet: WalletPublicKey,
+    /// This account's message-queue endpoint — where senders deposit offline
+    /// mail for it. Empty = no queue (pure P2P). Decoupled from the directory.
+    pub queue: String,
     /// The account's devices. One entry today; a cluster once linking lands.
     pub devices: Vec<Device>,
     /// Monotonic sequence number — freshness and anti-rollback (Layer 9.4).
@@ -148,6 +152,7 @@ mod tests {
         Record {
             handle: Handle::new("ari").unwrap(),
             wallet: WalletPublicKey([2u8; 33]),
+            queue: String::new(),
             devices: alloc::vec![Device {
                 device_key: DevicePublicKey([1u8; 32]),
                 peer_id: PeerId(alloc::vec![3u8; 34]),
@@ -202,6 +207,7 @@ mod tests {
         let record = Record {
             handle: Handle::new("ari").unwrap(),
             wallet: id.wallet_public(),
+            queue: String::new(),
             devices: alloc::vec![Device {
                 device_key: id.device_public(),
                 peer_id: id.peer_id(),
@@ -234,6 +240,7 @@ mod tests {
         let record = Record {
             handle: Handle::new("ari").unwrap(),
             wallet: id.wallet_public(),
+            queue: String::new(),
             devices: alloc::vec![
                 Device {
                     device_key: id.device_public(),
@@ -259,6 +266,7 @@ mod tests {
         let record = Record {
             handle: Handle::new("ari").unwrap(),
             wallet: id.wallet_public(),
+            queue: String::new(),
             devices: alloc::vec![],
             seq: 1,
         };
@@ -272,6 +280,7 @@ mod tests {
         let record = Record {
             handle: Handle::new("ari").unwrap(),
             wallet: id.wallet_public(),
+            queue: String::new(),
             devices: alloc::vec![Device {
                 device_key: id.device_public(),
                 peer_id: id.peer_id(),

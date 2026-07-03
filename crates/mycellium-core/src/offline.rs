@@ -59,6 +59,7 @@ mod tests {
         let record = Record {
             handle: Handle::new(handle).unwrap(),
             wallet: id.wallet_public(),
+            queue: String::new(),
             devices: alloc::vec![crate::record::Device {
                 device_key: id.device_public(),
                 peer_id: crate::identity::PeerId(alloc::vec![]),

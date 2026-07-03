@@ -69,8 +69,31 @@ fn wait_port(port: u16) {
     panic!("port {port} never opened");
 }
 
+/// One shared message queue for the whole test binary. It's keyed by wallet, so
+/// tests (each with fresh identities) never collide. Its URL is exported as
+/// `MYCELLIUM_QUEUE` so every spawned CLI inherits it — records carry it, and
+/// send/inbox deposit/collect against it (the queue is decoupled from the
+/// directory).
+static QUEUE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn ensure_queue() {
+    QUEUE_URL.get_or_init(|| {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let serve_addr = addr.clone();
+        std::thread::spawn(move || {
+            let _ = mycellium_queue::serve(&serve_addr);
+        });
+        wait_port(port);
+        let url = format!("http://{addr}");
+        std::env::set_var("MYCELLIUM_QUEUE", &url);
+        url
+    });
+}
+
 /// Start a directory on a fresh port, in a background thread. Returns its URL.
+/// Also ensures the shared queue is up (and `MYCELLIUM_QUEUE` exported).
 fn start_directory() -> String {
+    ensure_queue();
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let serve_addr = addr.clone();

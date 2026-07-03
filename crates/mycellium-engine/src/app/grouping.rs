@@ -16,7 +16,6 @@ pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &st
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
     let mut fs = open_history(&identity)?;
 
     let mut id_bytes = [0u8; 8];
@@ -41,7 +40,7 @@ pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &st
     };
     stored.note_sender(my_group_id(&identity), me.as_str());
     groups::save(&mut fs, &stored)?;
-    distribute_key(&identity, &me, &client, &token, &stored, &group);
+    distribute_key(&identity, &me, &client, &stored, &group);
 
     println!("created group '{name}' ({group_id}) with {} members", all.len());
     Ok(())
@@ -54,13 +53,12 @@ pub fn distribute_key(
     identity: &Identity,
     me: &Handle,
     client: &DirectoryClient,
-    token: &str,
     stored: &StoredGroup,
     group: &Group,
 ) {
     // Every member, including our own handle — `distribute_key_to` skips only
     // this exact device, so our sibling devices still get our key (Layer 11).
-    distribute_key_to(identity, me, client, token, stored, group, &stored.members);
+    distribute_key_to(identity, me, client, stored, group, &stored.members);
 }
 
 
@@ -70,7 +68,6 @@ pub fn distribute_key_to(
     identity: &Identity,
     me: &Handle,
     client: &DirectoryClient,
-    token: &str,
     stored: &StoredGroup,
     group: &Group,
     targets: &[String],
@@ -100,12 +97,13 @@ pub fn distribute_key_to(
         };
         // Seal the sender key to every device in the member's cluster (Layer 11) —
         // including our *own* siblings, but never this device itself.
+        let queue = QueueTarget::open(identity, &record.record);
         for device in &record.record.devices {
             if device.device_key == identity.device_public() {
                 continue;
             }
             let env = seal_to(identity, me, device, &plaintext);
-            deliver(client, token, &handle, device, &MailItem::GroupInvite(env));
+            deliver(client, &handle, queue.as_ref(), device, &MailItem::GroupInvite(env));
         }
     }
 }
@@ -116,7 +114,6 @@ pub fn handle_group_invite(
     identity: &Identity,
     me: &Handle,
     client: &DirectoryClient,
-    token: &str,
     fs: &mut FileStore,
     platform: &mut OsPlatform,
     env: &Envelope,
@@ -148,7 +145,7 @@ pub fn handle_group_invite(
             stored.state = group.export();
             groups::save(fs, &stored)?;
             if !newcomers.is_empty() {
-                distribute_key_to(identity, me, client, token, &stored, &group, &newcomers);
+                distribute_key_to(identity, me, client, &stored, &group, &newcomers);
             }
         }
         None => {
@@ -168,7 +165,7 @@ pub fn handle_group_invite(
             stored.note_sender(my_group_id(identity), me.as_str());
             groups::save(fs, &stored)?;
             println!("joined group '{}' (invited by {})", stored.name, from.as_str());
-            distribute_key(identity, me, client, token, &stored, &group);
+            distribute_key(identity, me, client, &stored, &group);
         }
     }
     Ok(())
@@ -250,7 +247,6 @@ pub fn group_add(group: &str, member: &str, whoami: &str, directory: &str) -> Re
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
     let mut fs = open_history(&identity)?;
 
     let mut stored = resolve_group(&fs, group)?;
@@ -263,7 +259,7 @@ pub fn group_add(group: &str, member: &str, whoami: &str, directory: &str) -> Re
     // Distribute our key with the updated roster: the newcomer joins, and
     // existing members learn the newcomer and send it their keys.
     let session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    distribute_key(&identity, &me, &client, &token, &stored, &session);
+    distribute_key(&identity, &me, &client, &stored, &session);
     println!("invited '{member}' to '{}'", stored.name);
     Ok(())
 }
@@ -274,7 +270,6 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
     let mut fs = open_history(&identity)?;
 
     let mut stored = resolve_group(&fs, group)?;
@@ -296,7 +291,7 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
     groups::save(&mut fs, &stored)?;
 
     // Give the remaining members our fresh key, and tell them to re-key too.
-    distribute_key(&identity, &me, &client, &token, &stored, &session);
+    distribute_key(&identity, &me, &client, &stored, &session);
     let control = MailItem::GroupRemove {
         group_id: stored.id.clone(),
         member: member.to_string(),
@@ -306,7 +301,7 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
             continue;
         }
         if let Ok(handle) = Handle::new(m.clone()) {
-            deliver_to_cluster(&client, &token, &handle, &control);
+            deliver_to_cluster(&client, &identity, &handle, &control);
         }
     }
     println!("removed '{member}' from '{}' (re-keyed)", stored.name);
@@ -320,7 +315,6 @@ pub fn handle_group_remove(
     identity: &Identity,
     me: &Handle,
     client: &DirectoryClient,
-    token: &str,
     fs: &mut FileStore,
     group_id: &str,
     member: &str,
@@ -343,7 +337,7 @@ pub fn handle_group_remove(
     session.rotate(&mut OsPlatform);
     stored.state = session.export();
     groups::save(fs, &stored)?;
-    distribute_key(identity, me, client, token, &stored, &session);
+    distribute_key(identity, me, client, &stored, &session);
     println!("'{member}' was removed from '{}' — re-keyed", stored.name);
     Ok(())
 }
@@ -367,7 +361,6 @@ pub fn group_send(
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
     let mut fs = open_history(&identity)?;
 
     let mut stored = resolve_group(&fs, group)?;
@@ -395,16 +388,17 @@ pub fn group_send(
             // Mirror to my *own* other devices (they hold my key from `group
             // sync`), so the group reads consistently across my cluster.
             if let Ok(my_rec) = client.lookup(&me) {
+                let my_queue = QueueTarget::open(&identity, &my_rec.record);
                 for device in &my_rec.record.devices {
                     if device.device_key != identity.device_public() {
-                        deliver(&client, &token, &me, device, &item);
+                        deliver(&client, &me, my_queue.as_ref(), device, &item);
                     }
                 }
             }
             continue;
         }
         // Fan the one ciphertext out to every device in the member's cluster.
-        deliver_to_cluster(&client, &token, &handle, &item);
+        deliver_to_cluster(&client, &identity, &handle, &item);
     }
 
     // Record our own message in the group transcript (edits/deletes already
@@ -458,11 +452,11 @@ pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
     let fs = open_history(&identity)?;
 
     // My sibling devices (everything in my cluster except this one).
     let my_record = client.lookup(&me)?;
+    let my_queue = QueueTarget::open(&identity, &my_record.record);
     let my_key = identity.device_public();
     let siblings: Vec<Device> = my_record
         .record
@@ -504,7 +498,7 @@ pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
         };
         for device in &siblings {
             let env = seal_to(&identity, &me, device, &plaintext);
-            deliver(&client, &token, &me, device, &MailItem::GroupSync(env));
+            deliver(&client, &me, my_queue.as_ref(), device, &MailItem::GroupSync(env));
         }
         synced += 1;
     }
@@ -519,7 +513,6 @@ pub fn handle_group_sync(
     identity: &Identity,
     me: &Handle,
     client: &DirectoryClient,
-    token: &str,
     platform: &mut OsPlatform,
     fs: &mut FileStore,
     env: &Envelope,
@@ -548,7 +541,7 @@ pub fn handle_group_sync(
     stored.note_sender(my_group_id(identity), me.as_str());
     groups::save(fs, &stored)?;
     // Announce our own key to the members so this device can also *send*.
-    distribute_key(identity, me, client, token, &stored, &group);
+    distribute_key(identity, me, client, &stored, &group);
     println!("bootstrapped into group '{}'", stored.name);
     Ok(())
 }
@@ -559,7 +552,6 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
     let mut fs = open_history(&identity)?;
     let stored = resolve_group(&fs, group)?;
 
@@ -573,7 +565,7 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
             continue;
         }
         if let Ok(handle) = Handle::new(member.clone()) {
-            deliver_to_cluster(&client, &token, &handle, &control);
+            deliver_to_cluster(&client, &identity, &handle, &control);
         }
     }
     groups::remove(&mut fs, &stored.id)?;
