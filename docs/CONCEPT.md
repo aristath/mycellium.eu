@@ -400,7 +400,12 @@ per-message post-compromise security** than the DH ratchet. Mitigation: periodic
 **sender-key rotation** (already in `group`) restores PCS at chosen intervals,
 and every membership change forces a re-key. Trust inside a cluster is mutual —
 your devices trust each other (all wallet-authorized); a compromised device
-reads the conversation until revoked, the same limit every messenger has. The
+reads the conversation until revoked, the same limit every messenger has.
+Revocation cleanly stops **1:1** delivery to the removed device (senders re-read
+your record and skip it); propagating a revoke into **group** sender keys (so a
+removed device's group key is superseded everywhere) is a deeper hardening still
+to come — today a revoked device stops *receiving* but its old group keys aren't
+force-rotated. The
 directory still sees the *shape* (who has how many devices, who talks to whom) —
 the same metadata honesty as Layers 6/8 — but never the content.
 

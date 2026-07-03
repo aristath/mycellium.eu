@@ -193,6 +193,53 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+fn revoked_device_stops_receiving() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let john = account(&dir, "john");
+
+    let mary_a = home("rev-a");
+    let created = cli(&mary_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6401", "--directory", &dir]), "register");
+    let mary_b = home("rev-b");
+    ok(
+        &Command::new(CLI)
+            .args(["link-device", "mary", "--addr", "127.0.0.1:6402", "--directory", &dir])
+            .env("MYCELLIUM_HOME", &mary_b)
+            .env("MYCELLIUM_PASSPHRASE", PASS)
+            .env("MYCELLIUM_PHRASE", &phrase)
+            .stdin(Stdio::null())
+            .output()
+            .expect("link-device"),
+        "link-device",
+    );
+
+    // Revoke device B (by short id).
+    let devs = cli(&mary_a, &["devices", "mary", "--directory", &dir]);
+    let text = String::from_utf8_lossy(&devs.stdout);
+    let b_id = text
+        .lines()
+        .find(|l| l.contains("6402"))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("device B id")
+        .to_string();
+    ok(&cli(&mary_a, &["revoke-device", "mary", &b_id, "--directory", &dir]), "revoke-device");
+
+    // A message sent after the revoke reaches A but not the revoked B.
+    ok(&cli(&john, &["send", "mary", "--as", "john", "--message", "after revoke", "--directory", &dir]), "send");
+    let a = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&a.stdout).contains("after revoke"), "device A missed it: {}", String::from_utf8_lossy(&a.stdout));
+    let b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(!String::from_utf8_lossy(&b.stdout).contains("after revoke"), "revoked device B still received it: {}", String::from_utf8_lossy(&b.stdout));
+}
+
+#[test]
 fn read_receipt_reaches_sender_cluster() {
     let _throttle = throttle();
     let dir = start_directory();
