@@ -16,6 +16,15 @@ use mycellium_core::wire;
 pub enum MailItem {
     /// A one-to-one offline message.
     Direct(Envelope),
+    /// A mirror of a message *you* sent, for your own other devices (Layer 11).
+    /// The envelope (sealed device→device) carries the message; `peer` is the
+    /// conversation it belongs to.
+    SelfSync {
+        /// The handle the original message was sent to.
+        peer: String,
+        /// The message, sealed from the sending device to this one.
+        envelope: Envelope,
+    },
     /// A group invite / sender-key share (its envelope decrypts to a
     /// [`GroupInvitePayload`]).
     GroupInvite(Envelope),

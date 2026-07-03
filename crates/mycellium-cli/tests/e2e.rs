@@ -193,6 +193,44 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+fn sent_messages_sync_to_own_devices() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let _john = account(&dir, "john");
+
+    // Mary: device A registers, device B links.
+    let mary_a = home("sync-a");
+    let created = cli(&mary_a, &["identity-new"]);
+    ok(&created, "identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6101", "--directory", &dir]), "register");
+
+    let mary_b = home("sync-b");
+    let linked = Command::new(CLI)
+        .args(["link-device", "mary", "--addr", "127.0.0.1:6102", "--directory", &dir])
+        .env("MYCELLIUM_HOME", &mary_b)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_PHRASE", &phrase)
+        .stdin(Stdio::null())
+        .output()
+        .expect("link-device");
+    ok(&linked, "link-device");
+
+    // Mary sends to John from device A.
+    ok(&cli(&mary_a, &["send", "john", "--as", "mary", "--message", "from my phone", "--directory", &dir]), "send");
+
+    // Device B mirrors the sent message, and it lands in Mary's transcript with John.
+    let inbox_b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&inbox_b.stdout).contains("from my phone"), "device B did not sync: {}", String::from_utf8_lossy(&inbox_b.stdout));
+    let hist = cli(&mary_b, &["history", "john"]);
+    assert!(String::from_utf8_lossy(&hist.stdout).contains("from my phone"), "not in device B history: {}", String::from_utf8_lossy(&hist.stdout));
+}
+
+#[test]
 fn message_reaches_all_recipient_devices() {
     let _throttle = throttle();
     let dir = start_directory();

@@ -1297,6 +1297,19 @@ fn send(
     }
     let total = peer_record.record.devices.len();
     println!("sent to '{}' — {delivered}/{total} device(s) (#{})", peer_handle.as_str(), app.id);
+
+    // Self-sync: mirror this message to my own other devices (Layer 11).
+    if let Ok(my_record) = client.lookup(&me) {
+        let my_key = identity.device_public();
+        for device in &my_record.record.devices {
+            if device.device_key == my_key {
+                continue;
+            }
+            let envelope = seal_to(&identity, &me, device, &encoded);
+            let sync = MailItem::SelfSync { peer: peer_handle.as_str().to_string(), envelope };
+            deliver(&client, &token, &me, device, &sync);
+        }
+    }
     Ok(())
 }
 
@@ -1447,6 +1460,7 @@ fn process_item(
 ) -> Result<()> {
     match item {
         MailItem::Direct(env) => handle_direct(identity, me, client, token, blocked, platform, fs, &env),
+        MailItem::SelfSync { peer, envelope } => handle_self_sync(identity, platform, fs, &peer, &envelope),
         MailItem::GroupInvite(env) => handle_group_invite(identity, me, client, token, fs, platform, &env),
         MailItem::GroupText { group_id, message } => handle_group_text(blocked, fs, &group_id, &message),
         MailItem::GroupRemove { group_id, member } => {
@@ -1458,6 +1472,39 @@ fn process_item(
 /// Decrypt and act on a one-to-one offline message: display + persist real
 /// messages (and reply with a read receipt), or show an incoming receipt.
 #[allow(clippy::too_many_arguments)]
+/// Process a mirror of a message *this account* sent from another device: record
+/// it in the peer's transcript as our own outgoing message (Layer 11 self-sync).
+fn handle_self_sync(
+    identity: &Identity,
+    platform: &mut OsPlatform,
+    fs: &mut FileStore,
+    peer: &str,
+    env: &Envelope,
+) -> Result<()> {
+    let (_from, bytes) = open_envelope(identity, platform, env)?;
+    let app = match AppMessage::decode(&bytes) {
+        Ok(app) => app,
+        Err(_) => return Ok(()),
+    };
+    match &app.body {
+        Body::Edit { to, text } => history::edit(fs, peer, to, text)?,
+        Body::Delete { to } => history::delete(fs, peer, to)?,
+        Body::Receipt { .. } => {} // receipts aren't mirrored
+        _ => {
+            println!("→ {peer}: {}  (#{})", app.summary(), app.id);
+            let entry = StoredMessage {
+                id: app.id.clone(),
+                from_me: true,
+                text: app.summary(),
+                timestamp: OsPlatform.now_unix_secs(),
+                expires_at: app.expires_at,
+            };
+            history::append(fs, peer, entry)?;
+        }
+    }
+    Ok(())
+}
+
 fn handle_direct(
     identity: &Identity,
     me: &Handle,
