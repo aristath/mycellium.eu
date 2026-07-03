@@ -193,6 +193,44 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+fn message_reaches_all_recipient_devices() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let john = account(&dir, "john");
+
+    // Mary: device A registers the account, device B links to it.
+    let mary_a = home("mary-a");
+    let created = cli(&mary_a, &["identity-new"]);
+    ok(&created, "mary identity-new");
+    let phrase = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("mnemonic");
+    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6001", "--directory", &dir]), "register");
+
+    let mary_b = home("mary-b");
+    let linked = Command::new(CLI)
+        .args(["link-device", "mary", "--addr", "127.0.0.1:6002", "--directory", &dir])
+        .env("MYCELLIUM_HOME", &mary_b)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_PHRASE", &phrase)
+        .stdin(Stdio::null())
+        .output()
+        .expect("link-device");
+    ok(&linked, "link-device");
+
+    // John sends once to "mary" — his client fans out to her whole cluster.
+    ok(&cli(&john, &["send", "mary", "--as", "john", "--message", "hi cluster", "--directory", &dir]), "send");
+
+    // Both of Mary's devices receive it.
+    let a = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&a.stdout).contains("hi cluster"), "device A missed it: {}", String::from_utf8_lossy(&a.stdout));
+    let b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
+    assert!(String::from_utf8_lossy(&b.stdout).contains("hi cluster"), "device B missed it: {}", String::from_utf8_lossy(&b.stdout));
+}
+
+#[test]
 fn link_device_joins_and_revoke_removes() {
     let _throttle = throttle();
     let dir = start_directory();

@@ -133,21 +133,21 @@ fn route(
             }
         }
 
-        // Offline mailbox: deposit an opaque envelope, or drain your own.
-        (Method::Post, ["mailbox", handle]) => {
+        // Offline mailbox: deposit to a device slot, or drain your own slot.
+        (Method::Post, ["mailbox", handle, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let handle = Handle::new(*handle).map_err(|_| ApiError::NotFound)?;
             directory
                 .lock()
                 .unwrap()
-                .deposit(token, &handle, body.to_string(), now_secs())?;
+                .deposit(token, &handle, slot, body.to_string(), now_secs())?;
             Ok((200, "\"ok\"".into()))
         }
 
-        (Method::Get, ["mailbox", handle]) => {
+        (Method::Get, ["mailbox", handle, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let handle = Handle::new(*handle).map_err(|_| ApiError::NotFound)?;
-            let messages = directory.lock().unwrap().collect(token, &handle)?;
+            let messages = directory.lock().unwrap().collect(token, &handle, slot)?;
             Ok((200, to_json(&Messages { messages })))
         }
 

@@ -96,8 +96,8 @@ fn publish_without_auth_is_401() {
 #[test]
 fn mailbox_without_auth_is_401() {
     let base = start();
-    assert_eq!(status(ureq::get(&format!("{base}/mailbox/alice")).call()), 401);
-    let post = ureq::post(&format!("{base}/mailbox/alice")).send_string("blob");
+    assert_eq!(status(ureq::get(&format!("{base}/mailbox/alice/account")).call()), 401);
+    let post = ureq::post(&format!("{base}/mailbox/alice/account")).send_string("blob");
     assert_eq!(status(post), 401);
 }
 

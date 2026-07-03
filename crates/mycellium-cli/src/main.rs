@@ -880,8 +880,8 @@ fn forward(message_id: &str, from: &str, to: &str, whoami: &str, directory: &str
     let token = client.login(&identity)?;
     let (to_handle, to_record) = lookup_verified(&client, &fs, to)?;
     let app = text_message(&forwarded);
-    let envelope = seal_to(&identity, &me, &to_record, &app.encode());
-    deliver(&client, &token, &to_handle, &to_record, &MailItem::Direct(envelope));
+    let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode());
+    deliver(&client, &token, &to_handle, to_record.record.primary(), &MailItem::Direct(envelope));
     println!("forwarded #{message_id} to '{}'", to_handle.as_str());
     Ok(())
 }
@@ -1284,13 +1284,19 @@ fn send(
 
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
-    let envelope = seal_to(&identity, &me, &peer_record, &app.encode());
-    let item = MailItem::Direct(envelope);
-    if deliver(&client, &token, &peer_handle, &peer_record, &item) {
-        println!("sent to '{}' (#{})", peer_handle.as_str(), app.id);
-    } else {
-        println!("could not deliver to '{}'", peer_handle.as_str());
+    let encoded = app.encode();
+
+    // Fan out one sealed copy per recipient device (Layer 11) — each device has
+    // its own keys, so every device in the cluster receives it.
+    let mut delivered = 0;
+    for device in &peer_record.record.devices {
+        let envelope = seal_to(&identity, &me, device, &encoded);
+        if deliver(&client, &token, &peer_handle, device, &MailItem::Direct(envelope)) {
+            delivered += 1;
+        }
     }
+    let total = peer_record.record.devices.len();
+    println!("sent to '{}' — {delivered}/{total} device(s) (#{})", peer_handle.as_str(), app.id);
     Ok(())
 }
 
@@ -1306,8 +1312,8 @@ fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: &str
         match lookup_verified(&client, &fs, recipient) {
             Ok((handle, record)) => {
                 let app = text_message(message);
-                let envelope = seal_to(&identity, &me, &record, &app.encode());
-                if deliver(&client, &token, &handle, &record, &MailItem::Direct(envelope)) {
+                let envelope = seal_to(&identity, &me, record.record.primary(), &app.encode());
+                if deliver(&client, &token, &handle, record.record.primary(), &MailItem::Direct(envelope)) {
                     sent += 1;
                 }
             }
@@ -1319,10 +1325,10 @@ fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: &str
 }
 
 /// Asynchronously X3DH-seal `plaintext` for `peer` (offline, one-shot session).
-fn seal_to(identity: &Identity, me: &Handle, peer_record: &SignedRecord, plaintext: &[u8]) -> Envelope {
+fn seal_to(identity: &Identity, me: &Handle, device: &Device, plaintext: &[u8]) -> Envelope {
     let mut platform = OsPlatform;
-    let responder_ik = peer_record.record.primary().id_key;
-    let responder_spk = peer_record.record.primary().signed_pre_key.public;
+    let responder_ik = device.id_key;
+    let responder_spk = device.signed_pre_key.public;
     let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk);
     let mut ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk);
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
@@ -1336,8 +1342,8 @@ fn seal_to(identity: &Identity, me: &Handle, peer_record: &SignedRecord, plainte
     }
 }
 
-fn deposit_item(client: &DirectoryClient, token: &str, to: &Handle, item: &MailItem) -> Result<()> {
-    client.deposit(token, to, &serde_json::to_string(item)?)
+fn deposit_item(client: &DirectoryClient, token: &str, to: &Handle, slot: &str, item: &MailItem) -> Result<()> {
+    client.deposit(token, to, slot, &serde_json::to_string(item)?)
 }
 
 /// Deliver `item` to a peer: push it live over a direct connection if they are
@@ -1346,12 +1352,13 @@ fn deliver(
     client: &DirectoryClient,
     token: &str,
     handle: &Handle,
-    record: &SignedRecord,
+    device: &Device,
     item: &MailItem,
 ) -> bool {
+    let slot = device_slot(&device.device_key);
     let online = client.presence(handle).unwrap_or(false);
     if online {
-        if let Ok(addr) = String::from_utf8(record.record.primary().peer_id.0.clone()) {
+        if let Ok(addr) = String::from_utf8(device.peer_id.0.clone()) {
             // Push over a plain TCP `serve` endpoint (a raw host:port).
             if !addr.is_empty() && !addr.starts_with('/') {
                 if let Ok(frame) = serde_json::to_vec(item) {
@@ -1364,7 +1371,7 @@ fn deliver(
             }
         }
     }
-    deposit_item(client, token, handle, item).is_ok()
+    deposit_item(client, token, handle, &slot, item).is_ok()
 }
 
 /// Accept live-pushed items from peers and process them (the `serve` receiver).
@@ -1399,7 +1406,10 @@ fn inbox(whoami: &str, directory: &str) -> Result<()> {
 
     let client = DirectoryClient::new(directory);
     let token = client.login(&identity)?;
-    let blobs = client.collect(&token, &me)?;
+    // Drain this device's own slot plus the cluster-wide account slot.
+    let my_slot = device_slot(&identity.device_public());
+    let mut blobs = client.collect(&token, &me, &my_slot)?;
+    blobs.extend(client.collect(&token, &me, ACCOUNT_SLOT)?);
     let mut fs = open_history(&identity)?;
     let blocked = blocklist::load(&fs)?;
 
@@ -1521,8 +1531,8 @@ fn send_receipt(identity: &Identity, me: &Handle, client: &DirectoryClient, toke
         expires_at: None,
         body: Body::Receipt { message_id: message_id.to_string(), read: true },
     };
-    let env = seal_to(identity, me, &record, &receipt.encode());
-    let _ = deposit_item(client, token, to, &MailItem::Direct(env));
+    let env = seal_to(identity, me, record.record.primary(), &receipt.encode());
+    let _ = deposit_item(client, token, to, ACCOUNT_SLOT, &MailItem::Direct(env));
 }
 
 /// Authenticate the sender and decrypt one offline envelope to raw bytes.
@@ -1645,8 +1655,8 @@ fn distribute_key_to(
                 continue;
             }
         };
-        let env = seal_to(identity, me, &record, &plaintext);
-        let _ = deposit_item(client, token, &handle, &MailItem::GroupInvite(env));
+        let env = seal_to(identity, me, record.record.primary(), &plaintext);
+        let _ = deposit_item(client, token, &handle, ACCOUNT_SLOT, &MailItem::GroupInvite(env));
     }
 }
 
@@ -1823,7 +1833,7 @@ fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) -> Res
             continue;
         }
         if let Ok(handle) = Handle::new(m.clone()) {
-            let _ = deposit_item(&client, &token, &handle, &control);
+            let _ = deposit_item(&client, &token, &handle, ACCOUNT_SLOT, &control);
         }
     }
     println!("removed '{member}' from '{}' (re-keyed)", stored.name);
@@ -1905,10 +1915,10 @@ fn group_send(
         // Deliver live to online members, mailbox otherwise.
         match client.lookup(&handle) {
             Ok(rec) if rec.verify().is_ok() => {
-                deliver(&client, &token, &handle, &rec, &item);
+                deliver(&client, &token, &handle, rec.record.primary(), &item);
             }
             _ => {
-                let _ = deposit_item(&client, &token, &handle, &item);
+                let _ = deposit_item(&client, &token, &handle, ACCOUNT_SLOT, &item);
             }
         }
     }
@@ -1972,7 +1982,7 @@ fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
             continue;
         }
         if let Ok(handle) = Handle::new(member.clone()) {
-            let _ = deposit_item(&client, &token, &handle, &control);
+            let _ = deposit_item(&client, &token, &handle, ACCOUNT_SLOT, &control);
         }
     }
     groups::remove(&mut fs, &stored.id)?;
@@ -2058,6 +2068,15 @@ fn guardian_recover(share_strs: &[String]) -> Result<()> {
 fn short_device_id(key: &DevicePublicKey) -> String {
     hex(&key.0[..4])
 }
+
+/// The mailbox slot a device drains: the full hex of its key. Account-wide
+/// items (group, control, receipts) instead use [`ACCOUNT_SLOT`].
+fn device_slot(key: &DevicePublicKey) -> String {
+    hex(&key.0)
+}
+
+/// The cluster-wide mailbox slot, read by every device of an account.
+const ACCOUNT_SLOT: &str = "account";
 
 /// Read the account's seed phrase from `MYCELLIUM_PHRASE` or stdin.
 fn read_phrase() -> Result<String> {

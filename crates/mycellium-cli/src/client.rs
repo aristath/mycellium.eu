@@ -84,8 +84,8 @@ impl DirectoryClient {
     }
 
     /// Deposit an opaque envelope blob into `handle`'s offline mailbox.
-    pub fn deposit(&self, token: &str, handle: &Handle, blob: &str) -> Result<()> {
-        ureq::post(&format!("{}/mailbox/{}", self.base, handle.as_str()))
+    pub fn deposit(&self, token: &str, handle: &Handle, slot: &str, blob: &str) -> Result<()> {
+        ureq::post(&format!("{}/mailbox/{}/{}", self.base, handle.as_str(), slot))
             .set("Authorization", &format!("Bearer {token}"))
             .send_string(blob)
             .context("deposit failed")?;
@@ -114,13 +114,13 @@ impl DirectoryClient {
         Ok(resp.online)
     }
 
-    /// Drain this identity's offline mailbox.
-    pub fn collect(&self, token: &str, handle: &Handle) -> Result<Vec<String>> {
+    /// Drain one slot of this identity's offline mailbox.
+    pub fn collect(&self, token: &str, handle: &Handle, slot: &str) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct Messages {
             messages: Vec<String>,
         }
-        let resp: Messages = ureq::get(&format!("{}/mailbox/{}", self.base, handle.as_str()))
+        let resp: Messages = ureq::get(&format!("{}/mailbox/{}/{}", self.base, handle.as_str(), slot))
             .set("Authorization", &format!("Bearer {token}"))
             .call()
             .map_err(|e| anyhow!("collect failed: {e}"))?

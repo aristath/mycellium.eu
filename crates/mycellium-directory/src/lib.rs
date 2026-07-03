@@ -96,8 +96,9 @@ pub struct Directory {
     bindings: HashMap<Handle, WalletPublicKey>,
     /// The published records: handle → latest signed record.
     records: HashMap<Handle, SignedRecord>,
-    /// Offline mailboxes: handle → queued opaque encrypted envelopes.
-    mailboxes: HashMap<Handle, Vec<String>>,
+    /// Offline mailboxes: (handle, device slot) → queued opaque envelopes.
+    /// The slot is a device id (targeted delivery) or `"account"` (cluster-wide).
+    mailboxes: HashMap<(Handle, String), Vec<String>>,
     /// Presence: handle → last-seen unix seconds.
     presence: HashMap<Handle, u64>,
     /// Fixed-window rate counters: (wallet, action) → (window_start, count).
@@ -220,6 +221,7 @@ impl Directory {
         &mut self,
         token: &str,
         handle: &Handle,
+        slot: &str,
         blob: String,
         now: u64,
     ) -> Result<(), ApiError> {
@@ -230,7 +232,7 @@ impl Directory {
         if !self.bindings.contains_key(handle) {
             return Err(ApiError::NotFound);
         }
-        let mailbox = self.mailboxes.entry(handle.clone()).or_default();
+        let mailbox = self.mailboxes.entry((handle.clone(), slot.to_string())).or_default();
         if mailbox.len() >= MAX_MAILBOX {
             return Err(ApiError::MailboxFull);
         }
@@ -256,14 +258,19 @@ impl Directory {
             .is_some_and(|last| now.saturating_sub(*last) <= PRESENCE_TTL)
     }
 
-    /// Drain `handle`'s mailbox. Only the handle's owner may collect.
-    pub fn collect(&mut self, token: &str, handle: &Handle) -> Result<Vec<String>, ApiError> {
+    /// Drain one mailbox slot of `handle`. Only the handle's owner may collect.
+    pub fn collect(
+        &mut self,
+        token: &str,
+        handle: &Handle,
+        slot: &str,
+    ) -> Result<Vec<String>, ApiError> {
         let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
         match self.bindings.get(handle) {
             Some(owner) if *owner == wallet => {}
             _ => return Err(ApiError::Forbidden),
         }
-        Ok(self.mailboxes.remove(handle).unwrap_or_default())
+        Ok(self.mailboxes.remove(&(handle.clone(), slot.to_string())).unwrap_or_default())
     }
 }
 
@@ -387,14 +394,14 @@ mod tests {
 
         // Alice logs in and deposits a message for Bob.
         let alice_token = login(&mut dir, &alice);
-        dir.deposit(&alice_token, &bob_handle, "sealed-envelope".into(), 0).unwrap();
+        dir.deposit(&alice_token, &bob_handle, "s", "sealed-envelope".into(), 0).unwrap();
 
         // Alice must NOT be able to read Bob's mailbox.
-        assert_eq!(dir.collect(&alice_token, &bob_handle), Err(ApiError::Forbidden));
+        assert_eq!(dir.collect(&alice_token, &bob_handle, "s"), Err(ApiError::Forbidden));
 
         // Bob drains his own mailbox, then it's empty.
-        assert_eq!(dir.collect(&bob_token, &bob_handle).unwrap(), vec!["sealed-envelope".to_string()]);
-        assert_eq!(dir.collect(&bob_token, &bob_handle).unwrap(), Vec::<String>::new());
+        assert_eq!(dir.collect(&bob_token, &bob_handle, "s").unwrap(), vec!["sealed-envelope".to_string()]);
+        assert_eq!(dir.collect(&bob_token, &bob_handle, "s").unwrap(), Vec::<String>::new());
     }
 
     #[test]
@@ -404,13 +411,13 @@ mod tests {
         let bob_handle = Handle::new("bob").unwrap();
 
         assert_eq!(
-            dir.deposit("no-token", &bob_handle, "x".into(), 0),
+            dir.deposit("no-token", &bob_handle, "s", "x".into(), 0),
             Err(ApiError::Unauthorized)
         );
         let alice_token = login(&mut dir, &alice);
         // Bob never registered.
         assert_eq!(
-            dir.deposit(&alice_token, &bob_handle, "x".into(), 0),
+            dir.deposit(&alice_token, &bob_handle, "s", "x".into(), 0),
             Err(ApiError::NotFound)
         );
     }
@@ -427,15 +434,15 @@ mod tests {
 
         // Up to the limit succeeds within one window (t=0).
         for _ in 0..DEPOSIT_RATE_LIMIT {
-            dir.deposit(&alice_token, &bob_handle, "x".into(), 0).unwrap();
+            dir.deposit(&alice_token, &bob_handle, "s", "x".into(), 0).unwrap();
         }
         // The next one is rejected.
         assert_eq!(
-            dir.deposit(&alice_token, &bob_handle, "x".into(), 0),
+            dir.deposit(&alice_token, &bob_handle, "s", "x".into(), 0),
             Err(ApiError::RateLimited)
         );
         // A later window resets the counter.
-        assert!(dir.deposit(&alice_token, &bob_handle, "x".into(), RATE_WINDOW).is_ok());
+        assert!(dir.deposit(&alice_token, &bob_handle, "s", "x".into(), RATE_WINDOW).is_ok());
     }
 
     #[test]
