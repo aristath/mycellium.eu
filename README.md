@@ -15,8 +15,10 @@ crates/
                                 X3DH + Double Ratchet, group sender keys, wire,
                                 login challenge, and the host-port *traits*
                                 (Transport / Storage / Platform). no_std-capable.
-  mycellium-directory/          the one hosted piece (server): login + signed
+  mycellium-directory/          the one hosted piece (library): login + signed
                                 record store + mailbox + presence
+  mycellium-server/             the deployable server: a thin shell over the
+                                directory library (args now; TLS/persistence later)
   ── adapters (implement the core ports; swapped per platform) ──
   mycellium-transport/          Transport ports: framed TCP + libp2p (feature-gated)
   mycellium-storage/            Storage port: encrypted file KV + at-rest identity
@@ -62,7 +64,7 @@ direct connection, brokered only by the directory.
 
 ```sh
 # 1. Start the directory (login + lookup; never sees message content)
-MYCELLIUM_DIRECTORY_ADDR=127.0.0.1:8078 cargo run -p mycellium-directory &
+cargo run -p mycellium-server -- --addr 127.0.0.1:8078 &
 
 # The seed is encrypted at rest; set a passphrase (or you'll be prompted).
 export MYCELLIUM_PASSPHRASE="a strong passphrase"

@@ -13,11 +13,11 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 fn main() {
     let addr = resolve_addr();
-    println!("mycellium-directory {} — listening on http://{addr}", env!("CARGO_PKG_VERSION"));
+    println!("mycellium-server {} — hosting the directory on http://{addr}", env!("CARGO_PKG_VERSION"));
     println!("  routes: /health · /login/{{challenge,verify}} · /records/{{handle}} · /mailbox/{{handle}}/{{slot}} · /presence/{{handle}}");
     println!("  untrusted: stores signed records + opaque blobs; holds no keys, reads no content");
     if let Err(err) = mycellium_directory::serve(&addr) {
-        eprintln!("mycellium-directory failed: {err}");
+        eprintln!("mycellium-server failed: {err}");
         exit(1);
     }
 }
@@ -41,7 +41,7 @@ fn resolve_addr() -> String {
                 exit(0);
             }
             "--version" | "-V" => {
-                println!("mycellium-directory {}", env!("CARGO_PKG_VERSION"));
+                println!("mycellium-server {}", env!("CARGO_PKG_VERSION"));
                 exit(0);
             }
             other => {
@@ -57,9 +57,9 @@ fn resolve_addr() -> String {
 }
 
 fn print_help() {
-    println!("mycellium-directory — the Mycellium rendezvous server\n");
+    println!("mycellium-server — the Mycellium rendezvous (directory) server\n");
     println!("USAGE:");
-    println!("    mycellium-directory [--addr HOST:PORT]\n");
+    println!("    mycellium-server [--addr HOST:PORT]\n");
     println!("The bind address may also be set via MYCELLIUM_DIRECTORY_ADDR");
     println!("(default: {DEFAULT_ADDR}).");
 }

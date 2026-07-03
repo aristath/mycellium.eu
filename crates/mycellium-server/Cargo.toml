@@ -1,0 +1,20 @@
+[package]
+name = "mycellium-server"
+version = "0.0.0"
+description = "The deployable Mycellium directory server (the shell around mycellium-directory)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mycellium-server"
+path = "src/main.rs"
+
+[dependencies]
+# The reusable directory logic; this crate is just the deployable shell (args,
+# and — later — config, TLS, persistence wiring).
+mycellium-directory = { path = "../mycellium-directory" }
+
+[lints.rust]
+unsafe_code = "forbid"
