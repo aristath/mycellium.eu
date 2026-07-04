@@ -16,7 +16,13 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use std::io::Read;
+
 use mycellium_observe::Metrics;
+
+/// Largest request body the directory will buffer (records are a few KB; this is
+/// generous headroom). Anything larger is refused with 413.
+const MAX_BODY: usize = 256 * 1024;
 
 use mycellium_core::identity::{Handle, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
@@ -175,9 +181,23 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
         return;
     }
 
+    // Reject oversized bodies before buffering them (memory-DoS defense).
+    if request.body_length().map(|n| n > MAX_BODY).unwrap_or(false) {
+        metrics.record(413);
+        mycellium_observe::access_log("directory", method.as_str(), &path, 413, start.elapsed().as_millis());
+        let mut resp = Response::from_string(error_json("payload too large")).with_status_code(413).with_header(json_header());
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+
     let token = bearer_token(&request);
     let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    // Cap the read too, in case Content-Length is absent or lies.
+    let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY as u64);
+    let _ = limited.read_to_string(&mut body);
 
     let (code, json) = match route(directory, &method, &path, token.as_deref(), &body) {
         Ok((code, json)) => (code, json),

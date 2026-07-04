@@ -123,8 +123,12 @@ deployment shape, and the operational essentials** around them.
 - [ ] **T2.4 — Load & scale testing.** Exercise the directory (designed to be
   cloned) and queue (per-user) under thousands of concurrent users; document the
   horizontal-scale story.
-- [ ] **T2.5 — Backpressure & limits.** Mailbox caps, connection limits, request
-  timeouts, graceful shutdown.
+- [~] **T2.5 — Backpressure & limits.** *(body caps + mailbox caps done)* Both
+  servers reject oversized request bodies with `413` before buffering them
+  (directory 256 KiB, queue 1 MiB) — via `Content-Length` *and* a capped read, so
+  a chunked/lying request can't exhaust memory either. Mailboxes are already
+  capped (`MAX_MAILBOX`). *Left: per-IP connection limits, request timeouts,
+  graceful shutdown.*
 
 ---
 

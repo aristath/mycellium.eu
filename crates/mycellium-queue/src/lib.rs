@@ -75,6 +75,10 @@ impl ApiError {
 /// Maximum number of queued messages per (wallet, slot) mailbox.
 pub const MAX_MAILBOX: usize = 256;
 
+/// Largest request body the queue will buffer. Deposits carry sealed envelopes
+/// (which may embed an attachment up to ~256 KiB), so this leaves headroom.
+pub const MAX_BODY: usize = 1024 * 1024;
+
 /// Deposits allowed per sender wallet per [`RATE_WINDOW`].
 pub const DEPOSIT_RATE_LIMIT: u32 = 30;
 
@@ -317,8 +321,22 @@ fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, metrics: &myce
         return;
     }
 
+    // Reject oversized bodies before buffering them (memory-DoS defense).
+    if request.body_length().map(|n| n > MAX_BODY).unwrap_or(false) {
+        metrics.record(413);
+        mycellium_observe::access_log("queue", method.as_str(), &path, 413, start.elapsed().as_millis());
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+        let mut resp = Response::from_string("{\"error\":\"payload too large\"}").with_status_code(413).with_header(header);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+
     let mut body = String::new();
-    let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
+    let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY as u64);
+    let _ = std::io::Read::read_to_string(&mut limited, &mut body);
     let token = bearer(&request);
     let (status, payload) = match route(queue, vapid, &request, &body, token.as_deref()) {
         Ok(ok) => ok,
