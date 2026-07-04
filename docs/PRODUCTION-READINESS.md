@@ -50,9 +50,21 @@ deployment shape, and the operational essentials** around them.
 
 - [ ] **T1.1 — Consumer distribution (WASM PWA).** Today a user must run a local
   Rust server and open `localhost` — not consumer-grade. Compile the engine to
-  WASM (the core is already `no_std`) and serve the PWA over HTTPS so it runs
-  entirely in the browser, talking straight to the directory/queue. (Native apps
-  are the alternative.) **Biggest single unlock.**
+  WASM and serve the PWA over HTTPS so it runs entirely in the browser, talking
+  straight to the directory/queue. **Biggest single unlock.** Staged, because the
+  engine couples blocking `ureq` + `std::fs` into each function:
+  - [x] **Stage 1 — pipeline + core crypto in-browser.** `crates/mycellium-wasm`
+    (excluded from the native workspace) exposes `user_id` + device-key
+    generation via `wasm-bindgen`; `clients/web` loads it. A headless-Chrome test
+    proves the WASM `user_id` matches an independent SHA-256 and that keys come
+    from real browser entropy. Build: `clients/web/build.sh`.
+  - [ ] **Stage 2 — pure step functions + JS-owned I/O.** Split engine
+    send/receive into I/O-free `(state, fetched-data) → (actions, new-state)`
+    steps; in-memory `Storage` synced to IndexedDB by JS; `fetch` for the network.
+  - [ ] **Stage 3 — full op surface** (signup/send/sync/contacts/groups) as pure
+    steps.
+  - [ ] **Stage 4 — port the PWA** off the local server; ship as a static HTTPS
+    PWA.
 
 - [ ] **T1.2 — Real-time delivery when open.** Replace 2s polling with a live
   channel (WebSocket/SSE) while the app is open — instant messages, far less

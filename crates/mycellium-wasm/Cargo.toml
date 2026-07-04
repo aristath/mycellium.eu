@@ -1,0 +1,22 @@
+[package]
+name = "mycellium-wasm"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Mycellium Team"]
+description = "Mycellium engine compiled to WebAssembly — runs the crypto in the browser (Tier 1.1)"
+
+# Excluded from the workspace (see root Cargo.toml) so the native build/tests
+# are unaffected. Build with:
+#   cargo build -p mycellium-wasm --target wasm32-unknown-unknown --release
+# then run wasm-bindgen over the resulting .wasm (see clients/web/build.sh).
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mycellium-core = { path = "../mycellium-core" }
+wasm-bindgen = "=0.2.100"
+# Browser entropy + clock (this crate only ever targets wasm32).
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"

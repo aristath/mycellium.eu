@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mycellium WASM — stage 1</title>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+    pre { background: #111; color: #b7f7c2; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+    h1 { font-size: 1.3rem; }
+  </style>
+</head>
+<body>
+  <h1>Mycellium — engine in the browser</h1>
+  <p>Stage 1: the account-id hash and device-key generation run entirely in WebAssembly — no server call.</p>
+  <pre id="out">loading WebAssembly…</pre>
+  <script type="module">
+    import init, { version, user_id, generate_wallet } from './pkg/mycellium_wasm.js';
+    (async () => {
+      await init();
+      const uid = user_id('mary@example.com');
+      const uidUpper = user_id('  MARY@Example.com  '); // trims + lowercases → same id
+      const w1 = generate_wallet();
+      const w2 = generate_wallet();
+      const lines = [
+        `version:            ${version()}`,
+        `user_id(mary):      ${uid}`,
+        `user_id(MARY, pad): ${uidUpper}`,
+        `normalized equal:   ${uid === uidUpper}`,
+        `wallet #1:          ${w1}`,
+        `wallet #2:          ${w2}`,
+        `wallets differ:     ${w1 !== w2}`,
+      ];
+      document.getElementById('out').textContent = lines.join('\n');
+      // Expose for the automated test.
+      window.__wasm = { version: version(), uid, uidUpper, w1, w2 };
+    })().catch((e) => {
+      document.getElementById('out').textContent = 'ERROR: ' + e;
+      window.__wasm = { error: String(e) };
+    });
+  </script>
+</body>
+</html>
