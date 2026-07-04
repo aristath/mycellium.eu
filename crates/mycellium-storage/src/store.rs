@@ -58,9 +58,16 @@ pub fn exists() -> bool {
     path().exists()
 }
 
+/// The minimum passphrase length enforced when *creating* an identity. Unlocking
+/// an existing one never checks length, so older shorter passphrases still work.
+pub const MIN_PASSPHRASE_LEN: usize = 8;
+
 /// Encrypt and store `identity` under a passphrase.
 pub fn save_identity(identity: &Identity) -> Result<()> {
     let passphrase = passphrase("Choose a passphrase to encrypt your identity")?;
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
+        bail!("passphrase must be at least {MIN_PASSPHRASE_LEN} characters");
+    }
 
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 12];

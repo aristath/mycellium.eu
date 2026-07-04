@@ -85,6 +85,9 @@ pub const DEPOSIT_RATE_LIMIT: u32 = 30;
 /// The rate-limit window, in seconds.
 pub const RATE_WINDOW: u64 = 60;
 
+/// How long a session token lives before it expires and is pruned (24 hours).
+pub const TOKEN_TTL: u64 = 24 * 3600;
+
 /// The in-memory queue state (POC). A real deployment swaps the maps for a
 /// durable store; the logic is unchanged.
 #[derive(Default)]
@@ -93,6 +96,8 @@ pub struct Queue {
     challenges: HashMap<String, WalletPublicKey>,
     /// Active sessions: token → authenticated wallet.
     tokens: HashMap<String, WalletPublicKey>,
+    /// Token issue times, for `TOKEN_TTL` expiry + pruning (bounds accumulation).
+    token_times: HashMap<String, u64>,
     /// Mailboxes: (recipient wallet hex, device slot) → queued opaque blobs.
     /// The slot is a device id (targeted) or `"account"` (cluster-wide).
     mailboxes: HashMap<(String, String), Vec<String>>,
@@ -136,6 +141,7 @@ impl Queue {
         wallet: &WalletPublicKey,
         nonce: &str,
         signature: &Signature,
+        now: u64,
     ) -> Result<String, ApiError> {
         match self.challenges.get(nonce) {
             Some(w) if w == wallet => {}
@@ -145,9 +151,32 @@ impl Queue {
             .verify(&mycellium_core::login::challenge_message(nonce), signature)
             .map_err(|_| ApiError::BadSignature)?;
         self.challenges.remove(nonce);
+        // Housekeeping: drop tokens older than the TTL so the map can't grow
+        // without bound over a long-running process.
+        let expired: Vec<String> = self
+            .token_times
+            .iter()
+            .filter(|(_, &issued)| now.saturating_sub(issued) > TOKEN_TTL)
+            .map(|(t, _)| t.clone())
+            .collect();
+        for t in expired {
+            self.tokens.remove(&t);
+            self.token_times.remove(&t);
+        }
         let token = random_hex::<24>();
         self.tokens.insert(token.clone(), *wallet);
+        self.token_times.insert(token.clone(), now);
         Ok(token)
+    }
+
+    /// Resolve a token to its wallet, rejecting one past `TOKEN_TTL`.
+    fn authed(&self, token: &str, now: u64) -> Result<WalletPublicKey, ApiError> {
+        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let issued = self.token_times.get(token).copied().unwrap_or(0);
+        if now.saturating_sub(issued) > TOKEN_TTL {
+            return Err(ApiError::Unauthorized);
+        }
+        Ok(wallet)
     }
 
     /// Register a browser push endpoint for the logged-in wallet (idempotent).
@@ -179,7 +208,7 @@ impl Queue {
         blob: String,
         now: u64,
     ) -> Result<(), ApiError> {
-        let sender = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let sender = self.authed(token, now)?;
         if !self.allow(sender.0, "deposit", now) {
             return Err(ApiError::RateLimited);
         }
@@ -455,7 +484,7 @@ fn route(
         }
         (Method::Post, ["login", "verify"]) => {
             let req: VerifyReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            let token = queue.lock().unwrap().verify(&req.wallet, &req.nonce, &req.signature)?;
+            let token = queue.lock().unwrap().verify(&req.wallet, &req.nonce, &req.signature, now)?;
             Ok((200, to_json(&VerifyResp { token })))
         }
 
@@ -557,7 +586,7 @@ mod tests {
     fn login(q: &mut Queue, id: &Identity) -> String {
         let nonce = q.challenge(id.wallet_public());
         let sig = id.sign(&mycellium_core::login::challenge_message(&nonce));
-        q.verify(&id.wallet_public(), &nonce, &sig).unwrap()
+        q.verify(&id.wallet_public(), &nonce, &sig, 0).unwrap()
     }
 
     #[test]
@@ -588,6 +617,20 @@ mod tests {
         assert!(q3.collect(&btoken2, &bob_hex, "s").unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn token_expires_after_ttl() {
+        let mut q = Queue::new();
+        let alice = Identity::generate(&mut P(3)).unwrap();
+        let bob = Identity::generate(&mut P(4)).unwrap();
+        let bob_hex = hex33(&bob.wallet_public().0);
+        let token = login(&mut q, &alice); // issued at now = 0
+        assert!(q.deposit(&token, &bob_hex, "s", "x".into(), 10).is_ok());
+        assert_eq!(
+            q.deposit(&token, &bob_hex, "s", "x".into(), TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized),
+        );
     }
 
     #[test]
