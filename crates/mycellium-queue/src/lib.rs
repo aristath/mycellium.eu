@@ -293,6 +293,16 @@ fn open_queue() -> Queue {
 }
 
 fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, mut request: Request) {
+    // CORS preflight (the browser PWA calls this API cross-origin).
+    if *request.method() == Method::Options {
+        let mut resp = Response::empty(204);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+
     let mut body = String::new();
     let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
     let token = bearer(&request);
@@ -301,7 +311,23 @@ fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, mut request: R
         Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
     };
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let _ = request.respond(Response::from_string(payload).with_status_code(status).with_header(header));
+    let mut response = Response::from_string(payload).with_status_code(status).with_header(header);
+    for h in cors_headers() {
+        response.add_header(h);
+    }
+    let _ = request.respond(response);
+}
+
+/// Permissive CORS headers so the browser-served PWA can call this API.
+fn cors_headers() -> Vec<Header> {
+    [
+        (&b"Access-Control-Allow-Origin"[..], &b"*"[..]),
+        (&b"Access-Control-Allow-Methods"[..], &b"GET, POST, PUT, DELETE, OPTIONS"[..]),
+        (&b"Access-Control-Allow-Headers"[..], &b"Authorization, Content-Type"[..]),
+    ]
+    .iter()
+    .filter_map(|(k, v)| Header::from_bytes(*k, *v).ok())
+    .collect()
 }
 
 #[derive(Deserialize)]

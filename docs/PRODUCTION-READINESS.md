@@ -58,9 +58,14 @@ deployment shape, and the operational essentials** around them.
     generation via `wasm-bindgen`; `clients/web` loads it. A headless-Chrome test
     proves the WASM `user_id` matches an independent SHA-256 and that keys come
     from real browser entropy. Build: `clients/web/build.sh`.
-  - [ ] **Stage 2 — pure step functions + JS-owned I/O.** Split engine
-    send/receive into I/O-free `(state, fetched-data) → (actions, new-state)`
-    steps; in-memory `Storage` synced to IndexedDB by JS; `fetch` for the network.
+  - [~] **Stage 2 — browser I/O.** *(2a + 2b done)* **2a:** HTTP behind a
+    `core::http::HttpTransport` trait; native `ureq` impl in `mycellium-http`;
+    directory/queue clients now hold `Box<dyn HttpTransport>` and compile to
+    wasm32 (ureq feature-gated). **2b:** a synchronous `XMLHttpRequest` transport
+    + CORS on both servers — the in-browser WASM engine does a full directory
+    login (identity → challenge → sign → verify) cross-origin against a real
+    server (headless-Chrome test). *Left: browser storage (in-memory `Storage`
+    → IndexedDB) so state persists.*
   - [ ] **Stage 3 — full op surface** (signup/send/sync/contacts/groups) as pure
     steps.
   - [ ] **Stage 4 — port the PWA** off the local server; ship as a static HTTPS

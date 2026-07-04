@@ -15,9 +15,11 @@
   <p>Stage 1: the account-id hash and device-key generation run entirely in WebAssembly — no server call.</p>
   <pre id="out">loading WebAssembly…</pre>
   <script type="module">
-    import init, { version, user_id, generate_wallet } from './pkg/mycellium_wasm.js';
+    import init, { version, user_id, generate_wallet, directory_login } from './pkg/mycellium_wasm.js';
     (async () => {
       await init();
+      // Expose the engine to the page + automated tests.
+      window.mycellium = { version, user_id, generate_wallet, directory_login };
       const uid = user_id('mary@example.com');
       const uidUpper = user_id('  MARY@Example.com  '); // trims + lowercases → same id
       const w1 = generate_wallet();

@@ -146,6 +146,18 @@ fn open_directory() -> Directory {
 
 fn handle_request(directory: &Mutex<Directory>, mut request: Request) {
     let method = request.method().clone();
+
+    // CORS: the browser PWA is served from a different origin than this API, so
+    // answer preflight and tag every response with permissive CORS headers.
+    if method == Method::Options {
+        let mut resp = Response::empty(204);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
     let token = bearer_token(&request);
@@ -157,8 +169,23 @@ fn handle_request(directory: &Mutex<Directory>, mut request: Request) {
         Ok((code, json)) => (code, json),
         Err(err) => (err.status(), error_json(err.reason())),
     };
-    let response = Response::from_string(json).with_status_code(code).with_header(json_header());
+    let mut response = Response::from_string(json).with_status_code(code).with_header(json_header());
+    for h in cors_headers() {
+        response.add_header(h);
+    }
     let _ = request.respond(response);
+}
+
+/// Permissive CORS headers so the browser-served PWA can call this API.
+fn cors_headers() -> Vec<Header> {
+    [
+        (&b"Access-Control-Allow-Origin"[..], &b"*"[..]),
+        (&b"Access-Control-Allow-Methods"[..], &b"GET, POST, PUT, DELETE, OPTIONS"[..]),
+        (&b"Access-Control-Allow-Headers"[..], &b"Authorization, Content-Type"[..]),
+    ]
+    .iter()
+    .filter_map(|(k, v)| Header::from_bytes(*k, *v).ok())
+    .collect()
 }
 
 /// Dispatch one request. Returns `(status, json_body)`.
