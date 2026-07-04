@@ -11,6 +11,16 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
+
+/// Max display-name length (bytes) allowed in a record.
+pub const MAX_NAME_LEN: usize = 128;
+/// Max queue-endpoint URL length (bytes).
+pub const MAX_QUEUE_LEN: usize = 512;
+/// Max peer-id length (bytes) per device (a `host:port` or a multiaddr).
+pub const MAX_PEER_ID_LEN: usize = 256;
+/// Max devices in one account's record.
+pub const MAX_DEVICES: usize = 32;
+
 use crate::identity::{
     DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId, Signature, WalletPublicKey,
 };
@@ -29,7 +39,7 @@ pub struct SignedPreKey {
 impl SignedPreKey {
     /// Certify a pre-key with the owner's wallet signature.
     pub fn create(public: MessagingPublicKey, owner: &Identity) -> Self {
-        let signature = owner.sign(&public.0);
+        let signature = owner.sign(&prekey_signing_bytes(&public));
         SignedPreKey { public, signature }
     }
 }
@@ -92,8 +102,29 @@ impl Record {
     /// Delegates to [`crate::wire::canonical`] so the exact same deterministic
     /// bytes are produced on every device, from a microcontroller to a desktop.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        crate::wire::canonical(self)
+        // Prefix a domain + schema version *inside the signed bytes*, so (a) a
+        // record signature can't be confused with any other signed object, and
+        // (b) an incompatible schema change bumps the version → old signatures
+        // no longer verify (a clean break, not silent misinterpretation).
+        let canon = crate::wire::canonical(self);
+        let mut out = Vec::with_capacity(RECORD_DOMAIN.len() + canon.len());
+        out.extend_from_slice(RECORD_DOMAIN);
+        out.extend_from_slice(&canon);
+        out
     }
+}
+
+/// Domain + schema-version tag prefixed to a record's signed bytes.
+const RECORD_DOMAIN: &[u8] = b"mycellium-record-v1\0";
+/// Domain + schema-version tag prefixed to a signed pre-key's signed bytes.
+const PREKEY_DOMAIN: &[u8] = b"mycellium-prekey-v1\0";
+
+/// The exact bytes a device's signed pre-key signature covers (domain-separated).
+fn prekey_signing_bytes(public: &MessagingPublicKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PREKEY_DOMAIN.len() + public.0.len());
+    out.extend_from_slice(PREKEY_DOMAIN);
+    out.extend_from_slice(&public.0);
+    out
 }
 
 /// A [`Record`] plus the wallet signature over its [`signing_bytes`].
@@ -123,11 +154,20 @@ impl SignedRecord {
     pub fn verify(&self) -> Result<(), Error> {
         let wallet = &self.record.wallet;
         wallet.verify(&self.record.signing_bytes(), &self.signature)?;
-        if self.record.devices.is_empty() {
+        // Shape limits: a validly-signed record can still be abusively large
+        // (bloating directory storage, lookup responses, and sender fan-out).
+        let r = &self.record;
+        if r.devices.is_empty() || r.devices.len() > MAX_DEVICES {
             return Err(Error::Malformed);
         }
-        for device in &self.record.devices {
-            wallet.verify(&device.signed_pre_key.public.0, &device.signed_pre_key.signature)?;
+        if r.name.len() > MAX_NAME_LEN || r.queue.len() > MAX_QUEUE_LEN {
+            return Err(Error::Malformed);
+        }
+        for device in &r.devices {
+            if device.peer_id.0.len() > MAX_PEER_ID_LEN {
+                return Err(Error::Malformed);
+            }
+            wallet.verify(&prekey_signing_bytes(&device.signed_pre_key.public), &device.signed_pre_key.signature)?;
         }
         Ok(())
     }
@@ -175,6 +215,13 @@ mod tests {
     fn signing_bytes_are_deterministic() {
         let r = sample_record(42);
         assert_eq!(r.signing_bytes(), r.signing_bytes());
+    }
+
+    #[test]
+    fn signing_bytes_are_domain_versioned() {
+        // The domain + schema version is inside the signed bytes (issue #34), so
+        // bumping it on a schema change makes old signatures cleanly fail.
+        assert!(sample_record(1).signing_bytes().starts_with(RECORD_DOMAIN));
     }
 
     #[test]
@@ -229,6 +276,39 @@ mod tests {
         let mut tampered = signed.clone();
         tampered.record.seq = 2;
         assert!(tampered.verify().is_err(), "tampered seq must fail");
+    }
+
+    #[test]
+    fn oversized_record_is_rejected() {
+        let mut p = TestPlatform;
+        let id = Identity::generate(&mut p).unwrap();
+        let device = Device {
+            device_key: id.device_public(),
+            peer_id: id.peer_id(),
+            id_key: id.messaging_public(),
+            signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+        };
+        // A validly-signed record with an over-long name is still rejected.
+        let big_name = Record {
+            handle: Handle::new("ari").unwrap(),
+            name: "x".repeat(MAX_NAME_LEN + 1),
+            wallet: id.wallet_public(),
+            queue: String::new(),
+            devices: alloc::vec![device.clone()],
+            seq: 1,
+        };
+        assert_eq!(SignedRecord::sign(big_name, &id).verify(), Err(Error::Malformed));
+
+        // Too many devices is also rejected (the count check fires before per-key verify).
+        let too_many = Record {
+            handle: Handle::new("ari").unwrap(),
+            name: String::new(),
+            wallet: id.wallet_public(),
+            queue: String::new(),
+            devices: alloc::vec![device; MAX_DEVICES + 1],
+            seq: 1,
+        };
+        assert_eq!(SignedRecord::sign(too_many, &id).verify(), Err(Error::Malformed));
     }
 
     #[test]
