@@ -92,6 +92,14 @@ pub const TOKEN_TTL: u64 = 24 * 3600;
 /// directory. Expired challenges are pruned when a new one is issued.
 pub const CHALLENGE_TTL: u64 = 300;
 
+/// Web Push endpoints kept per wallet. Generous for a multi-device account;
+/// the oldest is evicted past this, so the list (and per-deposit fan-out) is
+/// bounded no matter how many endpoints a client registers.
+pub const MAX_SUBS_PER_WALLET: usize = 20;
+
+/// Largest push-endpoint URL accepted (they're short HTTPS URLs in practice).
+pub const MAX_ENDPOINT_LEN: usize = 2048;
+
 /// The in-memory queue state (POC). A real deployment swaps the maps for a
 /// durable store; the logic is unchanged.
 #[derive(Default)]
@@ -190,15 +198,54 @@ impl Queue {
     /// Register a browser push endpoint for the logged-in wallet (idempotent).
     pub fn subscribe(&mut self, token: &str, endpoint: String) -> Result<(), ApiError> {
         let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        if !is_push_endpoint(&endpoint) {
+            return Err(ApiError::BadRequest);
+        }
         let wallet_hex = hex33(&wallet.0);
         let list = self.subs.entry(wallet_hex.clone()).or_default();
         if !list.contains(&endpoint) {
             list.push(endpoint);
+            // Cap per wallet by evicting the oldest, so a device rotating its
+            // endpoint doesn't wedge the list and a client can't grow it forever.
+            while list.len() > MAX_SUBS_PER_WALLET {
+                list.remove(0);
+            }
             if let Some(store) = &self.store {
                 store.put_subs(&wallet_hex, list).map_err(|_| ApiError::Storage)?;
             }
         }
         Ok(())
+    }
+
+    /// Remove a push endpoint for the logged-in wallet (explicit unsubscribe).
+    pub fn unsubscribe(&mut self, token: &str, endpoint: &str) -> Result<(), ApiError> {
+        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let wallet_hex = hex33(&wallet.0);
+        if let Some(list) = self.subs.get_mut(&wallet_hex) {
+            let before = list.len();
+            list.retain(|e| e != endpoint);
+            if list.len() != before {
+                if let Some(store) = &self.store {
+                    store.put_subs(&wallet_hex, list).map_err(|_| ApiError::Storage)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop endpoints a push service reported as gone (404/410). Called off the
+    /// request path after a deposit's fan-out, so dead endpoints don't linger and
+    /// waste a POST on every future deposit.
+    pub fn remove_endpoints(&mut self, wallet_hex: &str, gone: &[String]) {
+        if let Some(list) = self.subs.get_mut(wallet_hex) {
+            let before = list.len();
+            list.retain(|e| !gone.contains(e));
+            if list.len() != before {
+                if let Some(store) = &self.store {
+                    let _ = store.put_subs(wallet_hex, list);
+                }
+            }
+        }
     }
 
     /// The push endpoints registered for a recipient wallet.
@@ -381,7 +428,7 @@ fn restrict_perms(path: &str) {
 #[cfg(not(unix))]
 fn restrict_perms(_path: &str) {}
 
-fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, metrics: &mycellium_observe::Metrics, mut request: Request) {
+fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: &mycellium_observe::Metrics, mut request: Request) {
     let start = std::time::Instant::now();
     let method = request.method().clone();
 
@@ -479,7 +526,7 @@ struct SubscribeReq {
 }
 
 fn route(
-    queue: &Mutex<Queue>,
+    queue: &Arc<Mutex<Queue>>,
     vapid: &Arc<push::Vapid>,
     request: &Request,
     body: &str,
@@ -513,6 +560,12 @@ fn route(
             queue.lock().unwrap().subscribe(token, req.endpoint)?;
             Ok((200, "\"ok\"".into()))
         }
+        (Method::Post, ["push", "unsubscribe"]) => {
+            let token = token.ok_or(ApiError::Unauthorized)?;
+            let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
+            queue.lock().unwrap().unsubscribe(token, &req.endpoint)?;
+            Ok((200, "\"ok\"".into()))
+        }
 
         (Method::Post, ["mailbox", wallet_hex, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
@@ -522,9 +575,19 @@ fn route(
             let endpoints = queue.lock().unwrap().subscriptions(wallet_hex);
             if !endpoints.is_empty() {
                 let vapid = Arc::clone(vapid);
+                let queue = Arc::clone(queue);
+                let wallet_hex = wallet_hex.to_string();
                 std::thread::spawn(move || {
+                    let mut gone = Vec::new();
                     for endpoint in endpoints {
-                        let _ = vapid.send(&endpoint, now);
+                        if vapid.send(&endpoint, now) == push::SendResult::Gone {
+                            gone.push(endpoint);
+                        }
+                    }
+                    // Prune subscriptions the push service says are gone, so we
+                    // don't POST to them on every future deposit.
+                    if !gone.is_empty() {
+                        queue.lock().unwrap().remove_endpoints(&wallet_hex, &gone);
                     }
                 });
             }
@@ -585,6 +648,12 @@ fn is_wallet_hex(s: &str) -> bool {
 /// A slot is either the account slot or a 64-char device id (`device_slot` hex).
 fn is_slot(s: &str) -> bool {
     s == ACCOUNT_SLOT || is_lower_hex(s, 64)
+}
+
+/// A plausible Web Push endpoint: a bounded HTTPS URL with a host. (Requiring
+/// HTTPS also keeps the queue from being pointed at plain-HTTP internal URLs.)
+fn is_push_endpoint(e: &str) -> bool {
+    e.len() <= MAX_ENDPOINT_LEN && push::origin_of(e).map(|o| o.starts_with("https://")).unwrap_or(false)
 }
 
 fn random_hex<const N: usize>() -> String {
@@ -665,6 +734,39 @@ mod tests {
             q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), TOKEN_TTL + 1),
             Err(ApiError::Unauthorized),
         );
+    }
+
+    #[test]
+    fn push_subscriptions_are_validated_capped_and_removable() {
+        let mut q = Queue::new();
+        let a = Identity::generate(&mut P(11)).unwrap();
+        let token = login(&mut q, &a);
+        let hex = hex33(&a.wallet_public().0);
+
+        // Non-HTTPS / malformed endpoints are refused.
+        assert_eq!(q.subscribe(&token, "http://insecure/x".into()), Err(ApiError::BadRequest));
+        assert_eq!(q.subscribe(&token, "not a url".into()), Err(ApiError::BadRequest));
+
+        // Duplicate subscribes are idempotent.
+        q.subscribe(&token, "https://push.example/a".into()).unwrap();
+        q.subscribe(&token, "https://push.example/a".into()).unwrap();
+        assert_eq!(q.subscriptions(&hex).len(), 1);
+
+        // The list is capped, evicting the oldest.
+        for i in 0..MAX_SUBS_PER_WALLET + 5 {
+            q.subscribe(&token, format!("https://push.example/{i}")).unwrap();
+        }
+        assert_eq!(q.subscriptions(&hex).len(), MAX_SUBS_PER_WALLET);
+
+        // Explicit unsubscribe removes an endpoint.
+        let e0 = q.subscriptions(&hex)[0].clone();
+        q.unsubscribe(&token, &e0).unwrap();
+        assert!(!q.subscriptions(&hex).contains(&e0));
+
+        // Gone-removal (the 404/410 path) drops dead endpoints.
+        let e1 = q.subscriptions(&hex)[0].clone();
+        q.remove_endpoints(&hex, &[e1.clone()]);
+        assert!(!q.subscriptions(&hex).contains(&e1));
     }
 
     #[test]

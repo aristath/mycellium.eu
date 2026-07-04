@@ -25,7 +25,8 @@ wallet may collect.
 | POST   | `/mailbox/{wallet}/{slot}` | Bearer token  | Deposit an opaque blob (any authed sender, rate-limited). |
 | GET    | `/mailbox/{wallet}/{slot}` | Bearer token  | Collect & drain the slot (owning wallet only).   |
 | GET    | `/push/key`                | none          | The queue's VAPID public key (for `applicationServerKey`). |
-| POST   | `/push/subscribe`          | Bearer token  | Register a Web Push endpoint to be woken on new mail. |
+| POST   | `/push/subscribe`          | Bearer token  | Register a Web Push endpoint (HTTPS; capped + deduped per wallet). |
+| POST   | `/push/unsubscribe`        | Bearer token  | Remove a previously registered push endpoint. |
 | GET    | `/metrics`                 | none          | Prometheus counters (via `mycellium-observe`).   |
 
 Login is the SIWE-style wallet contract from `mycellium_core::login`. The token is

@@ -59,21 +59,41 @@ impl Vapid {
     }
 
     /// Send a single contentless wake to `endpoint` (a browser push endpoint).
-    pub fn send(&self, endpoint: &str, now: u64) -> Result<(), String> {
-        let aud = origin_of(endpoint).ok_or("bad endpoint")?;
+    pub fn send(&self, endpoint: &str, now: u64) -> SendResult {
+        let aud = match origin_of(endpoint) {
+            Some(a) => a,
+            None => return SendResult::Failed,
+        };
         let header = b64url(br#"{"typ":"JWT","alg":"ES256"}"#);
         let claims = format!(r#"{{"aud":"{aud}","exp":{},"sub":"{}"}}"#, now + 12 * 3600, self.subject);
         let signing_input = format!("{header}.{}", b64url(claims.as_bytes()));
         let sig: Signature = self.signing.sign(signing_input.as_bytes());
         let jwt = format!("{signing_input}.{}", b64url(&sig.to_bytes()));
 
-        ureq::post(endpoint)
+        match ureq::post(endpoint)
             .set("Authorization", &format!("vapid t={jwt}, k={}", self.public_b64))
             .set("TTL", "86400")
-            .send_bytes(&[]) // no payload → wake only
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .send_bytes(&[])
+        // no payload → wake only
+        {
+            Ok(_) => SendResult::Ok,
+            // The push service says this subscription is gone — the recipient
+            // unsubscribed or it expired. The caller should drop it.
+            Err(ureq::Error::Status(404 | 410, _)) => SendResult::Gone,
+            Err(_) => SendResult::Failed,
+        }
     }
+}
+
+/// The outcome of a push send, so callers can prune dead subscriptions.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendResult {
+    /// Accepted by the push service.
+    Ok,
+    /// The subscription is gone (404/410) — remove it.
+    Gone,
+    /// A transient failure — leave the subscription in place.
+    Failed,
 }
 
 fn b64url(bytes: &[u8]) -> String {
@@ -81,7 +101,7 @@ fn b64url(bytes: &[u8]) -> String {
 }
 
 /// The `scheme://host[:port]` origin of a URL — the VAPID `aud` claim.
-fn origin_of(url: &str) -> Option<String> {
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let host = rest.split('/').next()?;
     if host.is_empty() {
