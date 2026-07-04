@@ -1,9 +1,15 @@
 # Browser end-to-end test
 
 Drives the actual PWA in a real (system) Chrome against a live directory + queue
-+ two `mycellium-client` instances. Verifies passwordless signup (name + email),
-message delivery, the received-message UI (thread list, learned display names,
-rendered bubbles), and the Web Push subscription wiring.
++ two `mycellium-client` instances, entirely through the UI. Verifies:
+
+- passwordless signup (name + email — no password, no seed phrase),
+- composing + sending via the "New message" flow,
+- delivery and the received-message UI (thread list, display names learned from
+  the signed record, rendered conversation bubbles),
+- replying via the message-action menu,
+- adding a contact by email,
+- the Web Push subscription wiring (VAPID key, service worker).
 
 ## Run
 
@@ -18,8 +24,10 @@ Requires system Google Chrome at `/usr/bin/google-chrome` and Node 18+.
 
 ## Notes
 
-- Sends are issued via a same-origin `fetch` from the page, not the "New message"
-  modal — opening a modal disconnects *headless* Chrome (a headless-only quirk;
-  modals work in a normal browser). The receive/render path is fully UI-driven.
+- Interactions use JS-triggered clicks (`element.click()`) and value-setting,
+  not Puppeteer's synthetic mouse/keyboard. A synthetic mouse click that opens
+  an overlay crashes *headless* Chrome (a headless-only quirk; the app is fine
+  in a normal browser), and `waitForFunction` proved flaky here — so the test
+  polls the DOM via `evaluate`.
 - Web Push *delivery* can't be verified headlessly (needs a real vendor push
   round-trip to a device); the subscription wiring and VAPID key are checked.

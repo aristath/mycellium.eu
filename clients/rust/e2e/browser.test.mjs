@@ -1,15 +1,16 @@
 // Real-browser end-to-end test: drives the actual PWA in system Chrome against a
-// live directory + queue + two client instances. Verifies passwordless signup
-// (name + email), message delivery, the received-message UI (thread list, names
-// learned from the signed record, rendered bubbles), and the Web Push
-// *subscription* wiring.
+// live directory + queue + two client instances, entirely through the UI.
+//
+// Covers: passwordless signup (name + email), compose + send via the "New
+// message" flow, delivery, the received-message UI (thread list, names learned
+// from the signed record, rendered bubbles), replying via the message-action
+// menu, adding a contact by email, and the Web Push subscription wiring.
 //
 // Run:  cd clients/rust/e2e && npm test        (needs: cargo build, google-chrome)
 //
-// Note: sends are issued via a same-origin fetch from the page rather than the
-// "New message" modal — opening a modal disconnects *headless* Chrome (a headless
-// quirk; modals work in a normal browser). The receive/render path is still
-// driven fully through the UI.
+// Interactions use JS-triggered clicks (element.click()) and value-setting, not
+// Puppeteer's synthetic mouse — a synthetic click that opens an overlay crashes
+// *headless* Chrome (a headless-only quirk; the app is fine in a normal browser).
 
 import { spawn } from 'node:child_process';
 import net from 'node:net';
@@ -39,25 +40,43 @@ let failed = false;
 const step = (m) => console.error('•', m);
 const check = (cond, m) => { console.error((cond ? '  ✓ ' : '  ✗ ') + m); if (!cond) failed = true; };
 
+// --- UI helpers: JS-based, no synthetic input devices ---
+async function click(page, sel) {
+  await page.waitForSelector(sel, { timeout: 10000 });
+  await page.evaluate((s) => document.querySelector(s).click(), sel);
+}
+async function fill(page, sel, text) {
+  await page.waitForSelector(sel, { timeout: 10000 });
+  await page.evaluate((s, t) => {
+    const el = document.querySelector(s);
+    el.value = t;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }, sel, text);
+}
+async function textAppears(page, selector, needle, ms = 25000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const ok = await page
+      .evaluate((s, t) => Array.from(document.querySelectorAll(s)).some((e) => e.textContent.includes(t)), selector, needle)
+      .catch(() => false);
+    if (ok) return true;
+    await sleep(400);
+  }
+  throw new Error(`text "${needle}" never appeared in ${selector}`);
+}
+
 async function signup(browser, base, name, email) {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.error(`  [${name} pageerror] ${e.message}`));
+  page.on('dialog', (d) => { console.error(`  [${name} DIALOG] ${d.type()}: ${d.message()}`); d.dismiss().catch(() => {}); });
   await page.goto(base, { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('#name', { timeout: 10000 });
-  await page.type('#name', name);
-  await page.type('#email', email);
-  await page.click('#go');
-  await page.waitForSelector('#verify', { timeout: 10000 }); // dev-mode code is prefilled
-  await page.click('#verify');
+  await fill(page, '#name', name);
+  await fill(page, '#email', email);
+  await click(page, '#go');
+  await page.waitForSelector('#verify', { timeout: 10000 }); // dev-mode code prefilled
+  await click(page, '#verify');
   await page.waitForSelector('nav.tabs', { timeout: 10000 });
   return page;
-}
-
-async function textAppears(page, selector, needle, ms = 20000) {
-  await page.waitForFunction(
-    (sel, txt) => Array.from(document.querySelectorAll(sel)).some((e) => e.textContent.includes(txt)),
-    { timeout: ms }, selector, needle,
-  );
 }
 
 async function main() {
@@ -76,30 +95,53 @@ async function main() {
 
   const browser = await puppeteer.launch({
     executablePath: CHROME, headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+      // Keep both pages polling — headless throttles timers in background tabs.
+      '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+    ],
   });
 
-  step('passwordless signup (name + email) for two accounts');
+  step('passwordless signup (name + email)');
   const mary = await signup(browser, aUrl, 'Mary', 'mary@example.com');
   const john = await signup(browser, bUrl, 'John', 'john@example.com');
-  check(true, 'both reached the app with no password or seed phrase');
+  check(true, 'both reached the app — no password, no seed phrase');
 
-  step('mary messages john by email');
-  const status = await mary.evaluate(async () => {
-    const r = await fetch('/api/threads/' + encodeURIComponent('john@example.com'), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'hello from a real browser' }),
-    });
-    return r.status;
-  });
-  check(status === 200, `send accepted (HTTP ${status}) — email path resolved to the hashed id`);
+  step('mary composes a message to john@example.com via the New-message flow');
+  await click(mary, '#newChat');
+  await fill(mary, '#pval', 'john@example.com');
+  await click(mary, '#ok');
+  await fill(mary, '#msg', 'hello from a real browser');
+  await click(mary, '#send');
+  await textAppears(mary, '.bubble', 'hello from a real browser', 8000);
+  check(true, 'message composed and shown in the conversation');
 
-  step("john's UI receives and renders it (polling → thread list → conversation)");
-  await textAppears(john, '.item .title', 'Mary', 25000);        // name learned from the signed record
+  step("john's UI receives it (polling → thread list → conversation)");
+  await textAppears(john, '.item .title', 'Mary', 25000);      // name learned from the signed record
   await textAppears(john, '.item .snippet', 'hello from a real browser', 25000);
-  check(true, 'thread appears from "Mary" with the message preview');
-  await john.click('.item');
+  await click(john, '.item');
   await textAppears(john, '.bubble', 'hello from a real browser', 10000);
-  check(true, 'message renders inside the conversation');
+  check(true, 'john sees the thread from "Mary" and the message renders');
+
+  step('john replies via the message-action menu');
+  await click(john, '.bubble[data-id]');       // opens the action modal
+  await click(john, '#reply');                  // sets reply mode
+  await fill(john, '#msg', 'got it, thanks');
+  await click(john, '#send');
+  await textAppears(john, '.bubble', 'got it, thanks', 8000);
+  // Mary: verify receipt via her thread list.
+  await click(mary, '#back');
+  await textAppears(mary, '.item .snippet', 'got it, thanks', 25000);
+  check(true, "reply sent from john's UI and shows in mary's thread list");
+
+  step('mary adds a contact by email');
+  await click(mary, '[data-tab="contacts"]');
+  await click(mary, '#addContact');
+  await fill(mary, '#cemail', 'john@example.com');
+  await fill(mary, '#cnick', 'Johnny');
+  await click(mary, '#add');
+  await textAppears(mary, '.item .title', 'Johnny', 15000);
+  check(true, 'contact "Johnny" added by email and listed');
 
   step('web push subscription wiring');
   const sub = await mary.evaluate(async () => {
@@ -109,11 +151,11 @@ async function main() {
     const key = await (await fetch('/api/push/key')).json();
     return { sw: !!reg.active, hasKey: !!key.key, subscribed: !!s };
   });
-  check(sub.sw, 'service worker is active');
+  check(sub.sw, 'service worker active');
   check(sub.hasKey, 'queue exposes a VAPID key via /api/push/key');
   console.error(sub.subscribed
     ? '  ✓ browser push subscription created'
-    : '  ~ push subscription not created in headless (no reachable push service) — wiring verified, delivery needs a real device');
+    : '  ~ push subscription not created headless (no reachable push service) — wiring verified, delivery needs a real device');
 
   await browser.close();
 }
