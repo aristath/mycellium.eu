@@ -321,11 +321,28 @@ pub fn outbox_show(directory: &str) -> Result<()> {
 
 /// Accept live-pushed items from peers and process them (the `serve` receiver).
 pub fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
-    let identity = store::load_identity()?;
+    let identity = std::sync::Arc::new(store::load_identity()?);
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
     let token = client.login(&identity)?;
     let _ = client.announce(&token, &me); // mark ourselves online for delivery
+
+    // Keep presence fresh: it expires after the directory's PRESENCE_TTL (60s),
+    // so re-announce well inside that window while we're serving. Re-logging in
+    // each cycle also transparently handles a session-token expiry.
+    {
+        let identity = std::sync::Arc::clone(&identity);
+        let directory = directory.to_string();
+        let me = me.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let client = DirectoryClient::new(&directory);
+            if let Ok(token) = client.login(&identity) {
+                let _ = client.announce(&token, &me);
+            }
+        });
+    }
+
     let mut fs = open_history(&identity)?;
     let blocked = blocklist::load(&fs)?;
 
