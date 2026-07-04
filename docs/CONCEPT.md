@@ -62,6 +62,13 @@ So "your identity" is the secret plus its public half; your handle is just the l
 
 ## Layer 4 — What we build first (the POC)
 
+> **Status note.** "The POC" throughout this document means *the first slice we chose
+> to build* — a staging concept, not the project's current state. That slice is long
+> done and the system has grown well past it: durable services, groups, multi-device,
+> a full **browser (WASM) client**, and more. For what exists today see
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md);
+> this doc is the design narrative and keeps the original framing on purpose.
+
 We build the concept in its purest form and prove the hard part works before we soften it.
 
 **In scope for the POC:**

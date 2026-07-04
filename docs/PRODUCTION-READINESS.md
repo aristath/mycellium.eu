@@ -1,6 +1,6 @@
 # Production Readiness
 
-*What stands between the current working prototype and a service thousands of
+*What stands between today's feature-complete build and a service thousands of
 people can use seamlessly and reliably.* Ordered by priority. Check items off as
 they land.
 
