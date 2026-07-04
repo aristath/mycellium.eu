@@ -215,7 +215,7 @@ async function openThread(peer, quiet, name) {
   const label = state.openName || peer;
   let msgs = [];
   try { msgs = await api.get('threads/' + encodeURIComponent(peer)); } catch {}
-  const bubbles = msgs.map((m) => `<div class="bubble ${m.from_me ? 'me' : ''}"><div>${esc(m.text)}</div><div class="time">${when(m.timestamp)}</div></div>`).join('');
+  const bubbles = renderMessages(msgs);
   content().innerHTML = `
     <div class="convo">
       <div class="head"><button class="link" id="back">‹ Chats</button><div class="avatar">${esc(initials(label))}</div><b>${esc(label)}</b></div>
@@ -227,6 +227,13 @@ async function openThread(peer, quiet, name) {
   const send = async () => {
     const text = input.value.trim(); if (!text) return;
     input.value = '';
+    // Optimistic: show the message instantly, reconcile on refetch.
+    const box = byId('msgs');
+    if (box) {
+      const empty = box.querySelector('.empty'); if (empty) empty.remove();
+      box.insertAdjacentHTML('beforeend', `<div class="bubble me"><div>${esc(text)}</div><div class="time">now<span class="tick">✓</span></div></div>`);
+      box.scrollTop = box.scrollHeight;
+    }
     try { await api.post('threads/' + encodeURIComponent(peer), { message: text }); } catch (e) { alert(e.message); }
     openThread(peer, true);
   };
@@ -234,6 +241,30 @@ async function openThread(peer, quiet, name) {
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
   const m = byId('msgs'); if (m) m.scrollTop = m.scrollHeight;
   if (!quiet) input.focus();
+}
+
+// Render a message list with day dividers and a sent tick on our own messages.
+function renderMessages(msgs) {
+  let html = '', lastDay = '';
+  for (const m of msgs) {
+    const day = dayLabel(m.timestamp);
+    if (day && day !== lastDay) { html += `<div class="day-divider"><span>${esc(day)}</span></div>`; lastDay = day; }
+    const tick = m.from_me ? '<span class="tick">✓</span>' : '';
+    html += `<div class="bubble ${m.from_me ? 'me' : ''}"><div>${esc(m.text)}</div><div class="time">${when(m.timestamp)}${tick}</div></div>`;
+  }
+  return html || '<div class="empty">No messages yet. Say hello.</div>';
+}
+
+function dayLabel(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000), now = new Date();
+  const same = (a, b) => a.toDateString() === b.toDateString();
+  if (same(d, now)) return 'Today';
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (same(d, y)) return 'Yesterday';
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString([], opts);
 }
 
 /* ---- groups ---- */
