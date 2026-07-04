@@ -15,7 +15,9 @@
 //! opaque blob for a wallet, rate-limited); only the owning wallet may collect.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+mod push;
 
 use mycellium_core::identity::{Signature, WalletPublicKey};
 use serde::{Deserialize, Serialize};
@@ -87,6 +89,8 @@ pub struct Queue {
     mailboxes: HashMap<(String, String), Vec<String>>,
     /// Fixed-window rate counters: (wallet, action) → (window_start, count).
     rate: HashMap<([u8; 33], &'static str), (u64, u32)>,
+    /// Web Push subscriptions: recipient wallet hex → browser push endpoints.
+    subs: HashMap<String, Vec<String>>,
 }
 
 impl Queue {
@@ -120,6 +124,21 @@ impl Queue {
         let token = random_hex::<24>();
         self.tokens.insert(token.clone(), *wallet);
         Ok(token)
+    }
+
+    /// Register a browser push endpoint for the logged-in wallet (idempotent).
+    pub fn subscribe(&mut self, token: &str, endpoint: String) -> Result<(), ApiError> {
+        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let list = self.subs.entry(hex33(&wallet.0)).or_default();
+        if !list.contains(&endpoint) {
+            list.push(endpoint);
+        }
+        Ok(())
+    }
+
+    /// The push endpoints registered for a recipient wallet.
+    pub fn subscriptions(&self, wallet_hex: &str) -> Vec<String> {
+        self.subs.get(wallet_hex).cloned().unwrap_or_default()
     }
 
     /// Deposit an opaque blob into `recipient`'s (`wallet hex`) mailbox `slot`.
@@ -178,11 +197,13 @@ impl Queue {
 pub fn serve(addr: &str) -> std::io::Result<()> {
     let server = Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
     let queue = Mutex::new(Queue::new());
+    let vapid = Arc::new(push::Vapid::generate());
+    println!("  push: VAPID enabled");
     for mut request in server.incoming_requests() {
         let mut body = String::new();
         let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
         let token = bearer(&request);
-        let (status, payload) = match route(&queue, &request, &body, token.as_deref()) {
+        let (status, payload) = match route(&queue, &vapid, &request, &body, token.as_deref()) {
             Ok(ok) => ok,
             Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
         };
@@ -214,9 +235,18 @@ struct VerifyResp {
 struct Messages {
     messages: Vec<String>,
 }
+#[derive(Serialize)]
+struct PushKey {
+    key: String,
+}
+#[derive(Deserialize)]
+struct SubscribeReq {
+    endpoint: String,
+}
 
 fn route(
     queue: &Mutex<Queue>,
+    vapid: &Arc<push::Vapid>,
     request: &Request,
     body: &str,
     token: Option<&str>,
@@ -240,9 +270,30 @@ fn route(
             Ok((200, to_json(&VerifyResp { token })))
         }
 
+        (Method::Get, ["push", "key"]) => {
+            Ok((200, to_json(&PushKey { key: vapid.public_key().to_string() })))
+        }
+        (Method::Post, ["push", "subscribe"]) => {
+            let token = token.ok_or(ApiError::Unauthorized)?;
+            let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
+            queue.lock().unwrap().subscribe(token, req.endpoint)?;
+            Ok((200, "\"ok\"".into()))
+        }
+
         (Method::Post, ["mailbox", wallet_hex, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             queue.lock().unwrap().deposit(token, wallet_hex, slot, body.to_string(), now)?;
+            // Wake the recipient's devices — contentless, and off the lock/thread
+            // so a slow push endpoint never stalls the queue.
+            let endpoints = queue.lock().unwrap().subscriptions(wallet_hex);
+            if !endpoints.is_empty() {
+                let vapid = Arc::clone(vapid);
+                std::thread::spawn(move || {
+                    for endpoint in endpoints {
+                        let _ = vapid.send(&endpoint, now);
+                    }
+                });
+            }
             Ok((200, "\"ok\"".into()))
         }
         (Method::Get, ["mailbox", wallet_hex, slot]) => {

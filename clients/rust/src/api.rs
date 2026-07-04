@@ -13,6 +13,7 @@ use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::platform::Platform;
 use mycellium_core::userid::user_id;
 use mycellium_directory_client::DirectoryClient;
+use mycellium_queue_client::QueueClient;
 use mycellium_engine::app;
 use mycellium_engine::platform::OsPlatform;
 use mycellium_engine::{contacts, groups, history, names};
@@ -31,6 +32,7 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
     let open = matches!(
         (method, segs.as_slice()),
         (&Method::Get, ["status"])
+            | (&Method::Get, ["push", "key"])
             | (&Method::Post, ["signup"])
             | (&Method::Post, ["signup", "confirm"])
             | (&Method::Post, ["signup", "status"])
@@ -59,6 +61,9 @@ pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -
         (&Method::Post, ["groups", id]) => group_send(id, &req, &directory),
 
         (&Method::Post, ["sync"]) => sync(&directory),
+
+        (&Method::Get, ["push", "key"]) => push_key(),
+        (&Method::Post, ["push"]) => push_register(&req),
 
         _ => return (404, err("no such endpoint")),
     };
@@ -304,6 +309,36 @@ fn group_send(id: &str, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let message = field(req, "message").ok_or_else(|| anyhow::anyhow!("message required"))?;
     let me = read_handle().ok_or_else(|| anyhow::anyhow!("register a handle first"))?;
     app::group_send(id, &me, Some(message), None, None, None, None, None, None, None, directory)?;
+    Ok(json!({ "ok": true }))
+}
+
+// ---- push -------------------------------------------------------------------
+
+fn queue_url() -> String {
+    std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
+}
+
+/// The queue's VAPID public key, for the browser's push subscription.
+fn push_key() -> anyhow::Result<Value> {
+    let url = queue_url();
+    if url.is_empty() {
+        return Ok(json!({ "key": Value::Null }));
+    }
+    let key = QueueClient::new(&url).push_key()?;
+    Ok(json!({ "key": key }))
+}
+
+/// Register the browser's push endpoint with our queue (keyed by our wallet).
+fn push_register(req: &Value) -> anyhow::Result<Value> {
+    let endpoint = field(req, "endpoint").ok_or_else(|| anyhow::anyhow!("endpoint required"))?;
+    let url = queue_url();
+    if url.is_empty() {
+        anyhow::bail!("no queue configured");
+    }
+    let identity = ensure_identity()?;
+    let client = QueueClient::new(&url);
+    let token = client.login(&identity)?;
+    client.push_subscribe(&token, endpoint)?;
     Ok(json!({ "ok": true }))
 }
 

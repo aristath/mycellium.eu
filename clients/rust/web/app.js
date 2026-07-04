@@ -25,6 +25,31 @@ async function boot() {
   setInterval(tick, 2000);
 }
 
+// Subscribe this browser to Web Push and register the endpoint with our queue,
+// so messages wake us even when the tab/app is closed.
+async function enablePush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  try {
+    const { key } = await api.get('push/key');
+    if (!key) return;
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
+    }
+    await api.post('push', { endpoint: sub.endpoint });
+  } catch (e) { /* push unavailable — polling still works */ }
+}
+
+function urlB64ToUint8(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const s = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(s);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
 // Fire a browser notification for a new incoming message.
 function notify(name, body, peer) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
@@ -169,7 +194,9 @@ function renderApp() {
   });
   byId('profile').onclick = profileModal;
   if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission().catch(() => {});
+    Notification.requestPermission().then((p) => { if (p === 'granted') enablePush(); }).catch(() => {});
+  } else if ('Notification' in window && Notification.permission === 'granted') {
+    enablePush();
   }
   renderBar();
   renderContent();

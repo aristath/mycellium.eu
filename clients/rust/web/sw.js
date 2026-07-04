@@ -20,3 +20,21 @@ self.addEventListener('fetch', (e) => {
   if (url.pathname.startsWith('/api/')) return; // API is always live
   e.respondWith(caches.match(e.request).then((r) => r || fetch(e.request)));
 });
+
+// Web Push: a contentless wake. Show a generic notification (no sender/content
+// travels through the push service) and let the app sync when reopened.
+self.addEventListener('push', (e) => {
+  e.waitUntil(self.registration.showNotification('Mycellium', {
+    body: 'You have a new message',
+    icon: '/icon.svg',
+    tag: 'mycellium-msg',
+  }));
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
+    for (const c of cs) { if ('focus' in c) return c.focus(); }
+    return self.clients.openWindow ? self.clients.openWindow('/') : undefined;
+  }));
+});

@@ -16,6 +16,7 @@ mycellium-core = { path = "../../crates/mycellium-core" }
 mycellium-engine = { path = "../../crates/mycellium-engine" }
 mycellium-storage = { path = "../../crates/mycellium-storage" }
 mycellium-directory-client = { path = "../../crates/mycellium-directory-client" }
+mycellium-queue-client = { path = "../../crates/mycellium-queue-client" }
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

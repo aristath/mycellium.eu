@@ -63,6 +63,32 @@ impl QueueClient {
         Ok(())
     }
 
+    /// The queue's VAPID public key (for the browser's `applicationServerKey`).
+    pub fn push_key(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Resp {
+            key: String,
+        }
+        let resp: Resp = ureq::get(&format!("{}/push/key", self.base))
+            .call()
+            .map_err(|e| anyhow!("push key failed: {e}"))?
+            .into_json()?;
+        Ok(resp.key)
+    }
+
+    /// Register a browser push endpoint for the logged-in wallet.
+    pub fn push_subscribe(&self, token: &str, endpoint: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            endpoint: &'a str,
+        }
+        ureq::post(&format!("{}/push/subscribe", self.base))
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(Req { endpoint })
+            .map_err(|e| anyhow!("push subscribe failed: {e}"))?;
+        Ok(())
+    }
+
     /// Drain one slot of your own (`wallet_hex`) mailbox.
     pub fn collect(&self, token: &str, wallet_hex: &str, slot: &str) -> Result<Vec<String>> {
         #[derive(Deserialize)]
