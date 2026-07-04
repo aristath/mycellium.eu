@@ -164,6 +164,9 @@ pub const TOKEN_TTL: u64 = 24 * 3600;
 
 /// The rate-limit window (seconds).
 pub const RATE_WINDOW: u64 = 60;
+/// Once the rate map exceeds this many buckets, expired ones are pruned so the
+/// limiter itself can't become an unbounded memory sink.
+pub const RATE_PRUNE_AT: usize = 10_000;
 /// Verification emails a single caller wallet may trigger per window.
 pub const AUTH_START_PER_WALLET: u32 = 5;
 /// Verification emails a single recipient address may receive per window — caps
@@ -206,6 +209,12 @@ impl Directory {
     /// Fixed-window rate check for `(bucket, action)`. Returns `false` (and does
     /// not count the request) once `limit` is reached inside the window.
     fn allow(&mut self, bucket: String, action: &'static str, limit: u32, now: u64) -> bool {
+        // Bound memory: once the map grows large, drop buckets whose window has
+        // fully elapsed (they'd reset on next use anyway), so never-reused buckets
+        // can't accumulate forever.
+        if self.rate.len() > RATE_PRUNE_AT {
+            self.rate.retain(|_, (start, _)| now.saturating_sub(*start) < RATE_WINDOW);
+        }
         let entry = self.rate.entry((bucket, action)).or_insert((now, 0));
         if now.saturating_sub(entry.0) >= RATE_WINDOW {
             *entry = (now, 0);
@@ -667,6 +676,19 @@ mod tests {
         assert_eq!(dir2.bindings.get(&username), Some(&a.wallet_public()));
         assert_eq!(dir2.emails.get(&username), Some(&dir2.email_hash("alice@example.com")));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_rate_buckets_are_pruned() {
+        let mut dir = Directory::new();
+        // Accumulate never-reused buckets past the prune threshold (all at now=0).
+        for i in 0..=RATE_PRUNE_AT {
+            dir.allow(format!("bucket{i}"), "probe", 5, 0);
+        }
+        assert!(dir.rate.len() > RATE_PRUNE_AT);
+        // A call a full window later prunes the now-expired buckets.
+        dir.allow("fresh".into(), "probe", 5, RATE_WINDOW + 1);
+        assert!(dir.rate.len() < 10, "expired buckets should be pruned, got {}", dir.rate.len());
     }
 
     #[test]

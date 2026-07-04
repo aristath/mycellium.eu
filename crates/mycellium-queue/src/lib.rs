@@ -84,6 +84,8 @@ pub const DEPOSIT_RATE_LIMIT: u32 = 30;
 
 /// The rate-limit window, in seconds.
 pub const RATE_WINDOW: u64 = 60;
+/// Prune expired rate buckets once the map exceeds this, bounding its memory.
+pub const RATE_PRUNE_AT: usize = 10_000;
 
 /// How long a session token lives before it expires and is pruned (24 hours).
 pub const TOKEN_TTL: u64 = 24 * 3600;
@@ -308,6 +310,10 @@ impl Queue {
 
     /// A fixed-window rate check for `(wallet, action)` at `now`.
     fn allow(&mut self, wallet: [u8; 33], action: &'static str, now: u64) -> bool {
+        // Bound memory: prune fully-elapsed buckets once the map grows large.
+        if self.rate.len() > RATE_PRUNE_AT {
+            self.rate.retain(|_, (start, _)| now.saturating_sub(*start) < RATE_WINDOW);
+        }
         let entry = self.rate.entry((wallet, action)).or_insert((now, 0));
         if now.saturating_sub(entry.0) >= RATE_WINDOW {
             *entry = (now, 0);
