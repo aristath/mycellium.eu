@@ -38,11 +38,16 @@ deployment shape, and the operational essentials** around them.
   thread, best-effort (a flaky SMTP never fails signup); `dev_code` is returned
   only in dev mode. *Next: bounce/deliverability handling if needed.*
 
-- [ ] **T0.5 — Account recovery.** The seed phrase was dropped; email is the
-  recovery *hook* but the recover-on-a-new-device flow doesn't exist. Device
-  loss = permanent account loss.
-  - *Approach:* re-verify the email → re-bind the username id to the new device's
-    key → surface a "safety number changed" warning to contacts.
+- [x] **T0.5 — Account recovery.** *(mechanism done)* The directory now lets a
+  **new device key re-bind an existing username** when — and only when — the
+  caller proves control of the **same registered email** (`auth_confirm`);
+  `auth_start` no longer blocks the flow prematurely. Anyone with a different
+  email is rejected (`HandleTaken`). The native email-signup path therefore
+  recovers end to end on a fresh device; the client already **pins peer wallets**,
+  so a peer's key change (recovery *or* attack) is detected — the "safety number
+  changed" signal. Test: `account_recovery_rebinds_only_with_matching_email`.
+  *Follow-on: surface the key-change as a friendly warning (not a hard error) in
+  the UI, and register PWA accounts via the email flow so they're recoverable.*
 
 ---
 

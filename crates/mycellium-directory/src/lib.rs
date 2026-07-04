@@ -225,11 +225,11 @@ impl Directory {
         now: u64,
     ) -> Result<(String, String), ApiError> {
         let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
-        if let Some(bound) = self.bindings.get(username) {
-            if *bound != wallet {
-                return Err(ApiError::HandleTaken);
-            }
-        }
+        // Note: we do *not* reject an already-bound username here. Starting the
+        // flow only sends a code to the caller's email; whether they may claim or
+        // re-bind (recovery) the name is decided at `auth_confirm`, which requires
+        // the code AND a matching registered email. That gate can't run until the
+        // code is confirmed, so failing fast here would just block recovery.
         if !email.contains('@') || email.len() < 3 {
             return Err(ApiError::BadRequest);
         }
@@ -262,12 +262,18 @@ impl Directory {
         }
         p.verified = true;
         let (username, wallet, email) = (p.username.clone(), p.wallet, p.email.clone());
+        let hash = self.email_hash(&email);
         if let Some(bound) = self.bindings.get(&username) {
             if *bound != wallet {
-                return Err(ApiError::HandleTaken);
+                // Account recovery (Tier 0.5): a **new** device key may take over
+                // an existing username, but only by proving control of the SAME
+                // email it was registered with. Anyone else is locked out.
+                if self.emails.get(&username) != Some(&hash) {
+                    return Err(ApiError::HandleTaken);
+                }
+                // else: legitimate recovery — fall through and re-bind below.
             }
         }
-        let hash = self.email_hash(&email);
         if let Some(store) = &self.store {
             store.put_binding(&username, &wallet).map_err(|_| ApiError::Storage)?;
             store.put_email(&username, &hash).map_err(|_| ApiError::Storage)?;
@@ -452,6 +458,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn account_recovery_rebinds_only_with_matching_email() {
+        let mut dir = Directory::new();
+        let username = Handle::new("alice").unwrap(); // the directory binds a handle
+        let email = "alice@example.com";
+
+        // Device A registers the username.
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let tok_a = login(&mut dir, &a);
+        let (pending_a, code_a) = dir.auth_start(&tok_a, &username, email, 0).unwrap();
+        dir.auth_confirm(&pending_a, &code_a, 0).unwrap();
+        assert_eq!(dir.bindings.get(&username), Some(&a.wallet_public()));
+
+        // A new device (wallet B) recovers with the SAME email → re-binds.
+        let b = Identity::generate(&mut OsPlatform).unwrap();
+        let tok_b = login(&mut dir, &b);
+        let (pending_b, code_b) = dir.auth_start(&tok_b, &username, email, 1).unwrap();
+        dir.auth_confirm(&pending_b, &code_b, 1).unwrap();
+        assert_eq!(
+            dir.bindings.get(&username),
+            Some(&b.wallet_public()),
+            "email-verified recovery re-binds the username to the new device key"
+        );
+
+        // An attacker with a DIFFERENT email cannot take it over.
+        let c = Identity::generate(&mut OsPlatform).unwrap();
+        let tok_c = login(&mut dir, &c);
+        let (pending_c, code_c) = dir.auth_start(&tok_c, &username, "attacker@evil.com", 2).unwrap();
+        assert_eq!(dir.auth_confirm(&pending_c, &code_c, 2), Err(ApiError::HandleTaken));
+        assert_eq!(
+            dir.bindings.get(&username),
+            Some(&b.wallet_public()),
+            "a mismatched email leaves the binding untouched"
+        );
     }
 
     #[test]
