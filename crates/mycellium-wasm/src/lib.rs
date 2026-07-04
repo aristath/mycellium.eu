@@ -187,7 +187,12 @@ impl Session {
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
         let token = dir.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
         dir.publish(&token, &me, &record).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let _ = self.store.put(b"myc:handle", handle.as_bytes()); // for group processing during sync
+        // Remember our config so group-invite processing during sync() can
+        // distribute our own sender key back to members.
+        let _ = self.store.put(b"myc:handle", handle.as_bytes());
+        let _ = self.store.put(b"myc:name", name.as_bytes());
+        let _ = self.store.put(b"myc:dir", dir_url.as_bytes());
+        let _ = self.store.put(b"myc:queue", queue_url.as_bytes());
         Ok(())
     }
 
@@ -320,8 +325,27 @@ impl Session {
         };
         stored.note_sender(my_gid, me.as_str());
         groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
-        self.distribute_key(dir_url, my_name, my_queue, &me, &stored, &group)?;
+        let targets = stored.members.clone();
+        self.distribute_key(dir_url, my_name, my_queue, &me, &stored, &group, &targets)?;
         Ok(group_id)
+    }
+
+    /// Add `new_member` to a group and re-distribute keys with the updated
+    /// roster (the newcomer joins; existing members learn them and reciprocate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_add(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, group_id: &str, new_member: &str) -> Result<(), JsValue> {
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let mut stored =
+            groups::load(&self.store, group_id).map_err(|_| JsValue::from_str("store error"))?.ok_or_else(|| JsValue::from_str("no such group"))?;
+        if stored.members.iter().any(|m| m == new_member) {
+            return Err(JsValue::from_str("already a member"));
+        }
+        stored.members.push(new_member.to_string());
+        groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
+        let group = Group::import(stored.state.clone()).map_err(|_| JsValue::from_str("bad group state"))?;
+        let targets = stored.members.clone();
+        self.distribute_key(dir_url, my_name, my_queue, &me, &stored, &group, &targets)?;
+        Ok(())
     }
 
     /// Send a text message to a group. Returns devices delivered to.
@@ -489,17 +513,14 @@ impl Session {
         Ok(delivered)
     }
 
-    fn my_handle(&self) -> String {
-        self.store
-            .get(b"myc:handle")
-            .ok()
-            .flatten()
-            .map(|v| String::from_utf8_lossy(&v).into_owned())
-            .unwrap_or_default()
+    /// Read a stored config value (empty if unset).
+    fn cfg(&self, key: &[u8]) -> String {
+        self.store.get(key).ok().flatten().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
     }
 
-    /// Seal our group sender-key (a `GroupInvitePayload`) to every member device.
-    fn distribute_key(&self, dir_url: &str, my_name: &str, my_queue: &str, me: &Handle, stored: &StoredGroup, group: &Group) -> Result<(), JsValue> {
+    /// Seal our group sender-key (a `GroupInvitePayload`) to `targets`' devices.
+    #[allow(clippy::too_many_arguments)]
+    fn distribute_key(&self, dir_url: &str, my_name: &str, my_queue: &str, me: &Handle, stored: &StoredGroup, group: &Group, targets: &[String]) -> Result<(), JsValue> {
         let payload = GroupInvitePayload {
             group_id: stored.id.clone(),
             name: stored.name.clone(),
@@ -509,7 +530,7 @@ impl Session {
         };
         let plaintext = serde_json::to_vec(&payload).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        for member in &stored.members {
+        for member in targets {
             let Ok(handle) = Handle::new(member.clone()) else { continue };
             let Ok(record) = dir.lookup(&handle) else { continue };
             let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
@@ -533,18 +554,26 @@ impl Session {
         let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env) else { return };
         let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else { return };
         let sender_id = payload.sender_id.clone();
+        let (dir, name, queue, mine) = (self.cfg(b"myc:dir"), self.cfg(b"myc:name"), self.cfg(b"myc:queue"), self.cfg(b"myc:handle"));
+        let Ok(me) = Handle::new(mine.clone()) else { return };
         match groups::load(&self.store, &payload.group_id).ok().flatten() {
             Some(mut stored) => {
                 let Ok(mut group) = Group::import(stored.state.clone()) else { return };
                 let _ = group.add_member(sender_id.clone(), &payload.distribution);
                 stored.note_sender(sender_id, from.as_str());
+                // Learn any members we didn't know about, and send them our key.
+                let newcomers: Vec<String> =
+                    payload.members.iter().filter(|m| !stored.members.iter().any(|x| x == *m)).cloned().collect();
+                stored.members.extend(newcomers.iter().cloned());
                 stored.state = group.export();
                 let _ = groups::save(&mut self.store, &stored);
+                if !newcomers.is_empty() {
+                    let _ = self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &newcomers);
+                }
             }
             None => {
                 let mut group = Group::new(&mut BrowserPlatform, wireops::my_group_id(&self.identity));
                 let _ = group.add_member(sender_id.clone(), &payload.distribution);
-                let mine = self.my_handle();
                 let mut stored = StoredGroup {
                     id: payload.group_id.clone(),
                     name: payload.name.clone(),
@@ -556,6 +585,9 @@ impl Session {
                 stored.note_sender(sender_id, from.as_str());
                 stored.note_sender(wireops::my_group_id(&self.identity), &mine);
                 let _ = groups::save(&mut self.store, &stored);
+                // Reply with our own sender key so everyone can read us too.
+                let targets = stored.members.clone();
+                let _ = self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &targets);
             }
         }
     }

@@ -56,33 +56,49 @@ async function main() {
     await page.goto(`http://127.0.0.1:${webPort}/index.html`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.mycellium?.Session !== undefined, { timeout: 15000 });
 
-    console.error('• Alice creates a group with Bob, sends to it; Bob syncs and decrypts');
+    console.error('• group create, bidirectional messaging (the sender-key mesh), and add-member');
     const r = await page.evaluate((dir, q) => {
       try {
         const S = window.mycellium.Session;
-        const alice = new S(), bob = new S();
+        const alice = new S(), bob = new S(), carol = new S();
         alice.register(dir, q, 'alice', 'Alice');
         bob.register(dir, q, 'bob', 'Bob');
+        carol.register(dir, q, 'carol', 'Carol');
+        const settle = (who) => { for (let i = 0; i < 3; i++) who.forEach((s) => s.sync(q)); };
+
         const gid = alice.group_create(dir, 'alice', 'Alice', q, 'Team Mycelium', JSON.stringify(['bob']));
-        const delivered = alice.group_send(dir, 'alice', 'Alice', q, gid, 'hello team! 🍄');
-        const recv = bob.sync(q);
+        alice.group_send(dir, 'alice', 'Alice', q, gid, 'hello team! 🍄');
+        settle([bob, alice]); // bob joins + reciprocates its key; alice learns bob's key
+
+        // Mesh check: Bob sends, Alice (a different member) must decrypt.
+        bob.group_send(dir, 'bob', 'Bob', q, gid, 'hi from bob');
+        settle([alice]);
+
+        // Add Carol, let the roster + keys propagate, then message the group.
+        alice.group_add(dir, 'alice', 'Alice', q, gid, 'carol');
+        settle([carol, bob, alice]);
+        alice.group_send(dir, 'alice', 'Alice', q, gid, 'welcome carol');
+        settle([carol]);
+
         return {
-          gid, delivered, recv,
+          gid,
           bobGroups: JSON.parse(bob.groups()),
           bobThread: JSON.parse(bob.group_thread(gid)),
           aliceThread: JSON.parse(alice.group_thread(gid)),
+          carolGroups: JSON.parse(carol.groups()),
+          carolThread: JSON.parse(carol.group_thread(gid)),
         };
       } catch (e) { return { error: String(e) }; }
     }, dirUrl, qUrl);
 
+    const texts = (t) => (t || []).map((m) => m.text);
     check(!r.error, `no error (${r.error || 'ok'})`);
     check(typeof r.gid === 'string' && r.gid.length > 0, `group created (id ${r.gid})`);
-    check(r.delivered >= 1, `group message delivered to Bob's device(s) (${r.delivered})`);
-    check(r.recv >= 2, `Bob synced the invite + the message (${r.recv} items)`);
-    check(r.bobGroups?.some((g) => g.name === 'Team Mycelium'), "Bob joined the group from the invite");
-    check(r.bobThread?.length === 1 && r.bobThread[0].text === 'hello team! 🍄', 'Bob decrypted the group message');
-    check(r.bobThread?.[0]?.sender === 'alice', 'sender attributed to alice');
-    check(r.aliceThread?.length === 1, "Alice kept her own copy in the group transcript");
+    check(r.bobGroups?.some((g) => g.name === 'Team Mycelium'), 'Bob joined the group from the invite');
+    check(texts(r.bobThread).includes('hello team! 🍄'), "Bob decrypted Alice's group message");
+    check(texts(r.aliceThread).includes('hi from bob'), "Alice decrypted Bob's message (sender-key mesh works both ways)");
+    check(r.carolGroups?.some((g) => g.name === 'Team Mycelium'), 'Carol was added and joined the group');
+    check(texts(r.carolThread).includes('welcome carol'), 'Carol decrypted a message sent after she joined');
   } finally {
     await browser.close();
     web.close();
