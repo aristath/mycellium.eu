@@ -112,10 +112,11 @@ deployment shape, and the operational essentials** around them.
 - [~] **T2.1 — Anti-abuse.** *(email rate-limiting done)* The directory now
   fixed-window rate-limits `auth_start` — the endpoint that sends real email —
   **per caller wallet** (5/min) and **per recipient address** (3/min), so it
-  can't be used as an SMTP spam/mailbox-bomb relay. Test:
-  `auth_start_is_rate_limited_per_email`. *Left: limits on login/challenge +
-  publish, Sybil resistance (proof-of-work/cost on claims), enumeration defenses,
-  abuse reporting.*
+  can't be used as an SMTP spam/mailbox-bomb relay. **`publish`** is also
+  rate-limited per wallet (30/min) to cap durable-storage-write spam. Test:
+  `auth_start_is_rate_limited_per_email`. *Left: limits on login/challenge, Sybil
+  resistance (proof-of-work/cost on claims), enumeration defenses, abuse
+  reporting.*
 - [~] **T2.2 — Observability.** *(logs + metrics done)* Both servers now expose a
   Prometheus `GET /metrics` (request + 4xx/5xx counters, labelled by service) and
   emit structured JSON access logs (`MYCELLIUM_LOG=1`; 5xx always logged) — via a

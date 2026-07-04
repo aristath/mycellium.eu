@@ -256,7 +256,7 @@ fn route(
             let token = token.ok_or(ApiError::Unauthorized)?;
             let handle = Handle::new(*handle).map_err(|_| ApiError::HandleMismatch)?;
             let record: SignedRecord = parse(body)?;
-            directory.lock().unwrap().publish(token, &handle, record)?;
+            directory.lock().unwrap().publish(token, &handle, record, now_secs())?;
             Ok((200, "\"ok\"".into()))
         }
 

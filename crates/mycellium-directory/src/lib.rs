@@ -147,6 +147,9 @@ pub const AUTH_START_PER_WALLET: u32 = 5;
 /// Verification emails a single recipient address may receive per window — caps
 /// mailbox-bombing even across many caller wallets.
 pub const AUTH_START_PER_EMAIL: u32 = 3;
+/// Record publishes a single wallet may make per window (generous — publishing
+/// is infrequent, but this caps durable-storage-write spam).
+pub const PUBLISH_PER_WALLET: u32 = 30;
 
 impl Directory {
     /// A fresh, in-memory directory with a random email-hash pepper (tests).
@@ -334,8 +337,12 @@ impl Directory {
         token: &str,
         handle: &Handle,
         record: SignedRecord,
+        now: u64,
     ) -> Result<(), ApiError> {
         let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        if !self.allow(hex(&wallet.0), "publish", PUBLISH_PER_WALLET, now) {
+            return Err(ApiError::RateLimited);
+        }
 
         if &record.record.handle != handle {
             return Err(ApiError::HandleMismatch);
@@ -462,7 +469,7 @@ mod tests {
         let handle = Handle::new("ari").unwrap();
 
         let token = login(&mut dir, &ari);
-        dir.publish(&token, &handle, record_for(&ari, "ari", 1)).unwrap();
+        dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0).unwrap();
 
         let got = dir.lookup(&handle).expect("record present");
         assert!(got.verify().is_ok());
@@ -481,7 +488,7 @@ mod tests {
             let mut dir = Directory::open(path_str).unwrap();
             pepper1 = dir.email_hash("x@y.z"); // captures the pepper indirectly
             let token = login(&mut dir, &ari);
-            dir.publish(&token, &handle, record_for(&ari, "ari", 1)).unwrap();
+            dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0).unwrap();
         } // drop → store flushed/closed
 
         // A fresh process re-opening the same file sees the record, the binding,
@@ -495,7 +502,7 @@ mod tests {
         let mallory = Identity::generate(&mut OsPlatform).unwrap();
         let mtoken = login(&mut dir2, &mallory);
         assert_eq!(
-            dir2.publish(&mtoken, &handle, record_for(&mallory, "ari", 2)),
+            dir2.publish(&mtoken, &handle, record_for(&mallory, "ari", 2), 0),
             Err(ApiError::HandleTaken) // the persisted binding still protects the name
         );
 
@@ -575,7 +582,7 @@ mod tests {
         let ari = Identity::generate(&mut OsPlatform).unwrap();
         let handle = Handle::new("ari").unwrap();
         assert_eq!(
-            dir.publish("not-a-token", &handle, record_for(&ari, "ari", 1)),
+            dir.publish("not-a-token", &handle, record_for(&ari, "ari", 1), 0),
             Err(ApiError::Unauthorized)
         );
     }
@@ -588,12 +595,12 @@ mod tests {
         let handle = Handle::new("ari").unwrap();
 
         let ari_token = login(&mut dir, &ari);
-        dir.publish(&ari_token, &handle, record_for(&ari, "ari", 1)).unwrap();
+        dir.publish(&ari_token, &handle, record_for(&ari, "ari", 1), 0).unwrap();
 
         // Mallory logs in and tries to steal "ari".
         let mal_token = login(&mut dir, &mallory);
         assert_eq!(
-            dir.publish(&mal_token, &handle, record_for(&mallory, "ari", 2)),
+            dir.publish(&mal_token, &handle, record_for(&mallory, "ari", 2), 0),
             Err(ApiError::HandleTaken)
         );
     }
@@ -604,7 +611,7 @@ mod tests {
         let bob = Identity::generate(&mut OsPlatform).unwrap();
         let handle = Handle::new("bob").unwrap();
         let token = login(&mut dir, &bob);
-        dir.publish(&token, &handle, record_for(&bob, "bob", 1)).unwrap();
+        dir.publish(&token, &handle, record_for(&bob, "bob", 1), 0).unwrap();
 
         // Never heard of: offline.
         assert!(!dir.presence(&handle, 1000));
@@ -623,7 +630,7 @@ mod tests {
         let mallory = Identity::generate(&mut OsPlatform).unwrap();
         let handle = Handle::new("bob").unwrap();
         let bob_token = login(&mut dir, &bob);
-        dir.publish(&bob_token, &handle, record_for(&bob, "bob", 1)).unwrap();
+        dir.publish(&bob_token, &handle, record_for(&bob, "bob", 1), 0).unwrap();
 
         let mal_token = login(&mut dir, &mallory);
         assert_eq!(dir.heartbeat(&mal_token, &handle, 5), Err(ApiError::Forbidden));
@@ -636,12 +643,12 @@ mod tests {
         let handle = Handle::new("ari").unwrap();
         let token = login(&mut dir, &ari);
 
-        dir.publish(&token, &handle, record_for(&ari, "ari", 5)).unwrap();
+        dir.publish(&token, &handle, record_for(&ari, "ari", 5), 0).unwrap();
         // Newer seq is fine.
-        dir.publish(&token, &handle, record_for(&ari, "ari", 6)).unwrap();
+        dir.publish(&token, &handle, record_for(&ari, "ari", 6), 0).unwrap();
         // Replaying an old seq is not.
         assert_eq!(
-            dir.publish(&token, &handle, record_for(&ari, "ari", 6)),
+            dir.publish(&token, &handle, record_for(&ari, "ari", 6), 0),
             Err(ApiError::Stale)
         );
     }
