@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use mycellium_core::group::{Group, GroupMessage};
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
@@ -19,7 +20,7 @@ use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
-use mycellium_engine::groups::MailItem;
+use mycellium_engine::groups::{self, GroupInvitePayload, MailItem, StoredGroup};
 use mycellium_engine::{history, names, wireops};
 use mycellium_queue_client::{wallet_hex, QueueClient};
 use wasm_bindgen::prelude::*;
@@ -186,6 +187,7 @@ impl Session {
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
         let token = dir.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
         dir.publish(&token, &me, &record).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let _ = self.store.put(b"myc:handle", handle.as_bytes()); // for group processing during sync
         Ok(())
     }
 
@@ -268,15 +270,119 @@ impl Session {
         blobs.extend(queue.collect(&qtoken, &my_hex, "account").unwrap_or_default());
         let mut received = 0u32;
         for blob in blobs {
-            let Ok(MailItem::Direct(env)) = serde_json::from_str::<MailItem>(&blob) else { continue };
-            let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { continue };
-            let Ok(app) = AppMessage::decode(&plaintext) else { continue };
-            // Learn the sender's self-set display name (carried in their record).
-            let _ = names::note(&mut self.store, from.as_str(), &env.sender_record.record.name);
-            apply_to_history(&mut self.store, from.as_str(), &app, false);
-            received += 1;
+            let Ok(item) = serde_json::from_str::<MailItem>(&blob) else { continue };
+            match item {
+                MailItem::Direct(env) => {
+                    let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { continue };
+                    let Ok(app) = AppMessage::decode(&plaintext) else { continue };
+                    // Learn the sender's self-set display name (carried in their record).
+                    let _ = names::note(&mut self.store, from.as_str(), &env.sender_record.record.name);
+                    apply_to_history(&mut self.store, from.as_str(), &app, false);
+                    received += 1;
+                }
+                MailItem::GroupInvite(env) => {
+                    self.handle_group_invite(&env);
+                    received += 1;
+                }
+                MailItem::GroupText { group_id, message } => {
+                    self.handle_group_text(&group_id, &message);
+                    received += 1;
+                }
+                // GroupSync / GroupRemove / SelfSync aren't handled in the browser yet.
+                _ => {}
+            }
         }
         Ok(received)
+    }
+
+    /// Create a group with `members` (a JSON array of handles) and distribute our
+    /// sender key to them. Returns the new group id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_create(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, name: &str, members_json: &str) -> Result<String, JsValue> {
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let members: Vec<String> = serde_json::from_str(members_json).map_err(|e| JsValue::from_str(&format!("bad members: {e}")))?;
+        let mut id_bytes = [0u8; 8];
+        getrandom::getrandom(&mut id_bytes).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        let group_id = wireops::hex(&id_bytes);
+        let mut all = members;
+        if !all.iter().any(|m| m == me.as_str()) {
+            all.push(me.as_str().to_string());
+        }
+        let my_gid = wireops::my_group_id(&self.identity);
+        let group = Group::new(&mut BrowserPlatform, my_gid.clone());
+        let mut stored = StoredGroup {
+            id: group_id.clone(),
+            name: name.to_string(),
+            members: all,
+            me: me.as_str().to_string(),
+            sender_handles: Vec::new(),
+            state: group.export(),
+        };
+        stored.note_sender(my_gid, me.as_str());
+        groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
+        self.distribute_key(dir_url, my_name, my_queue, &me, &stored, &group)?;
+        Ok(group_id)
+    }
+
+    /// Send a text message to a group. Returns devices delivered to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_send(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, group_id: &str, text: &str) -> Result<u32, JsValue> {
+        let _ = (my_name, my_queue); // group messages use the group key, not a per-peer seal
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let mut stored =
+            groups::load(&self.store, group_id).map_err(|_| JsValue::from_str("store error"))?.ok_or_else(|| JsValue::from_str("no such group"))?;
+        let mut group = Group::import(stored.state.clone()).map_err(|_| JsValue::from_str("bad group state"))?;
+        let app = wireops::text_message(&mut BrowserPlatform, text);
+        let gm = group.encrypt(&app.encode(), &wireops::group_ad(&stored.id));
+        stored.state = group.export();
+        groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
+
+        let item = MailItem::GroupText { group_id: stored.id.clone(), message: gm };
+        let blob = serde_json::to_string(&item).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
+        let mut delivered = 0u32;
+        for member in &stored.members {
+            if member == me.as_str() {
+                continue;
+            }
+            let Ok(handle) = Handle::new(member.clone()) else { continue };
+            let Ok(record) = dir.lookup(&handle) else { continue };
+            let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
+            let Ok(qtoken) = queue.login(&self.identity) else { continue };
+            let peer_hex = wallet_hex(&record.record.wallet);
+            for device in &record.record.devices {
+                if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
+                    delivered += 1;
+                }
+            }
+        }
+        let entry = history::GroupStoredMessage {
+            id: app.id.clone(),
+            sender: me.as_str().to_string(),
+            text: app.summary(),
+            timestamp: app.timestamp,
+            expires_at: app.expires_at,
+        };
+        let _ = history::group_append(&mut self.store, &stored.id, entry);
+        Ok(delivered)
+    }
+
+    /// The groups we're in, as JSON: `[{id, name, members}]`.
+    pub fn groups(&self) -> Result<String, JsValue> {
+        let ids = groups::list(&self.store).map_err(|_| JsValue::from_str("store error"))?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Ok(Some(g)) = groups::load(&self.store, &id) {
+                out.push(serde_json::json!({ "id": g.id, "name": g.name, "members": g.members }));
+            }
+        }
+        serde_json::to_string(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// A group's messages as JSON: `[{id, sender, text, timestamp}]`.
+    pub fn group_thread(&self, group_id: &str) -> Result<String, JsValue> {
+        let msgs = history::group_load(&self.store, group_id).map_err(|_| JsValue::from_str("store error"))?;
+        serde_json::to_string(&msgs).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Store a value (UTF-8) under `key`.
@@ -381,6 +487,112 @@ impl Session {
         }
         apply_to_history(&mut self.store, peer_handle, &app, true);
         Ok(delivered)
+    }
+
+    fn my_handle(&self) -> String {
+        self.store
+            .get(b"myc:handle")
+            .ok()
+            .flatten()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Seal our group sender-key (a `GroupInvitePayload`) to every member device.
+    fn distribute_key(&self, dir_url: &str, my_name: &str, my_queue: &str, me: &Handle, stored: &StoredGroup, group: &Group) -> Result<(), JsValue> {
+        let payload = GroupInvitePayload {
+            group_id: stored.id.clone(),
+            name: stored.name.clone(),
+            members: stored.members.clone(),
+            sender_id: wireops::my_group_id(&self.identity),
+            distribution: group.distribution(),
+        };
+        let plaintext = serde_json::to_vec(&payload).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
+        for member in &stored.members {
+            let Ok(handle) = Handle::new(member.clone()) else { continue };
+            let Ok(record) = dir.lookup(&handle) else { continue };
+            let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
+            let Ok(qtoken) = queue.login(&self.identity) else { continue };
+            let peer_hex = wallet_hex(&record.record.wallet);
+            for device in &record.record.devices {
+                if device.device_key == self.identity.device_public() {
+                    continue; // never this exact device
+                }
+                let env = wireops::seal_to(&mut BrowserPlatform, &self.identity, me, my_name, my_queue, device, &plaintext);
+                let Ok(blob) = serde_json::to_string(&MailItem::GroupInvite(env)) else { continue };
+                let _ = queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob);
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a received group invite: join the group (or learn a member's key)
+    /// and record the sender key so we can decrypt their messages.
+    fn handle_group_invite(&mut self, env: &Envelope) {
+        let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env) else { return };
+        let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else { return };
+        let sender_id = payload.sender_id.clone();
+        match groups::load(&self.store, &payload.group_id).ok().flatten() {
+            Some(mut stored) => {
+                let Ok(mut group) = Group::import(stored.state.clone()) else { return };
+                let _ = group.add_member(sender_id.clone(), &payload.distribution);
+                stored.note_sender(sender_id, from.as_str());
+                stored.state = group.export();
+                let _ = groups::save(&mut self.store, &stored);
+            }
+            None => {
+                let mut group = Group::new(&mut BrowserPlatform, wireops::my_group_id(&self.identity));
+                let _ = group.add_member(sender_id.clone(), &payload.distribution);
+                let mine = self.my_handle();
+                let mut stored = StoredGroup {
+                    id: payload.group_id.clone(),
+                    name: payload.name.clone(),
+                    members: payload.members.clone(),
+                    me: mine.clone(),
+                    sender_handles: Vec::new(),
+                    state: group.export(),
+                };
+                stored.note_sender(sender_id, from.as_str());
+                stored.note_sender(wireops::my_group_id(&self.identity), &mine);
+                let _ = groups::save(&mut self.store, &stored);
+            }
+        }
+    }
+
+    /// Decrypt a received group message and store it.
+    fn handle_group_text(&mut self, group_id: &str, message: &GroupMessage) {
+        let Some(mut stored) = groups::load(&self.store, group_id).ok().flatten() else { return };
+        let sender = stored
+            .handle_of(&message.sender)
+            .map(str::to_string)
+            .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
+        let Ok(mut group) = Group::import(stored.state.clone()) else { return };
+        if let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) {
+            stored.state = group.export();
+            let _ = groups::save(&mut self.store, &stored);
+            if let Ok(app) = AppMessage::decode(&plaintext) {
+                match &app.body {
+                    Body::Edit { to, text } => {
+                        let _ = history::group_edit(&mut self.store, group_id, to, text);
+                    }
+                    Body::Delete { to } => {
+                        let _ = history::group_delete(&mut self.store, group_id, to);
+                    }
+                    Body::Receipt { .. } => {}
+                    _ => {
+                        let entry = history::GroupStoredMessage {
+                            id: app.id.clone(),
+                            sender,
+                            text: app.summary(),
+                            timestamp: app.timestamp,
+                            expires_at: app.expires_at,
+                        };
+                        let _ = history::group_append(&mut self.store, group_id, entry);
+                    }
+                }
+            }
+        }
     }
 }
 
