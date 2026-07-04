@@ -68,8 +68,15 @@ async function main() {
         bob.register(dir, q, 'bob', 'Bob');
         const delivered = alice.send(dir, 'alice', 'Alice', q, 'bob', 'hello bob, from alice 🍄');
         const received = bob.sync(q);
+
+        // Attachment size limit: an oversized file is rejected (before network).
+        // 350000 base64 chars decode to ~262 KB, just over the 256 KiB cap.
+        let oversizeRejected = false;
+        try { alice.send_file(dir, 'alice', 'Alice', q, 'bob', 'big.png', 'image/png', 'A'.repeat(350000)); }
+        catch { oversizeRejected = true; }
+
         return {
-          delivered, received,
+          delivered, received, oversizeRejected,
           bobThread: JSON.parse(bob.thread('alice')),
           aliceThread: JSON.parse(alice.thread('bob')),
         };
@@ -78,6 +85,7 @@ async function main() {
 
     check(!r.error, `no error (${r.error || 'ok'})`);
     check(r.delivered === 1, `sender delivered to 1 device (got ${r.delivered})`);
+    check(r.oversizeRejected, 'an oversized attachment (>256 KiB) is rejected by send_file');
     check(r.received === 1, `recipient synced 1 new message (got ${r.received})`);
     check(r.bobThread?.length === 1 && r.bobThread[0].text === 'hello bob, from alice 🍄', 'recipient decrypted the exact plaintext');
     check(r.bobThread?.[0]?.from_me === false, 'recipient sees it as incoming');

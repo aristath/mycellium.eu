@@ -13,6 +13,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 
 /// How long a device-link payload stays valid (10 minutes).
 const LINK_TTL: u64 = 600;
+
+/// Maximum attachment size, matching the native engine (attachments ride inline
+/// inside the sealed envelope, so this stays well under the queue's body cap).
+const MAX_ATTACHMENT: usize = 256 * 1024;
 use mycellium_core::group::{Group, GroupMessage};
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity};
@@ -234,6 +238,9 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn send_file(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, name: &str, mime: &str, data_b64: &str) -> Result<u32, JsValue> {
         let data = B64.decode(data_b64).map_err(|e| JsValue::from_str(&format!("bad base64: {e}")))?;
+        if data.len() > MAX_ATTACHMENT {
+            return Err(JsValue::from_str("attachment too large (max 256 KiB)"));
+        }
         let body = Body::File { mime: mime.to_string(), name: name.to_string(), data };
         let app = wireops::app_message(&mut BrowserPlatform, body);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)

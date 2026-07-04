@@ -389,6 +389,7 @@
       byId('attach').onclick = () => byId('file').click();
       byId('file').onchange = async () => {
         const f = byId('file').files[0]; if (!f) return;
+        if (f.size > 256 * 1024) { alert(`Image too large (${Math.ceil(f.size / 1024)} KB) — max 256 KB.`); byId('file').value = ''; return; }
         try {
           const b64 = await fileToB64(f);
           await rpc('send_file', [cfg.dir, me.handle, me.name, cfg.queue, peer, f.name, f.type || 'application/octet-stream', b64]);
