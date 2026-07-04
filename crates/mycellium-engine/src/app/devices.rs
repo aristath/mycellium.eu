@@ -115,10 +115,8 @@ pub fn read_phrase() -> Result<String> {
     if let Ok(p) = std::env::var("MYCELLIUM_PHRASE") {
         return Ok(p);
     }
-    eprint!("Enter your 24-word seed phrase: ");
-    std::io::Write::flush(&mut std::io::stderr()).ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    // No-echo so the seed isn't left in terminal scrollback / screen shares.
+    let line = rpassword::prompt_password("Enter your 24-word seed phrase: ")?;
     Ok(line.trim().to_string())
 }
 

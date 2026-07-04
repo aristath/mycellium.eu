@@ -21,6 +21,7 @@ native = [
 ]
 
 [dependencies]
+rpassword = "7"
 mycellium-core = { path = "../mycellium-core" }
 mycellium-transport = { path = "../mycellium-transport", optional = true }
 mycellium-storage = { path = "../mycellium-storage", optional = true }

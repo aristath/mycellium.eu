@@ -8,6 +8,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rpassword = "7"
 mycellium-core = { path = "../mycellium-core" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

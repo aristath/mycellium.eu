@@ -6,10 +6,10 @@
 //! copy — the 24 words remain the ultimate backup (Layer 9.4/9.5).
 //!
 //! The passphrase comes from `MYCELLIUM_PASSPHRASE` if set (for non-interactive
-//! use), otherwise it is read from stdin.
+//! use — convenient but it lands in the environment/process table, so prefer the
+//! prompt for real use), otherwise it is read from a **no-echo** terminal prompt.
 
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -64,7 +64,7 @@ pub const MIN_PASSPHRASE_LEN: usize = 8;
 
 /// Encrypt and store `identity` under a passphrase.
 pub fn save_identity(identity: &Identity) -> Result<()> {
-    let passphrase = passphrase("Choose a passphrase to encrypt your identity")?;
+    let passphrase = new_passphrase("Choose a passphrase to encrypt your identity")?;
     if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         bail!("passphrase must be at least {MIN_PASSPHRASE_LEN} characters");
     }
@@ -141,18 +141,30 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// Obtain the passphrase from the environment or, failing that, stdin.
+/// Obtain the passphrase from the environment or, failing that, a **no-echo**
+/// terminal prompt (so it isn't left in scrollback / screen shares).
 fn passphrase(prompt: &str) -> Result<String> {
     if let Ok(p) = std::env::var("MYCELLIUM_PASSPHRASE") {
         return Ok(p);
     }
-    eprint!("{prompt}: ");
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    let line = rpassword::prompt_password(format!("{prompt}: "))?;
     let line = line.trim_end_matches(['\r', '\n']).to_string();
     if line.is_empty() {
         bail!("an empty passphrase is not allowed");
     }
     Ok(line)
+}
+
+/// Like [`passphrase`], but on interactive creation prompts a second time and
+/// requires the two to match (typos in a new passphrase are unrecoverable).
+fn new_passphrase(prompt: &str) -> Result<String> {
+    if std::env::var("MYCELLIUM_PASSPHRASE").is_ok() {
+        return passphrase(prompt); // noninteractive: nothing to confirm against
+    }
+    let first = passphrase(prompt)?;
+    let again = rpassword::prompt_password("Confirm passphrase: ")?;
+    if first != again.trim_end_matches(['\r', '\n']) {
+        bail!("passphrases did not match");
+    }
+    Ok(first)
 }
