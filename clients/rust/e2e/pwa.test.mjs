@@ -41,10 +41,31 @@ async function hasText(page, sel, txt, ms = 20000) {
   return false;
 }
 
+// Mock the Notification API (record what the app would pop) + pin visibility.
+function installNotifMock() {
+  window.__notifs = [];
+  class N { constructor(title, opts) { window.__notifs.push({ title, body: (opts && opts.body) || '' }); } close() {} }
+  N.permission = 'granted';
+  N.requestPermission = () => Promise.resolve('granted');
+  window.Notification = N;
+  Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+  Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+}
+async function hasNotif(page, needle, ms = 20000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const hit = await page.evaluate((t) => (window.__notifs || []).some((n) => (n.body + ' ' + n.title).includes(t)), needle).catch(() => false);
+    if (hit) return true;
+    await sleep(300);
+  }
+  return false;
+}
+
 async function registerUI(ctx, url, username, name) {
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.error(`  [${username} pageerror] ${e.message}`));
   page.on('dialog', (d) => d.dismiss().catch(() => {}));
+  await page.evaluateOnNewDocument(installNotifMock);
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await setVal(page, '#u', username);
   await setVal(page, '#n', name);
@@ -98,6 +119,7 @@ async function main() {
 
     console.error("• Bob's PWA receives it via its own polling");
     check(await hasText(bob, '.item .snippet', 'hello bob', 20000), "conversation from alice appears in Bob's list");
+    check(await hasNotif(bob, 'hello bob'), "Bob's PWA raised a desktop notification");
     await jsClick(bob, '.item');
     check(await hasText(bob, '.bubble', 'hello bob — sent from the browser PWA 🍄', 10000), 'Bob opens the thread and sees the decrypted message');
   } finally {

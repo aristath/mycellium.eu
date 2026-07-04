@@ -64,6 +64,7 @@
     if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
 
     let session, me = null, open = null, poll = null;
+    let seen = {}, firstScan = true;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
@@ -79,8 +80,10 @@
       // Test hooks.
       window.mycellium = { version, user_id, generate_wallet, directory_login, session, Session, persist };
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+      if (me && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
       render();
       startPolling();
+      notifyNew(); // seed "seen" so only future messages notify
     }
 
     function startPolling() {
@@ -89,9 +92,26 @@
       poll = setInterval(async () => {
         try {
           const n = session.sync(cfg.queue);
-          if (n > 0) { await persist(); render(); }
+          if (n > 0) { await persist(); notifyNew(); render(); }
         } catch {}
       }, 3000);
+    }
+
+    // Fire a desktop notification for a new incoming message you're not looking
+    // at. Seeds `seen` on the first pass so pre-existing messages don't notify.
+    function notifyNew() {
+      let threads = [];
+      try { threads = JSON.parse(session.peers()); } catch { return; }
+      const granted = 'Notification' in window && Notification.permission === 'granted';
+      for (const t of threads) {
+        const prev = seen[t.peer] || 0;
+        if (!firstScan && granted && !t.mine && t.timestamp > prev) {
+          const viewing = open === t.peer && !document.hidden;
+          if (!viewing) { try { new Notification(t.peer, { body: t.last, tag: t.peer }); } catch {} }
+        }
+        seen[t.peer] = Math.max(prev, t.timestamp);
+      }
+      firstScan = false;
     }
 
     function render() {
