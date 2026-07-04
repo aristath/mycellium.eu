@@ -24,6 +24,7 @@ pub mod expiry;
 pub mod groups;
 pub mod history;
 pub mod names;
+pub mod inbound;
 pub mod outbox;
 #[cfg(feature = "native")]
 pub mod platform;

@@ -370,23 +370,40 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     // Opportunistically retry anything stuck in our outbox while we're online.
     let _ = flush_outbox(&identity, &client, &mut fs);
 
-    if blobs.is_empty() {
+    let now = OsPlatform.now_unix_secs();
+    // Write-ahead: collecting drained these from the queue, so persist them (plus
+    // anything still pending from a previous run) to the retry store BEFORE
+    // processing. A crash, a not-yet-decryptable group message, or a transient
+    // error can then be retried next time instead of being lost.
+    let mut pending = inbound::load(&fs).unwrap_or_default();
+    for blob in blobs {
+        pending.push(inbound::PendingItem { blob, created_at: now, attempts: 0 });
+    }
+    let _ = inbound::save(&mut fs, &pending);
+
+    if pending.is_empty() {
         println!("no new messages");
         return Ok(());
     }
+
     let mut platform = OsPlatform;
-    for blob in blobs {
-        let item: MailItem = match serde_json::from_str(&blob) {
-            Ok(item) => item,
-            Err(_) => {
-                eprintln!("(skipping an unrecognized item)");
-                continue;
-            }
+    let mut survivors = Vec::new();
+    for mut entry in pending {
+        if entry.is_expired(now) {
+            eprintln!("(giving up on an item after {} tries)", entry.attempts);
+            continue; // dead-letter: drop
+        }
+        let processed = match serde_json::from_str::<MailItem>(&entry.blob) {
+            Ok(item) => process_item(&identity, &me, &client, &blocked, &mut platform, &mut fs, item).is_ok(),
+            Err(_) => false, // unparseable — keep retrying until it dead-letters
         };
-        if let Err(err) = process_item(&identity, &me, &client, &blocked, &mut platform, &mut fs, item) {
-            eprintln!("(skipping an item: {err})");
+        if !processed {
+            entry.attempts += 1;
+            survivors.push(entry); // retry next inbox
         }
     }
+    // Only failures remain in the retry store.
+    let _ = inbound::save(&mut fs, &survivors);
     Ok(())
 }
 
