@@ -35,7 +35,7 @@
       if (saved) session.import(new Uint8Array(saved));
       // Expose the engine to the page + automated tests.
       window.mycellium = {
-        version, user_id, generate_wallet, directory_login, session,
+        version, user_id, generate_wallet, directory_login, session, Session,
         persist: async () => { await idbSave(session.export()); },
       };
       const uid = user_id('mary@example.com');

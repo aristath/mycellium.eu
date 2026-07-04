@@ -8,11 +8,16 @@
 use std::collections::HashMap;
 
 use mycellium_core::http::{HttpResponse, HttpTransport};
-use mycellium_core::identity::Identity;
+use mycellium_core::identity::{Handle, Identity};
+use mycellium_core::message::{AppMessage, Body};
+use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
+use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
+use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
+use mycellium_engine::wireops;
 use wasm_bindgen::prelude::*;
 
 /// The build's version string — a trivial export to confirm JS↔WASM bindings.
@@ -76,13 +81,60 @@ impl Storage for MemStore {
 #[wasm_bindgen]
 pub struct Session {
     store: MemStore,
+    identity: Identity,
 }
 
 #[wasm_bindgen]
 impl Session {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Session {
-        Session { store: MemStore::default() }
+        let identity = Identity::generate(&mut BrowserPlatform).expect("browser CSPRNG must be available");
+        Session { store: MemStore::default(), identity }
+    }
+
+    /// This session's wallet public key (hex) — a stable id for the device.
+    pub fn wallet(&self) -> String {
+        hex(&self.identity.wallet_public().0)
+    }
+
+    /// Build this identity's signed directory record (wire-encoded) so a peer can
+    /// seal messages to it. `handle` is the account name, `queue` its endpoint.
+    pub fn record(&mut self, handle: &str, name: &str, queue: &str) -> Result<Vec<u8>, JsValue> {
+        let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let record = wireops::build_record(&mut BrowserPlatform, &self.identity, &me, name, queue, "");
+        Ok(wire::encode(&record))
+    }
+
+    /// Seal a text message to `peer_record` (their wire-encoded [`SignedRecord`]),
+    /// returning the encrypted envelope (wire-encoded) to hand to the queue.
+    pub fn seal(&mut self, my_handle: &str, my_name: &str, my_queue: &str, peer_record: &[u8], text: &str) -> Result<Vec<u8>, JsValue> {
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let record: SignedRecord = wire::decode(peer_record).map_err(|e| JsValue::from_str(&format!("bad peer record: {e:?}")))?;
+        let plaintext = wireops::text_message(&mut BrowserPlatform, text).encode();
+        let envelope = wireops::seal_to(
+            &mut BrowserPlatform,
+            &self.identity,
+            &me,
+            my_name,
+            my_queue,
+            record.record.primary(),
+            &plaintext,
+        );
+        Ok(wire::encode(&envelope))
+    }
+
+    /// Open an encrypted envelope addressed to this session. Returns
+    /// `{"from":"…","text":"…"}` JSON.
+    pub fn open(&mut self, envelope: &[u8]) -> Result<String, JsValue> {
+        let env: Envelope = wire::decode(envelope).map_err(|e| JsValue::from_str(&format!("bad envelope: {e:?}")))?;
+        let (from, plaintext) =
+            wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let app = AppMessage::decode(&plaintext).map_err(|e| JsValue::from_str(&format!("bad message: {e:?}")))?;
+        let text = match app.body {
+            Body::Text(t) => t,
+            other => format!("{other:?}"),
+        };
+        Ok(serde_json::json!({ "from": from.as_str(), "text": text }).to_string())
     }
 
     /// Store a value (UTF-8) under `key`.
