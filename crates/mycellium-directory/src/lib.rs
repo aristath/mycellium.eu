@@ -51,6 +51,8 @@ pub enum ApiError {
     BadRequest,
     /// A durable-storage write failed.
     Storage,
+    /// Too many requests for this bucket in the current window.
+    RateLimited,
 }
 
 impl ApiError {
@@ -66,6 +68,7 @@ impl ApiError {
             ApiError::Forbidden => 403,
             ApiError::BadRequest => 400,
             ApiError::Storage => 500,
+            ApiError::RateLimited => 429,
         }
     }
 
@@ -84,6 +87,7 @@ impl ApiError {
             ApiError::Forbidden => "not permitted",
             ApiError::BadRequest => "malformed request",
             ApiError::Storage => "storage write failed",
+            ApiError::RateLimited => "rate limit exceeded",
         }
     }
 }
@@ -115,6 +119,9 @@ pub struct Directory {
     /// Durable backing store for bindings/records/emails/pepper. `None` = purely
     /// in-memory (tests); `Some` = write-through to disk (deployment).
     store: Option<persist::Store>,
+    /// Fixed-window rate counters: `(bucket, action) → (window_start, count)`.
+    /// Ephemeral; guards abuse-prone endpoints — above all email sends.
+    rate: HashMap<(String, &'static str), (u64, u32)>,
 }
 
 /// A username claim awaiting one-tap email verification (Layer 6 auth).
@@ -132,6 +139,14 @@ pub const PRESENCE_TTL: u64 = 60;
 
 /// How long an email verification code / link stays valid (15 minutes).
 pub const VERIFY_TTL: u64 = 900;
+
+/// The rate-limit window (seconds).
+pub const RATE_WINDOW: u64 = 60;
+/// Verification emails a single caller wallet may trigger per window.
+pub const AUTH_START_PER_WALLET: u32 = 5;
+/// Verification emails a single recipient address may receive per window — caps
+/// mailbox-bombing even across many caller wallets.
+pub const AUTH_START_PER_EMAIL: u32 = 3;
 
 impl Directory {
     /// A fresh, in-memory directory with a random email-hash pepper (tests).
@@ -163,6 +178,20 @@ impl Directory {
     }
 
     /// A keyed, non-reversible hash of an email — the only email data we keep.
+    /// Fixed-window rate check for `(bucket, action)`. Returns `false` (and does
+    /// not count the request) once `limit` is reached inside the window.
+    fn allow(&mut self, bucket: String, action: &'static str, limit: u32, now: u64) -> bool {
+        let entry = self.rate.entry((bucket, action)).or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= RATE_WINDOW {
+            *entry = (now, 0);
+        }
+        if entry.1 >= limit {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
     fn email_hash(&self, email: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.pepper);
@@ -232,6 +261,14 @@ impl Directory {
         // code is confirmed, so failing fast here would just block recovery.
         if !email.contains('@') || email.len() < 3 {
             return Err(ApiError::BadRequest);
+        }
+        // Rate-limit real email sends: per caller wallet (overall abuse) and per
+        // recipient address (mailbox-bombing, even across many caller wallets).
+        let email_bucket = self.email_hash(email);
+        if !self.allow(hex(&wallet.0), "auth_start", AUTH_START_PER_WALLET, now)
+            || !self.allow(email_bucket, "auth_email", AUTH_START_PER_EMAIL, now)
+        {
+            return Err(ApiError::RateLimited);
         }
         let pending_token = random_hex::<24>();
         let code = format!("{:06}", u32::from_le_bytes(random_bytes::<4>()) % 1_000_000);
@@ -357,7 +394,12 @@ impl Directory {
 fn random_hex<const N: usize>() -> String {
     let mut bytes = [0u8; N];
     getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
-    let mut out = String::with_capacity(N * 2);
+    hex(&bytes)
+}
+
+/// Lowercase hex of arbitrary bytes.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
         out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
@@ -494,6 +536,24 @@ mod tests {
             Some(&b.wallet_public()),
             "a mismatched email leaves the binding untouched"
         );
+    }
+
+    #[test]
+    fn auth_start_is_rate_limited_per_email() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let tok = login(&mut dir, &a);
+        let handle = Handle::new("alice").unwrap();
+        let email = "alice@example.com";
+
+        // Up to the per-email cap succeeds within the window.
+        for _ in 0..AUTH_START_PER_EMAIL {
+            assert!(dir.auth_start(&tok, &handle, email, 0).is_ok());
+        }
+        // The next send to that address is refused — no SMTP spam.
+        assert_eq!(dir.auth_start(&tok, &handle, email, 0), Err(ApiError::RateLimited));
+        // A fresh window resets the counter.
+        assert!(dir.auth_start(&tok, &handle, email, RATE_WINDOW).is_ok());
     }
 
     #[test]

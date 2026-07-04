@@ -106,9 +106,13 @@ deployment shape, and the operational essentials** around them.
 
 ## Tier 2 — Reliability & scale hardening
 
-- [ ] **T2.1 — Anti-abuse.** Free account creation = Sybil; no directory rate
-  limits; name/email enumeration; weak spam defenses. Add rate limiting,
-  proof-of-work or cost on claims, and abuse reporting.
+- [~] **T2.1 — Anti-abuse.** *(email rate-limiting done)* The directory now
+  fixed-window rate-limits `auth_start` — the endpoint that sends real email —
+  **per caller wallet** (5/min) and **per recipient address** (3/min), so it
+  can't be used as an SMTP spam/mailbox-bomb relay. Test:
+  `auth_start_is_rate_limited_per_email`. *Left: limits on login/challenge +
+  publish, Sybil resistance (proof-of-work/cost on claims), enumeration defenses,
+  abuse reporting.*
 - [ ] **T2.2 — Observability.** Structured logs, metrics, health/readiness
   probes, alerting. Production is blind without it.
 - [ ] **T2.3 — Outbox coverage.** Retry currently only wraps 1:1 sends; extend to
