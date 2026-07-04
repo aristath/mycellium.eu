@@ -443,6 +443,9 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
     }
 
     let path = request.url().split('?').next().unwrap_or("").to_string();
+    // Routing uses the real `path`; logging uses a redacted template so access
+    // logs never carry the wallet/mailbox identifier (only the route hit).
+    let log_path = redact_path(&path);
     if method == Method::Get && path == "/metrics" {
         metrics.record(200);
         let resp = Response::from_string(metrics.render("queue"))
@@ -463,7 +466,7 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
     }
     if over_cap || buf.len() > MAX_BODY {
         metrics.record(413);
-        mycellium_observe::access_log("queue", method.as_str(), &path, 413, start.elapsed().as_millis());
+        mycellium_observe::access_log("queue", method.as_str(), &log_path, 413, start.elapsed().as_millis());
         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
         let mut resp = Response::from_string("{\"error\":\"payload too large\"}").with_status_code(413).with_header(header);
         for h in cors_headers() {
@@ -479,7 +482,7 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
         Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
     };
     metrics.record(status);
-    mycellium_observe::access_log("queue", method.as_str(), &path, status, start.elapsed().as_millis());
+    mycellium_observe::access_log("queue", method.as_str(), &log_path, status, start.elapsed().as_millis());
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     let mut response = Response::from_string(payload).with_status_code(status).with_header(header);
     for h in cors_headers() {
@@ -629,6 +632,17 @@ fn now_secs() -> u64 {
 }
 
 /// Lowercase hex of a 33-byte compressed wallet key.
+/// Collapse the mailbox path's wallet + slot to a template, so access logs
+/// record which route was hit but never the wallet identifier (activity
+/// metadata). Fixed routes (login, push, metrics) log verbatim.
+fn redact_path(path: &str) -> String {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segs.as_slice() {
+        ["mailbox", _, _] => "/mailbox/:wallet/:slot".to_string(),
+        _ => path.to_string(),
+    }
+}
+
 pub fn hex33(bytes: &[u8; 33]) -> String {
     let mut out = String::with_capacity(66);
     for b in bytes {
@@ -790,6 +804,13 @@ mod tests {
         let nonce2 = q.challenge(a.wallet_public(), 0);
         let sig2 = a.sign(&mycellium_core::login::challenge_message(&nonce2));
         assert!(q.verify(&a.wallet_public(), &nonce2, &sig2, CHALLENGE_TTL).is_ok());
+    }
+
+    #[test]
+    fn access_log_paths_are_redacted() {
+        assert_eq!(redact_path("/mailbox/deadbeef/account"), "/mailbox/:wallet/:slot");
+        assert_eq!(redact_path("/login/challenge"), "/login/challenge");
+        assert_eq!(redact_path("/push/key"), "/push/key");
     }
 
     #[test]

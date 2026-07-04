@@ -4,8 +4,10 @@
 //!   for a `/metrics` endpoint.
 //! - [`access_log`]: a structured (JSON) access-log line per request.
 //!
-//! Paths may contain opaque ids (hashes), never plaintext names or emails, so
-//! logging them is privacy-safe.
+//! Callers pass a **redacted route template** as the path (e.g.
+//! `/records/:handle`, `/mailbox/:wallet/:slot`), not the raw request path, so
+//! access logs record which endpoint was hit without the specific handle or
+//! wallet identifier — no plaintext names/emails and no social-graph metadata.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

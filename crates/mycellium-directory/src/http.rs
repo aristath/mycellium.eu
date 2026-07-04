@@ -73,6 +73,18 @@ struct AuthStatusReq {
     pending: String,
 }
 
+/// Collapse id-bearing path segments to a route template, so access logs record
+/// *which* endpoint was hit but never the specific handle that was looked up
+/// (social-graph metadata). Fixed routes (login, auth, metrics) log verbatim.
+fn redact_path(path: &str) -> String {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segs.as_slice() {
+        ["records", _] => "/records/:handle".to_string(),
+        ["presence", _] => "/presence/:handle".to_string(),
+        _ => path.to_string(),
+    }
+}
+
 /// Current wall-clock time in whole seconds (for presence TTL).
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -171,6 +183,9 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
 
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
+    // Routing uses the real `path`; logging uses a redacted template so access
+    // logs never carry the specific handle that was looked up (only the route).
+    let log_path = redact_path(&path);
 
     // Operational metrics (Prometheus text). Open, no auth.
     if method == Method::Get && path == "/metrics" {
@@ -194,7 +209,7 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
     }
     if over_cap || buf.len() > MAX_BODY {
         metrics.record(413);
-        mycellium_observe::access_log("directory", method.as_str(), &path, 413, start.elapsed().as_millis());
+        mycellium_observe::access_log("directory", method.as_str(), &log_path, 413, start.elapsed().as_millis());
         let mut resp = Response::from_string(error_json("payload too large")).with_status_code(413).with_header(json_header());
         for h in cors_headers() {
             resp.add_header(h);
@@ -209,7 +224,7 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
         Err(err) => (err.status(), error_json(err.reason())),
     };
     metrics.record(code);
-    mycellium_observe::access_log("directory", method.as_str(), &path, code, start.elapsed().as_millis());
+    mycellium_observe::access_log("directory", method.as_str(), &log_path, code, start.elapsed().as_millis());
     let mut response = Response::from_string(json).with_status_code(code).with_header(json_header());
     for h in cors_headers() {
         response.add_header(h);
@@ -350,4 +365,19 @@ fn bearer_token(request: &Request) -> Option<String> {
         .find(|h| h.field.equiv("Authorization"))
         .and_then(|h| h.value.as_str().strip_prefix("Bearer "))
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_path;
+
+    #[test]
+    fn access_log_paths_are_redacted() {
+        // Id-bearing routes collapse to a template — no handle in the log.
+        assert_eq!(redact_path("/records/deadbeefcafe"), "/records/:handle");
+        assert_eq!(redact_path("/presence/deadbeefcafe"), "/presence/:handle");
+        // Fixed routes log verbatim (no identifier to leak).
+        assert_eq!(redact_path("/login/verify"), "/login/verify");
+        assert_eq!(redact_path("/metrics"), "/metrics");
+    }
 }
