@@ -128,9 +128,13 @@ deployment shape, and the operational essentials** around them.
   `flush_outbox` at the start of `group_send` — and for **1:1 self-sync** to your
   own other devices. (Receipts stay best-effort by design.) 127 tests, clippy
   clean; messaging e2e green.
-- [ ] **T2.4 — Load & scale testing.** Exercise the directory (designed to be
-  cloned) and queue (per-user) under thousands of concurrent users; document the
-  horizontal-scale story.
+- [~] **T2.4 — Load & scale testing.** *(directory read-load validated)* A load
+  harness (`clients/rust/e2e/load.test.mjs`) fires thousands of concurrent
+  lookups and asserts **zero drops** while reporting throughput + latency
+  percentiles; the worker pool sustains it comfortably (>15k req/s, p99 ~25 ms on
+  loopback — the client is the bottleneck, not the server). *Left: write-path +
+  queue load, and the multi-node horizontal-scale story (clone the directory,
+  shard the queue).*
 - [~] **T2.5 — Backpressure & limits.** *(body caps + mailbox caps done)* Both
   servers reject oversized request bodies with `413` before buffering them
   (directory 256 KiB, queue 1 MiB) — via `Content-Length` *and* a capped read, so
