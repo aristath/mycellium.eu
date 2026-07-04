@@ -167,6 +167,27 @@ pub const RATE_WINDOW: u64 = 60;
 /// Once the rate map exceeds this many buckets, expired ones are pruned so the
 /// limiter itself can't become an unbounded memory sink.
 pub const RATE_PRUNE_AT: usize = 10_000;
+
+/// Canonicalize an email address, so the value used for hashing, pending storage,
+/// and SMTP delivery is always identical (no whitespace/case drift).
+pub fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// A stricter-than-`contains('@')` syntax check: exactly one `@`, a non-empty
+/// local part, a dotted domain, no whitespace, and a bounded length.
+pub fn is_valid_email(email: &str) -> bool {
+    if email.is_empty() || email.len() > 254 || email.bytes().any(|b| b.is_ascii_whitespace()) {
+        return false;
+    }
+    let mut parts = email.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None) => {
+            !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+        }
+        _ => false,
+    }
+}
 /// Verification emails a single caller wallet may trigger per window.
 pub const AUTH_START_PER_WALLET: u32 = 5;
 /// Verification emails a single recipient address may receive per window — caps
@@ -230,7 +251,7 @@ impl Directory {
         let mut hasher = Sha256::new();
         hasher.update(self.pepper);
         hasher.update(b":");
-        hasher.update(email.trim().to_lowercase().as_bytes());
+        hasher.update(normalize_email(email).as_bytes());
         let digest = hasher.finalize();
         let mut out = String::with_capacity(64);
         for b in digest {
@@ -308,12 +329,15 @@ impl Directory {
         // re-bind (recovery) the name is decided at `auth_confirm`, which requires
         // the code AND a matching registered email. That gate can't run until the
         // code is confirmed, so failing fast here would just block recovery.
-        if !email.contains('@') || email.len() < 3 {
+        // Canonicalize once, so the value used for hashing, storage, and delivery
+        // is always the same (no whitespace/case drift), and validate its shape.
+        let email = normalize_email(email);
+        if !is_valid_email(&email) {
             return Err(ApiError::BadRequest);
         }
         // Rate-limit real email sends: per caller wallet (overall abuse) and per
         // recipient address (mailbox-bombing, even across many caller wallets).
-        let email_bucket = self.email_hash(email);
+        let email_bucket = self.email_hash(&email);
         if !self.allow(hex(&wallet.0), "auth_start", AUTH_START_PER_WALLET, now)
             || !self.allow(email_bucket, "auth_email", AUTH_START_PER_EMAIL, now)
         {
@@ -676,6 +700,31 @@ mod tests {
         assert_eq!(dir2.bindings.get(&username), Some(&a.wallet_public()));
         assert_eq!(dir2.emails.get(&username), Some(&dir2.email_hash("alice@example.com")));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn email_is_normalized_through_auth() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let username = Handle::new("alice").unwrap();
+        let tok = login(&mut dir, &a);
+
+        // Register with a messy-cased/whitespace email.
+        let (pending, code) = dir.auth_start(&tok, &username, "  Alice@Example.COM  ", 0).unwrap();
+        dir.auth_confirm(&pending, &code, 0).unwrap();
+        // Stored recovery hash is the canonical form.
+        assert_eq!(dir.emails.get(&username), Some(&dir.email_hash("alice@example.com")));
+
+        // Recovery from a new device using the same address in different case works.
+        let b = Identity::generate(&mut OsPlatform).unwrap();
+        let tok_b = login(&mut dir, &b);
+        let (p2, c2) = dir.auth_start(&tok_b, &username, "ALICE@example.com", 1).unwrap();
+        dir.auth_confirm(&p2, &c2, 1).unwrap();
+        assert_eq!(dir.bindings.get(&username), Some(&b.wallet_public()), "recovery matched despite case");
+
+        // Stricter validation rejects malformed addresses.
+        assert_eq!(dir.auth_start(&tok, &username, "no-at-sign", 2), Err(ApiError::BadRequest));
+        assert_eq!(dir.auth_start(&tok, &username, "a@b", 2), Err(ApiError::BadRequest)); // no dotted domain
     }
 
     #[test]

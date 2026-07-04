@@ -297,7 +297,8 @@ fn route(
                 directory.lock().unwrap().auth_start(token, &username, &req.email, now_secs())?;
             // Send the code off the lock — a slow SMTP server must never stall
             // the directory. Dev mode logs it; production emails it.
-            let (email, thread_code) = (req.email.clone(), code.clone());
+            // Send to the *canonical* address, matching what auth_start stored/hashed.
+            let (email, thread_code) = (crate::normalize_email(&req.email), code.clone());
             std::thread::spawn(move || crate::mailer::send_verification(&email, &thread_code));
             // Dev mode (no SMTP) also returns the code so local flows need no inbox.
             let resp = if crate::mailer::is_dev() {
