@@ -62,6 +62,14 @@ async function main() {
         a.register(dir, q, 'alice', 'Alice');
         carol.register(dir, q, 'carol', 'Carol');
         const payload = a.link_payload(dir, q, 'alice', 'Alice');
+
+        // A link whose exp is in the past must be refused (checked before the
+        // seed is even read). Craft one with URL-safe base64.
+        const b64url = (s) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        const stale = b64url(JSON.stringify({ v: 1, m: 'x', d: dir, q, h: 'alice', n: 'Alice', exp: 1 }));
+        let expiredRejected = false;
+        try { new S().link_device(stale); } catch { expiredRejected = true; }
+
         b.link_device(payload); // B: same seed, fresh device, merges into the record
         carol.send(dir, 'carol', 'Carol', q, 'alice', 'hi alice on all devices');
         a.sync(q); b.sync(q);
@@ -74,6 +82,7 @@ async function main() {
 
         return {
           payloadLen: payload.length,
+          expiredRejected,
           walletA: a.wallet(), walletB: b.wallet(),
           threadA: JSON.parse(a.thread('carol')).map((m) => m.text),
           threadB: JSON.parse(b.thread('carol')).map((m) => m.text),
@@ -83,6 +92,7 @@ async function main() {
 
     check(!r.error, `no error (${r.error || 'ok'})`);
     check(r.payloadLen > 40, 'link payload generated');
+    check(r.expiredRejected, 'an expired device link is rejected');
     check(r.walletA === r.walletB, 'both devices share the account wallet (same seed)');
     check(r.threadA.includes('hi alice on all devices'), "device A received the message");
     check(r.threadB.includes('hi alice on all devices'), "device B received the message (multi-device fan-out)");

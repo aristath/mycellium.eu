@@ -74,7 +74,11 @@ the full browser architecture and `clients/web/README.md` for the app.
 
 - **The link payload is the account key.** `link_payload` embeds the seed phrase so a
   second device can adopt the account; anyone who obtains it gains full read/write.
-  The UI shows it only in the device-link flow, with a warning — never log it.
+  The UI shows it only in the device-link flow, with a warning — never log it. The
+  payload carries a 10-minute expiry (`LINK_TTL`) that `link_device` enforces, so a
+  stale link/QR can't add a device later — but note this bounds the *flow* only, not
+  the seed inside it. The complete fix (a pairing protocol that transfers an
+  ephemeral secret instead of the seed) is tracked as a follow-up.
 - **`register` merges the device list.** Renaming/re-registering looks up the current
   record and re-appends this device, so it never drops a sibling a prior `link_device`
   added (`publish_merged`).

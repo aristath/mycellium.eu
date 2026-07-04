@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+
+/// How long a device-link payload stays valid (10 minutes).
+const LINK_TTL: u64 = 600;
 use mycellium_core::group::{Group, GroupMessage};
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity};
@@ -240,7 +243,13 @@ impl Session {
     /// carries the account seed phrase — treat it as the account secret; it's
     /// shown to the user only to transfer to their own other device (QR / link).
     pub fn link_payload(&self, dir: &str, queue: &str, handle: &str, name: &str) -> String {
-        let json = serde_json::json!({ "v": 1, "m": self.identity.mnemonic(), "d": dir, "q": queue, "h": handle, "n": name });
+        // The payload expires so a stale link/QR (left in history, a screenshot,
+        // an old tab) can't be used to add a device later. NOTE: this bounds the
+        // link_device *flow* only — it does not protect the seed the payload
+        // carries; the complete fix is a pairing protocol that never ships the
+        // seed at all (see the crate README / issue #6).
+        let exp = BrowserPlatform.now_unix_secs() + LINK_TTL;
+        let json = serde_json::json!({ "v": 1, "m": self.identity.mnemonic(), "d": dir, "q": queue, "h": handle, "n": name, "exp": exp });
         B64URL.encode(json.to_string())
     }
 
@@ -261,6 +270,12 @@ impl Session {
     pub fn link_device(&mut self, payload_b64: &str) -> Result<String, JsValue> {
         let bytes = B64URL.decode(payload_b64.trim()).map_err(|_| JsValue::from_str("invalid link"))?;
         let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| JsValue::from_str("invalid link"))?;
+        // Reject an expired link before doing anything else (a missing `exp` is
+        // treated as expired — every payload this build produces carries one).
+        let exp = v["exp"].as_u64().unwrap_or(0);
+        if BrowserPlatform.now_unix_secs() > exp {
+            return Err(JsValue::from_str("this device link has expired — generate a new one"));
+        }
         let mnemonic = v["m"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
         let handle = v["h"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
         let (dir, queue, name) = (v["d"].as_str().unwrap_or(""), v["q"].as_str().unwrap_or(""), v["n"].as_str().unwrap_or(handle));
