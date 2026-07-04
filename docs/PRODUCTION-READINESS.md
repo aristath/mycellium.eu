@@ -137,8 +137,10 @@ deployment shape, and the operational essentials** around them.
   a chunked/lying request can't exhaust memory either. Mailboxes are already
   capped (`MAX_MAILBOX`). Login challenges now carry an issue time and are
   pruned/rejected after `CHALLENGE_TTL` (5 min), so unsigned challenges can't
-  accumulate unboundedly. *Left: session (token) expiry, per-IP connection
-  limits, request timeouts, graceful shutdown.*
+  accumulate unboundedly. Sessions are likewise bounded: tokens carry an issue
+  time and are pruned after `TOKEN_TTL` (24 h; the client silently re-logs-in), so
+  a stale token reads as `Unauthorized` and the map can't grow forever. *Left:
+  per-IP connection limits, request timeouts, graceful shutdown.*
 
 ---
 

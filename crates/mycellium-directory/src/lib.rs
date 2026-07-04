@@ -101,6 +101,9 @@ pub struct Directory {
     challenges: HashMap<String, (WalletPublicKey, u64)>,
     /// Active sessions: token → authenticated wallet.
     tokens: HashMap<String, WalletPublicKey>,
+    /// Session issue times: token → issued_at, pruned after `TOKEN_TTL` to bound
+    /// the sessions map (a stale token then reads as `Unauthorized`).
+    token_times: HashMap<String, u64>,
     /// Permanent handle bindings: handle → owning wallet (never reassigned).
     bindings: HashMap<Handle, WalletPublicKey>,
     /// The published records: handle → latest signed record.
@@ -143,6 +146,10 @@ pub const VERIFY_TTL: u64 = 900;
 
 /// How long an unsigned login challenge stays valid (5 minutes).
 pub const CHALLENGE_TTL: u64 = 300;
+
+/// How long a session token lives before it's pruned (24 hours). The client
+/// silently re-logs-in with its wallet key, so this is transparent.
+pub const TOKEN_TTL: u64 = 24 * 3600;
 
 /// The rate-limit window (seconds).
 pub const RATE_WINDOW: u64 = 60;
@@ -221,9 +228,19 @@ impl Directory {
 
     /// Step 1 of login: issue a challenge nonce for `wallet`.
     pub fn challenge(&mut self, wallet: WalletPublicKey, now: u64) -> String {
-        // Housekeeping: drop challenges that were never signed in time, so the
-        // map is bounded by (issue-rate × TTL) rather than growing forever.
+        // Housekeeping: drop challenges never signed in time, and expired
+        // sessions, so both maps stay bounded rather than growing forever.
         self.challenges.retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
+        let expired: Vec<String> = self
+            .token_times
+            .iter()
+            .filter(|(_, &issued)| now.saturating_sub(issued) > TOKEN_TTL)
+            .map(|(tok, _)| tok.clone())
+            .collect();
+        for tok in expired {
+            self.tokens.remove(&tok);
+            self.token_times.remove(&tok);
+        }
         let nonce = random_hex::<16>();
         self.challenges.insert(nonce.clone(), (wallet, now));
         nonce
@@ -249,6 +266,7 @@ impl Directory {
         self.challenges.remove(nonce);
         let token = random_hex::<24>();
         self.tokens.insert(token.clone(), *wallet);
+        self.token_times.insert(token.clone(), now);
         Ok(token)
     }
 
@@ -587,6 +605,25 @@ mod tests {
         assert_eq!(
             dir.verify(&a.wallet_public(), &nonce2, &sig2, 1000 + CHALLENGE_TTL + 1),
             Err(ApiError::BadChallenge)
+        );
+    }
+
+    #[test]
+    fn stale_sessions_are_pruned() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let handle = Handle::new("ari").unwrap();
+
+        let nonce = dir.challenge(a.wallet_public(), 0);
+        let sig = a.sign(&Directory::challenge_message(&nonce));
+        let token = dir.verify(&a.wallet_public(), &nonce, &sig, 0).unwrap();
+        assert!(dir.publish(&token, &handle, record_for(&a, "ari", 1), 0).is_ok());
+
+        // A housekeeping pass past TOKEN_TTL prunes the session.
+        dir.challenge(a.wallet_public(), TOKEN_TTL + 1);
+        assert_eq!(
+            dir.publish(&token, &handle, record_for(&a, "ari", 2), TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized)
         );
     }
 
