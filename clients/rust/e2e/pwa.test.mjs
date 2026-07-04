@@ -111,6 +111,7 @@ async function main() {
 
     console.error('• Alice starts a chat with bob and sends a message');
     await jsClick(alice, '#new');
+    await jsClick(alice, '#dm');        // FAB menu → "Message someone"
     await setVal(alice, '#peer', 'bob');
     await jsClick(alice, '#ok');
     await setVal(alice, '#msg', 'hello bob — sent from the browser PWA 🍄');
@@ -151,6 +152,21 @@ async function main() {
       return false;
     })();
     check(gotImg, "Bob's PWA received and rendered the image");
+
+    console.error('• Alice creates a group and messages it; Bob joins + receives');
+    await jsClick(alice, '#back');      // back to the chat list
+    await jsClick(alice, '#new');       // FAB menu
+    await jsClick(alice, '#grp');       // New group
+    await setVal(alice, '#gname', 'Team Mycelium');
+    await setVal(alice, '#gmembers', 'bob');
+    await jsClick(alice, '#gok');       // create → opens the group
+    await setVal(alice, '#msg', 'welcome to the group');
+    await jsClick(alice, '#send');
+    check(await hasText(alice, '.bubble', 'welcome to the group', 8000), "Alice's group message shows");
+    await jsClick(bob, '#back');        // Bob to his list
+    check(await hasText(bob, '.item .title', 'Team Mycelium', 25000), "the group appears in Bob's list (joined from the invite)");
+    await jsClick(bob, '.item[data-group]');
+    check(await hasText(bob, '.bubble', 'welcome to the group', 10000), 'Bob opens the group and sees the decrypted message');
 
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');
     const pushKey = await bob.evaluate((q) => { try { return window.mycellium.session.push_key(q); } catch (e) { return 'ERR:' + e; } }, qUrl);

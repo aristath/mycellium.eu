@@ -38,6 +38,7 @@
     .bubble.me { background:var(--me); align-self:flex-end; }
     .attach { max-width:220px; max-height:220px; border-radius:8px; display:block; }
     .bubble .time { font-size:.62rem; opacity:.55; margin-left:8px; }
+    .bubble .sender { font-size:.7rem; color:var(--accent); margin-bottom:2px; }
     .when { float:right; font-size:.72rem; color:var(--dim); font-weight:400; }
     .bubble { cursor:pointer; }
     .replybar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#10161a; border-top:1px solid var(--line); font-size:.85rem; color:var(--dim); }
@@ -71,7 +72,7 @@
     if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
 
     let session, me = null, open = null, poll = null;
-    let seen = {}, firstScan = true, replyTo = null;
+    let seen = {}, firstScan = true, replyTo = null, og = null;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
@@ -149,6 +150,7 @@
     function render() {
       if (!cfg.dir || !cfg.queue) return renderSetup();
       if (!me) return renderRegister();
+      if (og) return renderGroupThread(og);
       return open ? renderThread(open) : renderList();
     }
 
@@ -191,20 +193,85 @@
     }
 
     function renderList() {
-      let threads = [];
+      let threads = [], groups = [];
       try { threads = JSON.parse(session.peers()); } catch {}
-      const items = threads.length ? threads.map((t) => `
+      try { groups = JSON.parse(session.groups()); } catch {}
+      const groupItems = groups.map((g) => `
+        <button class="item" data-group="${esc(g.id)}">
+          <div class="avatar" style="background:#22322a;color:#7fe0a8">#</div>
+          <div class="body"><div class="title">${esc(g.name)}</div>
+          <div class="snippet">${g.members.length} member${g.members.length === 1 ? '' : 's'}</div></div>
+        </button>`).join('');
+      const peerItems = threads.map((t) => `
         <button class="item" data-peer="${esc(t.peer)}">
           <div class="avatar">${initials(t.name || t.peer)}</div>
           <div class="body"><div class="title">${esc(t.name || t.peer)}<span class="when">${relTime(t.timestamp)}</span></div>
           <div class="snippet">${t.mine ? 'You: ' : ''}${esc(t.last) || 'No messages yet'}</div></div>
-        </button>`).join('') : `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
+        </button>`).join('');
+      const items = (groupItems + peerItems) || `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
       app.innerHTML = `
         <header><div class="who">${esc(me.name)} <small>@${esc(me.handle)}</small></div><div class="grow"></div></header>
         <main>${items}</main>
         <button class="fab" id="new">＋</button>`;
-      app.querySelectorAll('.item').forEach((b) => b.onclick = () => { open = b.dataset.peer; render(); });
-      byId('new').onclick = () => newChat();
+      app.querySelectorAll('.item[data-peer]').forEach((b) => b.onclick = () => { open = b.dataset.peer; render(); });
+      app.querySelectorAll('.item[data-group]').forEach((b) => b.onclick = () => { og = b.dataset.group; render(); });
+      byId('new').onclick = () => fabMenu();
+    }
+
+    function fabMenu() {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal"><div class="actions">
+        <button id="dm">✉ Message someone</button>
+        <button id="grp">👥 New group</button>
+        <button class="ghost" id="cancel">Cancel</button>
+      </div></div></div>`);
+      const close = () => byId('bg').remove();
+      byId('cancel').onclick = close;
+      byId('dm').onclick = () => { close(); newChat(); };
+      byId('grp').onclick = () => { close(); newGroup(); };
+    }
+
+    function newGroup() {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal">
+        <h1 style="font-size:1.1rem;margin:0 0 10px">New group</h1>
+        <label>Group name</label><input id="gname" placeholder="Team">
+        <label>Members (usernames, comma-separated)</label><input id="gmembers" placeholder="bob, carol">
+        <div class="row"><button id="gok">Create</button><button class="ghost" id="gcancel">Cancel</button></div>
+      </div></div></div>`);
+      const close = () => byId('bg').remove();
+      byId('gcancel').onclick = close;
+      byId('gok').onclick = async () => {
+        const name = byId('gname').value.trim();
+        const members = byId('gmembers').value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+        if (!name || !members.length) return;
+        try {
+          const gid = session.group_create(cfg.dir, me.handle, me.name, cfg.queue, name, JSON.stringify(members));
+          close(); await persist(); og = gid; render();
+        } catch (e) { alert('Create failed: ' + e); }
+      };
+    }
+
+    function renderGroupThread(gid) {
+      let group = null; try { group = JSON.parse(session.groups()).find((g) => g.id === gid); } catch {}
+      let msgs = []; try { msgs = JSON.parse(session.group_thread(gid)); } catch {}
+      const bubbles = msgs.map((m) => {
+        const mine = m.sender === me.handle;
+        const who = mine ? '' : `<div class="sender">${esc(m.sender)}</div>`;
+        return `<div class="bubble ${mine ? 'me' : ''}">${who}${esc(m.text)}<span class="time">${timeShort(m.timestamp)}</span></div>`;
+      }).join('') || `<div class="empty">No messages yet</div>`;
+      app.innerHTML = `
+        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b># ${esc(group ? group.name : gid)}</b></div>
+        <main><div class="msgs" id="msgs">${bubbles}</div></main>
+        <div class="composer"><input id="msg" placeholder="Message the group" autocomplete="off"><button id="send">Send</button></div>`;
+      byId('back').onclick = () => { og = null; render(); };
+      const send = async () => {
+        const text = byId('msg').value.trim(); if (!text) return;
+        byId('msg').value = '';
+        try { session.group_send(cfg.dir, me.handle, me.name, cfg.queue, gid, text); await persist(); renderGroupThread(gid); }
+        catch (e) { alert('Send failed: ' + e); }
+      };
+      byId('send').onclick = send;
+      byId('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+      const m = byId('msgs'); if (m) m.scrollTop = m.scrollHeight;
     }
 
     function renderThread(peer) {
