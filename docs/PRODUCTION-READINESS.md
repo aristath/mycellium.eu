@@ -135,8 +135,10 @@ deployment shape, and the operational essentials** around them.
   servers reject oversized request bodies with `413` before buffering them
   (directory 256 KiB, queue 1 MiB) — via `Content-Length` *and* a capped read, so
   a chunked/lying request can't exhaust memory either. Mailboxes are already
-  capped (`MAX_MAILBOX`). *Left: per-IP connection limits, request timeouts,
-  graceful shutdown.*
+  capped (`MAX_MAILBOX`). Login challenges now carry an issue time and are
+  pruned/rejected after `CHALLENGE_TTL` (5 min), so unsigned challenges can't
+  accumulate unboundedly. *Left: session (token) expiry, per-IP connection
+  limits, request timeouts, graceful shutdown.*
 
 ---
 

@@ -96,8 +96,9 @@ impl ApiError {
 /// database or, ultimately, an on-chain registry — the logic is unchanged.
 #[derive(Default)]
 pub struct Directory {
-    /// Outstanding login challenges: nonce → the wallet it was issued to.
-    challenges: HashMap<String, WalletPublicKey>,
+    /// Outstanding login challenges: nonce → `(wallet, issued_at)`. Pruned by
+    /// `CHALLENGE_TTL` so unsigned/abandoned challenges can't accumulate.
+    challenges: HashMap<String, (WalletPublicKey, u64)>,
     /// Active sessions: token → authenticated wallet.
     tokens: HashMap<String, WalletPublicKey>,
     /// Permanent handle bindings: handle → owning wallet (never reassigned).
@@ -139,6 +140,9 @@ pub const PRESENCE_TTL: u64 = 60;
 
 /// How long an email verification code / link stays valid (15 minutes).
 pub const VERIFY_TTL: u64 = 900;
+
+/// How long an unsigned login challenge stays valid (5 minutes).
+pub const CHALLENGE_TTL: u64 = 300;
 
 /// The rate-limit window (seconds).
 pub const RATE_WINDOW: u64 = 60;
@@ -216,9 +220,12 @@ impl Directory {
     }
 
     /// Step 1 of login: issue a challenge nonce for `wallet`.
-    pub fn challenge(&mut self, wallet: WalletPublicKey) -> String {
+    pub fn challenge(&mut self, wallet: WalletPublicKey, now: u64) -> String {
+        // Housekeeping: drop challenges that were never signed in time, so the
+        // map is bounded by (issue-rate × TTL) rather than growing forever.
+        self.challenges.retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
         let nonce = random_hex::<16>();
-        self.challenges.insert(nonce.clone(), wallet);
+        self.challenges.insert(nonce.clone(), (wallet, now));
         nonce
     }
 
@@ -228,9 +235,10 @@ impl Directory {
         wallet: &WalletPublicKey,
         nonce: &str,
         signature: &Signature,
+        now: u64,
     ) -> Result<String, ApiError> {
         match self.challenges.get(nonce) {
-            Some(w) if w == wallet => {}
+            Some((w, issued)) if w == wallet && now.saturating_sub(*issued) <= CHALLENGE_TTL => {}
             _ => return Err(ApiError::BadChallenge),
         }
         let message = Self::challenge_message(nonce);
@@ -457,9 +465,9 @@ mod tests {
 
     /// Drive a full login for `id`, returning the session token.
     fn login(dir: &mut Directory, id: &Identity) -> String {
-        let nonce = dir.challenge(id.wallet_public());
+        let nonce = dir.challenge(id.wallet_public(), 0);
         let sig = id.sign(&Directory::challenge_message(&nonce));
-        dir.verify(&id.wallet_public(), &nonce, &sig).unwrap()
+        dir.verify(&id.wallet_public(), &nonce, &sig, 0).unwrap()
     }
 
     #[test]
@@ -564,14 +572,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_login_challenge_is_rejected() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+
+        // Signed within the TTL → accepted.
+        let nonce = dir.challenge(a.wallet_public(), 0);
+        let sig = a.sign(&Directory::challenge_message(&nonce));
+        assert!(dir.verify(&a.wallet_public(), &nonce, &sig, CHALLENGE_TTL).is_ok());
+
+        // A fresh challenge signed after the TTL → rejected as stale.
+        let nonce2 = dir.challenge(a.wallet_public(), 1000);
+        let sig2 = a.sign(&Directory::challenge_message(&nonce2));
+        assert_eq!(
+            dir.verify(&a.wallet_public(), &nonce2, &sig2, 1000 + CHALLENGE_TTL + 1),
+            Err(ApiError::BadChallenge)
+        );
+    }
+
+    #[test]
     fn login_rejects_bad_signature() {
         let mut dir = Directory::new();
         let ari = Identity::generate(&mut OsPlatform).unwrap();
-        let nonce = dir.challenge(ari.wallet_public());
+        let nonce = dir.challenge(ari.wallet_public(), 0);
         // Sign the wrong message.
         let bad = ari.sign(b"not the challenge");
         assert_eq!(
-            dir.verify(&ari.wallet_public(), &nonce, &bad),
+            dir.verify(&ari.wallet_public(), &nonce, &bad, 0),
             Err(ApiError::BadSignature)
         );
     }

@@ -239,7 +239,7 @@ fn route(
 
         (Method::Post, ["login", "challenge"]) => {
             let req: ChallengeReq = parse(body)?;
-            let nonce = directory.lock().unwrap().challenge(req.wallet);
+            let nonce = directory.lock().unwrap().challenge(req.wallet, now_secs());
             Ok((200, to_json(&ChallengeResp { nonce })))
         }
 
@@ -248,7 +248,7 @@ fn route(
             let token = directory
                 .lock()
                 .unwrap()
-                .verify(&req.wallet, &req.nonce, &req.signature)?;
+                .verify(&req.wallet, &req.nonce, &req.signature, now_secs())?;
             Ok((200, to_json(&VerifyResp { token })))
         }
 
