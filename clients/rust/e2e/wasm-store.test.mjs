@@ -53,6 +53,17 @@ async function main() {
     check(before.name === 'Mary' && before.greeting === 'hello from wasm', 'values readable in the same session');
     check(before.missing === null, 'absent key returns undefined/null');
 
+    console.error('• the persisted snapshot is encrypted at rest (not raw identity)');
+    const snap = await page.evaluate(async () => {
+      const db = await new Promise((res, rej) => { const r = indexedDB.open('mycellium', 1); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      const get = (k) => new Promise((res) => { const g = db.transaction('state', 'readonly').objectStore('state').get(k); g.onsuccess = () => res(g.result ?? null); g.onerror = () => res(null); });
+      const s = await get('snapshot');
+      const key = await get('wrapkey');
+      return { hasIv: !!(s && s.iv), hasCt: !!(s && s.ct), isRawBuffer: s instanceof ArrayBuffer || s instanceof Uint8Array, keyExtractable: key ? key.extractable : null };
+    });
+    check(snap.hasIv && snap.hasCt && !snap.isRawBuffer, 'snapshot is AES-GCM ciphertext (iv+ct), not plaintext identity bytes');
+    check(snap.keyExtractable === false, 'the wrapping key is stored non-extractable');
+
     console.error('• reload the page — a fresh WASM instance restores from IndexedDB');
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });

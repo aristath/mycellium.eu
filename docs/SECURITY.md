@@ -79,6 +79,15 @@ HTTP that should run over TLS (native `MYCELLIUM_TLS_*` or a terminating proxy �
 is an encrypted file KV keyed from the identity; the seed at rest is Argon2id-sealed
 under a passphrase. Servers persist only self-certifying records and opaque blobs.
 
+In the **browser**, the IndexedDB session snapshot (which includes the seed) is
+encrypted with an AES-GCM key generated once and stored **non-extractable** — the
+browser holds the raw key bytes, never JavaScript, so the snapshot is ciphertext on
+disk and a script can't read the seed straight out of it. This is transparent (no
+passphrase prompt). *Residual limitation:* a determined attacker with the entire
+browser profile could, depending on browser internals, still recover a
+non-extractable key — so this raises the bar but is not a substitute for OS-level
+full-disk encryption on an untrusted device.
+
 ## Reporting
 
 Found a vulnerability? Please report privately rather than opening a public issue,

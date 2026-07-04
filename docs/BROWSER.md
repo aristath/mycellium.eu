@@ -70,7 +70,9 @@ store `"state"`, key `"snapshot"`); if a snapshot exists it does
 After any *mutating* RPC it re-snapshots via `session.export()`; read-only ops
 (`peers`, `thread`, `wallet`, …) skip the write. Identity and app config
 (`myc:me`, dir/queue URLs) live inside the store, so a reload restores the whole
-account. "Reset this device" in Settings deletes the IndexedDB database +
+account. Because the snapshot contains the account seed, it is **encrypted at rest**
+with an AES-GCM key kept non-extractable in IndexedDB (transparent — no passphrase
+prompt); see [`SECURITY.md`](SECURITY.md) for the residual limitation. "Reset this device" in Settings deletes the IndexedDB database +
 `localStorage` and reloads.
 
 ## Multi-device: QR and link

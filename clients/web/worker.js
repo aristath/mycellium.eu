@@ -11,13 +11,52 @@ const idb = () => new Promise((res, rej) => {
   r.onsuccess = () => res(r.result);
   r.onerror = () => rej(r.error);
 });
-const load = async () => {
+const idbGet = async (key) => {
   const db = await idb();
-  return new Promise((res) => { const tx = db.transaction('state', 'readonly'); const g = tx.objectStore('state').get('snapshot'); g.onsuccess = () => res(g.result || null); g.onerror = () => res(null); });
+  return new Promise((res) => { const g = db.transaction('state', 'readonly').objectStore('state').get(key); g.onsuccess = () => res(g.result ?? null); g.onerror = () => res(null); });
 };
-const save = async (bytes) => {
+const idbPut = async (key, val) => {
   const db = await idb();
-  return new Promise((res) => { const tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(bytes, 'snapshot'); tx.oncomplete = res; tx.onerror = res; });
+  return new Promise((res) => { const tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(val, key); tx.oncomplete = res; tx.onerror = res; });
+};
+
+// The snapshot holds the account seed, so it is encrypted at rest with an
+// AES-GCM key that is generated once and stored **non-extractable** in
+// IndexedDB — the browser keeps the raw key bytes, never JS, so a script can't
+// read the seed straight out of the snapshot and it isn't plaintext on disk.
+// (Residual limit: a determined attacker with the whole browser profile — see
+// docs/SECURITY.md — still needs OS-level disk encryption underneath.)
+let keyPromise = null;
+const wrapKey = () => {
+  if (!keyPromise) keyPromise = (async () => {
+    const existing = await idbGet('wrapkey');
+    if (existing) return existing;
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    await idbPut('wrapkey', key);
+    return key;
+  })();
+  return keyPromise;
+};
+
+const load = async () => {
+  const snap = await idbGet('snapshot');
+  if (!snap) return null;
+  // Legacy plaintext snapshot (pre-encryption): use it, then the next save
+  // rewrites it encrypted.
+  if (snap instanceof ArrayBuffer || snap instanceof Uint8Array) return new Uint8Array(snap);
+  if (snap && snap.iv && snap.ct) {
+    try {
+      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: snap.iv }, await wrapKey(), snap.ct);
+      return new Uint8Array(plain);
+    } catch { return null; }
+  }
+  return null;
+};
+
+const save = async (bytes) => {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await wrapKey(), bytes);
+  await idbPut('snapshot', { iv, ct });
 };
 
 // Ops that only read never need a persist afterwards.
