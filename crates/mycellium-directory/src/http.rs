@@ -181,8 +181,18 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
         return;
     }
 
-    // Reject oversized bodies before buffering them (memory-DoS defense).
-    if request.body_length().map(|n| n > MAX_BODY).unwrap_or(false) {
+    // Reject oversized bodies before buffering them (memory-DoS defense). The
+    // Content-Length check is a fast path; we then read one byte *past* the cap so
+    // a missing or lying Content-Length can't slip an over-cap body through by
+    // truncation — if that extra byte materializes, it's 413.
+    let over_cap = request.body_length().map(|n| n > MAX_BODY).unwrap_or(false);
+    let token = bearer_token(&request);
+    let mut buf = Vec::new();
+    {
+        let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY as u64 + 1);
+        let _ = limited.read_to_end(&mut buf);
+    }
+    if over_cap || buf.len() > MAX_BODY {
         metrics.record(413);
         mycellium_observe::access_log("directory", method.as_str(), &path, 413, start.elapsed().as_millis());
         let mut resp = Response::from_string(error_json("payload too large")).with_status_code(413).with_header(json_header());
@@ -192,12 +202,7 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
         let _ = request.respond(resp);
         return;
     }
-
-    let token = bearer_token(&request);
-    let mut body = String::new();
-    // Cap the read too, in case Content-Length is absent or lies.
-    let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY as u64);
-    let _ = limited.read_to_string(&mut body);
+    let body = String::from_utf8_lossy(&buf).into_owned();
 
     let (code, json) = match route(directory, &method, &path, token.as_deref(), &body) {
         Ok((code, json)) => (code, json),

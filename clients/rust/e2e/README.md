@@ -19,6 +19,7 @@ origin, and runs the WASM engine (or the full PWA UI) against them. Build first:
 | `pwa.test.mjs` | The full **two-user UI flow**: signup, send/receive, reply, react, delete, image attachment, groups (create/add), settings rename, multi-device QR/link, and the offline indicator. |
 | `browser.test.mjs` | A companion full-PWA UI run in system Chrome. |
 | `load.test.mjs` | T2.4 load check — hammers the directory concurrently, confirms the worker pool drops nothing, reports throughput + latency percentiles. |
+| `http-limits.test.mjs` | Oversized **chunked** bodies (no Content-Length) are rejected with 413 by the directory + queue, not truncated. |
 
 ## Run
 
