@@ -28,13 +28,25 @@ crates/
   ── adapters (implement the core ports / talk to the services) ──
   mycellium-transport/          Transport ports: framed TCP + libp2p (feature-gated)
   mycellium-storage/            Storage port: encrypted file KV + at-rest identity
-  mycellium-directory-client/   HTTP client of the directory
-  mycellium-queue-client/       HTTP client of the queue
-  ── engine + shell ──
+  mycellium-http/               native (ureq) impl of core's HttpTransport
+  mycellium-directory-client/   HTTP client of the directory (transport-injectable)
+  mycellium-queue-client/       HTTP client of the queue (transport-injectable)
+  mycellium-observe/            server metrics (/metrics) + structured access logs
+  ── engine + shells ──
   mycellium-engine/             the headless peer: conversations, groups,
                                 multi-device delivery, outbox retry, contacts
   mycellium-cli/                a shell: clap arg-parsing + terminal UI
+  mycellium-wasm/               the engine compiled to WebAssembly (browser)
+clients/
+  rust/                         local Rust server + PWA (a native-backed client)
+  web/                          the browser-native PWA — the engine runs as
+                                WASM in the page, no local binary
 ```
+
+Two ways to use it: the **CLI** (below) and a **browser PWA** ([`clients/web`](clients/web)) —
+open a link, pick a username, and message someone with the whole client (identity,
+X3DH + Double Ratchet, delivery, history) running as WebAssembly in the page. See
+[the browser app](#browser-app-pwa).
 
 Every crate links its own README: [core](crates/mycellium-core/README.md) ·
 [directory](crates/mycellium-directory/README.md) ·
@@ -71,9 +83,38 @@ the wire decoders with garbage/truncated/bit-flipped bytes (never panics, never
 accepts a tampered record) and checks the ratchet rejects replays and bounds
 skips. A `model` suite checks correctness properties over random inputs — the
 ratchet decrypts under many random two-way interleavings, and Shamir sharing
-round-trips for random thresholds/subsets. ~105 tests in all. (The e2e suite
-throttles itself to a few concurrent subprocess-heavy tests to stay reliable
-under parallel runs.)
+round-trips for random thresholds/subsets. ~130 workspace tests in all, plus
+seven real-browser suites (WASM crypto, storage, networked messaging, and the
+full PWA) under [`clients/rust/e2e`](clients/rust/e2e). (The e2e suite throttles
+itself to a few concurrent subprocess-heavy tests to stay reliable under parallel
+runs.)
+
+## Browser app (PWA)
+
+The consumer interface: a static Progressive Web App that runs the engine as
+WebAssembly — no local binary, no `localhost` server. It talks directly to a
+directory and queue; those servers only ever move opaque sealed blobs.
+
+```sh
+# Build the WASM engine + JS bindings (once):
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.100
+./clients/web/build.sh                 # → clients/web/pkg
+
+# Start a directory + queue (see below), serve clients/web over HTTPS, open it.
+# First load: set your directory/queue URLs, pick a username, and chat.
+```
+
+Everything runs in the page: passwordless identity (persisted in IndexedDB, so it
+survives reloads), record publishing, X3DH-sealed send, queue deposit/collect,
+decryption, and history — plus desktop notifications, reply / react / delete, and
+Web Push wiring. Six headless-Chrome suites in
+[`clients/rust/e2e`](clients/rust/e2e) (`wasm*.test.mjs`, `pwa.test.mjs`) cover it
+end to end, up to a two-user message delivered *browser → servers → browser*.
+
+> HTTPS is required off `localhost` (service workers + Web Push). Deploy behind
+> Caddy/nginx — see [`docs/DEPLOY.md`](docs/DEPLOY.md). Production readiness is
+> tracked in [`docs/PRODUCTION-READINESS.md`](docs/PRODUCTION-READINESS.md).
 
 ## Run the end-to-end demo
 
