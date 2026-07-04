@@ -23,7 +23,9 @@ use crate::State;
 
 /// Route an `/api/...` request. Returns `(http_status, json_body)`.
 pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -> (u16, String) {
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Percent-decode each segment — a browser sends emails as e.g. `a%40b.com`.
+    let owned: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(percent_decode).collect();
+    let segs: Vec<&str> = owned.iter().map(String::as_str).collect();
     let req = parse(body);
     let directory = state.lock().unwrap().directory.clone();
 
@@ -391,6 +393,25 @@ fn socket_addr(url: &str) -> Option<std::net::SocketAddr> {
         .split('/')
         .next()?;
     hostport.to_socket_addrs().ok()?.next()
+}
+
+/// Minimal percent-decoding for URL path segments (enough for emails: `%40` etc.).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A short, readable stand-in for an unknown id (no contact name yet).
