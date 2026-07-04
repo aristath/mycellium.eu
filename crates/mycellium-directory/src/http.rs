@@ -192,10 +192,12 @@ fn route(
             let username = Handle::new(&req.username).map_err(|_| ApiError::BadRequest)?;
             let (pending, code) =
                 directory.lock().unwrap().auth_start(token, &username, &req.email, now_secs())?;
-            // Dev mode (no SMTP configured) surfaces the code so the flow works
-            // locally; production emails it and returns only the pending token.
-            let dev = std::env::var("MYCELLIUM_DEV_EMAIL").map(|v| v != "0").unwrap_or(true);
-            let resp = if dev {
+            // Send the code off the lock — a slow SMTP server must never stall
+            // the directory. Dev mode logs it; production emails it.
+            let (email, thread_code) = (req.email.clone(), code.clone());
+            std::thread::spawn(move || crate::mailer::send_verification(&email, &thread_code));
+            // Dev mode (no SMTP) also returns the code so local flows need no inbox.
+            let resp = if crate::mailer::is_dev() {
                 serde_json::json!({ "pending": pending, "dev_code": code })
             } else {
                 serde_json::json!({ "pending": pending })

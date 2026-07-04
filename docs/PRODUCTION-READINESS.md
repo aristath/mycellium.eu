@@ -29,10 +29,13 @@ deployment shape, and the operational essentials** around them.
   - *Approach:* terminate TLS at a reverse proxy (nginx/caddy) in front of the
     directory/queue, or add rustls to the servers. Document the deploy.
 
-- [ ] **T0.4 — Real email sending.** Signup verification codes are logged, not
-  emailed (`deliver_email` is a dev stub). Nobody can actually register.
-  - *Approach:* pluggable sender; SMTP implementation (self-hosted, **never** a
-    US SMS/email gateway). Gate `dev_code` off when SMTP is configured.
+- [x] **T0.4 — Real email sending.** *(done)* A `mailer` module sends the
+  verification code by **SMTP** (via `lettre`, rustls — no OpenSSL) when
+  configured, else a dev fallback that logs the code and returns it in the API.
+  Config: `MYCELLIUM_SMTP_HOST` (set = production), `_PORT` (587/STARTTLS, or 465
+  implicit TLS), `_FROM`, `_USER`, `_PASS`. Sent **off the request lock** in a
+  thread, best-effort (a flaky SMTP never fails signup); `dev_code` is returned
+  only in dev mode. *Next: bounce/deliverability handling if needed.*
 
 - [ ] **T0.5 — Account recovery.** The seed phrase was dropped; email is the
   recovery *hook* but the recover-on-a-new-device flow doesn't exist. Device

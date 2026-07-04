@@ -20,6 +20,7 @@ use mycellium_core::record::SignedRecord;
 use sha2::{Digest, Sha256};
 
 mod http;
+mod mailer;
 mod persist;
 pub use http::serve;
 
@@ -234,7 +235,7 @@ impl Directory {
         }
         let pending_token = random_hex::<24>();
         let code = format!("{:06}", u32::from_le_bytes(random_bytes::<4>()) % 1_000_000);
-        deliver_email(email, username.as_str(), &code, &pending_token);
+        // The email is sent by the caller, off the lock — see the HTTP route.
         self.pending.insert(
             pending_token.clone(),
             Pending {
@@ -364,13 +365,6 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
-/// Deliver a verification email. Dev default: log it to the console. Production
-/// swaps this body for an SMTP send (self-hosted; never a US SMS/email gateway).
-fn deliver_email(email: &str, username: &str, code: &str, pending_token: &str) {
-    eprintln!(
-        "[mycellium-directory] verify '{username}' for {email}: code {code}  (pending {pending_token})"
-    );
-}
 
 #[cfg(test)]
 mod tests {
