@@ -12,7 +12,7 @@ async function json(res) {
   return data;
 }
 
-const state = { status: null, tab: 'threads', open: null, online: false };
+const state = { status: null, tab: 'threads', open: null, online: false, seen: {}, firstScan: true, openName: null };
 const root = document.getElementById('app');
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])));
 const initials = (s) => (s || '?').slice(0, 2).toUpperCase();
@@ -22,7 +22,29 @@ async function boot() {
   if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(() => {}); }
   await refreshStatus();
   render();
-  setInterval(tick, 5000);
+  setInterval(tick, 2000);
+}
+
+// Fire a browser notification for a new incoming message.
+function notify(name, body, peer) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const n = new Notification(name || 'New message', { body: body || '', icon: '/icon.svg', tag: peer });
+  n.onclick = () => { window.focus(); state.tab = 'threads'; state.open = peer; state.openName = name; render(); n.close(); };
+}
+
+// Detect newly-arrived incoming messages across all threads and notify. Seeds
+// silently on the first scan so existing history doesn't spam on startup.
+async function notifyNew() {
+  let threads = [];
+  try { threads = await api.get('threads'); } catch { return; }
+  for (const t of threads) {
+    if (t.timestamp > (state.seen[t.peer] || 0)) {
+      const viewing = !document.hidden && state.tab === 'threads' && state.open === t.peer;
+      if (!state.firstScan && !t.mine && !viewing) notify(t.name, t.last, t.peer);
+      state.seen[t.peer] = t.timestamp;
+    }
+  }
+  state.firstScan = false;
 }
 
 async function refreshStatus() {
@@ -35,6 +57,7 @@ async function tick() {
   if (!state.status || !state.status.handle) return;
   try { await api.post('sync'); state.online = true; } catch { state.online = false; }
   renderBar();
+  await notifyNew();
   if (state.tab === 'threads' && state.open) return openThread(state.open, true);
   if (state.tab === 'groups' && state.open) return openGroup(state.open, true);
   renderContent();
@@ -145,6 +168,9 @@ function renderApp() {
     b.onclick = () => { state.tab = b.dataset.tab; state.open = null; renderContent(); renderBar(); };
   });
   byId('profile').onclick = profileModal;
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => {});
+  }
   renderBar();
   renderContent();
   tick();

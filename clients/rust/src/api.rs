@@ -221,6 +221,7 @@ fn threads_list() -> anyhow::Result<Value> {
             "name": display,
             "last": last.map(|m| m.text.clone()).unwrap_or_default(),
             "timestamp": last.map(|m| m.timestamp).unwrap_or(0),
+            "mine": last.map(|m| m.from_me).unwrap_or(false),
             "count": msgs.len(),
         }));
     }
