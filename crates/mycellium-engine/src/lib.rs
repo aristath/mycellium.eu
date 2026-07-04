@@ -10,6 +10,12 @@
 //! modules are the domain state it operates on, generic over
 //! `mycellium_core::storage`.
 
+// `app` (native orchestration) and `platform` (OS clock + RNG) pull in the
+// filesystem, env, native HTTP clients, and the P2P transport — none of which
+// exist on wasm32. They're gated behind the default `native` feature; the other
+// modules are pure domain state, generic over `mycellium_core::storage`, and
+// compile to wasm so the browser build can drive them.
+#[cfg(feature = "native")]
 pub mod app;
 pub mod blocklist;
 pub mod contacts;
@@ -19,4 +25,5 @@ pub mod groups;
 pub mod history;
 pub mod names;
 pub mod outbox;
+#[cfg(feature = "native")]
 pub mod platform;

@@ -64,6 +64,22 @@ async function main() {
     check(after.name === 'Mary', 'value survived the reload (loaded from IndexedDB)');
     check(after.greeting === 'hello from wasm', 'second value survived too');
 
+    console.error("• the engine's own history module runs against the browser store");
+    const thread = await page.evaluate(async () => {
+      const s = window.mycellium.session;
+      s.add_message('bob', 'hi bob', true);
+      s.add_message('bob', 'hey!', false);
+      await window.mycellium.persist();
+      return JSON.parse(s.thread('bob'));
+    });
+    check(thread.length === 2, 'two messages stored via engine::history');
+    check(thread[0].text === 'hi bob' && thread[0].from_me === true, 'sent message fields correct');
+    check(thread[1].from_me === false, 'received message flagged');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => window.mycellium?.session !== undefined, { timeout: 15000 });
+    const threadAfter = await page.evaluate(() => JSON.parse(window.mycellium.session.thread('bob')));
+    check(threadAfter.length === 2, 'conversation survived reload (engine history + IndexedDB)');
+
     console.error('• delete persists as well');
     const afterDel = await page.evaluate(async () => {
       window.mycellium.session.del('greeting');

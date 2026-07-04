@@ -100,6 +100,31 @@ impl Session {
         let _ = self.store.delete(key.as_bytes());
     }
 
+    /// Append a message to a peer's conversation, using the **engine's own**
+    /// generic history module against the browser store. Returns the message id.
+    pub fn add_message(&mut self, peer: &str, text: &str, from_me: bool) -> Result<String, JsValue> {
+        let mut id_bytes = [0u8; 8];
+        getrandom::getrandom(&mut id_bytes).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        let id = hex(&id_bytes);
+        let message = mycellium_engine::history::StoredMessage {
+            id: id.clone(),
+            from_me,
+            text: text.to_string(),
+            timestamp: BrowserPlatform.now_unix_secs(),
+            expires_at: None,
+        };
+        mycellium_engine::history::append(&mut self.store, peer, message)
+            .map_err(|_| JsValue::from_str("store error"))?;
+        Ok(id)
+    }
+
+    /// Load a peer's conversation as JSON (via the engine's history module).
+    pub fn thread(&self, peer: &str) -> Result<String, JsValue> {
+        let messages =
+            mycellium_engine::history::load(&self.store, peer).map_err(|_| JsValue::from_str("store error"))?;
+        serde_json::to_string(&messages).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Serialize the whole store for the host to persist (→ IndexedDB).
     pub fn export(&self) -> Vec<u8> {
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self.store.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

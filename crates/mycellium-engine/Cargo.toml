@@ -7,16 +7,29 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native"]
+# Native orchestration: filesystem storage, OS clock/RNG, the P2P transport, and
+# the blocking HTTP clients. Off for wasm32 (the browser build drives the generic
+# modules with its own storage/clock/transport).
+native = [
+    "dep:mycellium-transport",
+    "dep:mycellium-storage",
+    "dep:mycellium-directory-client",
+    "dep:mycellium-queue-client",
+    "dep:getrandom",
+]
+
 [dependencies]
 mycellium-core = { path = "../mycellium-core" }
-mycellium-transport = { path = "../mycellium-transport" }
-mycellium-storage = { path = "../mycellium-storage" }
-mycellium-directory-client = { path = "../mycellium-directory-client" }
-mycellium-queue-client = { path = "../mycellium-queue-client" }
+mycellium-transport = { path = "../mycellium-transport", optional = true }
+mycellium-storage = { path = "../mycellium-storage", optional = true }
+mycellium-directory-client = { path = "../mycellium-directory-client", optional = true }
+mycellium-queue-client = { path = "../mycellium-queue-client", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = "0.2"
+getrandom = { version = "0.2", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
