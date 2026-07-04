@@ -394,6 +394,9 @@ fn apply_to_history(store: &mut MemStore, peer: &str, app: &AppMessage, from_me:
         Body::Delete { to } => {
             let _ = history::delete(store, peer, to);
         }
+        Body::Receipt { .. } => {
+            // A delivery/read acknowledgment — not a visible message.
+        }
         _ => {
             // Stash attachment bytes as a data: URL, keyed by message id, so the
             // UI can render it (history itself keeps just the "📎 name" summary).

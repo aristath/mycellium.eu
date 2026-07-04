@@ -37,6 +37,8 @@
     .bubble { max-width:78%; padding:8px 12px; border-radius:14px; background:var(--them); align-self:flex-start; word-wrap:break-word; }
     .bubble.me { background:var(--me); align-self:flex-end; }
     .attach { max-width:220px; max-height:220px; border-radius:8px; display:block; }
+    .bubble .time { font-size:.62rem; opacity:.55; margin-left:8px; }
+    .when { float:right; font-size:.72rem; color:var(--dim); font-weight:400; }
     .bubble { cursor:pointer; }
     .replybar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#10161a; border-top:1px solid var(--line); font-size:.85rem; color:var(--dim); }
     .replybar span { color:var(--ink); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -73,6 +75,8 @@
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
+    const timeShort = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const relTime = (ts) => { const s = Date.now() / 1000 - ts; if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; };
     const persist = async () => { await idbSave(session.export()); };
 
     async function boot() {
@@ -192,7 +196,7 @@
       const items = threads.length ? threads.map((t) => `
         <button class="item" data-peer="${esc(t.peer)}">
           <div class="avatar">${initials(t.name || t.peer)}</div>
-          <div class="body"><div class="title">${esc(t.name || t.peer)}</div>
+          <div class="body"><div class="title">${esc(t.name || t.peer)}<span class="when">${relTime(t.timestamp)}</span></div>
           <div class="snippet">${t.mine ? 'You: ' : ''}${esc(t.last) || 'No messages yet'}</div></div>
         </button>`).join('') : `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
       app.innerHTML = `
@@ -211,7 +215,7 @@
         let inner = esc(m.text);
         let file = null; try { file = session.file(m.id); } catch {}
         if (file && file.startsWith('data:image')) inner = `<img class="attach" src="${file}" alt="${esc(m.text)}">`;
-        return `<div class="bubble ${m.from_me ? 'me' : ''}" data-id="${esc(m.id)}" title="Tap to reply">${inner}</div>`;
+        return `<div class="bubble ${m.from_me ? 'me' : ''}" data-id="${esc(m.id)}" title="Tap to reply">${inner}<span class="time">${timeShort(m.timestamp)}</span></div>`;
       }).join('') || `<div class="empty">Say hello 👋</div>`;
       const replyMsg = replyTo && msgs.find((m) => m.id === replyTo);
       const banner = replyMsg
