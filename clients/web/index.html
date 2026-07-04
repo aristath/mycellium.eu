@@ -285,11 +285,11 @@
         return `<div class="bubble ${mine ? 'me' : ''}">${who}${esc(m.text)}<span class="time">${timeShort(m.timestamp)}</span></div>`;
       }).join('') || `<div class="empty">No messages yet</div>`;
       app.innerHTML = `
-        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b># ${esc(group ? group.name : gid)}</b><div class="grow"></div><button class="ghost" id="addmem">＋ Add</button></div>
+        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b># ${esc(group ? group.name : gid)}</b><div class="grow"></div><button class="ghost" id="gmenu">⋯</button></div>
         <main><div class="msgs" id="msgs">${bubbles}</div></main>
         <div class="composer"><input id="msg" placeholder="Message the group" autocomplete="off"><button id="send">Send</button></div>`;
       byId('back').onclick = () => { og = null; render(); };
-      byId('addmem').onclick = () => addMember(gid);
+      byId('gmenu').onclick = () => groupMenu(gid);
       const send = async () => {
         const text = byId('msg').value.trim(); if (!text) return;
         byId('msg').value = '';
@@ -375,6 +375,23 @@
       const close = () => byId('bg').remove();
       byId('cancel').onclick = close;
       byId('ok').onclick = () => { const p = byId('peer').value.trim().toLowerCase(); if (p) { close(); open = p; renderThread(p); } };
+    }
+
+    function groupMenu(gid) {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal"><div class="actions">
+        <button id="gadd">＋ Add member</button>
+        <button id="gleave" style="background:#5a1f1f;color:#ffdede">Leave group</button>
+        <button class="ghost" id="gcancel">Cancel</button>
+      </div></div></div>`);
+      const close = () => byId('bg').remove();
+      byId('gcancel').onclick = close;
+      byId('gadd').onclick = () => { close(); addMember(gid); };
+      byId('gleave').onclick = async () => {
+        close();
+        if (!confirm('Leave this group?')) return;
+        try { session.group_leave(gid); og = null; await persist(); render(); }
+        catch (e) { alert('Leave failed: ' + e); }
+      };
     }
 
     function addMember(gid) {

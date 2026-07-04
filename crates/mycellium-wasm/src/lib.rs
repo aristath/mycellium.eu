@@ -391,6 +391,12 @@ impl Session {
         Ok(delivered)
     }
 
+    /// Leave a group locally (stop participating; drops its keys + state).
+    pub fn group_leave(&mut self, group_id: &str) -> Result<(), JsValue> {
+        groups::remove(&mut self.store, group_id).map_err(|_| JsValue::from_str("store error"))?;
+        Ok(())
+    }
+
     /// The groups we're in, as JSON: `[{id, name, members}]`.
     pub fn groups(&self) -> Result<String, JsValue> {
         let ids = groups::list(&self.store).map_err(|_| JsValue::from_str("store error"))?;

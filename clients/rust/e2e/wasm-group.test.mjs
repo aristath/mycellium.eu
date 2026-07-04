@@ -80,13 +80,18 @@ async function main() {
         alice.group_send(dir, 'alice', 'Alice', q, gid, 'welcome carol');
         settle([carol]);
 
+        // Capture Bob's state, then have him leave the group.
+        const bobGroups = JSON.parse(bob.groups());
+        const bobThread = JSON.parse(bob.group_thread(gid));
+        bob.group_leave(gid);
+        const bobAfterLeave = JSON.parse(bob.groups()).length;
+
         return {
-          gid,
-          bobGroups: JSON.parse(bob.groups()),
-          bobThread: JSON.parse(bob.group_thread(gid)),
+          gid, bobGroups, bobThread,
           aliceThread: JSON.parse(alice.group_thread(gid)),
           carolGroups: JSON.parse(carol.groups()),
           carolThread: JSON.parse(carol.group_thread(gid)),
+          bobLeft: bobGroups.length === 1 && bobAfterLeave === 0,
         };
       } catch (e) { return { error: String(e) }; }
     }, dirUrl, qUrl);
@@ -99,6 +104,7 @@ async function main() {
     check(texts(r.aliceThread).includes('hi from bob'), "Alice decrypted Bob's message (sender-key mesh works both ways)");
     check(r.carolGroups?.some((g) => g.name === 'Team Mycelium'), 'Carol was added and joined the group');
     check(texts(r.carolThread).includes('welcome carol'), 'Carol decrypted a message sent after she joined');
+    check(r.bobLeft, 'Bob left the group (it dropped from his list)');
   } finally {
     await browser.close();
     web.close();

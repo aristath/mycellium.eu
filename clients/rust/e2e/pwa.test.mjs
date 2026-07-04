@@ -169,7 +169,8 @@ async function main() {
     check(await hasText(bob, '.bubble', 'welcome to the group', 10000), 'Bob opens the group and sees the decrypted message');
 
     console.error('• Alice adds a member to the group via the UI');
-    await jsClick(alice, '#addmem');
+    await jsClick(alice, '#gmenu');
+    await jsClick(alice, '#gadd');
     await setVal(alice, '#amu', 'carol');
     await jsClick(alice, '#amok');
     await jsClick(alice, '#back');
