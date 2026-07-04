@@ -158,16 +158,37 @@ pub fn guess_mime(name: &str) -> String {
 
 /// Save an attachment to `MYCELLIUM_HOME/downloads` (name sanitized to a basename).
 pub fn save_attachment(name: &str, data: &[u8]) -> Result<std::path::PathBuf> {
+    let dir = store::data_dir().join("downloads");
+    save_attachment_in(&dir, name, data)
+}
+
+/// Save `data` under a sanitized basename in `dir`, **never overwriting**: if the
+/// name is taken, append " (n)" until a free name is found (and `create_new` so a
+/// race can't clobber an existing file either).
+fn save_attachment_in(dir: &std::path::Path, name: &str, data: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
     let safe = std::path::Path::new(name)
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
         .unwrap_or("file");
-    let dir = store::data_dir().join("downloads");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(safe);
-    std::fs::write(&path, data)?;
-    Ok(path)
+    std::fs::create_dir_all(dir)?;
+    let (stem, ext) = match safe.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (safe.to_string(), String::new()),
+    };
+    for n in 0..10_000 {
+        let candidate = if n == 0 { dir.join(safe) } else { dir.join(format!("{stem} ({n}){ext}")) };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut f) => {
+                f.write_all(data)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("too many attachments named '{safe}'")
 }
 
 
@@ -192,4 +213,30 @@ pub fn from_hex(s: &str) -> Result<Vec<u8>> {
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| anyhow!("invalid hex")))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_attachment_in;
+
+    #[test]
+    fn attachments_never_overwrite() {
+        let dir = std::env::temp_dir().join(format!("myc-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Path traversal is stripped to a basename.
+        let p0 = save_attachment_in(&dir, "../../etc/passwd", b"a").unwrap();
+        assert_eq!(p0.file_name().unwrap(), "passwd");
+
+        // Same name twice → distinct files, both preserved.
+        let p1 = save_attachment_in(&dir, "pic.png", b"first").unwrap();
+        let p2 = save_attachment_in(&dir, "pic.png", b"second").unwrap();
+        assert_ne!(p1, p2);
+        assert_eq!(p1.file_name().unwrap(), "pic.png");
+        assert_eq!(p2.file_name().unwrap(), "pic (1).png");
+        assert_eq!(std::fs::read(&p1).unwrap(), b"first");
+        assert_eq!(std::fs::read(&p2).unwrap(), b"second");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
