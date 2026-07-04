@@ -12,7 +12,7 @@ async function json(res) {
   return data;
 }
 
-const state = { status: null, tab: 'threads', open: null, online: false, seen: {}, firstScan: true, openName: null };
+const state = { status: null, tab: 'threads', open: null, online: false, seen: {}, firstScan: true, openName: null, replyTo: null };
 const root = document.getElementById('app');
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])));
 const initials = (s) => (s || '?').slice(0, 2).toUpperCase();
@@ -220,13 +220,17 @@ async function openThread(peer, quiet, name) {
     <div class="convo">
       <div class="head"><button class="link" id="back">‹ Chats</button><div class="avatar">${esc(initials(label))}</div><b>${esc(label)}</b></div>
       <div class="messages" id="msgs">${bubbles || '<div class="empty">No messages yet. Say hello.</div>'}</div>
+      ${state.replyTo ? `<div class="reply-banner">↩ Replying <button class="link" id="cancelReply">✕</button></div>` : ''}
       <div class="composer"><input id="msg" placeholder="Message ${esc(label)}…" autocomplete="off" /><button id="send">Send</button></div>
     </div>`;
-  byId('back').onclick = () => { state.open = null; renderThreads(); };
+  byId('back').onclick = () => { state.open = null; state.replyTo = null; renderThreads(); };
+  if (byId('cancelReply')) byId('cancelReply').onclick = () => { state.replyTo = null; openThread(peer, true); };
   const input = byId('msg');
   const send = async () => {
     const text = input.value.trim(); if (!text) return;
     input.value = '';
+    const body = { message: text };
+    if (state.replyTo) { body.reply_to = state.replyTo; state.replyTo = null; }
     // Optimistic: show the message instantly, reconcile on refetch.
     const box = byId('msgs');
     if (box) {
@@ -234,13 +238,34 @@ async function openThread(peer, quiet, name) {
       box.insertAdjacentHTML('beforeend', `<div class="bubble me"><div>${esc(text)}</div><div class="time">now<span class="tick">✓</span></div></div>`);
       box.scrollTop = box.scrollHeight;
     }
-    try { await api.post('threads/' + encodeURIComponent(peer), { message: text }); } catch (e) { alert(e.message); }
+    try { await api.post('threads/' + encodeURIComponent(peer), body); } catch (e) { alert(e.message); }
     openThread(peer, true);
   };
   byId('send').onclick = send;
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+  // Tap a message for actions (reply, react, delete).
+  content().querySelectorAll('.bubble[data-id]').forEach((b) => {
+    if (b.dataset.id) b.onclick = () => msgActions(peer, b.dataset.id, b.dataset.mine === 'true');
+  });
   const m = byId('msgs'); if (m) m.scrollTop = m.scrollHeight;
   if (!quiet) input.focus();
+}
+
+// Reply / react / delete on a message.
+function msgActions(peer, id, mine) {
+  const post = (body) => api.post('threads/' + encodeURIComponent(peer), body).then(() => openThread(peer, true)).catch((e) => alert(e.message));
+  modal(`
+    <h3>Message</h3>
+    <div class="chips">${['👍', '❤️', '😂', '🎉', '😮', '😢'].map((e) => `<button class="chip react" data-e="${e}">${e}</button>`).join('')}</div>
+    <div class="actions" style="margin-top:14px">
+      <button class="ghost" data-close>Cancel</button>
+      <button id="reply">Reply</button>
+      ${mine ? '<button class="ghost danger" id="del">Delete</button>' : ''}
+    </div>`, (close) => {
+    document.querySelectorAll('.chip.react').forEach((c) => (c.onclick = () => { close(); post({ react: c.dataset.e, to: id }); }));
+    byId('reply').onclick = () => { close(); state.replyTo = id; openThread(peer, true); };
+    if (byId('del')) byId('del').onclick = () => { close(); post({ delete: id }); };
+  });
 }
 
 // Render a message list with day dividers and a sent tick on our own messages.
@@ -250,7 +275,7 @@ function renderMessages(msgs) {
     const day = dayLabel(m.timestamp);
     if (day && day !== lastDay) { html += `<div class="day-divider"><span>${esc(day)}</span></div>`; lastDay = day; }
     const tick = m.from_me ? '<span class="tick">✓</span>' : '';
-    html += `<div class="bubble ${m.from_me ? 'me' : ''}"><div>${esc(m.text)}</div><div class="time">${when(m.timestamp)}${tick}</div></div>`;
+    html += `<div class="bubble ${m.from_me ? 'me' : ''}" data-id="${esc(m.id || '')}" data-mine="${m.from_me}"><div>${esc(m.text)}</div><div class="time">${when(m.timestamp)}${tick}</div></div>`;
   }
   return html || '<div class="empty">No messages yet. Say hello.</div>';
 }

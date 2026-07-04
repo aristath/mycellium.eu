@@ -242,9 +242,17 @@ fn thread_load(peer: &str, directory: &str) -> anyhow::Result<Value> {
 }
 
 fn thread_send(peer: &str, req: &Value, directory: &str) -> anyhow::Result<Value> {
-    let message = field(req, "message").ok_or_else(|| anyhow::anyhow!("message required"))?;
     let me = read_handle().ok_or_else(|| anyhow::anyhow!("finish signing up first"))?;
-    app::send(&to_uid(peer), &me, Some(message), None, None, None, None, None, None, None, directory)?;
+    // A plain message, a reply (message + reply_to), a reaction (react + to), or
+    // a deletion (delete) — the engine's build_message picks by which are set.
+    let message = field(req, "message");
+    let reply_to = field(req, "reply_to");
+    let react = field(req, "react");
+    let target = field(req, "to");
+    let delete = field(req, "delete");
+    app::send(
+        &to_uid(peer), &me, message, reply_to, react, target, None, None, delete, None, directory,
+    )?;
     Ok(json!({ "ok": true }))
 }
 
