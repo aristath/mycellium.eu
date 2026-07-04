@@ -15,7 +15,7 @@ use mycellium_core::userid::user_id;
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::app;
 use mycellium_engine::platform::OsPlatform;
-use mycellium_engine::{contacts, groups, history};
+use mycellium_engine::{contacts, groups, history, names};
 use mycellium_storage::store;
 
 use crate::State;
@@ -199,8 +199,8 @@ fn contacts_remove(nick: &str) -> anyhow::Result<Value> {
 fn threads_list() -> anyhow::Result<Value> {
     let mut fs = open()?;
     let now = OsPlatform.now_unix_secs();
-    // Map each peer id to a contact nickname for display (falls back to the id).
-    let names: std::collections::HashMap<String, String> = contacts::list(&fs)?
+    // Map each peer id to a saved contact nickname (highest-priority display).
+    let contact_names: std::collections::HashMap<String, String> = contacts::list(&fs)?
         .into_iter()
         .map(|c| (c.handle, c.nickname))
         .collect();
@@ -208,9 +208,15 @@ fn threads_list() -> anyhow::Result<Value> {
     for peer in history::peers(&fs)? {
         let msgs = history::load_active(&mut fs, &peer, now)?;
         let last = msgs.last();
+        // Display: saved contact nickname → learned self-set name → short id.
+        let display = contact_names
+            .get(&peer)
+            .cloned()
+            .or_else(|| names::get(&fs, &peer).ok().flatten())
+            .unwrap_or_else(|| short(&peer));
         threads.push(json!({
             "peer": peer,
-            "name": names.get(&peer).cloned().unwrap_or_else(|| short(&peer)),
+            "name": display,
             "last": last.map(|m| m.text.clone()).unwrap_or_default(),
             "timestamp": last.map(|m| m.timestamp).unwrap_or(0),
             "count": msgs.len(),

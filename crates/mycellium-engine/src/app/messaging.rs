@@ -453,6 +453,9 @@ pub fn handle_direct(
     if blocklist::is_blocked(blocked, from.as_str()) {
         return Ok(()); // silently drop — no display, storage, or receipt
     }
+    // Learn the sender's self-set name (from their signed record), so an unsaved
+    // sender shows "Mary" rather than a raw id. A saved contact still wins.
+    let _ = names::note(fs, from.as_str(), &env.sender_record.record.name);
 
     match AppMessage::decode(&bytes) {
         Ok(app) => match &app.body {

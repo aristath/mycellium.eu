@@ -17,5 +17,6 @@ pub mod draft;
 pub mod expiry;
 pub mod groups;
 pub mod history;
+pub mod names;
 pub mod outbox;
 pub mod platform;

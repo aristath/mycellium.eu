@@ -29,6 +29,7 @@ use crate::draft;
 use crate::expiry;
 use crate::groups::{self, GroupInvitePayload, GroupSyncPayload, MailItem, StoredGroup};
 use crate::history::{self, GroupStoredMessage, StoredMessage};
+use crate::names;
 use crate::outbox;
 use crate::platform::OsPlatform;
 use mycellium_transport::libp2p_net::{self};
