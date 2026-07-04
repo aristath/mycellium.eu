@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod persist;
 mod push;
 
 use mycellium_core::identity::{Signature, WalletPublicKey};
@@ -40,6 +41,8 @@ pub enum ApiError {
     MailboxFull,
     /// Malformed request.
     BadRequest,
+    /// A durable-storage write failed.
+    Storage,
 }
 
 impl ApiError {
@@ -50,6 +53,7 @@ impl ApiError {
             ApiError::Unauthorized => 401,
             ApiError::Forbidden => 403,
             ApiError::RateLimited | ApiError::MailboxFull => 429,
+            ApiError::Storage => 500,
         }
     }
 
@@ -63,6 +67,7 @@ impl ApiError {
             ApiError::RateLimited => "rate limit exceeded",
             ApiError::MailboxFull => "recipient mailbox is full",
             ApiError::BadRequest => "malformed request",
+            ApiError::Storage => "storage write failed",
         }
     }
 }
@@ -91,12 +96,27 @@ pub struct Queue {
     rate: HashMap<([u8; 33], &'static str), (u64, u32)>,
     /// Web Push subscriptions: recipient wallet hex → browser push endpoints.
     subs: HashMap<String, Vec<String>>,
+    /// Durable backing store. `None` = in-memory (tests); `Some` = write-through.
+    store: Option<persist::Store>,
 }
 
 impl Queue {
-    /// A fresh, empty queue.
+    /// A fresh, in-memory queue (tests).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a **durable** queue backed by the store at `path`, loading any
+    /// queued mail and push subscriptions.
+    pub fn open(path: &str) -> Result<Self, String> {
+        let store = persist::Store::open(path)?;
+        let loaded = store.load()?;
+        Ok(Queue {
+            mailboxes: loaded.mailboxes,
+            subs: loaded.subs,
+            store: Some(store),
+            ..Default::default()
+        })
     }
 
     /// Step 1 of login: issue a challenge nonce for `wallet`.
@@ -129,9 +149,13 @@ impl Queue {
     /// Register a browser push endpoint for the logged-in wallet (idempotent).
     pub fn subscribe(&mut self, token: &str, endpoint: String) -> Result<(), ApiError> {
         let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
-        let list = self.subs.entry(hex33(&wallet.0)).or_default();
+        let wallet_hex = hex33(&wallet.0);
+        let list = self.subs.entry(wallet_hex.clone()).or_default();
         if !list.contains(&endpoint) {
             list.push(endpoint);
+            if let Some(store) = &self.store {
+                store.put_subs(&wallet_hex, list).map_err(|_| ApiError::Storage)?;
+            }
         }
         Ok(())
     }
@@ -161,6 +185,9 @@ impl Queue {
             return Err(ApiError::MailboxFull);
         }
         mailbox.push(blob);
+        if let Some(store) = &self.store {
+            store.put_mailbox(recipient_wallet_hex, slot, mailbox).map_err(|_| ApiError::Storage)?;
+        }
         Ok(())
     }
 
@@ -176,7 +203,11 @@ impl Queue {
         if hex33(&caller.0) != wallet_hex {
             return Err(ApiError::Forbidden);
         }
-        Ok(self.mailboxes.remove(&(wallet_hex.to_string(), slot.to_string())).unwrap_or_default())
+        let drained = self.mailboxes.remove(&(wallet_hex.to_string(), slot.to_string())).unwrap_or_default();
+        if let Some(store) = &self.store {
+            store.del_mailbox(wallet_hex, slot).map_err(|_| ApiError::Storage)?;
+        }
+        Ok(drained)
     }
 
     /// A fixed-window rate check for `(wallet, action)` at `now`.
@@ -195,22 +226,63 @@ impl Queue {
 
 /// Run the queue as an HTTP service on `addr` (blocks).
 pub fn serve(addr: &str) -> std::io::Result<()> {
-    let server = Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let queue = Mutex::new(Queue::new());
+    let server = Arc::new(Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?);
+    let queue = Arc::new(Mutex::new(open_queue()));
     let vapid = Arc::new(push::Vapid::generate());
     println!("  push: VAPID enabled");
-    for mut request in server.incoming_requests() {
-        let mut body = String::new();
-        let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
-        let token = bearer(&request);
-        let (status, payload) = match route(&queue, &vapid, &request, &body, token.as_deref()) {
-            Ok(ok) => ok,
-            Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
-        };
-        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-        let _ = request.respond(Response::from_string(payload).with_status_code(status).with_header(header));
+
+    // A worker pool so many clients are served concurrently (Tier 0.2).
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 32);
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let (server, queue, vapid) = (Arc::clone(&server), Arc::clone(&queue), Arc::clone(&vapid));
+        handles.push(std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                handle_request(&queue, &vapid, request);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
     }
     Ok(())
+}
+
+/// Open the queue durably from `MYCELLIUM_DATA` (a data *directory*; we use
+/// `queue.redb` inside it), falling back to in-memory.
+fn open_queue() -> Queue {
+    match std::env::var("MYCELLIUM_DATA") {
+        Ok(dir) if !dir.is_empty() => {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = format!("{}/queue.redb", dir.trim_end_matches('/'));
+            match Queue::open(&path) {
+                Ok(queue) => {
+                    println!("  persistence: {path}");
+                    queue
+                }
+                Err(e) => {
+                    eprintln!("  persistence open failed ({e}); using in-memory");
+                    Queue::new()
+                }
+            }
+        }
+        _ => {
+            println!("  storage: in-memory (set MYCELLIUM_DATA to persist)");
+            Queue::new()
+        }
+    }
+}
+
+fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, mut request: Request) {
+    let mut body = String::new();
+    let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
+    let token = bearer(&request);
+    let (status, payload) = match route(queue, vapid, &request, &body, token.as_deref()) {
+        Ok(ok) => ok,
+        Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
+    };
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let _ = request.respond(Response::from_string(payload).with_status_code(status).with_header(header));
 }
 
 #[derive(Deserialize)]
@@ -369,6 +441,36 @@ mod tests {
         let nonce = q.challenge(id.wallet_public());
         let sig = id.sign(&mycellium_core::login::challenge_message(&nonce));
         q.verify(&id.wallet_public(), &nonce, &sig).unwrap()
+    }
+
+    #[test]
+    fn mail_and_subs_survive_a_reopen() {
+        let path = std::env::temp_dir().join(format!("myc-q-persist-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap();
+        let bob = Identity::generate(&mut P(90)).unwrap();
+        let bob_hex = hex33(&bob.wallet_public().0);
+        let alice = Identity::generate(&mut P(1)).unwrap();
+
+        {
+            let mut q = Queue::open(path_str).unwrap();
+            let atoken = login(&mut q, &alice);
+            q.deposit(&atoken, &bob_hex, "s", "sealed".into(), 0).unwrap();
+            let btoken = login(&mut q, &bob);
+            q.subscribe(&btoken, "https://push.example/abc".into()).unwrap();
+        } // drop → flushed
+
+        // Reopen: the queued blob and the push subscription are both still there.
+        let mut q2 = Queue::open(path_str).unwrap();
+        assert_eq!(q2.subscriptions(&bob_hex), vec!["https://push.example/abc".to_string()]);
+        let btoken = login(&mut q2, &bob);
+        assert_eq!(q2.collect(&btoken, &bob_hex, "s").unwrap(), vec!["sealed".to_string()]);
+        // ...and after collecting, the drain is persisted (empty on next reopen).
+        drop(q2);
+        let mut q3 = Queue::open(path_str).unwrap();
+        let btoken2 = login(&mut q3, &bob);
+        assert!(q3.collect(&btoken2, &bob_hex, "s").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

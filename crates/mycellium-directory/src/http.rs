@@ -99,19 +99,24 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Open the directory durably from `MYCELLIUM_DATA`, falling back to in-memory.
+/// Open the directory durably from `MYCELLIUM_DATA` (a data *directory*; we use
+/// `directory.redb` inside it), falling back to in-memory.
 fn open_directory() -> Directory {
     match std::env::var("MYCELLIUM_DATA") {
-        Ok(path) if !path.is_empty() => match Directory::open(&path) {
-            Ok(dir) => {
-                println!("  persistence: {path}");
-                dir
+        Ok(dir) if !dir.is_empty() => {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = format!("{}/directory.redb", dir.trim_end_matches('/'));
+            match Directory::open(&path) {
+                Ok(directory) => {
+                    println!("  persistence: {path}");
+                    directory
+                }
+                Err(e) => {
+                    eprintln!("  persistence open failed ({e}); using in-memory");
+                    Directory::new()
+                }
             }
-            Err(e) => {
-                eprintln!("  persistence open failed ({e}); using in-memory");
-                Directory::new()
-            }
-        },
+        }
         _ => {
             println!("  storage: in-memory (set MYCELLIUM_DATA to persist)");
             Directory::new()

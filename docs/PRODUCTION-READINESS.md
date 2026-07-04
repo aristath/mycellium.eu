@@ -11,21 +11,18 @@ deployment shape, and the operational essentials** around them.
 
 ## Tier 0 — Blockers (cannot serve real users without these)
 
-- [ ] **T0.1 — Durable storage.** The directory and queue keep all state in
-  in-memory `HashMap`s. A restart wipes every account (names, records, email
-  bindings) and every queued message + push subscription.
-  - *Persist:* directory `bindings`, `records`, `emails`, `pepper`; queue
-    `mailboxes`, push `subs`.
-  - *Keep in-memory (ephemeral, fine to lose):* login challenges, session
-    tokens, presence, rate counters, pending email codes.
-  - *Approach:* embedded pure-Rust store (`redb`) for the first durable version;
-    load on startup, write-through on change. Move to Postgres for multi-node.
+- [x] **T0.1 — Durable storage.** *(directory + queue done)* Bindings, records,
+  emails, pepper (directory) and mailboxes + push subs (queue) persist to an
+  embedded `redb` store — write-through, loaded on startup. Ephemeral state
+  (challenges, tokens, presence, rate, pending codes) stays in memory. Enabled
+  via `MYCELLIUM_DATA` (a data directory; `directory.redb` / `queue.redb`
+  inside); unset = in-memory. Reopen tests prove survival. *Next: Postgres for
+  multi-node.*
 
-- [ ] **T0.2 — Concurrency.** `tiny_http`'s loop serves one request at a time;
-  thousands of clients polling + sending will serialize into unusable latency.
-  - *Approach:* a worker-thread pool sharing `Arc<Server>` (each thread calls
-    `recv()`), with the state behind a `Mutex`/pool. Keep push sends off the
-    lock (already done).
+- [x] **T0.2 — Concurrency.** *(directory + queue done)* Both servers now use a
+  worker-thread pool sharing `Arc<Server>` (each thread calls `recv()`), state
+  behind a `Mutex`, push sends off the lock. *Next: validate under load (T2.4),
+  connection limits (T2.5).*
 
 - [ ] **T0.3 — TLS / HTTPS.** Service workers, Web Push, PWA install, and basic
   security all require HTTPS off `localhost`. Everything is `http://` today.
