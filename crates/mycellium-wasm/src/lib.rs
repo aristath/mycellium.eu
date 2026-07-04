@@ -5,9 +5,12 @@
 //! Later stages add the pure send/receive step functions and JS-owned I/O
 //! (`fetch` + IndexedDB), replacing the local Rust server entirely.
 
+use std::collections::HashMap;
+
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::Identity;
 use mycellium_core::platform::Platform;
+use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
 use mycellium_directory_client::DirectoryClient;
 use wasm_bindgen::prelude::*;
@@ -42,6 +45,80 @@ pub fn directory_login(base: &str) -> Result<String, JsValue> {
     let identity = Identity::generate(&mut BrowserPlatform).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
     let client = DirectoryClient::with_transport(base, Box::new(XhrTransport));
     client.login(&identity).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// An in-memory [`Storage`] for the browser. Engine state lives here during a
+/// session; the host snapshots it to IndexedDB for durability (see [`Session`]).
+/// This is the wasm counterpart to the native `FileStore`.
+#[derive(Default)]
+struct MemStore {
+    map: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl Storage for MemStore {
+    type Error = core::convert::Infallible;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.map.get(key).cloned())
+    }
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        self.map.insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+    fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error> {
+        self.map.remove(key);
+        Ok(())
+    }
+}
+
+/// A browser-side engine session: holds the in-memory store and (de)serializes it
+/// so the host can persist it to IndexedDB. Later stages give it the identity and
+/// the send/receive operations; today it proves state survives a reload.
+#[wasm_bindgen]
+pub struct Session {
+    store: MemStore,
+}
+
+#[wasm_bindgen]
+impl Session {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Session {
+        Session { store: MemStore::default() }
+    }
+
+    /// Store a value (UTF-8) under `key`.
+    pub fn put(&mut self, key: &str, value: &str) {
+        let _ = self.store.put(key.as_bytes(), value.as_bytes());
+    }
+
+    /// Read a value, or `undefined` if absent.
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.store.get(key.as_bytes()).ok().flatten().map(|v| String::from_utf8_lossy(&v).into_owned())
+    }
+
+    /// Remove a key.
+    pub fn del(&mut self, key: &str) {
+        let _ = self.store.delete(key.as_bytes());
+    }
+
+    /// Serialize the whole store for the host to persist (→ IndexedDB).
+    pub fn export(&self) -> Vec<u8> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self.store.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        mycellium_core::wire::encode(&entries)
+    }
+
+    /// Restore a previously exported snapshot (from IndexedDB).
+    pub fn import(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> =
+            mycellium_core::wire::decode(bytes).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        self.store.map = entries.into_iter().collect();
+        Ok(())
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A synchronous `XMLHttpRequest`-backed [`HttpTransport`]. Synchronous so the

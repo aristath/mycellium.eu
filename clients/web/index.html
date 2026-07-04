@@ -15,11 +15,29 @@
   <p>Stage 1: the account-id hash and device-key generation run entirely in WebAssembly — no server call.</p>
   <pre id="out">loading WebAssembly…</pre>
   <script type="module">
-    import init, { version, user_id, generate_wallet, directory_login } from './pkg/mycellium_wasm.js';
+    import init, { version, user_id, generate_wallet, directory_login, Session } from './pkg/mycellium_wasm.js';
+
+    // Minimal IndexedDB blob store for the session snapshot.
+    const idb = () => new Promise((res, rej) => {
+      const r = indexedDB.open('mycellium', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('state');
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    const idbSave = async (bytes) => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(bytes, 'snapshot'); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
+    const idbLoad = async () => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state', 'readonly'); const g = tx.objectStore('state').get('snapshot'); g.onsuccess = () => res(g.result || null); g.onerror = () => rej(g.error); }); };
+
     (async () => {
       await init();
+      // Restore engine state from IndexedDB (survives reloads / restarts).
+      const session = new Session();
+      const saved = await idbLoad();
+      if (saved) session.import(new Uint8Array(saved));
       // Expose the engine to the page + automated tests.
-      window.mycellium = { version, user_id, generate_wallet, directory_login };
+      window.mycellium = {
+        version, user_id, generate_wallet, directory_login, session,
+        persist: async () => { await idbSave(session.export()); },
+      };
       const uid = user_id('mary@example.com');
       const uidUpper = user_id('  MARY@Example.com  '); // trims + lowercases → same id
       const w1 = generate_wallet();
