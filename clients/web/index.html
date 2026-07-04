@@ -72,7 +72,7 @@
     if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
 
     let session, me = null, open = null, poll = null;
-    let seen = {}, firstScan = true, replyTo = null, og = null;
+    let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
@@ -150,6 +150,7 @@
     function render() {
       if (!cfg.dir || !cfg.queue) return renderSetup();
       if (!me) return renderRegister();
+      if (showSettings) return renderSettings();
       if (og) return renderGroupThread(og);
       return open ? renderThread(open) : renderList();
     }
@@ -210,12 +211,37 @@
         </button>`).join('');
       const items = (groupItems + peerItems) || `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
       app.innerHTML = `
-        <header><div class="who">${esc(me.name)} <small>@${esc(me.handle)}</small></div><div class="grow"></div></header>
+        <header><div class="who">${esc(me.name)} <small>@${esc(me.handle)}</small></div><div class="grow"></div><button class="ghost" id="settings">⚙</button></header>
         <main>${items}</main>
         <button class="fab" id="new">＋</button>`;
       app.querySelectorAll('.item[data-peer]').forEach((b) => b.onclick = () => { open = b.dataset.peer; render(); });
       app.querySelectorAll('.item[data-group]').forEach((b) => b.onclick = () => { og = b.dataset.group; render(); });
       byId('new').onclick = () => fabMenu();
+      byId('settings').onclick = () => { showSettings = true; render(); };
+    }
+
+    function renderSettings() {
+      app.innerHTML = `
+        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b>Settings</b></div>
+        <main><div class="wrap"><div class="card">
+          <label>Display name</label><input id="sname" value="${esc(me.name)}">
+          <div class="row"><button id="ssave">Save</button></div>
+          <p style="margin-top:16px;color:var(--dim)">Username <b style="color:var(--ink)">@${esc(me.handle)}</b> — people reach you by this.</p>
+          <p style="color:var(--dim)">Device key <code style="font-size:.72rem">${esc((session.wallet() || '').slice(0, 24))}…</code></p>
+          <hr style="border-color:var(--line);margin:18px 0">
+          <button id="reset" style="background:#5a1f1f;color:#ffdede">Reset this device</button>
+          <p style="color:var(--dim);font-size:.8rem;margin-top:6px">Erases your identity + conversations from this browser.</p>
+        </div></div></main>`;
+      byId('back').onclick = () => { showSettings = false; render(); };
+      byId('ssave').onclick = async () => {
+        const n = byId('sname').value.trim(); if (!n) return;
+        try { session.register(cfg.dir, cfg.queue, me.handle, n); me.name = n; session.put('myc:me', JSON.stringify(me)); await persist(); showSettings = false; render(); }
+        catch (e) { alert('Save failed: ' + e); }
+      };
+      byId('reset').onclick = () => {
+        if (!confirm('Reset this device? This erases your account + messages here.')) return;
+        indexedDB.deleteDatabase('mycellium'); localStorage.clear(); location.reload();
+      };
     }
 
     function fabMenu() {

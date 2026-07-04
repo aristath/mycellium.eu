@@ -175,6 +175,13 @@ async function main() {
     await jsClick(alice, '#back');
     check(await hasText(alice, '.item .snippet', '3 member', 8000), 'group roster grew to 3 after adding a member');
 
+    console.error('• Alice edits her display name in settings');
+    await jsClick(alice, '#settings');
+    check(await hasText(alice, 'b', 'alice'), 'settings shows the username');
+    await setVal(alice, '#sname', 'Alice Cooper');
+    await jsClick(alice, '#ssave');
+    check(await hasText(alice, 'header .who', 'Alice Cooper', 8000), 'display name updated in the header');
+
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');
     const pushKey = await bob.evaluate((q) => { try { return window.mycellium.session.push_key(q); } catch (e) { return 'ERR:' + e; } }, qUrl);
     check(typeof pushKey === 'string' && pushKey.length > 20 && !pushKey.startsWith('ERR'), `queue serves the Session a VAPID key (${String(pushKey).slice(0, 14)}…)`);
