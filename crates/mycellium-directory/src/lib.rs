@@ -20,6 +20,7 @@ use mycellium_core::record::SignedRecord;
 use sha2::{Digest, Sha256};
 
 mod http;
+mod persist;
 pub use http::serve;
 
 /// A request the directory rejected, with the HTTP status it maps to.
@@ -47,6 +48,8 @@ pub enum ApiError {
     Forbidden,
     /// A malformed request (e.g. an invalid email).
     BadRequest,
+    /// A durable-storage write failed.
+    Storage,
 }
 
 impl ApiError {
@@ -61,6 +64,7 @@ impl ApiError {
             ApiError::NotFound => 404,
             ApiError::Forbidden => 403,
             ApiError::BadRequest => 400,
+            ApiError::Storage => 500,
         }
     }
 
@@ -78,6 +82,7 @@ impl ApiError {
             ApiError::NotFound => "no such handle",
             ApiError::Forbidden => "not permitted",
             ApiError::BadRequest => "malformed request",
+            ApiError::Storage => "storage write failed",
         }
     }
 }
@@ -104,9 +109,11 @@ pub struct Directory {
     /// without the directory ever holding a readable address.
     emails: HashMap<Handle, String>,
     /// Per-server secret mixed into email hashes. A leaked directory reveals no
-    /// testable emails without this too. (In-memory today; persist it alongside
-    /// the store in a real deployment.)
+    /// testable emails without this too. Persisted with the durable store.
     pepper: [u8; 32],
+    /// Durable backing store for bindings/records/emails/pepper. `None` = purely
+    /// in-memory (tests); `Some` = write-through to disk (deployment).
+    store: Option<persist::Store>,
 }
 
 /// A username claim awaiting one-tap email verification (Layer 6 auth).
@@ -126,9 +133,32 @@ pub const PRESENCE_TTL: u64 = 60;
 pub const VERIFY_TTL: u64 = 900;
 
 impl Directory {
-    /// A fresh, empty directory with a random email-hash pepper.
+    /// A fresh, in-memory directory with a random email-hash pepper (tests).
     pub fn new() -> Self {
         Self { pepper: random_bytes::<32>(), ..Default::default() }
+    }
+
+    /// Open a **durable** directory backed by the store at `path`, loading any
+    /// existing bindings/records/emails and re-using the persisted pepper.
+    pub fn open(path: &str) -> Result<Self, String> {
+        let store = persist::Store::open(path)?;
+        let loaded = store.load()?;
+        let pepper = match loaded.pepper {
+            Some(p) => p,
+            None => {
+                let p = random_bytes::<32>();
+                store.set_pepper(&p)?;
+                p
+            }
+        };
+        Ok(Directory {
+            bindings: loaded.bindings,
+            records: loaded.records,
+            emails: loaded.emails,
+            pepper,
+            store: Some(store),
+            ..Default::default()
+        })
     }
 
     /// A keyed, non-reversible hash of an email — the only email data we keep.
@@ -236,8 +266,13 @@ impl Directory {
                 return Err(ApiError::HandleTaken);
             }
         }
+        let hash = self.email_hash(&email);
+        if let Some(store) = &self.store {
+            store.put_binding(&username, &wallet).map_err(|_| ApiError::Storage)?;
+            store.put_email(&username, &hash).map_err(|_| ApiError::Storage)?;
+        }
         self.bindings.insert(username.clone(), wallet);
-        self.emails.insert(username.clone(), self.email_hash(&email));
+        self.emails.insert(username.clone(), hash);
         Ok(username)
     }
 
@@ -277,6 +312,11 @@ impl Directory {
             }
         }
 
+        // Persist first, so a storage failure aborts before we mutate memory.
+        if let Some(store) = &self.store {
+            store.put_binding(handle, &wallet).map_err(|_| ApiError::Storage)?;
+            store.put_record(handle, &record).map_err(|_| ApiError::Storage)?;
+        }
         self.bindings.insert(handle.clone(), wallet);
         self.records.insert(handle.clone(), record);
         Ok(())
@@ -385,6 +425,39 @@ mod tests {
         let got = dir.lookup(&handle).expect("record present");
         assert!(got.verify().is_ok());
         assert_eq!(got.record.wallet, ari.wallet_public());
+    }
+
+    #[test]
+    fn records_and_pepper_survive_a_reopen() {
+        let path = std::env::temp_dir().join(format!("myc-dir-persist-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap();
+        let ari = Identity::generate(&mut OsPlatform).unwrap();
+        let handle = Handle::new("ari").unwrap();
+
+        let pepper1;
+        {
+            let mut dir = Directory::open(path_str).unwrap();
+            pepper1 = dir.email_hash("x@y.z"); // captures the pepper indirectly
+            let token = login(&mut dir, &ari);
+            dir.publish(&token, &handle, record_for(&ari, "ari", 1)).unwrap();
+        } // drop → store flushed/closed
+
+        // A fresh process re-opening the same file sees the record, the binding,
+        // and the SAME pepper (so email hashes still match).
+        let dir2 = Directory::open(path_str).unwrap();
+        let got = dir2.lookup(&handle).expect("record survived restart");
+        assert_eq!(got.record.wallet, ari.wallet_public());
+        assert_eq!(dir2.email_hash("x@y.z"), pepper1, "pepper must be stable across restarts");
+        // Binding is enforced after reopen: a different wallet can't take the name.
+        let mut dir2 = dir2;
+        let mallory = Identity::generate(&mut OsPlatform).unwrap();
+        let mtoken = login(&mut dir2, &mallory);
+        assert_eq!(
+            dir2.publish(&mtoken, &handle, record_for(&mallory, "ari", 2)),
+            Err(ApiError::HandleTaken) // the persisted binding still protects the name
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

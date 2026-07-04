@@ -11,7 +11,7 @@
 //!
 //! Deliberately minimal: all real logic and rules live in [`Directory`].
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -75,30 +75,65 @@ fn now_secs() -> u64 {
 
 /// Bind `addr` and serve the directory until the process ends.
 pub fn serve(addr: &str) -> std::io::Result<()> {
-    let server = Server::http(addr)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::AddrInUse, e.to_string()))?;
-    let directory = Mutex::new(Directory::new());
+    let server = Arc::new(
+        Server::http(addr).map_err(|e| std::io::Error::new(std::io::ErrorKind::AddrInUse, e.to_string()))?,
+    );
+    let directory = Arc::new(Mutex::new(open_directory()));
 
-    for mut request in server.incoming_requests() {
-        let method = request.method().clone();
-        let url = request.url().to_string();
-        let path = url.split('?').next().unwrap_or("").to_string();
-        let token = bearer_token(&request);
-
-        let mut body = String::new();
-        let _ = request.as_reader().read_to_string(&mut body);
-
-        let (code, json) = match route(&directory, &method, &path, token.as_deref(), &body) {
-            Ok((code, json)) => (code, json),
-            Err(err) => (err.status(), error_json(err.reason())),
-        };
-
-        let response = Response::from_string(json)
-            .with_status_code(code)
-            .with_header(json_header());
-        let _ = request.respond(response);
+    // A worker pool so many clients are served concurrently, not one-at-a-time
+    // (Tier 0.2). tiny_http's `recv` is safe to call from multiple threads.
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 32);
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let server = Arc::clone(&server);
+        let directory = Arc::clone(&directory);
+        handles.push(std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                handle_request(&directory, request);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
     }
     Ok(())
+}
+
+/// Open the directory durably from `MYCELLIUM_DATA`, falling back to in-memory.
+fn open_directory() -> Directory {
+    match std::env::var("MYCELLIUM_DATA") {
+        Ok(path) if !path.is_empty() => match Directory::open(&path) {
+            Ok(dir) => {
+                println!("  persistence: {path}");
+                dir
+            }
+            Err(e) => {
+                eprintln!("  persistence open failed ({e}); using in-memory");
+                Directory::new()
+            }
+        },
+        _ => {
+            println!("  storage: in-memory (set MYCELLIUM_DATA to persist)");
+            Directory::new()
+        }
+    }
+}
+
+fn handle_request(directory: &Mutex<Directory>, mut request: Request) {
+    let method = request.method().clone();
+    let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or("").to_string();
+    let token = bearer_token(&request);
+
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+
+    let (code, json) = match route(directory, &method, &path, token.as_deref(), &body) {
+        Ok((code, json)) => (code, json),
+        Err(err) => (err.status(), error_json(err.reason())),
+    };
+    let response = Response::from_string(json).with_status_code(code).with_header(json_header());
+    let _ = request.respond(response);
 }
 
 /// Dispatch one request. Returns `(status, json_body)`.
