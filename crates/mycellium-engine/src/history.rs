@@ -124,11 +124,13 @@ pub fn clear<S: Storage>(store: &mut S, peer: &str) -> Result<(), S::Error> {
 }
 
 /// Edit a stored 1:1 message by id (marks it edited). No-op if not found.
-pub fn edit<S: Storage>(store: &mut S, peer: &str, id: &str, new_text: &str) -> Result<(), S::Error> {
+/// Edit a stored 1:1 message by id — but only one authored by the same side as
+/// the edit (`by_me`), so a peer can't rewrite *your* messages and vice versa.
+pub fn edit<S: Storage>(store: &mut S, peer: &str, id: &str, new_text: &str, by_me: bool) -> Result<(), S::Error> {
     let mut transcript = load(store, peer)?;
     let mut changed = false;
     for m in &mut transcript {
-        if m.id == id {
+        if m.id == id && m.from_me == by_me {
             m.text = format!("{new_text} (edited)");
             changed = true;
         }
@@ -139,27 +141,30 @@ pub fn edit<S: Storage>(store: &mut S, peer: &str, id: &str, new_text: &str) -> 
     Ok(())
 }
 
-/// Delete a stored 1:1 message by id. No-op if not found.
-pub fn delete<S: Storage>(store: &mut S, peer: &str, id: &str) -> Result<(), S::Error> {
-    let transcript: Vec<StoredMessage> = load(store, peer)?.into_iter().filter(|m| m.id != id).collect();
+/// Delete a stored 1:1 message by id — only if authored by the same side as the
+/// delete (`by_me`). No-op if not found or authored by the other side.
+pub fn delete<S: Storage>(store: &mut S, peer: &str, id: &str, by_me: bool) -> Result<(), S::Error> {
+    let transcript: Vec<StoredMessage> =
+        load(store, peer)?.into_iter().filter(|m| !(m.id == id && m.from_me == by_me)).collect();
     store.put(&history_key(peer), &wire::encode(&transcript))
 }
 
-/// Edit a stored group message by id.
-pub fn group_edit<S: Storage>(store: &mut S, group_id: &str, id: &str, new_text: &str) -> Result<(), S::Error> {
+/// Edit a stored group message by id — only one whose recorded `sender` matches,
+/// so a member can't rewrite another member's message.
+pub fn group_edit<S: Storage>(store: &mut S, group_id: &str, id: &str, new_text: &str, sender: &str) -> Result<(), S::Error> {
     let mut transcript = group_load(store, group_id)?;
     for m in &mut transcript {
-        if m.id == id {
+        if m.id == id && m.sender == sender {
             m.text = format!("{new_text} (edited)");
         }
     }
     store.put(&group_history_key(group_id), &wire::encode(&transcript))
 }
 
-/// Delete a stored group message by id.
-pub fn group_delete<S: Storage>(store: &mut S, group_id: &str, id: &str) -> Result<(), S::Error> {
+/// Delete a stored group message by id — only if its recorded `sender` matches.
+pub fn group_delete<S: Storage>(store: &mut S, group_id: &str, id: &str, sender: &str) -> Result<(), S::Error> {
     let transcript: Vec<GroupStoredMessage> =
-        group_load(store, group_id)?.into_iter().filter(|m| m.id != id).collect();
+        group_load(store, group_id)?.into_iter().filter(|m| !(m.id == id && m.sender == sender)).collect();
     store.put(&group_history_key(group_id), &wire::encode(&transcript))
 }
 
@@ -246,13 +251,48 @@ mod tests {
         append(&mut store, "bob", m("m1", "helo")).unwrap();
         append(&mut store, "bob", m("m2", "keep me")).unwrap();
 
-        edit(&mut store, "bob", "m1", "hello").unwrap();
+        // The peer authored these (from_me: false), so a peer edit/delete applies.
+        edit(&mut store, "bob", "m1", "hello", false).unwrap();
         assert_eq!(load(&store, "bob").unwrap()[0].text, "hello (edited)");
 
-        delete(&mut store, "bob", "m1").unwrap();
+        delete(&mut store, "bob", "m1", false).unwrap();
         let left = load(&store, "bob").unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, "m2");
+    }
+
+    #[test]
+    fn edit_delete_are_author_scoped() {
+        let mut store = MemStore::default();
+        // A message the peer authored (from_me: false).
+        append(&mut store, "bob", StoredMessage { id: "m1".into(), from_me: false, text: "theirs".into(), timestamp: 0, expires_at: None }).unwrap();
+
+        // A "mine"-scoped edit/delete (by_me: true) must NOT touch the peer's message.
+        edit(&mut store, "bob", "m1", "hacked", true).unwrap();
+        assert_eq!(load(&store, "bob").unwrap()[0].text, "theirs", "a peer can't edit as if it were mine");
+        delete(&mut store, "bob", "m1", true).unwrap();
+        assert_eq!(load(&store, "bob").unwrap().len(), 1, "a peer can't delete my-scoped");
+
+        // The correctly-scoped delete (by_me: false) does remove it.
+        delete(&mut store, "bob", "m1", false).unwrap();
+        assert!(load(&store, "bob").unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_edit_delete_are_sender_scoped() {
+        let mut store = MemStore::default();
+        let gm = |id: &str, sender: &str, text: &str| GroupStoredMessage { id: id.into(), sender: sender.into(), text: text.into(), timestamp: 0, expires_at: None };
+        group_append(&mut store, "g1", gm("m1", "alice", "alice's")).unwrap();
+
+        // Bob can't edit or delete Alice's message.
+        group_edit(&mut store, "g1", "m1", "hacked", "bob").unwrap();
+        assert_eq!(group_load(&store, "g1").unwrap()[0].text, "alice's", "another member can't rewrite it");
+        group_delete(&mut store, "g1", "m1", "bob").unwrap();
+        assert_eq!(group_load(&store, "g1").unwrap().len(), 1, "another member can't delete it");
+
+        // Alice (the author) can.
+        group_delete(&mut store, "g1", "m1", "alice").unwrap();
+        assert!(group_load(&store, "g1").unwrap().is_empty());
     }
 
     #[test]

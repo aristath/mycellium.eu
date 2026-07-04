@@ -212,12 +212,12 @@ pub fn handle_group_text(
                 Ok(app) => {
                     match &app.body {
                         Body::Edit { to, text } => {
-                            history::group_edit(fs, group_id, to, text)?;
+                            history::group_edit(fs, group_id, to, text, &sender)?;
                             println!("[{}] {sender}: edited #{to}", stored.name);
                             return Ok(());
                         }
                         Body::Delete { to } => {
-                            history::group_delete(fs, group_id, to)?;
+                            history::group_delete(fs, group_id, to, &sender)?;
                             println!("[{}] {sender}: deleted #{to}", stored.name);
                             return Ok(());
                         }
@@ -380,8 +380,8 @@ pub fn group_send(
 
     // Apply an edit/delete to our own copy of the transcript too.
     match &app.body {
-        Body::Edit { to, text } => history::group_edit(&mut fs, &stored.id, to, text)?,
-        Body::Delete { to } => history::group_delete(&mut fs, &stored.id, to)?,
+        Body::Edit { to, text } => history::group_edit(&mut fs, &stored.id, to, text, me.as_str())?,
+        Body::Delete { to } => history::group_delete(&mut fs, &stored.id, to, me.as_str())?,
         _ => {}
     }
     let gm = session.encrypt(&app.encode(), &group_ad(&stored.id));

@@ -700,10 +700,10 @@ impl Session {
             if let Ok(app) = AppMessage::decode(&plaintext) {
                 match &app.body {
                     Body::Edit { to, text } => {
-                        let _ = history::group_edit(&mut self.store, group_id, to, text);
+                        let _ = history::group_edit(&mut self.store, group_id, to, text, &sender);
                     }
                     Body::Delete { to } => {
-                        let _ = history::group_delete(&mut self.store, group_id, to);
+                        let _ = history::group_delete(&mut self.store, group_id, to, &sender);
                     }
                     Body::Receipt { .. } => {}
                     _ => {
@@ -727,10 +727,10 @@ impl Session {
 fn apply_to_history(store: &mut MemStore, peer: &str, app: &AppMessage, from_me: bool) {
     match &app.body {
         Body::Edit { to, text } => {
-            let _ = history::edit(store, peer, to, text);
+            let _ = history::edit(store, peer, to, text, from_me);
         }
         Body::Delete { to } => {
-            let _ = history::delete(store, peer, to);
+            let _ = history::delete(store, peer, to, from_me);
             // Drop the attachment blob too, so a deleted image doesn't linger.
             let _ = store.delete(format!("file:{to}").as_bytes());
         }

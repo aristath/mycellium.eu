@@ -79,8 +79,8 @@ pub fn send(
     // Record our own copy in this device's transcript, so the conversation shows
     // what we sent (edits/deletes apply to it; other kinds append).
     match &app.body {
-        Body::Edit { to, text } => history::edit(&mut fs, peer_handle.as_str(), to, text)?,
-        Body::Delete { to } => history::delete(&mut fs, peer_handle.as_str(), to)?,
+        Body::Edit { to, text } => history::edit(&mut fs, peer_handle.as_str(), to, text, true)?,
+        Body::Delete { to } => history::delete(&mut fs, peer_handle.as_str(), to, true)?,
         Body::Receipt { .. } => {}
         _ => history::append(
             &mut fs,
@@ -431,8 +431,8 @@ pub fn handle_self_sync(
         Err(_) => return Ok(()),
     };
     match &app.body {
-        Body::Edit { to, text } => history::edit(fs, peer, to, text)?,
-        Body::Delete { to } => history::delete(fs, peer, to)?,
+        Body::Edit { to, text } => history::edit(fs, peer, to, text, true)?,
+        Body::Delete { to } => history::delete(fs, peer, to, true)?,
         Body::Receipt { .. } => {} // receipts aren't mirrored
         _ => {
             println!("→ {peer}: {}  (#{})", app.summary(), app.id);
@@ -480,11 +480,11 @@ pub fn handle_direct(
             }
             // An edit or deletion of an earlier message: apply to the transcript.
             Body::Edit { to, text } => {
-                history::edit(fs, from.as_str(), to, text)?;
+                history::edit(fs, from.as_str(), to, text, false)?;
                 println!("from {}: edited #{to}", from.as_str());
             }
             Body::Delete { to } => {
-                history::delete(fs, from.as_str(), to)?;
+                history::delete(fs, from.as_str(), to, false)?;
                 println!("from {}: deleted #{to}", from.as_str());
             }
             // Already expired in transit? drop it entirely.
