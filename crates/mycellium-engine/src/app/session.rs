@@ -29,7 +29,7 @@ pub fn handshake_initiator(
     let mut platform = OsPlatform;
     let responder_ik = peer_record.record.primary().id_key;
     let responder_spk = peer_record.record.primary().signed_pre_key.public;
-    let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk);
+    let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk).map_err(|e| anyhow!("{e}"))?;
     conn.send(&wire::encode(&initiated.init))?;
 
     let ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk);
@@ -58,7 +58,7 @@ pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<S
     }
     let init: HandshakeInit = wire::decode(&conn.recv()?)?;
 
-    let shared = x3dh::respond(identity, &init);
+    let shared = x3dh::respond(identity, &init).map_err(|e| anyhow!("{e}"))?;
     let ratchet = Ratchet::new_responder(&shared, identity);
     let ad = associated_data(&init.initiator_ik, &identity.messaging_public());
 

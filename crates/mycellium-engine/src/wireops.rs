@@ -115,20 +115,21 @@ pub fn seal_to<P: Platform>(
     my_queue: &str,
     device: &Device,
     plaintext: &[u8],
-) -> Envelope {
+) -> Result<Envelope> {
     let responder_ik = device.id_key;
     let responder_spk = device.signed_pre_key.public;
-    let initiated = x3dh::initiate(platform, identity, &responder_ik, &responder_spk);
+    // Fails closed if the recipient device published a low-order key.
+    let initiated = x3dh::initiate(platform, identity, &responder_ik, &responder_spk).map_err(|e| anyhow!("{e}"))?;
     let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk);
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
     let sealed = ratchet.encrypt(plaintext, &ad);
-    Envelope {
+    Ok(Envelope {
         from: me.clone(),
         sender_record: build_record(platform, identity, me, my_name, my_queue, ""),
         init: initiated.init,
         message: sealed,
         timestamp: platform.now_unix_secs(),
-    }
+    })
 }
 
 /// Decrypt an incoming envelope, verifying the sender's self-record binds their
@@ -143,7 +144,7 @@ pub fn open_envelope<P: Platform>(platform: &mut P, identity: &Identity, env: &E
     if env.init.initiator_ik != env.sender_record.record.primary().id_key {
         bail!("handshake is not bound to the sender's identity");
     }
-    let shared = x3dh::respond(identity, &env.init);
+    let shared = x3dh::respond(identity, &env.init).map_err(|e| anyhow!("{e}"))?;
     let mut ratchet = Ratchet::new_responder(&shared, identity);
     let ad = associated_data(&env.init.initiator_ik, &identity.messaging_public());
     let plaintext =

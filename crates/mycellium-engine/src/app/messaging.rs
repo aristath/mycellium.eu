@@ -19,7 +19,7 @@ pub fn forward(message_id: &str, from: &str, to: &str, whoami: &str, directory: 
     let client = DirectoryClient::new(directory);
     let (to_handle, to_record) = lookup_verified(&client, &fs, to)?;
     let app = text_message(&forwarded);
-    let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode());
+    let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode())?;
     let queue = QueueTarget::open(&identity, &to_record.record);
     deliver(&client, &to_handle, queue.as_ref(), to_record.record.primary(), &MailItem::Direct(envelope));
     println!("forwarded #{message_id} to '{}'", to_handle.as_str());
@@ -62,7 +62,7 @@ pub fn send(
     let now = OsPlatform.now_unix_secs();
     let mut delivered = 0;
     for device in &peer_record.record.devices {
-        let envelope = seal_to(&identity, &me, device, &encoded);
+        let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else { continue };
         let slot = device_slot(&device.device_key);
         let item = MailItem::Direct(envelope);
         if deliver(&client, &peer_handle, queue.as_ref(), device, &item) {
@@ -103,7 +103,7 @@ pub fn send(
             if device.device_key == my_key {
                 continue;
             }
-            let envelope = seal_to(&identity, &me, device, &encoded);
+            let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else { continue };
             let sync = MailItem::SelfSync { peer: peer_handle.as_str().to_string(), envelope };
             if !deliver(&client, &me, my_queue.as_ref(), device, &sync) {
                 let slot = device_slot(&device.device_key);
@@ -127,7 +127,7 @@ pub fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: 
         match lookup_verified(&client, &fs, recipient) {
             Ok((handle, record)) => {
                 let app = text_message(message);
-                let envelope = seal_to(&identity, &me, record.record.primary(), &app.encode());
+                let envelope = seal_to(&identity, &me, record.record.primary(), &app.encode())?;
                 let queue = QueueTarget::open(&identity, &record.record);
                 if deliver(&client, &handle, queue.as_ref(), record.record.primary(), &MailItem::Direct(envelope)) {
                     sent += 1;
@@ -143,7 +143,8 @@ pub fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: 
 
 
 /// Asynchronously X3DH-seal `plaintext` for `peer` (offline, one-shot session).
-pub fn seal_to(identity: &Identity, me: &Handle, device: &Device, plaintext: &[u8]) -> Envelope {
+/// Fails if the recipient device published a low-order key.
+pub fn seal_to(identity: &Identity, me: &Handle, device: &Device, plaintext: &[u8]) -> Result<Envelope> {
     crate::wireops::seal_to(&mut OsPlatform, identity, me, &display_name_for(me), &own_queue(), device, plaintext)
 }
 
@@ -536,7 +537,7 @@ pub fn send_receipt(identity: &Identity, me: &Handle, client: &DirectoryClient, 
     let encoded = receipt.encode();
     let queue = QueueTarget::open(identity, &record.record);
     for device in &record.record.devices {
-        let env = seal_to(identity, me, device, &encoded);
+        let Ok(env) = seal_to(identity, me, device, &encoded) else { continue };
         deliver(client, to, queue.as_ref(), device, &MailItem::Direct(env));
     }
 }

@@ -105,7 +105,7 @@ pub fn distribute_key_to(
             if device.device_key == identity.device_public() {
                 continue;
             }
-            let env = seal_to(identity, me, device, &plaintext);
+            let Ok(env) = seal_to(identity, me, device, &plaintext) else { continue };
             let item = MailItem::GroupInvite(env);
             if !deliver(client, &handle, queue.as_ref(), device, &item) {
                 let slot = device_slot(&device.device_key);
@@ -511,7 +511,7 @@ pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
             Err(_) => continue,
         };
         for device in &siblings {
-            let env = seal_to(&identity, &me, device, &plaintext);
+            let Ok(env) = seal_to(&identity, &me, device, &plaintext) else { continue };
             deliver(&client, &me, my_queue.as_ref(), device, &MailItem::GroupSync(env));
         }
         synced += 1;

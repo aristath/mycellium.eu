@@ -47,8 +47,8 @@ const AD: &[u8] = b"a|b";
 fn established(p: &mut RngPlatform) -> (Ratchet, Ratchet) {
     let alice = Identity::generate(p).unwrap();
     let bob = Identity::generate(p).unwrap();
-    let initiated = x3dh::initiate(p, &alice, &bob.messaging_public(), &bob.signed_pre_key_public());
-    let bob_sk = x3dh::respond(&bob, &initiated.init);
+    let initiated = x3dh::initiate(p, &alice, &bob.messaging_public(), &bob.signed_pre_key_public()).unwrap();
+    let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
     let a = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public());
     let b = Ratchet::new_responder(&bob_sk, &bob);
     (a, b)

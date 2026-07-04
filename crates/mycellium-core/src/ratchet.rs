@@ -327,8 +327,9 @@ mod tests {
             &alice,
             &bob.messaging_public(),
             &bob.signed_pre_key_public(),
-        );
-        let bob_sk = x3dh::respond(&bob, &initiated.init);
+        )
+        .unwrap();
+        let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
 
         let alice_r = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public());
         let bob_r = Ratchet::new_responder(&bob_sk, &bob);

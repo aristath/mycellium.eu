@@ -21,6 +21,9 @@ pub enum Error {
     DecryptFailed,
     /// A message would require skipping more keys than allowed.
     TooManySkipped,
+    /// A key-agreement input was a low-order point (all-zero DH output); the
+    /// handshake fails closed rather than deriving a weak secret.
+    WeakKey,
 }
 
 impl fmt::Display for Error {
@@ -32,6 +35,7 @@ impl fmt::Display for Error {
             Error::StaleRecord => "record is older than the known one",
             Error::DecryptFailed => "decryption failed",
             Error::TooManySkipped => "too many skipped messages",
+            Error::WeakKey => "low-order key rejected",
         };
         f.write_str(msg)
     }

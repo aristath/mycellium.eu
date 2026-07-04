@@ -170,7 +170,8 @@ impl Session {
             my_queue,
             record.record.primary(),
             &plaintext,
-        );
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(wire::encode(&envelope))
     }
 
@@ -609,7 +610,7 @@ impl Session {
         let peer_hex = wallet_hex(&precord.record.wallet);
         let mut delivered = 0u32;
         for device in &precord.record.devices {
-            let env = wireops::seal_to(&mut BrowserPlatform, &self.identity, &me, my_name, my_queue, device, &plaintext);
+            let Ok(env) = wireops::seal_to(&mut BrowserPlatform, &self.identity, &me, my_name, my_queue, device, &plaintext) else { continue };
             let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(|e| JsValue::from_str(&e.to_string()))?;
             if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
                 delivered += 1;
@@ -646,7 +647,7 @@ impl Session {
                 if device.device_key == self.identity.device_public() {
                     continue; // never this exact device
                 }
-                let env = wireops::seal_to(&mut BrowserPlatform, &self.identity, me, my_name, my_queue, device, &plaintext);
+                let Ok(env) = wireops::seal_to(&mut BrowserPlatform, &self.identity, me, my_name, my_queue, device, &plaintext) else { continue };
                 let Ok(blob) = serde_json::to_string(&MailItem::GroupInvite(env)) else { continue };
                 let _ = queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob);
             }
