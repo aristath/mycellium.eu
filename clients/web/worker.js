@@ -59,8 +59,13 @@ const save = async (bytes) => {
   await idbPut('snapshot', { iv, ct });
 };
 
-// Ops that only read never need a persist afterwards.
-const READS = new Set(['peers', 'groups', 'thread', 'group_thread', 'wallet', 'file', 'name_of', 'get', 'push_key', 'export', 'version']);
+// Allowlist of engine ops reachable over RPC — a stray postMessage (or injected
+// script) can't call arbitrary Session methods, only these. READS don't mutate
+// (no persist afterwards); WRITES do. `export`/`import` are intentionally absent:
+// nothing calls them over RPC (save() uses session.export() directly), and they
+// dump/replace the whole store (seed included), so they stay off the wire.
+const READS = new Set(['peers', 'groups', 'thread', 'group_thread', 'wallet', 'file', 'name_of', 'get', 'push_key', 'link_payload', 'qr_svg', 'version']);
+const WRITES = new Set(['register', 'send', 'reply', 'react', 'delete_message', 'send_file', 'sync', 'group_create', 'group_send', 'group_add', 'group_leave', 'link_device', 'push_subscribe', 'put', 'del', 'add_message']);
 
 let session = null;
 const ready = (async () => {
@@ -80,8 +85,12 @@ self.onmessage = async (e) => {
   const { id, op, args } = e.data;
   try {
     await ready;
+    if (!READS.has(op) && !WRITES.has(op)) {
+      self.postMessage({ id, ok: false, err: `unknown op: ${op}` });
+      return;
+    }
     const result = session[op](...(args || []));
-    if (!READS.has(op)) await save(session.export());
+    if (WRITES.has(op)) await save(session.export());
     self.postMessage({ id, ok: true, result });
   } catch (err) {
     self.postMessage({ id, ok: false, err: String((err && err.message) || err) });

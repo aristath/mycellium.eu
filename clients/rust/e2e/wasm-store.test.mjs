@@ -64,6 +64,15 @@ async function main() {
     check(snap.hasIv && snap.hasCt && !snap.isRawBuffer, 'snapshot is AES-GCM ciphertext (iv+ct), not plaintext identity bytes');
     check(snap.keyExtractable === false, 'the wrapping key is stored non-extractable');
 
+    console.error('• the worker RPC only honors allowlisted ops');
+    const guard = await page.evaluate(async () => {
+      const tryOp = async (op) => { try { await window.mycellium.rpc(op, []); return 'ok'; } catch { return 'rejected'; } };
+      return { exp: await tryOp('export'), proto: await tryOp('__proto__'), bogus: await tryOp('nope'), wallet: await tryOp('wallet') };
+    });
+    check(guard.exp === 'rejected', "'export' is not reachable over RPC");
+    check(guard.proto === 'rejected' && guard.bogus === 'rejected', 'unknown / prototype ops are rejected');
+    check(guard.wallet === 'ok', 'an allowlisted op still works');
+
     console.error('• reload the page — a fresh WASM instance restores from IndexedDB');
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
