@@ -183,11 +183,9 @@ impl Session {
 
     /// Publish this identity's record to the directory so peers can find us.
     pub fn register(&mut self, dir_url: &str, queue_url: &str, handle: &str, name: &str) -> Result<(), JsValue> {
-        let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let record = wireops::build_record(&mut BrowserPlatform, &self.identity, &me, name, queue_url, "");
-        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        let token = dir.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        dir.publish(&token, &me, &record).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        // Merge into any existing record so renaming/re-registering never drops
+        // a device that a prior link_device added to the account.
+        self.publish_merged(dir_url, handle, name, queue_url)?;
         // Remember our config so group-invite processing during sync() can
         // distribute our own sender key back to members.
         let _ = self.store.put(b"myc:handle", handle.as_bytes());
@@ -273,28 +271,8 @@ impl Session {
         self.identity = Identity::restore(mnemonic.trim(), seed).map_err(|_| JsValue::from_str("invalid seed phrase"))?;
         store_identity(&mut self.store, &self.identity);
 
-        // Merge our device into the account's record (or create it) and publish.
-        let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let dc = DirectoryClient::with_transport(dir, Box::new(XhrTransport));
-        let existing = dc.lookup(&me).ok();
-        let mut devices = existing.as_ref().map(|r| r.record.devices.clone()).unwrap_or_default();
-        let mine = wireops::this_device(&self.identity, "");
-        if !devices.iter().any(|d| d.device_key == mine.device_key) {
-            devices.push(mine);
-        }
-        let now = BrowserPlatform.now_unix_secs();
-        let seq = existing.as_ref().map(|r| r.record.seq + 1).unwrap_or(now).max(now);
-        let record = Record {
-            handle: core_user_id(handle),
-            name: name.to_string(),
-            wallet: self.identity.wallet_public(),
-            queue: queue.to_string(),
-            devices,
-            seq,
-        };
-        let signed = SignedRecord::sign(record, &self.identity);
-        let token = dc.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        dc.publish(&token, &me, &signed).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        // Merge our (new) device into the account's record and publish.
+        self.publish_merged(dir, handle, name, queue)?;
 
         let _ = self.store.put(b"myc:handle", handle.as_bytes());
         let _ = self.store.put(b"myc:name", name.as_bytes());
@@ -560,6 +538,34 @@ impl Session {
 }
 
 impl Session {
+    /// Publish our record, **merging** this device into any record that already
+    /// exists for the handle, so re-registering or linking never drops sibling
+    /// devices. Bumps `seq` past the existing one.
+    fn publish_merged(&self, dir_url: &str, handle: &str, name: &str, queue_url: &str) -> Result<(), JsValue> {
+        let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
+        let existing = dir.lookup(&me).ok();
+        let mut devices = existing.as_ref().map(|r| r.record.devices.clone()).unwrap_or_default();
+        let mine = wireops::this_device(&self.identity, "");
+        if !devices.iter().any(|d| d.device_key == mine.device_key) {
+            devices.push(mine);
+        }
+        let now = BrowserPlatform.now_unix_secs();
+        let seq = existing.as_ref().map(|r| r.record.seq + 1).unwrap_or(now).max(now);
+        let record = Record {
+            handle: core_user_id(handle),
+            name: name.to_string(),
+            wallet: self.identity.wallet_public(),
+            queue: queue_url.to_string(),
+            devices,
+            seq,
+        };
+        let signed = SignedRecord::sign(record, &self.identity);
+        let token = dir.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        dir.publish(&token, &me, &signed).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(())
+    }
+
     /// Shared delivery path: look up the peer, X3DH-seal `app` to each of their
     /// devices, deposit to their queue, and record our own copy.
     #[allow(clippy::too_many_arguments)]

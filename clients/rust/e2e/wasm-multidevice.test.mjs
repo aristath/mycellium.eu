@@ -65,6 +65,13 @@ async function main() {
         b.link_device(payload); // B: same seed, fresh device, merges into the record
         carol.send(dir, 'carol', 'Carol', q, 'alice', 'hi alice on all devices');
         a.sync(q); b.sync(q);
+
+        // Device A re-registers (e.g. renames itself). This must NOT drop device B
+        // from the record — a later message must still reach both devices.
+        a.register(dir, q, 'alice', 'Alice Renamed');
+        carol.send(dir, 'carol', 'Carol', q, 'alice', 'still on both after rename');
+        a.sync(q); b.sync(q);
+
         return {
           payloadLen: payload.length,
           walletA: a.wallet(), walletB: b.wallet(),
@@ -79,6 +86,7 @@ async function main() {
     check(r.walletA === r.walletB, 'both devices share the account wallet (same seed)');
     check(r.threadA.includes('hi alice on all devices'), "device A received the message");
     check(r.threadB.includes('hi alice on all devices'), "device B received the message (multi-device fan-out)");
+    check(r.threadB.includes('still on both after rename'), "device B still reachable after A re-registered (no device drop)");
   } finally {
     await browser.close();
     web.close();
