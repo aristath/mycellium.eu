@@ -186,6 +186,10 @@ async function main() {
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');
     const pushKey = await bob.evaluate((q) => { try { return window.mycellium.session.push_key(q); } catch (e) { return 'ERR:' + e; } }, qUrl);
     check(typeof pushKey === 'string' && pushKey.length > 20 && !pushKey.startsWith('ERR'), `queue serves the Session a VAPID key (${String(pushKey).slice(0, 14)}…)`);
+
+    console.error('• offline indicator when the servers are unreachable');
+    for (const p of procs) { try { p.kill('SIGKILL'); } catch {} } // take the servers down (must be the last check)
+    check(await hasText(alice, '.offline', 'offline', 15000), "Alice's PWA shows 'offline' when its queue is unreachable");
   } finally {
     await browser.close();
     web.close();

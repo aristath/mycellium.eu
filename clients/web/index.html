@@ -40,6 +40,7 @@
     .bubble .time { font-size:.62rem; opacity:.55; margin-left:8px; }
     .bubble .sender { font-size:.7rem; color:var(--accent); margin-bottom:2px; }
     .when { float:right; font-size:.72rem; color:var(--dim); font-weight:400; }
+    .offline { color:#e8908f; font-size:.8rem; margin-right:10px; }
     .bubble { cursor:pointer; }
     .replybar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#10161a; border-top:1px solid var(--line); font-size:.85rem; color:var(--dim); }
     .replybar span { color:var(--ink); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -72,7 +73,7 @@
     if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
 
     let session, me = null, open = null, poll = null;
-    let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false;
+    let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false, online = true;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
@@ -103,8 +104,11 @@
       poll = setInterval(async () => {
         try {
           const n = session.sync(cfg.queue);
+          if (!online) { online = true; render(); }
           if (n > 0) { await persist(); notifyNew(); render(); }
-        } catch {}
+        } catch {
+          if (online) { online = false; render(); }
+        }
       }, 3000);
     }
 
@@ -211,7 +215,7 @@
         </button>`).join('');
       const items = (groupItems + peerItems) || `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
       app.innerHTML = `
-        <header><div class="who">${esc(me.name)} <small>@${esc(me.handle)}</small></div><div class="grow"></div><button class="ghost" id="settings">⚙</button></header>
+        <header><div class="who">${esc(me.name)} <small>@${esc(me.handle)}</small></div><div class="grow"></div>${online ? '' : '<span class="offline">● offline</span>'}<button class="ghost" id="settings">⚙</button></header>
         <main>${items}</main>
         <button class="fab" id="new">＋</button>`;
       app.querySelectorAll('.item[data-peer]').forEach((b) => b.onclick = () => { open = b.dataset.peer; render(); });
