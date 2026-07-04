@@ -141,20 +141,7 @@ pub fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: 
 
 /// Asynchronously X3DH-seal `plaintext` for `peer` (offline, one-shot session).
 pub fn seal_to(identity: &Identity, me: &Handle, device: &Device, plaintext: &[u8]) -> Envelope {
-    let mut platform = OsPlatform;
-    let responder_ik = device.id_key;
-    let responder_spk = device.signed_pre_key.public;
-    let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk);
-    let mut ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk);
-    let ad = associated_data(&identity.messaging_public(), &responder_ik);
-    let sealed = ratchet.encrypt(plaintext, &ad);
-    Envelope {
-        from: me.clone(),
-        sender_record: build_record(identity, me, ""),
-        init: initiated.init,
-        message: sealed,
-        timestamp: platform.now_unix_secs(),
-    }
+    crate::wireops::seal_to(&mut OsPlatform, identity, me, &display_name_for(me), &own_queue(), device, plaintext)
 }
 
 
@@ -530,28 +517,6 @@ pub fn send_receipt(identity: &Identity, me: &Handle, client: &DirectoryClient, 
 
 
 /// Authenticate the sender and decrypt one offline envelope to raw bytes.
-pub fn open_envelope(
-    identity: &Identity,
-    platform: &mut OsPlatform,
-    env: &Envelope,
-) -> Result<(Handle, Vec<u8>)> {
-    env.sender_record
-        .verify()
-        .map_err(|_| anyhow!("sender record failed verification"))?;
-    // The envelope carries the sender's plaintext name for display; it's
-    // self-verifying — its id must equal the id in the wallet-signed record.
-    if user_id(env.from.as_str()) != env.sender_record.record.handle {
-        bail!("sender name does not match its record");
-    }
-    if env.init.initiator_ik != env.sender_record.record.primary().id_key {
-        bail!("handshake is not bound to the sender's identity");
-    }
-
-    let shared = x3dh::respond(identity, &env.init);
-    let mut ratchet = Ratchet::new_responder(&shared, identity);
-    let ad = associated_data(&env.init.initiator_ik, &identity.messaging_public());
-    let plaintext = ratchet
-        .decrypt(platform, &env.message, &ad)
-        .map_err(|_| anyhow!("could not decrypt message"))?;
-    Ok((env.from.clone(), plaintext))
+pub fn open_envelope(identity: &Identity, platform: &mut OsPlatform, env: &Envelope) -> Result<(Handle, Vec<u8>)> {
+    crate::wireops::open_envelope(platform, identity, env)
 }

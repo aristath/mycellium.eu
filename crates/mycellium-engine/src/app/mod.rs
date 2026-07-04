@@ -6,12 +6,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 
 use mycellium_core::group::{Group, GroupMessage};
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::Ratchet;
-use mycellium_core::record::{Device, Record, SignedPreKey, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::shamir::{self, Share};
 use mycellium_core::transport::Transport;

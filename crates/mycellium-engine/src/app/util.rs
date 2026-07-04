@@ -43,43 +43,18 @@ pub fn preview(text: &str) -> String {
 
 /// Bind both peers' messaging identities into the AEAD associated data, so a
 /// ciphertext is cryptographically tied to *this* pair. Initiator's key first.
-pub fn associated_data(initiator_ik: &MessagingPublicKey, responder_ik: &MessagingPublicKey) -> Vec<u8> {
-    let mut ad = Vec::with_capacity(64);
-    ad.extend_from_slice(&initiator_ik.0);
-    ad.extend_from_slice(&responder_ik.0);
-    ad
-}
+// The platform-agnostic crypto helpers live in `crate::wireops`; these are the
+// native entry points that supply the OS platform.
+pub use crate::wireops::{associated_data, hex};
 
-
-
-pub fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    out
-}
-
-
-
-/// A short random message id.
+/// A short random message id (native).
 pub fn random_id() -> String {
-    let mut bytes = [0u8; 6];
-    let _ = getrandom::getrandom(&mut bytes);
-    hex(&bytes)
+    crate::wireops::random_id(&mut OsPlatform)
 }
-
-
 
 /// A plain-text application message (no expiry).
 pub fn text_message(text: &str) -> AppMessage {
-    AppMessage {
-        id: random_id(),
-        timestamp: OsPlatform.now_unix_secs(),
-        expires_at: None,
-        body: Body::Text(text.to_string()),
-    }
+    crate::wireops::text_message(&mut OsPlatform, text)
 }
 
 

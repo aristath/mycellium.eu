@@ -242,16 +242,9 @@ pub fn revoke_device(handle: &str, device_id: &str, directory: &str) -> Result<(
 
 
 pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecord {
-    let record = Record {
-        // The record binds `user_id(name)`, so the directory never sees the name.
-        handle: user_id(handle.as_str()),
-        name: display_name_for(handle),
-        wallet: identity.wallet_public(),
-        queue: own_queue(),
-        devices: vec![this_device(identity, addr)],
-        seq: OsPlatform.now_unix_secs(),
-    };
-    SignedRecord::sign(record, identity)
+    // Supply the OS platform, plus the display name and queue from the
+    // environment; the platform-agnostic core lives in `crate::wireops`.
+    crate::wireops::build_record(&mut OsPlatform, identity, handle, &display_name_for(handle), &own_queue(), addr)
 }
 
 
@@ -266,11 +259,4 @@ pub fn my_group_id(identity: &Identity) -> Vec<u8> {
 
 /// This device's entry for a record: its transport address plus its own
 /// (currently seed-derived) messaging keys, signed by the account wallet.
-pub fn this_device(identity: &Identity, addr: &str) -> Device {
-    Device {
-        device_key: identity.device_public(),
-        peer_id: PeerId(addr.as_bytes().to_vec()),
-        id_key: identity.messaging_public(),
-        signed_pre_key: SignedPreKey::create(identity.signed_pre_key_public(), identity),
-    }
-}
+pub use crate::wireops::this_device;

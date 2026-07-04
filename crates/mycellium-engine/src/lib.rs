@@ -27,3 +27,4 @@ pub mod names;
 pub mod outbox;
 #[cfg(feature = "native")]
 pub mod platform;
+pub mod wireops;
