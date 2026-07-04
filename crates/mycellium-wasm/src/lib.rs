@@ -187,36 +187,20 @@ impl Session {
         Ok(())
     }
 
-    /// Send a text message to `peer_handle` via the directory + queue. Returns the
-    /// number of recipient devices delivered to.
+    /// Send a text message to `peer_handle`. Returns the number of recipient
+    /// devices delivered to.
     #[allow(clippy::too_many_arguments)]
     pub fn send(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, text: &str) -> Result<u32, JsValue> {
-        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let peer = Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
-        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        let precord = dir.lookup(&peer).map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
-        let plaintext = wireops::text_message(&mut BrowserPlatform, text).encode();
-        let queue = QueueClient::with_transport(&precord.record.queue, Box::new(XhrTransport));
-        let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let peer_hex = wallet_hex(&precord.record.wallet);
-        let mut delivered = 0u32;
-        for device in &precord.record.devices {
-            let env = wireops::seal_to(&mut BrowserPlatform, &self.identity, &me, my_name, my_queue, device, &plaintext);
-            let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
-                delivered += 1;
-            }
-        }
-        // Record our own copy of the message in local history.
-        let sent = history::StoredMessage {
-            id: wireops::random_id(&mut BrowserPlatform),
-            from_me: true,
-            text: text.to_string(),
-            timestamp: BrowserPlatform.now_unix_secs(),
-            expires_at: None,
-        };
-        let _ = history::append(&mut self.store, peer_handle, sent);
-        Ok(delivered)
+        let app = wireops::text_message(&mut BrowserPlatform, text);
+        self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
+    }
+
+    /// Reply to message `reply_to` in the conversation with `peer_handle`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reply(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, reply_to: &str, text: &str) -> Result<u32, JsValue> {
+        let body = Body::Reply { to: reply_to.to_string(), text: text.to_string() };
+        let app = wireops::app_message(&mut BrowserPlatform, body);
+        self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
     /// Drain our queue, decrypt direct messages, and store them. Returns the
@@ -233,18 +217,7 @@ impl Session {
             let Ok(MailItem::Direct(env)) = serde_json::from_str::<MailItem>(&blob) else { continue };
             let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { continue };
             let Ok(app) = AppMessage::decode(&plaintext) else { continue };
-            let text = match app.body {
-                Body::Text(t) => t,
-                other => format!("{other:?}"),
-            };
-            let msg = history::StoredMessage {
-                id: app.id,
-                from_me: false,
-                text,
-                timestamp: app.timestamp,
-                expires_at: app.expires_at,
-            };
-            let _ = history::append(&mut self.store, from.as_str(), msg);
+            apply_to_history(&mut self.store, from.as_str(), &app, false);
             received += 1;
         }
         Ok(received)
@@ -322,6 +295,55 @@ impl Session {
             mycellium_core::wire::decode(bytes).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
         self.store.map = entries.into_iter().collect();
         Ok(())
+    }
+}
+
+impl Session {
+    /// Shared delivery path: look up the peer, X3DH-seal `app` to each of their
+    /// devices, deposit to their queue, and record our own copy.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_app(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, app: AppMessage) -> Result<u32, JsValue> {
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let peer = Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
+        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
+        let precord = dir.lookup(&peer).map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
+        let plaintext = app.encode();
+        let queue = QueueClient::with_transport(&precord.record.queue, Box::new(XhrTransport));
+        let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let peer_hex = wallet_hex(&precord.record.wallet);
+        let mut delivered = 0u32;
+        for device in &precord.record.devices {
+            let env = wireops::seal_to(&mut BrowserPlatform, &self.identity, &me, my_name, my_queue, device, &plaintext);
+            let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
+                delivered += 1;
+            }
+        }
+        apply_to_history(&mut self.store, peer_handle, &app, true);
+        Ok(delivered)
+    }
+}
+
+/// Apply a sent/received message to a conversation: edits/deletes mutate the
+/// referenced message, everything else appends. `from_me` marks the direction.
+fn apply_to_history(store: &mut MemStore, peer: &str, app: &AppMessage, from_me: bool) {
+    match &app.body {
+        Body::Edit { to, text } => {
+            let _ = history::edit(store, peer, to, text);
+        }
+        Body::Delete { to } => {
+            let _ = history::delete(store, peer, to);
+        }
+        _ => {
+            let msg = history::StoredMessage {
+                id: app.id.clone(),
+                from_me,
+                text: app.summary(),
+                timestamp: app.timestamp,
+                expires_at: app.expires_at,
+            };
+            let _ = history::append(store, peer, msg);
+        }
     }
 }
 

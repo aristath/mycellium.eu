@@ -42,14 +42,14 @@ pub fn random_id<P: Platform>(platform: &mut P) -> String {
     hex(&bytes)
 }
 
+/// Wrap a message `body` into an [`AppMessage`] with a fresh id + timestamp.
+pub fn app_message<P: Platform>(platform: &mut P, body: Body) -> AppMessage {
+    AppMessage { id: random_id(platform), timestamp: platform.now_unix_secs(), expires_at: None, body }
+}
+
 /// A plain-text application message (no expiry).
 pub fn text_message<P: Platform>(platform: &mut P, text: &str) -> AppMessage {
-    AppMessage {
-        id: random_id(platform),
-        timestamp: platform.now_unix_secs(),
-        expires_at: None,
-        body: Body::Text(text.to_string()),
-    }
+    app_message(platform, Body::Text(text.to_string()))
 }
 
 /// The mailbox slot a device drains: the full hex of its key. Account-wide items

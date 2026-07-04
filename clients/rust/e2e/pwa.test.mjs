@@ -122,6 +122,14 @@ async function main() {
     check(await hasNotif(bob, 'hello bob'), "Bob's PWA raised a desktop notification");
     await jsClick(bob, '.item');
     check(await hasText(bob, '.bubble', 'hello bob — sent from the browser PWA 🍄', 10000), 'Bob opens the thread and sees the decrypted message');
+
+    console.error('• Bob replies to the message (rich message)');
+    await jsClick(bob, '.bubble[data-id]'); // tap a message to reply
+    check(await hasText(bob, '.replybar', 'Replying', 5000), 'reply banner appears');
+    await setVal(bob, '#msg', 'sounds good to me');
+    await jsClick(bob, '#send');
+    check(await hasText(bob, '.bubble', 'sounds good to me', 8000), "reply shows in Bob's thread");
+    check(await hasText(alice, '.bubble', 'sounds good to me', 20000), 'Alice receives the reply (rendered with the ↪ marker)');
   } finally {
     await browser.close();
     web.close();
