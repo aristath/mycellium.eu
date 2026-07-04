@@ -2,61 +2,195 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mycellium WASM — stage 1</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f0c" />
+  <link rel="manifest" href="./manifest.json" />
+  <title>Mycellium</title>
   <style>
-    body { font: 15px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
-    pre { background: #111; color: #b7f7c2; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    h1 { font-size: 1.3rem; }
+    :root { --bg:#0b0f0c; --panel:#12181400; --card:#151b17; --line:#232c26; --ink:#e8f2ea; --dim:#8fa596; --accent:#37d67a; --me:#1f6f43; --them:#1b2620; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; }
+    body { background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, -apple-system, sans-serif; display:flex; flex-direction:column; height:100dvh; }
+    header { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card); }
+    header .who { font-weight:600; } header .who small { color:var(--dim); font-weight:400; }
+    header .grow { flex:1; }
+    button { font:inherit; border:0; border-radius:9px; padding:9px 13px; background:var(--accent); color:#04120a; font-weight:600; cursor:pointer; }
+    button.ghost { background:transparent; color:var(--accent); padding:6px 8px; }
+    button:disabled { opacity:.5; cursor:default; }
+    main { flex:1; overflow-y:auto; }
+    .wrap { max-width:640px; margin:0 auto; padding:16px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-top:10vh; }
+    .card h1 { font-size:1.4rem; margin:0 0 4px; } .card p { color:var(--dim); margin:.2rem 0 1rem; }
+    label { display:block; font-size:.8rem; color:var(--dim); margin:12px 0 4px; }
+    input { width:100%; padding:11px 12px; border-radius:9px; border:1px solid var(--line); background:#0d120f; color:var(--ink); font:inherit; }
+    .row { display:flex; gap:8px; margin-top:16px; }
+    .err { color:#ff8f8f; font-size:.85rem; min-height:1.1em; margin-top:8px; }
+    .item { display:flex; gap:12px; align-items:center; width:100%; text-align:left; background:transparent; color:var(--ink); border-bottom:1px solid var(--line); border-radius:0; padding:14px 16px; }
+    .item:hover { background:#10161200; }
+    .avatar { width:42px; height:42px; border-radius:50%; background:var(--them); display:grid; place-items:center; font-weight:700; color:var(--accent); flex:none; }
+    .item .body { flex:1; min-width:0; }
+    .item .title { font-weight:600; }
+    .item .snippet { color:var(--dim); font-size:.87rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .empty { color:var(--dim); text-align:center; padding:3rem 1rem; }
+    .fab { position:sticky; bottom:16px; float:right; margin:16px; box-shadow:0 6px 20px #0008; }
+    .msgs { display:flex; flex-direction:column; gap:6px; padding:16px; }
+    .bubble { max-width:78%; padding:8px 12px; border-radius:14px; background:var(--them); align-self:flex-start; word-wrap:break-word; }
+    .bubble.me { background:var(--me); align-self:flex-end; }
+    .composer { display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); background:var(--card); }
+    .composer input { flex:1; }
+    .backbar { display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line); background:var(--card); }
+    .modal-bg { position:fixed; inset:0; background:#000a; display:grid; place-items:center; padding:16px; }
+    .modal { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; width:100%; max-width:380px; }
   </style>
 </head>
 <body>
-  <h1>Mycellium — engine in the browser</h1>
-  <p>Stage 1: the account-id hash and device-key generation run entirely in WebAssembly — no server call.</p>
-  <pre id="out">loading WebAssembly…</pre>
+  <div id="app"><div class="wrap"><div class="card"><h1>Mycellium</h1><p>loading…</p></div></div></div>
+
   <script type="module">
     import init, { version, user_id, generate_wallet, directory_login, Session } from './pkg/mycellium_wasm.js';
 
-    // Minimal IndexedDB blob store for the session snapshot.
-    const idb = () => new Promise((res, rej) => {
-      const r = indexedDB.open('mycellium', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('state');
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
-    });
-    const idbSave = async (bytes) => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(bytes, 'snapshot'); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
-    const idbLoad = async () => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state', 'readonly'); const g = tx.objectStore('state').get('snapshot'); g.onsuccess = () => res(g.result || null); g.onerror = () => rej(g.error); }); };
+    // ---- IndexedDB snapshot store ----
+    const idb = () => new Promise((res, rej) => { const r = indexedDB.open('mycellium', 1); r.onupgradeneeded = () => r.result.createObjectStore('state'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const idbSave = async (b) => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state','readwrite'); tx.objectStore('state').put(b,'snapshot'); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
+    const idbLoad = async () => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state','readonly'); const g = tx.objectStore('state').get('snapshot'); g.onsuccess = () => res(g.result || null); g.onerror = () => rej(g.error); }); };
 
-    (async () => {
+    // ---- config (the directory + queue this app talks to) ----
+    const qs = new URLSearchParams(location.search);
+    const cfg = {
+      dir: qs.get('dir') || localStorage.getItem('myc_dir') || '',
+      queue: qs.get('queue') || localStorage.getItem('myc_queue') || '',
+    };
+    if (qs.get('dir')) localStorage.setItem('myc_dir', cfg.dir);
+    if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
+
+    let session, me = null, open = null, poll = null;
+    const app = document.getElementById('app');
+    const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+    const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
+    const persist = async () => { await idbSave(session.export()); };
+
+    async function boot() {
       await init();
-      // Restore the same identity + state from IndexedDB (survives reloads).
       const saved = await idbLoad();
-      const session = saved ? Session.restore(new Uint8Array(saved)) : new Session();
-      // Expose the engine to the page + automated tests.
-      window.mycellium = {
-        version, user_id, generate_wallet, directory_login, session, Session,
-        persist: async () => { await idbSave(session.export()); },
+      session = saved ? Session.restore(new Uint8Array(saved)) : new Session();
+      if (!saved) await persist();
+      const stored = session.get('myc:me');
+      me = stored ? JSON.parse(stored) : null;
+      // Test hooks.
+      window.mycellium = { version, user_id, generate_wallet, directory_login, session, Session, persist };
+      if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+      render();
+      startPolling();
+    }
+
+    function startPolling() {
+      if (poll) clearInterval(poll);
+      if (!me || !cfg.queue) return;
+      poll = setInterval(async () => {
+        try {
+          const n = session.sync(cfg.queue);
+          if (n > 0) { await persist(); render(); }
+        } catch {}
+      }, 3000);
+    }
+
+    function render() {
+      if (!cfg.dir || !cfg.queue) return renderSetup();
+      if (!me) return renderRegister();
+      return open ? renderThread(open) : renderList();
+    }
+
+    function renderSetup() {
+      app.innerHTML = `<div class="wrap"><div class="card">
+        <h1>Connect Mycellium</h1><p>Point this app at your directory and queue.</p>
+        <label>Directory URL</label><input id="dir" placeholder="https://directory.example" value="${esc(cfg.dir)}">
+        <label>Queue URL</label><input id="queue" placeholder="https://queue.example" value="${esc(cfg.queue)}">
+        <div class="row"><button id="save">Continue</button></div><div class="err" id="err"></div>
+      </div></div>`;
+      byId('save').onclick = () => {
+        cfg.dir = byId('dir').value.trim().replace(/\/$/, '');
+        cfg.queue = byId('queue').value.trim().replace(/\/$/, '');
+        if (!cfg.dir || !cfg.queue) return setErr('Both URLs are required.');
+        localStorage.setItem('myc_dir', cfg.dir); localStorage.setItem('myc_queue', cfg.queue);
+        render();
       };
-      const uid = user_id('mary@example.com');
-      const uidUpper = user_id('  MARY@Example.com  '); // trims + lowercases → same id
-      const w1 = generate_wallet();
-      const w2 = generate_wallet();
-      const lines = [
-        `version:            ${version()}`,
-        `user_id(mary):      ${uid}`,
-        `user_id(MARY, pad): ${uidUpper}`,
-        `normalized equal:   ${uid === uidUpper}`,
-        `wallet #1:          ${w1}`,
-        `wallet #2:          ${w2}`,
-        `wallets differ:     ${w1 !== w2}`,
-      ];
-      document.getElementById('out').textContent = lines.join('\n');
-      // Expose for the automated test.
-      window.__wasm = { version: version(), uid, uidUpper, w1, w2 };
-    })().catch((e) => {
-      document.getElementById('out').textContent = 'ERROR: ' + e;
-      window.__wasm = { error: String(e) };
-    });
+    }
+
+    function renderRegister() {
+      app.innerHTML = `<div class="wrap"><div class="card">
+        <h1>Pick a username</h1><p>Others reach you by this name. It runs entirely in your browser.</p>
+        <label>Username</label><input id="u" placeholder="alice" autocapitalize="off">
+        <label>Display name</label><input id="n" placeholder="Alice">
+        <div class="row"><button id="go">Create account</button></div><div class="err" id="err"></div>
+      </div></div>`;
+      byId('go').onclick = async () => {
+        const handle = byId('u').value.trim().toLowerCase();
+        const name = byId('n').value.trim() || handle;
+        if (!/^[a-z0-9_]{2,32}$/.test(handle)) return setErr('Username: 2–32 chars, a–z 0–9 _');
+        byId('go').disabled = true; setErr('');
+        try {
+          session.register(cfg.dir, cfg.queue, handle, name);
+          me = { handle, name };
+          session.put('myc:me', JSON.stringify(me));
+          await persist();
+          render(); startPolling();
+        } catch (e) { byId('go').disabled = false; setErr('Registration failed: ' + e); }
+      };
+    }
+
+    function renderList() {
+      let threads = [];
+      try { threads = JSON.parse(session.peers()); } catch {}
+      const items = threads.length ? threads.map((t) => `
+        <button class="item" data-peer="${esc(t.peer)}">
+          <div class="avatar">${initials(t.peer)}</div>
+          <div class="body"><div class="title">${esc(t.peer)}</div>
+          <div class="snippet">${t.mine ? 'You: ' : ''}${esc(t.last) || 'No messages yet'}</div></div>
+        </button>`).join('') : `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
+      app.innerHTML = `
+        <header><div class="who">${esc(me.name)} <small>@${esc(me.handle)}</small></div><div class="grow"></div></header>
+        <main>${items}</main>
+        <button class="fab" id="new">＋</button>`;
+      app.querySelectorAll('.item').forEach((b) => b.onclick = () => { open = b.dataset.peer; render(); });
+      byId('new').onclick = () => newChat();
+    }
+
+    function renderThread(peer) {
+      let msgs = [];
+      try { msgs = JSON.parse(session.thread(peer)); } catch {}
+      const bubbles = msgs.map((m) => `<div class="bubble ${m.from_me ? 'me' : ''}">${esc(m.text)}</div>`).join('')
+        || `<div class="empty">Say hello 👋</div>`;
+      app.innerHTML = `
+        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b>${esc(peer)}</b></div>
+        <main><div class="msgs" id="msgs">${bubbles}</div></main>
+        <div class="composer"><input id="msg" placeholder="Message @${esc(peer)}" autocomplete="off"><button id="send">Send</button></div>`;
+      byId('back').onclick = () => { open = null; render(); };
+      const send = async () => {
+        const text = byId('msg').value.trim(); if (!text) return;
+        byId('msg').value = '';
+        try { session.send(cfg.dir, me.handle, me.name, cfg.queue, peer, text); await persist(); renderThread(peer); }
+        catch (e) { alert('Send failed: ' + e); }
+      };
+      byId('send').onclick = send;
+      byId('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+      const m = byId('msgs'); if (m) m.scrollTop = m.scrollHeight;
+    }
+
+    function newChat() {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal">
+        <h1 style="font-size:1.1rem;margin:0 0 10px">New message</h1>
+        <label>Their username</label><input id="peer" placeholder="bob" autocapitalize="off">
+        <div class="row"><button id="ok">Open</button><button class="ghost" id="cancel">Cancel</button></div>
+      </div></div>`);
+      const close = () => byId('bg').remove();
+      byId('cancel').onclick = close;
+      byId('ok').onclick = () => { const p = byId('peer').value.trim().toLowerCase(); if (p) { close(); open = p; renderThread(p); } };
+    }
+
+    function byId(id) { return document.getElementById(id); }
+    function setErr(m) { const e = byId('err'); if (e) e.textContent = m; }
+
+    boot().catch((e) => { app.innerHTML = `<div class="wrap"><div class="card"><h1>Error</h1><p>${esc(String(e))}</p></div></div>`; });
   </script>
 </body>
 </html>

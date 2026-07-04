@@ -290,6 +290,26 @@ impl Session {
         serde_json::to_string(&messages).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// The conversation list as JSON: `[{peer, last, timestamp, mine}]`, newest
+    /// first — for rendering the threads screen.
+    pub fn peers(&self) -> Result<String, JsValue> {
+        let peers = mycellium_engine::history::peers(&self.store).map_err(|_| JsValue::from_str("store error"))?;
+        let mut out = Vec::new();
+        for peer in peers {
+            let msgs =
+                mycellium_engine::history::load(&self.store, &peer).map_err(|_| JsValue::from_str("store error"))?;
+            let last = msgs.last();
+            out.push(serde_json::json!({
+                "peer": peer,
+                "last": last.map(|m| m.text.clone()).unwrap_or_default(),
+                "timestamp": last.map(|m| m.timestamp).unwrap_or(0),
+                "mine": last.map(|m| m.from_me).unwrap_or(false),
+            }));
+        }
+        out.sort_by(|a, b| b["timestamp"].as_u64().cmp(&a["timestamp"].as_u64()));
+        serde_json::to_string(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Serialize the whole store for the host to persist (→ IndexedDB).
     pub fn export(&self) -> Vec<u8> {
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self.store.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

@@ -1,0 +1,13 @@
+{
+  "name": "Mycellium",
+  "short_name": "Mycellium",
+  "description": "Peer-to-peer, end-to-end-encrypted messaging that runs in your browser.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b0f0c",
+  "theme_color": "#0b0f0c",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

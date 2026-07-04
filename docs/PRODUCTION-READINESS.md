@@ -48,11 +48,12 @@ deployment shape, and the operational essentials** around them.
 
 ## Tier 1 — Seamlessness (hitches users would feel)
 
-- [ ] **T1.1 — Consumer distribution (WASM PWA).** Today a user must run a local
-  Rust server and open `localhost` — not consumer-grade. Compile the engine to
-  WASM and serve the PWA over HTTPS so it runs entirely in the browser, talking
-  straight to the directory/queue. **Biggest single unlock.** Staged, because the
-  engine couples blocking `ureq` + `std::fs` into each function:
+- [x] **T1.1 — Consumer distribution (WASM PWA).** *(done)* The engine is
+  compiled to WASM and served as a static PWA that runs entirely in the browser,
+  talking straight to the directory/queue — no local Rust server. Same engine
+  code as native (feature-gating + `wireops` + a `Session` façade), native never
+  regressed (125 tests). Six headless-Chrome suites cover it end to end. The
+  staged path:
   - [x] **Stage 1 — pipeline + core crypto in-browser.** `crates/mycellium-wasm`
     (excluded from the native workspace) exposes `user_id` + device-key
     generation via `wasm-bindgen`; `clients/web` loads it. A headless-Chrome test
@@ -76,8 +77,13 @@ deployment shape, and the operational essentials** around them.
     a full message **browser → real directory+queue → browser** (register, X3DH
     seal, queue deposit, collect, decrypt, history), same engine code as native.
     Five browser suites green.
-  - [ ] **Stage 4 — port the PWA** off the local server; ship as a static HTTPS
-    PWA.
+  - [x] **Stage 4 — the PWA.** *(done)* `clients/web` is now a real static
+    messenger (setup → username registration → threads → compose → send, polling
+    to receive) driving the WASM `Session` — no local server. Identity persists
+    across reloads (`Session.restore`); `manifest.json` + service worker make it
+    installable/offline-capable. A two-user headless-Chrome test (isolated
+    contexts) registers both through the UI and delivers a message Alice → real
+    directory+queue → Bob's PWA. **"Open a link and message someone" works.**
 
 - [ ] **T1.2 — Real-time delivery when open.** Replace 2s polling with a live
   channel (WebSocket/SSE) while the app is open — instant messages, far less

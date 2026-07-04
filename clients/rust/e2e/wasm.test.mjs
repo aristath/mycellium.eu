@@ -51,11 +51,19 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.__wasm !== undefined, { timeout: 15000 });
-    const r = await page.evaluate(() => window.__wasm);
+    await page.waitForFunction(() => window.mycellium !== undefined, { timeout: 15000 });
+    const r = await page.evaluate(() => {
+      const m = window.mycellium;
+      return {
+        version: m.version(),
+        uid: m.user_id('mary@example.com'),
+        uidUpper: m.user_id('  MARY@Example.com  '),
+        w1: m.generate_wallet(),
+        w2: m.generate_wallet(),
+      };
+    });
 
     console.error('• WebAssembly engine loaded and ran in the browser');
-    check(!r.error, `no init error (${r.error || 'ok'})`);
     check(typeof r.version === 'string' && r.version.includes('mycellium-wasm'), `version export works: ${r.version}`);
     check(r.uid === expectedUserId('mary@example.com'), `user_id matches independent SHA-256: ${r.uid}`);
     check(r.uid === r.uidUpper, 'user_id normalizes case + whitespace (MARY/pad → same id)');
