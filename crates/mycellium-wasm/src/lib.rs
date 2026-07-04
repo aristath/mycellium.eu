@@ -15,7 +15,7 @@ use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
-use mycellium_core::record::SignedRecord;
+use mycellium_core::record::{Record, SignedRecord};
 use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
@@ -235,6 +235,61 @@ impl Session {
         let body = Body::File { mime: mime.to_string(), name: name.to_string(), data };
         let app = wireops::app_message(&mut BrowserPlatform, body);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
+    }
+
+    /// A base64 link payload to add a **second device** to this account. It
+    /// carries the account seed phrase — treat it as the account secret; it's
+    /// shown to the user only to transfer to their own other device (QR / link).
+    pub fn link_payload(&self, dir: &str, queue: &str, handle: &str, name: &str) -> String {
+        let json = serde_json::json!({ "v": 1, "m": self.identity.mnemonic(), "d": dir, "q": queue, "h": handle, "n": name });
+        B64.encode(json.to_string())
+    }
+
+    /// Adopt an account from a [`link_payload`](Self::link_payload): same seed
+    /// phrase (→ same wallet) but a fresh device key, then merge this device into
+    /// the account's directory record. Returns `{dir,queue,handle,name}` JSON.
+    pub fn link_device(&mut self, payload_b64: &str) -> Result<String, JsValue> {
+        let bytes = B64.decode(payload_b64.trim()).map_err(|_| JsValue::from_str("invalid link"))?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| JsValue::from_str("invalid link"))?;
+        let mnemonic = v["m"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
+        let handle = v["h"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
+        let (dir, queue, name) = (v["d"].as_str().unwrap_or(""), v["q"].as_str().unwrap_or(""), v["n"].as_str().unwrap_or(handle));
+
+        // New identity: the account's seed, a brand-new device seed.
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        self.identity = Identity::restore(mnemonic.trim(), seed).map_err(|_| JsValue::from_str("invalid seed phrase"))?;
+        store_identity(&mut self.store, &self.identity);
+
+        // Merge our device into the account's record (or create it) and publish.
+        let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let dc = DirectoryClient::with_transport(dir, Box::new(XhrTransport));
+        let existing = dc.lookup(&me).ok();
+        let mut devices = existing.as_ref().map(|r| r.record.devices.clone()).unwrap_or_default();
+        let mine = wireops::this_device(&self.identity, "");
+        if !devices.iter().any(|d| d.device_key == mine.device_key) {
+            devices.push(mine);
+        }
+        let now = BrowserPlatform.now_unix_secs();
+        let seq = existing.as_ref().map(|r| r.record.seq + 1).unwrap_or(now).max(now);
+        let record = Record {
+            handle: core_user_id(handle),
+            name: name.to_string(),
+            wallet: self.identity.wallet_public(),
+            queue: queue.to_string(),
+            devices,
+            seq,
+        };
+        let signed = SignedRecord::sign(record, &self.identity);
+        let token = dc.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        dc.publish(&token, &me, &signed).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let _ = self.store.put(b"myc:handle", handle.as_bytes());
+        let _ = self.store.put(b"myc:name", name.as_bytes());
+        let _ = self.store.put(b"myc:dir", dir.as_bytes());
+        let _ = self.store.put(b"myc:queue", queue.as_bytes());
+        let _ = self.store.put(b"myc:me", serde_json::json!({ "handle": handle, "name": name }).to_string().as_bytes());
+        Ok(serde_json::json!({ "dir": dir, "queue": queue, "handle": handle, "name": name }).to_string())
     }
 
     /// The learned display name for a peer handle, if we've seen their record.
