@@ -142,7 +142,7 @@ async function main() {
 
     console.error('• Alice sends an image attachment, Bob renders it');
     const tinyPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-    await alice.evaluate((dir, q, png) => window.mycellium.session.send_file(dir, 'alice', 'Alice', q, 'bob', 'pixel.png', 'image/png', png), dirUrl, qUrl, tinyPng);
+    await alice.evaluate((dir, q, png) => window.mycellium.rpc('send_file', [dir, 'alice', 'Alice', q, 'bob', 'pixel.png', 'image/png', png]), dirUrl, qUrl, tinyPng);
     const gotImg = await (async () => {
       const end = Date.now() + 20000;
       while (Date.now() < end) {
@@ -184,7 +184,7 @@ async function main() {
     check(await hasText(alice, 'header .who', 'Alice Cooper', 8000), 'display name updated in the header');
 
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');
-    const pushKey = await bob.evaluate((q) => { try { return window.mycellium.session.push_key(q); } catch (e) { return 'ERR:' + e; } }, qUrl);
+    const pushKey = await bob.evaluate(async (q) => { try { return await window.mycellium.rpc('push_key', [q]); } catch (e) { return 'ERR:' + e; } }, qUrl);
     check(typeof pushKey === 'string' && pushKey.length > 20 && !pushKey.startsWith('ERR'), `queue serves the Session a VAPID key (${String(pushKey).slice(0, 14)}…)`);
 
     console.error('• offline indicator when the servers are unreachable');

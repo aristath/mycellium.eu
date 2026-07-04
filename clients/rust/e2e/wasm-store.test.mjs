@@ -41,26 +41,25 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(url, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.session !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
 
     console.error('• write engine state and snapshot it to IndexedDB');
     const before = await page.evaluate(async () => {
-      const s = window.mycellium.session;
-      s.put('name', 'Mary');
-      s.put('greeting', 'hello from wasm');
-      await window.mycellium.persist();
-      return { name: s.get('name'), greeting: s.get('greeting'), missing: s.get('nope') ?? null, wallet: s.wallet() };
+      const rpc = window.mycellium.rpc;
+      await rpc('put', ['name', 'Mary']);
+      await rpc('put', ['greeting', 'hello from wasm']);
+      return { name: await rpc('get', ['name']), greeting: await rpc('get', ['greeting']), missing: (await rpc('get', ['nope'])) ?? null, wallet: await rpc('wallet') };
     });
     check(before.name === 'Mary' && before.greeting === 'hello from wasm', 'values readable in the same session');
     check(before.missing === null, 'absent key returns undefined/null');
 
     console.error('• reload the page — a fresh WASM instance restores from IndexedDB');
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.session !== undefined, { timeout: 15000 });
-    const after = await page.evaluate(() => ({
-      name: window.mycellium.session.get('name'),
-      greeting: window.mycellium.session.get('greeting'),
-      wallet: window.mycellium.session.wallet(),
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    const after = await page.evaluate(async () => ({
+      name: await window.mycellium.rpc('get', ['name']),
+      greeting: await window.mycellium.rpc('get', ['greeting']),
+      wallet: await window.mycellium.rpc('wallet'),
     }));
     check(after.name === 'Mary', 'value survived the reload (loaded from IndexedDB)');
     check(after.greeting === 'hello from wasm', 'second value survived too');
@@ -68,30 +67,28 @@ async function main() {
 
     console.error("• the engine's own history module runs against the browser store");
     const thread = await page.evaluate(async () => {
-      const s = window.mycellium.session;
-      s.add_message('bob', 'hi bob', true);
-      s.add_message('bob', 'hey!', false);
-      await window.mycellium.persist();
-      return JSON.parse(s.thread('bob'));
+      const rpc = window.mycellium.rpc;
+      await rpc('add_message', ['bob', 'hi bob', true]);
+      await rpc('add_message', ['bob', 'hey!', false]);
+      return JSON.parse(await rpc('thread', ['bob']));
     });
     check(thread.length === 2, 'two messages stored via engine::history');
     check(thread[0].text === 'hi bob' && thread[0].from_me === true, 'sent message fields correct');
     check(thread[1].from_me === false, 'received message flagged');
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.session !== undefined, { timeout: 15000 });
-    const threadAfter = await page.evaluate(() => JSON.parse(window.mycellium.session.thread('bob')));
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    const threadAfter = await page.evaluate(async () => JSON.parse(await window.mycellium.rpc('thread', ['bob'])));
     check(threadAfter.length === 2, 'conversation survived reload (engine history + IndexedDB)');
 
     console.error('• delete persists as well');
     const afterDel = await page.evaluate(async () => {
-      window.mycellium.session.del('greeting');
-      await window.mycellium.persist();
-      return window.mycellium.session.get('greeting') ?? null;
+      await window.mycellium.rpc('del', ['greeting']);
+      return (await window.mycellium.rpc('get', ['greeting'])) ?? null;
     });
     check(afterDel === null, 'deleted key is gone');
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.session !== undefined, { timeout: 15000 });
-    const gone = await page.evaluate(() => window.mycellium.session.get('greeting') ?? null);
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    const gone = await page.evaluate(async () => (await window.mycellium.rpc('get', ['greeting'])) ?? null);
     check(gone === null, 'deletion survived the reload');
   } finally {
     await browser.close();

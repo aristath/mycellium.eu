@@ -58,10 +58,11 @@
   <script type="module">
     import init, { version, user_id, generate_wallet, directory_login, Session } from './pkg/mycellium_wasm.js';
 
-    // ---- IndexedDB snapshot store ----
-    const idb = () => new Promise((res, rej) => { const r = indexedDB.open('mycellium', 1); r.onupgradeneeded = () => r.result.createObjectStore('state'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-    const idbSave = async (b) => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state','readwrite'); tx.objectStore('state').put(b,'snapshot'); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
-    const idbLoad = async () => { const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('state','readonly'); const g = tx.objectStore('state').get('snapshot'); g.onsuccess = () => res(g.result || null); g.onerror = () => rej(g.error); }); };
+    // ---- the engine runs in a Web Worker (off the UI thread) — talk to it by RPC ----
+    const worker = new Worker('./worker.js', { type: 'module' });
+    let rpcId = 0; const pending = new Map();
+    worker.onmessage = (e) => { const { id, ok, result, err } = e.data; const p = pending.get(id); if (p) { pending.delete(id); ok ? p.res(result) : p.rej(new Error(err)); } };
+    const rpc = (op, args = []) => new Promise((res, rej) => { const id = ++rpcId; pending.set(id, { res, rej }); worker.postMessage({ id, op, args }); });
 
     // ---- config (the directory + queue this app talks to) ----
     const qs = new URLSearchParams(location.search);
@@ -72,30 +73,26 @@
     if (qs.get('dir')) localStorage.setItem('myc_dir', cfg.dir);
     if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
 
-    let session, me = null, open = null, poll = null;
+    let me = null, open = null, poll = null;
     let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false, online = true;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
     const timeShort = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const relTime = (ts) => { const s = Date.now() / 1000 - ts; if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; };
-    const persist = async () => { await idbSave(session.export()); };
 
     async function boot() {
-      await init();
-      const saved = await idbLoad();
-      session = saved ? Session.restore(new Uint8Array(saved)) : new Session();
-      if (!saved) await persist();
-      const stored = session.get('myc:me');
+      await init(); // for the test hooks below; the worker loads its own engine copy
+      const stored = await rpc('get', ['myc:me']);
       me = stored ? JSON.parse(stored) : null;
-      // Test hooks.
-      window.mycellium = { version, user_id, generate_wallet, directory_login, session, Session, persist };
+      // Test hooks: the class (for standalone sessions) + the worker RPC.
+      window.mycellium = { version, user_id, generate_wallet, directory_login, Session, rpc };
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
       if (me && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission().catch(() => {});
       if (me) enablePush();
-      render();
+      await render();
       startPolling();
-      notifyNew(); // seed "seen" so only future messages notify
+      await notifyNew(); // seed "seen" so only future messages notify
     }
 
     function startPolling() {
@@ -103,9 +100,9 @@
       if (!me || !cfg.queue) return;
       poll = setInterval(async () => {
         try {
-          const n = session.sync(cfg.queue);
+          const n = await rpc('sync', [cfg.queue]);
           if (!online) { online = true; render(); }
-          if (n > 0) { await persist(); notifyNew(); render(); }
+          if (n > 0) { await notifyNew(); render(); }
         } catch {
           if (online) { online = false; render(); }
         }
@@ -114,9 +111,9 @@
 
     // Fire a desktop notification for a new incoming message you're not looking
     // at. Seeds `seen` on the first pass so pre-existing messages don't notify.
-    function notifyNew() {
+    async function notifyNew() {
       let threads = [];
-      try { threads = JSON.parse(session.peers()); } catch { return; }
+      try { threads = JSON.parse(await rpc('peers')); } catch { return; }
       const granted = 'Notification' in window && Notification.permission === 'granted';
       for (const t of threads) {
         const prev = seen[t.peer] || 0;
@@ -138,10 +135,10 @@
         const reg = await navigator.serviceWorker.ready;
         let sub = await reg.pushManager.getSubscription();
         if (!sub) {
-          const key = session.push_key(cfg.queue);
+          const key = await rpc('push_key', [cfg.queue]);
           sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
         }
-        session.push_subscribe(cfg.queue, sub.endpoint);
+        await rpc('push_subscribe', [cfg.queue, sub.endpoint]);
       } catch {}
     }
     function urlB64ToUint8(b64) {
@@ -151,7 +148,7 @@
       return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
     }
 
-    function render() {
+    async function render() {
       if (!cfg.dir || !cfg.queue) return renderSetup();
       if (!me) return renderRegister();
       if (showSettings) return renderSettings();
@@ -188,19 +185,18 @@
         if (!/^[a-z0-9_]{2,32}$/.test(handle)) return setErr('Username: 2–32 chars, a–z 0–9 _');
         byId('go').disabled = true; setErr('');
         try {
-          session.register(cfg.dir, cfg.queue, handle, name);
+          await rpc('register', [cfg.dir, cfg.queue, handle, name]);
           me = { handle, name };
-          session.put('myc:me', JSON.stringify(me));
-          await persist();
+          await rpc('put', ['myc:me', JSON.stringify(me)]);
           render(); startPolling();
         } catch (e) { byId('go').disabled = false; setErr('Registration failed: ' + e); }
       };
     }
 
-    function renderList() {
+    async function renderList() {
       let threads = [], groups = [];
-      try { threads = JSON.parse(session.peers()); } catch {}
-      try { groups = JSON.parse(session.groups()); } catch {}
+      try { threads = JSON.parse(await rpc('peers')); } catch {}
+      try { groups = JSON.parse(await rpc('groups')); } catch {}
       const groupItems = groups.map((g) => `
         <button class="item" data-group="${esc(g.id)}">
           <div class="avatar" style="background:#22322a;color:#7fe0a8">#</div>
@@ -224,14 +220,15 @@
       byId('settings').onclick = () => { showSettings = true; render(); };
     }
 
-    function renderSettings() {
+    async function renderSettings() {
+      const wallet = (await rpc('wallet').catch(() => '')) || '';
       app.innerHTML = `
         <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b>Settings</b></div>
         <main><div class="wrap"><div class="card">
           <label>Display name</label><input id="sname" value="${esc(me.name)}">
           <div class="row"><button id="ssave">Save</button></div>
           <p style="margin-top:16px;color:var(--dim)">Username <b style="color:var(--ink)">@${esc(me.handle)}</b> — people reach you by this.</p>
-          <p style="color:var(--dim)">Device key <code style="font-size:.72rem">${esc((session.wallet() || '').slice(0, 24))}…</code></p>
+          <p style="color:var(--dim)">Device key <code style="font-size:.72rem">${esc(wallet.slice(0, 24))}…</code></p>
           <hr style="border-color:var(--line);margin:18px 0">
           <button id="reset" style="background:#5a1f1f;color:#ffdede">Reset this device</button>
           <p style="color:var(--dim);font-size:.8rem;margin-top:6px">Erases your identity + conversations from this browser.</p>
@@ -239,7 +236,7 @@
       byId('back').onclick = () => { showSettings = false; render(); };
       byId('ssave').onclick = async () => {
         const n = byId('sname').value.trim(); if (!n) return;
-        try { session.register(cfg.dir, cfg.queue, me.handle, n); me.name = n; session.put('myc:me', JSON.stringify(me)); await persist(); showSettings = false; render(); }
+        try { await rpc('register', [cfg.dir, cfg.queue, me.handle, n]); me.name = n; await rpc('put', ['myc:me', JSON.stringify(me)]); showSettings = false; render(); }
         catch (e) { alert('Save failed: ' + e); }
       };
       byId('reset').onclick = () => {
@@ -274,15 +271,15 @@
         const members = byId('gmembers').value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
         if (!name || !members.length) return;
         try {
-          const gid = session.group_create(cfg.dir, me.handle, me.name, cfg.queue, name, JSON.stringify(members));
-          close(); await persist(); og = gid; render();
+          const gid = await rpc('group_create', [cfg.dir, me.handle, me.name, cfg.queue, name, JSON.stringify(members)]);
+          close(); og = gid; render();
         } catch (e) { alert('Create failed: ' + e); }
       };
     }
 
-    function renderGroupThread(gid) {
-      let group = null; try { group = JSON.parse(session.groups()).find((g) => g.id === gid); } catch {}
-      let msgs = []; try { msgs = JSON.parse(session.group_thread(gid)); } catch {}
+    async function renderGroupThread(gid) {
+      let group = null; try { group = JSON.parse(await rpc('groups')).find((g) => g.id === gid); } catch {}
+      let msgs = []; try { msgs = JSON.parse(await rpc('group_thread', [gid])); } catch {}
       const bubbles = msgs.map((m) => {
         const mine = m.sender === me.handle;
         const who = mine ? '' : `<div class="sender">${esc(m.sender)}</div>`;
@@ -297,7 +294,7 @@
       const send = async () => {
         const text = byId('msg').value.trim(); if (!text) return;
         byId('msg').value = '';
-        try { session.group_send(cfg.dir, me.handle, me.name, cfg.queue, gid, text); await persist(); renderGroupThread(gid); }
+        try { await rpc('group_send', [cfg.dir, me.handle, me.name, cfg.queue, gid, text]); renderGroupThread(gid); }
         catch (e) { alert('Send failed: ' + e); }
       };
       byId('send').onclick = send;
@@ -305,13 +302,14 @@
       const m = byId('msgs'); if (m) m.scrollTop = m.scrollHeight;
     }
 
-    function renderThread(peer) {
+    async function renderThread(peer) {
       let msgs = [];
-      try { msgs = JSON.parse(session.thread(peer)); } catch {}
-      let pname = peer; try { pname = session.name_of(peer) || peer; } catch {}
-      const bubbles = msgs.map((m) => {
+      try { msgs = JSON.parse(await rpc('thread', [peer])); } catch {}
+      let pname = peer; try { pname = (await rpc('name_of', [peer])) || peer; } catch {}
+      const files = await Promise.all(msgs.map((m) => rpc('file', [m.id]).catch(() => null)));
+      const bubbles = msgs.map((m, i) => {
         let inner = esc(m.text);
-        let file = null; try { file = session.file(m.id); } catch {}
+        const file = files[i];
         if (file && file.startsWith('data:image')) inner = `<img class="attach" src="${file}" alt="${esc(m.text)}">`;
         return `<div class="bubble ${m.from_me ? 'me' : ''}" data-id="${esc(m.id)}" title="Tap to reply">${inner}<span class="time">${timeShort(m.timestamp)}</span></div>`;
       }).join('') || `<div class="empty">Say hello 👋</div>`;
@@ -334,8 +332,8 @@
         const f = byId('file').files[0]; if (!f) return;
         try {
           const b64 = await fileToB64(f);
-          session.send_file(cfg.dir, me.handle, me.name, cfg.queue, peer, f.name, f.type || 'application/octet-stream', b64);
-          await persist(); renderThread(peer);
+          await rpc('send_file', [cfg.dir, me.handle, me.name, cfg.queue, peer, f.name, f.type || 'application/octet-stream', b64]);
+          renderThread(peer);
         } catch (e) { alert('Attach failed: ' + e); }
       };
       app.querySelectorAll('.bubble[data-id]').forEach((b) => b.onclick = () => msgActions(peer, b.dataset.id, b.classList.contains('me')));
@@ -345,9 +343,9 @@
         byId('msg').value = '';
         const rt = replyTo; replyTo = null;
         try {
-          if (rt) session.reply(cfg.dir, me.handle, me.name, cfg.queue, peer, rt, text);
-          else session.send(cfg.dir, me.handle, me.name, cfg.queue, peer, text);
-          await persist(); renderThread(peer);
+          if (rt) await rpc('reply', [cfg.dir, me.handle, me.name, cfg.queue, peer, rt, text]);
+          else await rpc('send', [cfg.dir, me.handle, me.name, cfg.queue, peer, text]);
+          renderThread(peer);
         } catch (e) { alert('Send failed: ' + e); }
       };
       byId('send').onclick = send;
@@ -363,11 +361,11 @@
         <button class="ghost" id="cancel">Cancel</button>
       </div></div></div>`);
       const close = () => byId('bg').remove();
-      const act = async (fn) => { close(); try { fn(); await persist(); renderThread(peer); } catch (e) { alert('Failed: ' + e); } };
+      const act = async (fn) => { close(); try { await fn(); renderThread(peer); } catch (e) { alert('Failed: ' + e); } };
       byId('cancel').onclick = close;
-      byId('reply').onclick = () => { close(); replyTo = id; renderThread(peer); byId('msg').focus(); };
-      byId('react').onclick = () => act(() => session.react(cfg.dir, me.handle, me.name, cfg.queue, peer, id, '👍'));
-      if (byId('del')) byId('del').onclick = () => act(() => session.delete_message(cfg.dir, me.handle, me.name, cfg.queue, peer, id));
+      byId('reply').onclick = () => { close(); replyTo = id; renderThread(peer); };
+      byId('react').onclick = () => act(() => rpc('react', [cfg.dir, me.handle, me.name, cfg.queue, peer, id, '👍']));
+      if (byId('del')) byId('del').onclick = () => act(() => rpc('delete_message', [cfg.dir, me.handle, me.name, cfg.queue, peer, id]));
     }
 
     function newChat() {
@@ -393,7 +391,7 @@
       byId('gleave').onclick = async () => {
         close();
         if (!confirm('Leave this group?')) return;
-        try { session.group_leave(gid); og = null; await persist(); render(); }
+        try { await rpc('group_leave', [gid]); og = null; render(); }
         catch (e) { alert('Leave failed: ' + e); }
       };
     }
@@ -408,7 +406,7 @@
       byId('amcancel').onclick = close;
       byId('amok').onclick = async () => {
         const u = byId('amu').value.trim().toLowerCase(); if (!u) return;
-        try { session.group_add(cfg.dir, me.handle, me.name, cfg.queue, gid, u); close(); await persist(); renderGroupThread(gid); }
+        try { await rpc('group_add', [cfg.dir, me.handle, me.name, cfg.queue, gid, u]); close(); renderGroupThread(gid); }
         catch (e) { alert('Add failed: ' + e); }
       };
     }
