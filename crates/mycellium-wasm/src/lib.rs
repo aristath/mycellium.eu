@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
@@ -218,6 +220,25 @@ impl Session {
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
+    /// Send a file attachment (`data` is base64). Carried end-to-end like any
+    /// other message; the servers never see the bytes in the clear.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_file(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, name: &str, mime: &str, data_b64: &str) -> Result<u32, JsValue> {
+        let data = B64.decode(data_b64).map_err(|e| JsValue::from_str(&format!("bad base64: {e}")))?;
+        let body = Body::File { mime: mime.to_string(), name: name.to_string(), data };
+        let app = wireops::app_message(&mut BrowserPlatform, body);
+        self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
+    }
+
+    /// The attachment for message `id` as a `data:` URL, if any.
+    pub fn file(&self, id: &str) -> Option<String> {
+        self.store
+            .get(format!("file:{id}").as_bytes())
+            .ok()
+            .flatten()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+    }
+
     /// The queue's VAPID public key, for the browser's `applicationServerKey`.
     pub fn push_key(&self, queue_url: &str) -> Result<String, JsValue> {
         let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
@@ -363,6 +384,12 @@ fn apply_to_history(store: &mut MemStore, peer: &str, app: &AppMessage, from_me:
             let _ = history::delete(store, peer, to);
         }
         _ => {
+            // Stash attachment bytes as a data: URL, keyed by message id, so the
+            // UI can render it (history itself keeps just the "📎 name" summary).
+            if let Body::File { mime, data, .. } = &app.body {
+                let url = format!("data:{mime};base64,{}", B64.encode(data));
+                let _ = store.put(format!("file:{}", app.id).as_bytes(), url.as_bytes());
+            }
             let msg = history::StoredMessage {
                 id: app.id.clone(),
                 from_me,

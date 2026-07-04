@@ -137,6 +137,19 @@ async function main() {
     await jsClick(bob, '#react');           // 👍
     check(await hasText(alice, '.bubble', '👍', 20000), 'Alice receives the reaction');
 
+    console.error('• Alice sends an image attachment, Bob renders it');
+    const tinyPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    await alice.evaluate((dir, q, png) => window.mycellium.session.send_file(dir, 'alice', 'Alice', q, 'bob', 'pixel.png', 'image/png', png), dirUrl, qUrl, tinyPng);
+    const gotImg = await (async () => {
+      const end = Date.now() + 20000;
+      while (Date.now() < end) {
+        if (await bob.evaluate(() => !!document.querySelector('img.attach[src^="data:image"]')).catch(() => false)) return true;
+        await sleep(300);
+      }
+      return false;
+    })();
+    check(gotImg, "Bob's PWA received and rendered the image");
+
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');
     const pushKey = await bob.evaluate((q) => { try { return window.mycellium.session.push_key(q); } catch (e) { return 'ERR:' + e; } }, qUrl);
     check(typeof pushKey === 'string' && pushKey.length > 20 && !pushKey.startsWith('ERR'), `queue serves the Session a VAPID key (${String(pushKey).slice(0, 14)}…)`);

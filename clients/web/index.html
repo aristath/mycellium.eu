@@ -36,6 +36,7 @@
     .msgs { display:flex; flex-direction:column; gap:6px; padding:16px; }
     .bubble { max-width:78%; padding:8px 12px; border-radius:14px; background:var(--them); align-self:flex-start; word-wrap:break-word; }
     .bubble.me { background:var(--me); align-self:flex-end; }
+    .attach { max-width:220px; max-height:220px; border-radius:8px; display:block; }
     .bubble { cursor:pointer; }
     .replybar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#10161a; border-top:1px solid var(--line); font-size:.85rem; color:var(--dim); }
     .replybar span { color:var(--ink); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -205,8 +206,12 @@
     function renderThread(peer) {
       let msgs = [];
       try { msgs = JSON.parse(session.thread(peer)); } catch {}
-      const bubbles = msgs.map((m) => `<div class="bubble ${m.from_me ? 'me' : ''}" data-id="${esc(m.id)}" title="Tap to reply">${esc(m.text)}</div>`).join('')
-        || `<div class="empty">Say hello 👋</div>`;
+      const bubbles = msgs.map((m) => {
+        let inner = esc(m.text);
+        let file = null; try { file = session.file(m.id); } catch {}
+        if (file && file.startsWith('data:image')) inner = `<img class="attach" src="${file}" alt="${esc(m.text)}">`;
+        return `<div class="bubble ${m.from_me ? 'me' : ''}" data-id="${esc(m.id)}" title="Tap to reply">${inner}</div>`;
+      }).join('') || `<div class="empty">Say hello 👋</div>`;
       const replyMsg = replyTo && msgs.find((m) => m.id === replyTo);
       const banner = replyMsg
         ? `<div class="replybar">↪ Replying: <span>${esc(replyMsg.text.slice(0, 60))}</span><button class="ghost" id="cancelReply">✕</button></div>`
@@ -215,8 +220,21 @@
         <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b>${esc(peer)}</b></div>
         <main><div class="msgs" id="msgs">${bubbles}</div></main>
         ${banner}
-        <div class="composer"><input id="msg" placeholder="Message @${esc(peer)}" autocomplete="off"><button id="send">Send</button></div>`;
+        <div class="composer">
+          <button class="ghost" id="attach" title="Attach image">📎</button>
+          <input type="file" id="file" accept="image/*" hidden>
+          <input id="msg" placeholder="Message @${esc(peer)}" autocomplete="off"><button id="send">Send</button>
+        </div>`;
       byId('back').onclick = () => { open = null; replyTo = null; render(); };
+      byId('attach').onclick = () => byId('file').click();
+      byId('file').onchange = async () => {
+        const f = byId('file').files[0]; if (!f) return;
+        try {
+          const b64 = await fileToB64(f);
+          session.send_file(cfg.dir, me.handle, me.name, cfg.queue, peer, f.name, f.type || 'application/octet-stream', b64);
+          await persist(); renderThread(peer);
+        } catch (e) { alert('Attach failed: ' + e); }
+      };
       app.querySelectorAll('.bubble[data-id]').forEach((b) => b.onclick = () => msgActions(peer, b.dataset.id, b.classList.contains('me')));
       if (byId('cancelReply')) byId('cancelReply').onclick = () => { replyTo = null; renderThread(peer); };
       const send = async () => {
@@ -260,6 +278,7 @@
       byId('ok').onclick = () => { const p = byId('peer').value.trim().toLowerCase(); if (p) { close(); open = p; renderThread(p); } };
     }
 
+    function fileToB64(f) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(f); }); }
     function byId(id) { return document.getElementById(id); }
     function setErr(m) { const e = byId('err'); if (e) e.textContent = m; }
 
