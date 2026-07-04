@@ -23,6 +23,7 @@ getrandom = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 base64 = "0.22"
 redb = "2"
+mycellium-observe = { path = "../mycellium-observe" }
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]

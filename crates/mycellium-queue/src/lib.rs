@@ -229,16 +229,18 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     let server = Arc::new(bind_server(addr)?);
     let queue = Arc::new(Mutex::new(open_queue()));
     let vapid = Arc::new(push::Vapid::generate());
+    let metrics = Arc::new(mycellium_observe::Metrics::default());
     println!("  push: VAPID enabled");
 
     // A worker pool so many clients are served concurrently (Tier 0.2).
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 32);
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let (server, queue, vapid) = (Arc::clone(&server), Arc::clone(&queue), Arc::clone(&vapid));
+        let (server, queue, vapid, metrics) =
+            (Arc::clone(&server), Arc::clone(&queue), Arc::clone(&vapid), Arc::clone(&metrics));
         handles.push(std::thread::spawn(move || {
             while let Ok(request) = server.recv() {
-                handle_request(&queue, &vapid, request);
+                handle_request(&queue, &vapid, &metrics, request);
             }
         }));
     }
@@ -292,13 +294,25 @@ fn open_queue() -> Queue {
     }
 }
 
-fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, mut request: Request) {
+fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, metrics: &mycellium_observe::Metrics, mut request: Request) {
+    let start = std::time::Instant::now();
+    let method = request.method().clone();
+
     // CORS preflight (the browser PWA calls this API cross-origin).
-    if *request.method() == Method::Options {
+    if method == Method::Options {
         let mut resp = Response::empty(204);
         for h in cors_headers() {
             resp.add_header(h);
         }
+        let _ = request.respond(resp);
+        return;
+    }
+
+    let path = request.url().split('?').next().unwrap_or("").to_string();
+    if method == Method::Get && path == "/metrics" {
+        metrics.record(200);
+        let resp = Response::from_string(metrics.render("queue"))
+            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap());
         let _ = request.respond(resp);
         return;
     }
@@ -310,6 +324,8 @@ fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, mut request: R
         Ok(ok) => ok,
         Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
     };
+    metrics.record(status);
+    mycellium_observe::access_log("queue", method.as_str(), &path, status, start.elapsed().as_millis());
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     let mut response = Response::from_string(payload).with_status_code(status).with_header(header);
     for h in cors_headers() {

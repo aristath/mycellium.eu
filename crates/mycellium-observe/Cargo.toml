@@ -1,0 +1,14 @@
+[package]
+name = "mycellium-observe"
+version = "0.0.0"
+description = "Lightweight server observability: request metrics + structured access logs"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

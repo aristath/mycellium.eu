@@ -13,6 +13,7 @@ Both binaries read the same variables:
 |---|---|---|
 | `MYCELLIUM_DATA` | Data **directory**. Each service creates its own file inside (`directory.redb` / `queue.redb`). | unset → in-memory (dev only) |
 | `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` | PEM cert + key → serve HTTPS directly. | unset → HTTP (put a proxy in front) |
+| `MYCELLIUM_LOG` | `1` → structured JSON access log per request on stdout. | unset → only 5xx are logged |
 
 Directory only (signup email — see below):
 
@@ -67,6 +68,16 @@ mycellium-server --addr 0.0.0.0:443
 ```
 
 You are then responsible for certificate renewal (e.g. a certbot cron).
+
+## Observability
+
+- **`GET /health`** — liveness (returns `"ok"`).
+- **`GET /metrics`** — Prometheus text: `mycellium_requests_total`,
+  `mycellium_client_errors_total` (4xx), `mycellium_server_errors_total` (5xx),
+  each labelled `service="directory"|"queue"`. Point Prometheus at both.
+- **Access logs** — set `MYCELLIUM_LOG=1` for a JSON line per request
+  (`{t, svc, method, path, status, ms}`). Paths carry only opaque ids, never
+  plaintext names or emails.
 
 ## Scaling notes
 

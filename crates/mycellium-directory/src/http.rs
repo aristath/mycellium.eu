@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use mycellium_observe::Metrics;
+
 use mycellium_core::identity::{Handle, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
 
@@ -77,6 +79,7 @@ fn now_secs() -> u64 {
 pub fn serve(addr: &str) -> std::io::Result<()> {
     let server = Arc::new(bind_server(addr)?);
     let directory = Arc::new(Mutex::new(open_directory()));
+    let metrics = Arc::new(Metrics::default());
 
     // A worker pool so many clients are served concurrently, not one-at-a-time
     // (Tier 0.2). tiny_http's `recv` is safe to call from multiple threads.
@@ -85,9 +88,10 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     for _ in 0..workers {
         let server = Arc::clone(&server);
         let directory = Arc::clone(&directory);
+        let metrics = Arc::clone(&metrics);
         handles.push(std::thread::spawn(move || {
             while let Ok(request) = server.recv() {
-                handle_request(&directory, request);
+                handle_request(&directory, &metrics, request);
             }
         }));
     }
@@ -144,7 +148,8 @@ fn open_directory() -> Directory {
     }
 }
 
-fn handle_request(directory: &Mutex<Directory>, mut request: Request) {
+fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: Request) {
+    let start = std::time::Instant::now();
     let method = request.method().clone();
 
     // CORS: the browser PWA is served from a different origin than this API, so
@@ -160,8 +165,17 @@ fn handle_request(directory: &Mutex<Directory>, mut request: Request) {
 
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
-    let token = bearer_token(&request);
 
+    // Operational metrics (Prometheus text). Open, no auth.
+    if method == Method::Get && path == "/metrics" {
+        metrics.record(200);
+        let resp = Response::from_string(metrics.render("directory"))
+            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap());
+        let _ = request.respond(resp);
+        return;
+    }
+
+    let token = bearer_token(&request);
     let mut body = String::new();
     let _ = request.as_reader().read_to_string(&mut body);
 
@@ -169,6 +183,8 @@ fn handle_request(directory: &Mutex<Directory>, mut request: Request) {
         Ok((code, json)) => (code, json),
         Err(err) => (err.status(), error_json(err.reason())),
     };
+    metrics.record(code);
+    mycellium_observe::access_log("directory", method.as_str(), &path, code, start.elapsed().as_millis());
     let mut response = Response::from_string(json).with_status_code(code).with_header(json_header());
     for h in cors_headers() {
         response.add_header(h);

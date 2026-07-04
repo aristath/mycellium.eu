@@ -113,8 +113,11 @@ deployment shape, and the operational essentials** around them.
   `auth_start_is_rate_limited_per_email`. *Left: limits on login/challenge +
   publish, Sybil resistance (proof-of-work/cost on claims), enumeration defenses,
   abuse reporting.*
-- [ ] **T2.2 — Observability.** Structured logs, metrics, health/readiness
-  probes, alerting. Production is blind without it.
+- [~] **T2.2 — Observability.** *(logs + metrics done)* Both servers now expose a
+  Prometheus `GET /metrics` (request + 4xx/5xx counters, labelled by service) and
+  emit structured JSON access logs (`MYCELLIUM_LOG=1`; 5xx always logged) — via a
+  shared dependency-free `mycellium-observe` crate. `GET /health` already exists.
+  *Left: latency histograms, domain gauges (mailbox depth, bindings), alerting.*
 - [ ] **T2.3 — Outbox coverage.** Retry currently only wraps 1:1 sends; extend to
   groups, receipts, and self-sync.
 - [ ] **T2.4 — Load & scale testing.** Exercise the directory (designed to be
