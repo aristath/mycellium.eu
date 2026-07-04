@@ -29,10 +29,9 @@
 
     (async () => {
       await init();
-      // Restore engine state from IndexedDB (survives reloads / restarts).
-      const session = new Session();
+      // Restore the same identity + state from IndexedDB (survives reloads).
       const saved = await idbLoad();
-      if (saved) session.import(new Uint8Array(saved));
+      const session = saved ? Session.restore(new Uint8Array(saved)) : new Session();
       // Expose the engine to the page + automated tests.
       window.mycellium = {
         version, user_id, generate_wallet, directory_login, session, Session,

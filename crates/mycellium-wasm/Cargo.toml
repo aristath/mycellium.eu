@@ -22,6 +22,7 @@ mycellium-queue-client = { path = "../mycellium-queue-client", default-features 
 # The engine's generic domain modules (history, contacts, …) without its
 # native-only orchestration.
 mycellium-engine = { path = "../mycellium-engine", default-features = false }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = "=0.2.100"
 # Browser entropy + clock (this crate only ever targets wasm32).

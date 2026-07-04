@@ -49,7 +49,7 @@ async function main() {
       s.put('name', 'Mary');
       s.put('greeting', 'hello from wasm');
       await window.mycellium.persist();
-      return { name: s.get('name'), greeting: s.get('greeting'), missing: s.get('nope') ?? null };
+      return { name: s.get('name'), greeting: s.get('greeting'), missing: s.get('nope') ?? null, wallet: s.wallet() };
     });
     check(before.name === 'Mary' && before.greeting === 'hello from wasm', 'values readable in the same session');
     check(before.missing === null, 'absent key returns undefined/null');
@@ -60,9 +60,11 @@ async function main() {
     const after = await page.evaluate(() => ({
       name: window.mycellium.session.get('name'),
       greeting: window.mycellium.session.get('greeting'),
+      wallet: window.mycellium.session.wallet(),
     }));
     check(after.name === 'Mary', 'value survived the reload (loaded from IndexedDB)');
     check(after.greeting === 'hello from wasm', 'second value survived too');
+    check(!!before.wallet && before.wallet === after.wallet, `the device identity is the SAME after reload (${after.wallet.slice(0, 12)}…)`);
 
     console.error("• the engine's own history module runs against the browser store");
     const thread = await page.evaluate(async () => {

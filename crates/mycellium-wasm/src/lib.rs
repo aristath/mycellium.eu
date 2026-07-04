@@ -86,12 +86,50 @@ pub struct Session {
     identity: Identity,
 }
 
+/// The device identity's persistable secret (mnemonic + device seed), from which
+/// `Identity::restore` rebuilds all keys. Stored in the session's own store so it
+/// round-trips through IndexedDB — the browser account survives reloads.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredIdentity {
+    mnemonic: String,
+    device_seed: [u8; 32],
+}
+
+const IDENTITY_KEY: &[u8] = b"myc:identity";
+
+fn store_identity(store: &mut MemStore, identity: &Identity) {
+    let secret = StoredIdentity { mnemonic: identity.mnemonic().to_string(), device_seed: identity.device_seed() };
+    if let Ok(bytes) = serde_json::to_vec(&secret) {
+        let _ = store.put(IDENTITY_KEY, &bytes);
+    }
+}
+
 #[wasm_bindgen]
 impl Session {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Session {
         let identity = Identity::generate(&mut BrowserPlatform).expect("browser CSPRNG must be available");
-        Session { store: MemStore::default(), identity }
+        let mut store = MemStore::default();
+        store_identity(&mut store, &identity);
+        Session { store, identity }
+    }
+
+    /// Restore a session — **the same device identity** and all state — from a
+    /// snapshot previously produced by [`Session::export`].
+    pub fn restore(snapshot: &[u8]) -> Result<Session, JsValue> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> =
+            mycellium_core::wire::decode(snapshot).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        let store = MemStore { map: entries.into_iter().collect() };
+        let raw = store
+            .get(IDENTITY_KEY)
+            .ok()
+            .flatten()
+            .ok_or_else(|| JsValue::from_str("snapshot has no identity"))?;
+        let secret: StoredIdentity =
+            serde_json::from_slice(&raw).map_err(|e| JsValue::from_str(&format!("corrupt identity: {e}")))?;
+        let identity = Identity::restore(secret.mnemonic.trim(), secret.device_seed)
+            .map_err(|_| JsValue::from_str("stored identity is invalid"))?;
+        Ok(Session { store, identity })
     }
 
     /// This session's wallet public key (hex) — a stable id for the device.
