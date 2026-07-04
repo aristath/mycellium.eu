@@ -81,11 +81,12 @@ impl Ratchet {
         platform: &mut P,
         sk: &SharedSecret,
         responder_spk: &MessagingPublicKey,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let (dhs, dhs_pub) = generate_dh(platform);
         let dhr = responder_spk.0;
-        let (root, cks) = kdf_rk(sk.as_bytes(), &dh(&dhs, &dhr));
-        Ratchet {
+        // X3DH already validated this pre-key, but fail closed here too.
+        let (root, cks) = kdf_rk(sk.as_bytes(), &dh(&dhs, &dhr)?);
+        Ok(Ratchet {
             root,
             dhs,
             dhs_pub,
@@ -96,7 +97,7 @@ impl Ratchet {
             nr: 0,
             pn: 0,
             skipped: Vec::new(),
-        }
+        })
     }
 
     /// Initialise the **responder's** ratchet after X3DH.
@@ -165,7 +166,7 @@ impl Ratchet {
         if self.dhr != Some(header_dh) {
             // New ratchet key: bank the rest of the current chain, then step.
             self.skip_message_keys(msg.header.pn)?;
-            self.dh_ratchet(platform, header_dh);
+            self.dh_ratchet(platform, header_dh)?;
         }
         self.skip_message_keys(msg.header.n)?;
 
@@ -223,13 +224,16 @@ impl Ratchet {
         Ok(())
     }
 
-    fn dh_ratchet<P: Platform>(&mut self, platform: &mut P, header_dh: [u8; 32]) {
+    fn dh_ratchet<P: Platform>(&mut self, platform: &mut P, header_dh: [u8; 32]) -> Result<(), Error> {
+        // Reject a low-order remote ratchet key *before* mutating any state, so a
+        // rejected header can't leave the ratchet half-stepped.
+        let dh_recv = dh(&self.dhs, &header_dh)?;
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
         self.dhr = Some(header_dh);
 
-        let (root, ckr) = kdf_rk(&self.root, &dh(&self.dhs, &header_dh));
+        let (root, ckr) = kdf_rk(&self.root, &dh_recv);
         self.root = root;
         self.ckr = Some(ckr);
 
@@ -237,9 +241,10 @@ impl Ratchet {
         self.dhs = dhs;
         self.dhs_pub = dhs_pub;
 
-        let (root, cks) = kdf_rk(&self.root, &dh(&self.dhs, &header_dh));
+        let (root, cks) = kdf_rk(&self.root, &dh(&self.dhs, &header_dh)?);
         self.root = root;
         self.cks = Some(cks);
+        Ok(())
     }
 }
 
@@ -268,9 +273,14 @@ fn generate_dh<P: Platform>(platform: &mut P) -> (StaticSecret, [u8; 32]) {
     (secret, public)
 }
 
-/// X25519 DH between our secret and a remote public.
-fn dh(secret: &StaticSecret, remote: &[u8; 32]) -> [u8; 32] {
-    secret.diffie_hellman(&PublicKey::from(*remote)).to_bytes()
+/// X25519 DH between our secret and a remote public. Rejects a low-order remote
+/// key (all-zero output) so the ratchet never derives keys from a degenerate DH.
+fn dh(secret: &StaticSecret, remote: &[u8; 32]) -> Result<[u8; 32], Error> {
+    let out = secret.diffie_hellman(&PublicKey::from(*remote)).to_bytes();
+    if out.iter().all(|&b| b == 0) {
+        return Err(Error::WeakKey);
+    }
+    Ok(out)
 }
 
 /// Root KDF: `(root', chain) = HKDF(root, dh_out)`.
@@ -331,7 +341,7 @@ mod tests {
         .unwrap();
         let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
 
-        let alice_r = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public());
+        let alice_r = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
         let bob_r = Ratchet::new_responder(&bob_sk, &bob);
         (alice_r, bob_r)
     }
@@ -345,6 +355,17 @@ mod tests {
         let msg = alice.encrypt(b"hello bob", AD);
         let got = bob.decrypt(&mut p, &msg, AD).unwrap();
         assert_eq!(got, b"hello bob");
+    }
+
+    #[test]
+    fn rejects_low_order_ratchet_header() {
+        let mut p = SeededPlatform(0);
+        let (mut alice, mut bob) = established(&mut p);
+        let mut msg = alice.encrypt(b"hello", AD);
+        // A malformed/malicious header carrying a low-order ratchet key must be
+        // rejected before the DH ratchet derives any root/chain key.
+        msg.header.dh.0 = [0u8; 32];
+        assert_eq!(bob.decrypt(&mut p, &msg, AD).err(), Some(Error::WeakKey));
     }
 
     #[test]

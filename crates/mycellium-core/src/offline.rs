@@ -97,7 +97,7 @@ mod tests {
         )
         .unwrap();
         let mut ratchet =
-            Ratchet::new_initiator(&mut p, &initiated.shared_secret, &bob_record.record.primary().signed_pre_key.public);
+            Ratchet::new_initiator(&mut p, &initiated.shared_secret, &bob_record.record.primary().signed_pre_key.public).unwrap();
         let ad_bytes = ad(&alice, &bob);
         let message = ratchet.encrypt(b"see you tomorrow", &ad_bytes);
 

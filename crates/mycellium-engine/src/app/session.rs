@@ -32,7 +32,7 @@ pub fn handshake_initiator(
     let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk).map_err(|e| anyhow!("{e}"))?;
     conn.send(&wire::encode(&initiated.init))?;
 
-    let ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk);
+    let ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk).map_err(|e| anyhow!("{e}"))?;
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
 
     let sn = safety::safety_number(&identity.wallet_public(), &peer_record.record.wallet);

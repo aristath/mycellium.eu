@@ -69,7 +69,7 @@ fn established(p: &mut SeededPlatform) -> (Ratchet, Ratchet) {
     let bob = Identity::generate(p).unwrap();
     let initiated = x3dh::initiate(p, &alice, &bob.messaging_public(), &bob.signed_pre_key_public()).unwrap();
     let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
-    let a = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public());
+    let a = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
     let b = Ratchet::new_responder(&bob_sk, &bob);
     (a, b)
 }

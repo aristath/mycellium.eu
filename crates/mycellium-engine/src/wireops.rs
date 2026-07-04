@@ -120,7 +120,7 @@ pub fn seal_to<P: Platform>(
     let responder_spk = device.signed_pre_key.public;
     // Fails closed if the recipient device published a low-order key.
     let initiated = x3dh::initiate(platform, identity, &responder_ik, &responder_spk).map_err(|e| anyhow!("{e}"))?;
-    let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk);
+    let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk).map_err(|e| anyhow!("{e}"))?;
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
     let sealed = ratchet.encrypt(plaintext, &ad);
     Ok(Envelope {
