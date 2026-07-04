@@ -470,8 +470,9 @@ impl Session {
     }
 
     /// A group's messages as JSON: `[{id, sender, text, timestamp}]`.
-    pub fn group_thread(&self, group_id: &str) -> Result<String, JsValue> {
-        let msgs = history::group_load(&self.store, group_id).map_err(|_| JsValue::from_str("store error"))?;
+    pub fn group_thread(&mut self, group_id: &str) -> Result<String, JsValue> {
+        let now = BrowserPlatform.now_unix_secs();
+        let msgs = history::group_load_active(&mut self.store, group_id, now).map_err(|_| JsValue::from_str("store error"))?;
         serde_json::to_string(&msgs).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -492,7 +493,7 @@ impl Session {
 
     /// Append a message to a peer's conversation, using the **engine's own**
     /// generic history module against the browser store. Returns the message id.
-    pub fn add_message(&mut self, peer: &str, text: &str, from_me: bool) -> Result<String, JsValue> {
+    pub fn add_message(&mut self, peer: &str, text: &str, from_me: bool, expires_at: Option<u64>) -> Result<String, JsValue> {
         let mut id_bytes = [0u8; 8];
         getrandom::getrandom(&mut id_bytes).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let id = hex(&id_bytes);
@@ -501,7 +502,7 @@ impl Session {
             from_me,
             text: text.to_string(),
             timestamp: BrowserPlatform.now_unix_secs(),
-            expires_at: None,
+            expires_at,
         };
         mycellium_engine::history::append(&mut self.store, peer, message)
             .map_err(|_| JsValue::from_str("store error"))?;
@@ -509,20 +510,24 @@ impl Session {
     }
 
     /// Load a peer's conversation as JSON (via the engine's history module).
-    pub fn thread(&self, peer: &str) -> Result<String, JsValue> {
+    pub fn thread(&mut self, peer: &str) -> Result<String, JsValue> {
+        // load_active prunes disappearing messages that have expired, so they
+        // drop out of the view (and, on the next write, the snapshot).
+        let now = BrowserPlatform.now_unix_secs();
         let messages =
-            mycellium_engine::history::load(&self.store, peer).map_err(|_| JsValue::from_str("store error"))?;
+            mycellium_engine::history::load_active(&mut self.store, peer, now).map_err(|_| JsValue::from_str("store error"))?;
         serde_json::to_string(&messages).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// The conversation list as JSON: `[{peer, last, timestamp, mine}]`, newest
     /// first — for rendering the threads screen.
-    pub fn peers(&self) -> Result<String, JsValue> {
+    pub fn peers(&mut self) -> Result<String, JsValue> {
+        let now = BrowserPlatform.now_unix_secs();
         let peers = mycellium_engine::history::peers(&self.store).map_err(|_| JsValue::from_str("store error"))?;
         let mut out = Vec::new();
         for peer in peers {
             let msgs =
-                mycellium_engine::history::load(&self.store, &peer).map_err(|_| JsValue::from_str("store error"))?;
+                mycellium_engine::history::load_active(&mut self.store, &peer, now).map_err(|_| JsValue::from_str("store error"))?;
             let last = msgs.last();
             let name = names::get(&self.store, &peer).ok().flatten().unwrap_or_default();
             out.push(serde_json::json!({

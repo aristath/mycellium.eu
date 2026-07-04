@@ -100,6 +100,18 @@ async function main() {
     const threadAfter = await page.evaluate(async () => JSON.parse(await window.mycellium.rpc('thread', ['bob'])));
     check(threadAfter.length === 2, 'conversation survived reload (engine history + IndexedDB)');
 
+    console.error('• expired (disappearing) messages drop out of the thread + list views');
+    const exp = await page.evaluate(async () => {
+      const rpc = window.mycellium.rpc;
+      await rpc('add_message', ['dave', 'still here', true]);      // no expiry
+      await rpc('add_message', ['dave', 'poof', true, 1n]);        // expires_at = 1 (long past); u64 → BigInt
+      const thread = JSON.parse(await rpc('thread', ['dave'])).map((m) => m.text);
+      const list = JSON.parse(await rpc('peers')).find((p) => p.peer === 'dave');
+      return { thread, listLast: list ? list.last : null };
+    });
+    check(exp.thread.includes('still here') && !exp.thread.includes('poof'), 'an expired message is pruned from the thread view');
+    check(exp.listLast === 'still here', 'the conversation list shows the last non-expired message');
+
     console.error('• delete persists as well');
     const afterDel = await page.evaluate(async () => {
       await window.mycellium.rpc('del', ['greeting']);
