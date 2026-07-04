@@ -36,7 +36,7 @@ pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &st
     };
     stored.note_sender(my_group_id(&identity), me.as_str());
     groups::save(&mut fs, &stored)?;
-    distribute_key(&identity, &me, &client, &stored, &group);
+    distribute_key(&identity, &me, &client, &stored, &group, &mut fs, OsPlatform.now_unix_secs());
 
     println!("created group '{name}' ({group_id}) with {} members", all.len());
     Ok(())
@@ -51,15 +51,20 @@ pub fn distribute_key(
     client: &DirectoryClient,
     stored: &StoredGroup,
     group: &Group,
+    fs: &mut FileStore,
+    now: u64,
 ) {
     // Every member, including our own handle — `distribute_key_to` skips only
     // this exact device, so our sibling devices still get our key (Layer 11).
-    distribute_key_to(identity, me, client, stored, group, &stored.members);
+    distribute_key_to(identity, me, client, stored, group, &stored.members, fs, now);
 }
 
 
 
-/// Send our sender-key distribution to a specific set of members.
+/// Send our sender-key distribution to a specific set of members. Any device we
+/// can't reach live or via its queue is parked in the outbox for retry — so key
+/// distribution (like group text) isn't silently lost on a transient failure.
+#[allow(clippy::too_many_arguments)]
 pub fn distribute_key_to(
     identity: &Identity,
     me: &Handle,
@@ -67,6 +72,8 @@ pub fn distribute_key_to(
     stored: &StoredGroup,
     group: &Group,
     targets: &[String],
+    fs: &mut FileStore,
+    now: u64,
 ) {
     let payload = GroupInvitePayload {
         group_id: stored.id.clone(),
@@ -99,7 +106,11 @@ pub fn distribute_key_to(
                 continue;
             }
             let env = seal_to(identity, me, device, &plaintext);
-            deliver(client, &handle, queue.as_ref(), device, &MailItem::GroupInvite(env));
+            let item = MailItem::GroupInvite(env);
+            if !deliver(client, &handle, queue.as_ref(), device, &item) {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item, now);
+            }
         }
     }
 }
@@ -141,7 +152,7 @@ pub fn handle_group_invite(
             stored.state = group.export();
             groups::save(fs, &stored)?;
             if !newcomers.is_empty() {
-                distribute_key_to(identity, me, client, &stored, &group, &newcomers);
+                distribute_key_to(identity, me, client, &stored, &group, &newcomers, fs, OsPlatform.now_unix_secs());
             }
         }
         None => {
@@ -161,7 +172,7 @@ pub fn handle_group_invite(
             stored.note_sender(my_group_id(identity), me.as_str());
             groups::save(fs, &stored)?;
             println!("joined group '{}' (invited by {})", stored.name, from.as_str());
-            distribute_key(identity, me, client, &stored, &group);
+            distribute_key(identity, me, client, &stored, &group, fs, OsPlatform.now_unix_secs());
         }
     }
     Ok(())
@@ -255,7 +266,7 @@ pub fn group_add(group: &str, member: &str, whoami: &str, directory: &str) -> Re
     // Distribute our key with the updated roster: the newcomer joins, and
     // existing members learn the newcomer and send it their keys.
     let session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    distribute_key(&identity, &me, &client, &stored, &session);
+    distribute_key(&identity, &me, &client, &stored, &session, &mut fs, OsPlatform.now_unix_secs());
     println!("invited '{member}' to '{}'", stored.name);
     Ok(())
 }
@@ -287,7 +298,7 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
     groups::save(&mut fs, &stored)?;
 
     // Give the remaining members our fresh key, and tell them to re-key too.
-    distribute_key(&identity, &me, &client, &stored, &session);
+    distribute_key(&identity, &me, &client, &stored, &session, &mut fs, OsPlatform.now_unix_secs());
     let control = MailItem::GroupRemove {
         group_id: stored.id.clone(),
         member: member.to_string(),
@@ -297,7 +308,7 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
             continue;
         }
         if let Ok(handle) = Handle::new(m.clone()) {
-            deliver_to_cluster(&client, &identity, &handle, &control);
+            deliver_to_cluster_or_queue(&client, &identity, &handle, &control, &mut fs, OsPlatform.now_unix_secs());
         }
     }
     println!("removed '{member}' from '{}' (re-keyed)", stored.name);
@@ -333,7 +344,7 @@ pub fn handle_group_remove(
     session.rotate(&mut OsPlatform);
     stored.state = session.export();
     groups::save(fs, &stored)?;
-    distribute_key(identity, me, client, &stored, &session);
+    distribute_key(identity, me, client, &stored, &session, fs, OsPlatform.now_unix_secs());
     println!("'{member}' was removed from '{}' — re-keyed", stored.name);
     Ok(())
 }
@@ -544,7 +555,7 @@ pub fn handle_group_sync(
     stored.note_sender(my_group_id(identity), me.as_str());
     groups::save(fs, &stored)?;
     // Announce our own key to the members so this device can also *send*.
-    distribute_key(identity, me, client, &stored, &group);
+    distribute_key(identity, me, client, &stored, &group, fs, OsPlatform.now_unix_secs());
     println!("bootstrapped into group '{}'", stored.name);
     Ok(())
 }
@@ -568,7 +579,7 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
             continue;
         }
         if let Ok(handle) = Handle::new(member.clone()) {
-            deliver_to_cluster(&client, &identity, &handle, &control);
+            deliver_to_cluster_or_queue(&client, &identity, &handle, &control, &mut fs, OsPlatform.now_unix_secs());
         }
     }
     groups::remove(&mut fs, &stored.id)?;
