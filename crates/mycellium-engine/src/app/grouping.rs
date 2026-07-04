@@ -362,6 +362,9 @@ pub fn group_send(
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
     let mut fs = open_history(&identity)?;
+    let now = OsPlatform.now_unix_secs();
+    // Retry anything parked from an earlier send before adding more.
+    let _ = flush_outbox(&identity, &client, &mut fs);
 
     let mut stored = resolve_group(&fs, group)?;
     let mut session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
@@ -390,15 +393,19 @@ pub fn group_send(
             if let Ok(my_rec) = client.lookup(&me) {
                 let my_queue = QueueTarget::open(&identity, &my_rec.record);
                 for device in &my_rec.record.devices {
-                    if device.device_key != identity.device_public() {
-                        deliver(&client, &me, my_queue.as_ref(), device, &item);
+                    if device.device_key != identity.device_public()
+                        && !deliver(&client, &me, my_queue.as_ref(), device, &item)
+                    {
+                        let slot = device_slot(&device.device_key);
+                        let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, item.clone(), now);
                     }
                 }
             }
             continue;
         }
-        // Fan the one ciphertext out to every device in the member's cluster.
-        deliver_to_cluster(&client, &identity, &handle, &item);
+        // Fan the one ciphertext out to every device in the member's cluster,
+        // parking any we can't reach in the outbox for retry (Tier 2.3).
+        deliver_to_cluster_or_queue(&client, &identity, &handle, &item, &mut fs, now);
     }
 
     // Record our own message in the group transcript (edits/deletes already

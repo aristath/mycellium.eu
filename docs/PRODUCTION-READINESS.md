@@ -122,8 +122,12 @@ deployment shape, and the operational essentials** around them.
   emit structured JSON access logs (`MYCELLIUM_LOG=1`; 5xx always logged) — via a
   shared dependency-free `mycellium-observe` crate. `GET /health` already exists.
   *Left: latency histograms, domain gauges (mailbox depth, bindings), alerting.*
-- [ ] **T2.3 — Outbox coverage.** Retry currently only wraps 1:1 sends; extend to
-  groups, receipts, and self-sync.
+- [x] **T2.3 — Outbox coverage.** *(done)* Failed deliveries are now parked in
+  the outbox (and retried by `flush_outbox` on the next send) for **group
+  messages** — new store-aware `deliver_to_cluster_or_queue`, plus a
+  `flush_outbox` at the start of `group_send` — and for **1:1 self-sync** to your
+  own other devices. (Receipts stay best-effort by design.) 127 tests, clippy
+  clean; messaging e2e green.
 - [ ] **T2.4 — Load & scale testing.** Exercise the directory (designed to be
   cloned) and queue (per-user) under thousands of concurrent users; document the
   horizontal-scale story.

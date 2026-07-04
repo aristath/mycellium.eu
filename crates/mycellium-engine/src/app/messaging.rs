@@ -105,7 +105,10 @@ pub fn send(
             }
             let envelope = seal_to(&identity, &me, device, &encoded);
             let sync = MailItem::SelfSync { peer: peer_handle.as_str().to_string(), envelope };
-            deliver(&client, &me, my_queue.as_ref(), device, &sync);
+            if !deliver(&client, &me, my_queue.as_ref(), device, &sync) {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, sync, now);
+            }
         }
     }
     Ok(())
@@ -212,6 +215,30 @@ pub fn deliver_to_cluster(dir: &DirectoryClient, identity: &Identity, handle: &H
             let queue = QueueTarget::open(identity, &rec.record);
             for device in &rec.record.devices {
                 deliver(dir, handle, queue.as_ref(), device, item);
+            }
+        }
+    }
+}
+
+/// Like [`deliver_to_cluster`], but parks any device we couldn't reach in the
+/// outbox for retry — so group messages aren't silently lost on a transient
+/// failure (Tier 2.3). `flush_outbox` re-attempts them on the next send.
+pub fn deliver_to_cluster_or_queue(
+    dir: &DirectoryClient,
+    identity: &Identity,
+    handle: &Handle,
+    item: &MailItem,
+    fs: &mut FileStore,
+    now: u64,
+) {
+    if let Ok(rec) = dir.lookup(handle) {
+        if rec.verify().is_ok() {
+            let queue = QueueTarget::open(identity, &rec.record);
+            for device in &rec.record.devices {
+                if !deliver(dir, handle, queue.as_ref(), device, item) {
+                    let slot = device_slot(&device.device_key);
+                    let _ = outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item.clone(), now);
+                }
             }
         }
     }
