@@ -25,10 +25,16 @@ const READS = new Set(['peers', 'groups', 'thread', 'group_thread', 'wallet', 'f
 
 let session = null;
 const ready = (async () => {
-  await init();
-  const snap = await load();
-  session = snap ? W.Session.restore(new Uint8Array(snap)) : new W.Session();
-  if (!snap) await save(session.export());
+  try {
+    await init();
+    const snap = await load();
+    session = snap ? W.Session.restore(new Uint8Array(snap)) : new W.Session();
+    if (!snap) await save(session.export());
+  } catch (e) {
+    // Surface a clear reason (WASM load or IndexedDB failure) rather than letting
+    // every RPC reject cryptically.
+    throw new Error('engine failed to start: ' + ((e && e.message) || e));
+  }
 })();
 
 self.onmessage = async (e) => {

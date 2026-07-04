@@ -95,8 +95,11 @@
           history.replaceState(null, '', location.pathname + location.search);
         } catch (e) { console.error('link failed:', e); }
       }
-      // Test hooks: the class (for standalone sessions) + the worker RPC.
-      window.mycellium = { version, user_id, generate_wallet, directory_login, Session, rpc };
+      // Test/dev hook only — exposes the engine for the e2e suites. Gated to
+      // localhost so a real deployment never hands the engine to page scripts.
+      if (['localhost', '127.0.0.1', ''].includes(location.hostname)) {
+        window.mycellium = { version, user_id, generate_wallet, directory_login, Session, rpc };
+      }
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
       if (me && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission().catch(() => {});
       if (me) enablePush();

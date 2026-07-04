@@ -716,6 +716,8 @@ fn apply_to_history(store: &mut MemStore, peer: &str, app: &AppMessage, from_me:
         }
         Body::Delete { to } => {
             let _ = history::delete(store, peer, to);
+            // Drop the attachment blob too, so a deleted image doesn't linger.
+            let _ = store.delete(format!("file:{to}").as_bytes());
         }
         Body::Receipt { .. } => {
             // A delivery/read acknowledgment — not a visible message.
