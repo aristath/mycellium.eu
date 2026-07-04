@@ -84,7 +84,8 @@
       // Test hooks.
       window.mycellium = { version, user_id, generate_wallet, directory_login, session, Session, persist };
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
-      if (me && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
+      if (me && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission().catch(() => {});
+      if (me) enablePush();
       render();
       startPolling();
       notifyNew(); // seed "seen" so only future messages notify
@@ -116,6 +117,28 @@
         seen[t.peer] = Math.max(prev, t.timestamp);
       }
       firstScan = false;
+    }
+
+    // Subscribe to Web Push so the queue can wake us when the app is closed.
+    // Best-effort: no-op if the browser/push service is unavailable.
+    async function enablePush() {
+      try {
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+        if (Notification.permission !== 'granted' || !cfg.queue) return;
+        const reg = await navigator.serviceWorker.ready;
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {
+          const key = session.push_key(cfg.queue);
+          sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
+        }
+        session.push_subscribe(cfg.queue, sub.endpoint);
+      } catch {}
+    }
+    function urlB64ToUint8(b64) {
+      const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+      const s = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+      const raw = atob(s);
+      return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
     }
 
     function render() {

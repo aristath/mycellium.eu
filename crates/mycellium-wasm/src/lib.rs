@@ -218,6 +218,19 @@ impl Session {
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
+    /// The queue's VAPID public key, for the browser's `applicationServerKey`.
+    pub fn push_key(&self, queue_url: &str) -> Result<String, JsValue> {
+        let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
+        queue.push_key().map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Register a browser push `endpoint` so the queue can wake us when closed.
+    pub fn push_subscribe(&self, queue_url: &str, endpoint: &str) -> Result<(), JsValue> {
+        let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
+        let token = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        queue.push_subscribe(&token, endpoint).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Drain our queue, decrypt direct messages, and store them. Returns the
     /// number of new messages received.
     pub fn sync(&mut self, queue_url: &str) -> Result<u32, JsValue> {
