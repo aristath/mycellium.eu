@@ -9,6 +9,9 @@ Drives the actual PWA in a real (system) Chrome against a live directory + queue
   the signed record, rendered conversation bubbles),
 - replying via the message-action menu,
 - adding a contact by email,
+- **desktop notifications** — one *is* raised for a message you're not viewing,
+  and *isn't* while you're looking at that conversation (the `Notification` API
+  is mocked in-page to record what the app would pop),
 - the Web Push subscription wiring (VAPID key, service worker).
 
 ## Run

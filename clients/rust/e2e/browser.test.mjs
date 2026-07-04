@@ -65,10 +65,45 @@ async function textAppears(page, selector, needle, ms = 25000) {
   throw new Error(`text "${needle}" never appeared in ${selector}`);
 }
 
+function sendFrom(page, email, text) {
+  return page.evaluate(async (e, t) => {
+    const r = await fetch('/api/threads/' + encodeURIComponent(e), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: t }) });
+    return r.status;
+  }, email, text);
+}
+const clearNotifs = (page) => page.evaluate(() => { window.__notifications = []; });
+const notifCount = (page) => page.evaluate(() => (window.__notifications || []).length);
+async function waitNotif(page, needle, ms = 20000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const hit = await page.evaluate((t) => (window.__notifications || []).some((n) => (n.body + ' ' + n.title).includes(t)), needle).catch(() => false);
+    if (hit) return true;
+    await sleep(400);
+  }
+  return false;
+}
+
+// Runs in the page before any app code: mock the Notification API so we can see
+// what the app *would* pop, and pin visibility to 'visible' so the "are you
+// looking at this thread?" check is deterministic (headless backgrounds pages).
+function installNotificationMock() {
+  window.__notifications = [];
+  class MockNotification {
+    constructor(title, opts) { window.__notifications.push({ title, body: (opts && opts.body) || '' }); }
+    close() {}
+  }
+  MockNotification.permission = 'granted';
+  MockNotification.requestPermission = () => Promise.resolve('granted');
+  window.Notification = MockNotification;
+  Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+  Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+}
+
 async function signup(browser, base, name, email) {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.error(`  [${name} pageerror] ${e.message}`));
   page.on('dialog', (d) => { console.error(`  [${name} DIALOG] ${d.type()}: ${d.message()}`); d.dismiss().catch(() => {}); });
+  await page.evaluateOnNewDocument(installNotificationMock);
   await page.goto(base, { waitUntil: 'domcontentloaded' });
   await fill(page, '#name', name);
   await fill(page, '#email', email);
@@ -142,6 +177,22 @@ async function main() {
   await click(mary, '#add');
   await textAppears(mary, '.item .title', 'Johnny', 15000);
   check(true, 'contact "Johnny" added by email and listed');
+
+  step('desktop notification fires for a message you are NOT viewing');
+  await click(john, '#back');           // leave the conversation → on the thread list
+  await sleep(2000);                     // let a tick seed "seen" state
+  await clearNotifs(john);
+  await sendFrom(mary, 'john@example.com', 'ping while away');
+  check(await waitNotif(john, 'ping while away', 20000), 'notification raised with the message text');
+
+  step('NO notification while actively viewing that conversation');
+  await click(john, '.item');           // open Mary's thread → now "viewing"
+  await textAppears(john, '.bubble', 'ping while away', 10000);
+  await clearNotifs(john);
+  await sendFrom(mary, 'john@example.com', 'while you watch');
+  await textAppears(john, '.bubble', 'while you watch', 20000); // it arrives + renders
+  await sleep(2000);
+  check((await notifCount(john)) === 0, 'no notification raised while the thread is open');
 
   step('web push subscription wiring');
   const sub = await mary.evaluate(async () => {
