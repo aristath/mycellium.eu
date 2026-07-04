@@ -216,6 +216,11 @@ impl Queue {
         blob: String,
         now: u64,
     ) -> Result<(), ApiError> {
+        // Reject malformed/oversized keys before they can mint a sparse mailbox
+        // (a valid wallet is 66 hex chars; a valid slot is `account` or 64 hex).
+        if !is_wallet_hex(recipient_wallet_hex) || !is_slot(slot) {
+            return Err(ApiError::BadRequest);
+        }
         let sender = self.authed(token, now)?;
         if !self.allow(sender.0, "deposit", now) {
             return Err(ApiError::RateLimited);
@@ -240,6 +245,9 @@ impl Queue {
         wallet_hex: &str,
         slot: &str,
     ) -> Result<Vec<String>, ApiError> {
+        if !is_slot(slot) {
+            return Err(ApiError::BadRequest);
+        }
         let caller = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
         if hex33(&caller.0) != wallet_hex {
             return Err(ApiError::Forbidden);
@@ -561,6 +569,24 @@ pub fn hex33(bytes: &[u8; 33]) -> String {
     out
 }
 
+/// The cluster-wide mailbox slot (mirrors the engine's `ACCOUNT_SLOT`).
+pub const ACCOUNT_SLOT: &str = "account";
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A recipient key is exactly one 66-char compressed-wallet hex (as `hex33`
+/// produces). Anything else can't name a real mailbox.
+fn is_wallet_hex(s: &str) -> bool {
+    is_lower_hex(s, 66)
+}
+
+/// A slot is either the account slot or a 64-char device id (`device_slot` hex).
+fn is_slot(s: &str) -> bool {
+    s == ACCOUNT_SLOT || is_lower_hex(s, 64)
+}
+
 fn random_hex<const N: usize>() -> String {
     let mut bytes = [0u8; N];
     getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
@@ -608,7 +634,7 @@ mod tests {
         {
             let mut q = Queue::open(path_str).unwrap();
             let atoken = login(&mut q, &alice);
-            q.deposit(&atoken, &bob_hex, "s", "sealed".into(), 0).unwrap();
+            q.deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0).unwrap();
             let btoken = login(&mut q, &bob);
             q.subscribe(&btoken, "https://push.example/abc".into()).unwrap();
         } // drop → flushed
@@ -617,12 +643,12 @@ mod tests {
         let mut q2 = Queue::open(path_str).unwrap();
         assert_eq!(q2.subscriptions(&bob_hex), vec!["https://push.example/abc".to_string()]);
         let btoken = login(&mut q2, &bob);
-        assert_eq!(q2.collect(&btoken, &bob_hex, "s").unwrap(), vec!["sealed".to_string()]);
+        assert_eq!(q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT).unwrap(), vec!["sealed".to_string()]);
         // ...and after collecting, the drain is persisted (empty on next reopen).
         drop(q2);
         let mut q3 = Queue::open(path_str).unwrap();
         let btoken2 = login(&mut q3, &bob);
-        assert!(q3.collect(&btoken2, &bob_hex, "s").unwrap().is_empty());
+        assert!(q3.collect(&btoken2, &bob_hex, ACCOUNT_SLOT).unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
     }
@@ -634,9 +660,9 @@ mod tests {
         let bob = Identity::generate(&mut P(4)).unwrap();
         let bob_hex = hex33(&bob.wallet_public().0);
         let token = login(&mut q, &alice); // issued at now = 0
-        assert!(q.deposit(&token, &bob_hex, "s", "x".into(), 10).is_ok());
+        assert!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 10).is_ok());
         assert_eq!(
-            q.deposit(&token, &bob_hex, "s", "x".into(), TOKEN_TTL + 1),
+            q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), TOKEN_TTL + 1),
             Err(ApiError::Unauthorized),
         );
     }
@@ -659,6 +685,23 @@ mod tests {
     }
 
     #[test]
+    fn malformed_deposit_targets_are_rejected() {
+        let mut q = Queue::new();
+        let a = Identity::generate(&mut P(9)).unwrap();
+        let b = Identity::generate(&mut P(10)).unwrap();
+        let token = login(&mut q, &a);
+        let bob_hex = hex33(&b.wallet_public().0);
+        // A too-short wallet hex names no real mailbox.
+        assert_eq!(q.deposit(&token, "abc", ACCOUNT_SLOT, "x".into(), 0), Err(ApiError::BadRequest));
+        // An oversized / non-hex slot can't mint a sparse mailbox.
+        let huge = "z".repeat(10_000);
+        assert_eq!(q.deposit(&token, &bob_hex, &huge, "x".into(), 0), Err(ApiError::BadRequest));
+        assert!(q.mailboxes.is_empty(), "no mailbox created for malformed targets");
+        // A well-formed target still works.
+        assert!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0).is_ok());
+    }
+
+    #[test]
     fn expired_challenges_are_pruned() {
         let mut q = Queue::new();
         let a = Identity::generate(&mut P(8)).unwrap();
@@ -677,16 +720,16 @@ mod tests {
         let bob_hex = hex33(&bob.wallet_public().0);
 
         let alice_token = login(&mut q, &alice);
-        q.deposit(&alice_token, &bob_hex, "s", "sealed".into(), 0).unwrap();
+        q.deposit(&alice_token, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0).unwrap();
 
         // A non-owner can't collect Bob's mailbox.
         let alice_hex = hex33(&alice.wallet_public().0);
-        assert_eq!(q.collect(&alice_token, &alice_hex, "s").unwrap(), Vec::<String>::new());
+        assert_eq!(q.collect(&alice_token, &alice_hex, ACCOUNT_SLOT).unwrap(), Vec::<String>::new());
 
         // Bob collects his own, then it's drained.
         let bob_token = login(&mut q, &bob);
-        assert_eq!(q.collect(&bob_token, &bob_hex, "s").unwrap(), vec!["sealed".to_string()]);
-        assert_eq!(q.collect(&bob_token, &bob_hex, "s").unwrap(), Vec::<String>::new());
+        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT).unwrap(), vec!["sealed".to_string()]);
+        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT).unwrap(), Vec::<String>::new());
     }
 
     #[test]
@@ -696,9 +739,9 @@ mod tests {
         let bob_hex = hex33(&Identity::generate(&mut P(90)).unwrap().wallet_public().0);
         let token = login(&mut q, &alice);
         for _ in 0..DEPOSIT_RATE_LIMIT {
-            q.deposit(&token, &bob_hex, "s", "x".into(), 0).unwrap();
+            q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0).unwrap();
         }
-        assert_eq!(q.deposit(&token, &bob_hex, "s", "x".into(), 0), Err(ApiError::RateLimited));
-        assert!(q.deposit(&token, &bob_hex, "s", "x".into(), RATE_WINDOW).is_ok());
+        assert_eq!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0), Err(ApiError::RateLimited));
+        assert!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), RATE_WINDOW).is_ok());
     }
 }
