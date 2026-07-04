@@ -4,11 +4,7 @@ use super::*;
 // ---- groups -----------------------------------------------------------------
 
 /// Associated data binding a group message to its group.
-pub fn group_ad(group_id: &str) -> Vec<u8> {
-    let mut ad = b"group:".to_vec();
-    ad.extend_from_slice(group_id.as_bytes());
-    ad
-}
+pub use crate::wireops::group_ad;
 
 
 

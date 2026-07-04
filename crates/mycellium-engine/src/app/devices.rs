@@ -245,11 +245,7 @@ pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedR
 
 
 
-/// This device's unique sender id inside any group (Layer 11): its device key,
-/// so two devices of one account are distinct senders and don't collide.
-pub fn my_group_id(identity: &Identity) -> Vec<u8> {
-    identity.device_public().0.to_vec()
-}
+pub use crate::wireops::my_group_id;
 
 
 

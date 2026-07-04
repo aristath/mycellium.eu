@@ -58,6 +58,19 @@ pub fn device_slot(key: &DevicePublicKey) -> String {
     hex(&key.0)
 }
 
+/// This device's unique sender id inside any group (Layer 11): its device key,
+/// so two devices of one account are distinct senders and don't collide.
+pub fn my_group_id(identity: &Identity) -> Vec<u8> {
+    identity.device_public().0.to_vec()
+}
+
+/// The AEAD associated data binding a message to its group.
+pub fn group_ad(group_id: &str) -> Vec<u8> {
+    let mut ad = b"group:".to_vec();
+    ad.extend_from_slice(group_id.as_bytes());
+    ad
+}
+
 /// This device's directory entry (keys + signed pre-key). Pure — derived from
 /// the identity.
 pub fn this_device(identity: &Identity, addr: &str) -> Device {
