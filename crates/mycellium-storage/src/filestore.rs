@@ -23,6 +23,7 @@ impl FileStore {
     /// Open (creating if needed) a store in `dir`, encrypting with `key`.
     pub fn open(dir: PathBuf, key: [u8; 32]) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
+        crate::perms::restrict_dir(&dir);
         Ok(FileStore { dir, key })
     }
 
@@ -72,7 +73,10 @@ impl Storage for FileStore {
         let mut blob = Vec::with_capacity(12 + ciphertext.len());
         blob.extend_from_slice(&nonce);
         blob.extend_from_slice(&ciphertext);
-        fs::write(self.path(key), blob)
+        let p = self.path(key);
+        fs::write(&p, blob)?;
+        crate::perms::restrict_file(&p);
+        Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<(), io::Error> {
@@ -93,6 +97,19 @@ mod tests {
         p.push(format!("mycellium-store-test-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_is_0700_and_files_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perms");
+        let mut store = FileStore::open(dir.clone(), [7u8; 32]).unwrap();
+        store.put(b"k", b"v").unwrap();
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(store.path(b"k")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "store dir should be 0700");
+        assert_eq!(file_mode, 0o600, "store files should be 0600");
     }
 
     #[test]

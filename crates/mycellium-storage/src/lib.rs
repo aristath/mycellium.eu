@@ -11,3 +11,28 @@
 
 pub mod filestore;
 pub mod store;
+
+/// Best-effort restrictive permissions for local storage. On Unix, directories
+/// become `0700` and files `0600`; a no-op on platforms without Unix modes.
+pub(crate) mod perms {
+    use std::path::Path;
+
+    #[cfg(unix)]
+    fn set(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+
+    #[cfg(unix)]
+    pub fn restrict_dir(path: &Path) {
+        set(path, 0o700);
+    }
+    #[cfg(unix)]
+    pub fn restrict_file(path: &Path) {
+        set(path, 0o600);
+    }
+    #[cfg(not(unix))]
+    pub fn restrict_dir(_path: &Path) {}
+    #[cfg(not(unix))]
+    pub fn restrict_file(_path: &Path) {}
+}

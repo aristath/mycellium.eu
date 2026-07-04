@@ -93,8 +93,10 @@ pub fn save_identity(identity: &Identity) -> Result<()> {
     };
 
     fs::create_dir_all(home())?;
+    crate::perms::restrict_dir(&home());
     let json = serde_json::to_string(&sealed)?;
     fs::write(path(), json)?;
+    crate::perms::restrict_file(&path());
     Ok(())
 }
 
