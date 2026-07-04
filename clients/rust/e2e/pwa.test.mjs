@@ -168,6 +168,13 @@ async function main() {
     await jsClick(bob, '.item[data-group]');
     check(await hasText(bob, '.bubble', 'welcome to the group', 10000), 'Bob opens the group and sees the decrypted message');
 
+    console.error('• Alice adds a member to the group via the UI');
+    await jsClick(alice, '#addmem');
+    await setVal(alice, '#amu', 'carol');
+    await jsClick(alice, '#amok');
+    await jsClick(alice, '#back');
+    check(await hasText(alice, '.item .snippet', '3 member', 8000), 'group roster grew to 3 after adding a member');
+
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');
     const pushKey = await bob.evaluate((q) => { try { return window.mycellium.session.push_key(q); } catch (e) { return 'ERR:' + e; } }, qUrl);
     check(typeof pushKey === 'string' && pushKey.length > 20 && !pushKey.startsWith('ERR'), `queue serves the Session a VAPID key (${String(pushKey).slice(0, 14)}…)`);

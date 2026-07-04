@@ -259,10 +259,11 @@
         return `<div class="bubble ${mine ? 'me' : ''}">${who}${esc(m.text)}<span class="time">${timeShort(m.timestamp)}</span></div>`;
       }).join('') || `<div class="empty">No messages yet</div>`;
       app.innerHTML = `
-        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b># ${esc(group ? group.name : gid)}</b></div>
+        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b># ${esc(group ? group.name : gid)}</b><div class="grow"></div><button class="ghost" id="addmem">＋ Add</button></div>
         <main><div class="msgs" id="msgs">${bubbles}</div></main>
         <div class="composer"><input id="msg" placeholder="Message the group" autocomplete="off"><button id="send">Send</button></div>`;
       byId('back').onclick = () => { og = null; render(); };
+      byId('addmem').onclick = () => addMember(gid);
       const send = async () => {
         const text = byId('msg').value.trim(); if (!text) return;
         byId('msg').value = '';
@@ -350,6 +351,20 @@
       byId('ok').onclick = () => { const p = byId('peer').value.trim().toLowerCase(); if (p) { close(); open = p; renderThread(p); } };
     }
 
+    function addMember(gid) {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal">
+        <h1 style="font-size:1.1rem;margin:0 0 10px">Add member</h1>
+        <label>Username</label><input id="amu" placeholder="carol" autocapitalize="off">
+        <div class="row"><button id="amok">Add</button><button class="ghost" id="amcancel">Cancel</button></div>
+      </div></div></div>`);
+      const close = () => byId('bg').remove();
+      byId('amcancel').onclick = close;
+      byId('amok').onclick = async () => {
+        const u = byId('amu').value.trim().toLowerCase(); if (!u) return;
+        try { session.group_add(cfg.dir, me.handle, me.name, cfg.queue, gid, u); close(); await persist(); renderGroupThread(gid); }
+        catch (e) { alert('Add failed: ' + e); }
+      };
+    }
     function fileToB64(f) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(f); }); }
     function byId(id) { return document.getElementById(id); }
     function setErr(m) { const e = byId('err'); if (e) e.textContent = m; }
