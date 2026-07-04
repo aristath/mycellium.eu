@@ -136,6 +136,12 @@ struct Pending {
     code: String,
     verified: bool,
     created: u64,
+    /// Wrong-code guesses so far; the claim is consumed at `MAX_CONFIRM_ATTEMPTS`.
+    attempts: u32,
+    /// Set once confirmed (or burned by too many guesses): the `code` no longer
+    /// verifies, so the entry can't be replayed or brute-forced — but it lingers
+    /// (until pruned) so `auth_status` polling still sees `verified`.
+    consumed: bool,
 }
 
 /// How long after its last heartbeat a handle is still considered online.
@@ -143,6 +149,11 @@ pub const PRESENCE_TTL: u64 = 60;
 
 /// How long an email verification code / link stays valid (15 minutes).
 pub const VERIFY_TTL: u64 = 900;
+
+/// Wrong-code guesses allowed before a pending claim is burned. With the
+/// per-email `auth_start` limit, this bounds an online brute-force of the 6-digit
+/// code to a negligible fraction of its 10^6 space.
+pub const MAX_CONFIRM_ATTEMPTS: u32 = 5;
 
 /// How long an unsigned login challenge stays valid (5 minutes).
 pub const CHALLENGE_TTL: u64 = 300;
@@ -299,6 +310,9 @@ impl Directory {
         {
             return Err(ApiError::RateLimited);
         }
+        // Opportunistic housekeeping: drop claims past their TTL so `pending`
+        // can't grow without bound over a long-running process.
+        self.pending.retain(|_, p| now.saturating_sub(p.created) <= VERIFY_TTL);
         let pending_token = random_hex::<24>();
         let code = format!("{:06}", u32::from_le_bytes(random_bytes::<4>()) % 1_000_000);
         // The email is sent by the caller, off the lock — see the HTTP route.
@@ -311,6 +325,8 @@ impl Directory {
                 code: code.clone(),
                 verified: false,
                 created: now,
+                attempts: 0,
+                consumed: false,
             },
         );
         Ok((pending_token, code))
@@ -320,13 +336,29 @@ impl Directory {
     /// success the name is bound to the wallet and the recovery email stored.
     pub fn auth_confirm(&mut self, pending_token: &str, code: &str, now: u64) -> Result<Handle, ApiError> {
         let p = self.pending.get_mut(pending_token).ok_or(ApiError::NotFound)?;
+        // Expired, or already consumed (confirmed once, or burned by too many
+        // guesses): the code no longer verifies — no replay, no brute-force oracle.
         if now.saturating_sub(p.created) > VERIFY_TTL {
             return Err(ApiError::Stale);
         }
+        if p.consumed {
+            return Err(ApiError::Stale);
+        }
         if p.code != code {
+            // Cap online guessing of the 6-digit code: burn the claim after a few
+            // wrong tries, forcing a fresh (rate-limited) auth_start to try again.
+            p.attempts += 1;
+            if p.attempts >= MAX_CONFIRM_ATTEMPTS {
+                p.consumed = true;
+                p.code.clear();
+            }
             return Err(ApiError::BadSignature);
         }
+        // Correct code — consume the claim so it can't be replayed or brute-forced,
+        // but keep the (now codeless) entry so `auth_status` polling still sees it.
         p.verified = true;
+        p.consumed = true;
+        p.code.clear();
         let (username, wallet, email) = (p.username.clone(), p.wallet, p.email.clone());
         let hash = self.email_hash(&email);
         if let Some(bound) = self.bindings.get(&username) {
@@ -569,6 +601,54 @@ mod tests {
             Some(&b.wallet_public()),
             "a mismatched email leaves the binding untouched"
         );
+    }
+
+    #[test]
+    fn auth_confirm_rejects_replay() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let tok = login(&mut dir, &a);
+        let username = Handle::new("alice").unwrap();
+        let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+
+        assert!(dir.auth_confirm(&pending, &code, 0).is_ok());
+        // The same token + code cannot be replayed once consumed.
+        assert_eq!(dir.auth_confirm(&pending, &code, 0), Err(ApiError::Stale));
+        // ...but status polling still reports the claim verified.
+        assert_eq!(dir.auth_status(&pending), Some((true, "alice".to_string())));
+    }
+
+    #[test]
+    fn auth_confirm_burns_the_claim_after_too_many_wrong_codes() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let tok = login(&mut dir, &a);
+        let username = Handle::new("alice").unwrap();
+        let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+        let wrong = if code == "000000" { "111111" } else { "000000" };
+
+        // Exhaust the guess budget with wrong codes.
+        for _ in 0..MAX_CONFIRM_ATTEMPTS {
+            assert_eq!(dir.auth_confirm(&pending, wrong, 0), Err(ApiError::BadSignature));
+        }
+        // The claim is now burned — even the CORRECT code no longer works, so an
+        // attacker can't brute-force it; they must start over (rate-limited).
+        assert_eq!(dir.auth_confirm(&pending, &code, 0), Err(ApiError::Stale));
+        assert!(dir.bindings.get(&username).is_none(), "no binding after a burned claim");
+    }
+
+    #[test]
+    fn expired_pending_claims_are_pruned() {
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let tok = login(&mut dir, &a);
+        let username = Handle::new("alice").unwrap();
+        let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+
+        // A later auth_start (past the TTL) prunes the stale claim before inserting.
+        let _ = dir.auth_start(&tok, &username, "alice@example.com", VERIFY_TTL + 1).unwrap();
+        assert_eq!(dir.pending.len(), 1, "the expired claim was pruned; only the new one remains");
+        assert_eq!(dir.auth_confirm(&pending, &code, VERIFY_TTL + 1), Err(ApiError::NotFound));
     }
 
     #[test]
