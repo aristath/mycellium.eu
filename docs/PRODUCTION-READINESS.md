@@ -24,10 +24,11 @@ deployment shape, and the operational essentials** around them.
   behind a `Mutex`, push sends off the lock. *Next: validate under load (T2.4),
   connection limits (T2.5).*
 
-- [ ] **T0.3 — TLS / HTTPS.** Service workers, Web Push, PWA install, and basic
-  security all require HTTPS off `localhost`. Everything is `http://` today.
-  - *Approach:* terminate TLS at a reverse proxy (nginx/caddy) in front of the
-    directory/queue, or add rustls to the servers. Document the deploy.
+- [x] **T0.3 — TLS / HTTPS.** *(done)* Both servers serve HTTPS natively when
+  `MYCELLIUM_TLS_CERT` + `MYCELLIUM_TLS_KEY` point at PEM files (tiny_http
+  rustls), else plain HTTP behind a proxy. [docs/DEPLOY.md](DEPLOY.md) documents
+  the recommended Caddy reverse-proxy (automatic Let's Encrypt) and the native
+  option. Verified with a self-signed cert.
 
 - [x] **T0.4 — Real email sending.** *(done)* A `mailer` module sends the
   verification code by **SMTP** (via `lettre`, rustls — no OpenSSL) when

@@ -75,9 +75,7 @@ fn now_secs() -> u64 {
 
 /// Bind `addr` and serve the directory until the process ends.
 pub fn serve(addr: &str) -> std::io::Result<()> {
-    let server = Arc::new(
-        Server::http(addr).map_err(|e| std::io::Error::new(std::io::ErrorKind::AddrInUse, e.to_string()))?,
-    );
+    let server = Arc::new(bind_server(addr)?);
     let directory = Arc::new(Mutex::new(open_directory()));
 
     // A worker pool so many clients are served concurrently, not one-at-a-time
@@ -97,6 +95,28 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// Bind an HTTP or HTTPS server. TLS is enabled when both `MYCELLIUM_TLS_CERT`
+/// and `MYCELLIUM_TLS_KEY` point at PEM files; otherwise plain HTTP (typically
+/// behind a TLS-terminating reverse proxy — see docs/DEPLOY.md).
+fn bind_server(addr: &str) -> std::io::Result<Server> {
+    let to_io = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
+    match (env_str("MYCELLIUM_TLS_CERT"), env_str("MYCELLIUM_TLS_KEY")) {
+        (Some(cert), Some(key)) => {
+            let config = tiny_http::SslConfig { certificate: std::fs::read(&cert)?, private_key: std::fs::read(&key)? };
+            println!("  tls: enabled ({cert})");
+            Server::https(addr, config).map_err(to_io)
+        }
+        _ => {
+            println!("  tls: disabled (set MYCELLIUM_TLS_CERT + MYCELLIUM_TLS_KEY, or terminate at a proxy)");
+            Server::http(addr).map_err(to_io)
+        }
+    }
+}
+
+fn env_str(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// Open the directory durably from `MYCELLIUM_DATA` (a data *directory*; we use

@@ -1,0 +1,81 @@
+# Deploying Mycellium
+
+The public services are the **directory** (`mycellium-server`) and the **queue**
+(`mycellium-queue`). Both are single static binaries that serve HTTP(S) and hold
+their own durable state. Neither ever sees message plaintext — only names,
+records, and sealed store-and-forward blobs.
+
+## Environment
+
+Both binaries read the same variables:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MYCELLIUM_DATA` | Data **directory**. Each service creates its own file inside (`directory.redb` / `queue.redb`). | unset → in-memory (dev only) |
+| `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` | PEM cert + key → serve HTTPS directly. | unset → HTTP (put a proxy in front) |
+
+Directory only (signup email — see below):
+
+| Variable | Purpose |
+|---|---|
+| `MYCELLIUM_SMTP_HOST` | SMTP server (set = production; unset = dev, code is logged + returned) |
+| `MYCELLIUM_SMTP_PORT` | 587 (STARTTLS, default) or 465 (implicit TLS) |
+| `MYCELLIUM_SMTP_FROM` | e.g. `Mycellium <noreply@yourdomain>` |
+| `MYCELLIUM_SMTP_USER` / `MYCELLIUM_SMTP_PASS` | SMTP auth (optional) |
+
+> **Privacy:** use your **own** SMTP server. Never a US SMS/email gateway.
+
+## TLS
+
+HTTPS is required off `localhost` — service workers, Web Push, and PWA install
+all refuse to run over plain HTTP.
+
+### Recommended: reverse proxy (automatic HTTPS)
+
+Run the services on plain HTTP bound to localhost and let [Caddy](https://caddyserver.com)
+terminate TLS with automatic Let's Encrypt certificates:
+
+```
+# Caddyfile
+directory.example.com {
+    reverse_proxy 127.0.0.1:8600
+}
+queue.example.com {
+    reverse_proxy 127.0.0.1:8700
+}
+```
+
+```sh
+export MYCELLIUM_DATA=/var/lib/mycellium
+export MYCELLIUM_SMTP_HOST=smtp.yourdomain  MYCELLIUM_SMTP_FROM='Mycellium <noreply@yourdomain>'
+mycellium-server --addr 127.0.0.1:8600 &
+mycellium-queue  --addr 127.0.0.1:8700 &
+caddy run
+```
+
+Caddy handles certificate issuance/renewal, HTTP/2, and redirects — nothing to
+manage in the app.
+
+### Alternative: native TLS
+
+For a single-box deploy without a proxy, point the services at PEM files:
+
+```sh
+export MYCELLIUM_TLS_CERT=/etc/mycellium/cert.pem
+export MYCELLIUM_TLS_KEY=/etc/mycellium/key.pem
+mycellium-server --addr 0.0.0.0:443
+```
+
+You are then responsible for certificate renewal (e.g. a certbot cron).
+
+## Scaling notes
+
+- The **directory** is read-mostly and designed to be cloned behind a load
+  balancer; the durable store moves to Postgres for multi-node (roadmap T0.1).
+- The **queue** is per-recipient store-and-forward; shard by recipient wallet
+  when one node isn't enough.
+- Both serve on a worker-thread pool today (roadmap T0.2); validate under load
+  before a large launch (T2.4).
+
+See [PRODUCTION-READINESS.md](PRODUCTION-READINESS.md) for what's done and what's
+left.
