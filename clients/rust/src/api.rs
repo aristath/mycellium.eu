@@ -250,9 +250,16 @@ fn thread_send(peer: &str, req: &Value, directory: &str) -> anyhow::Result<Value
     let react = field(req, "react");
     let target = field(req, "to");
     let delete = field(req, "delete");
-    app::send(
-        &to_uid(peer), &me, message, reply_to, react, target, None, None, delete, None, directory,
-    )?;
+    // Optional attachment: base64 bytes written to a temp file the engine reads.
+    let attachment = save_upload(req)?;
+    let file = attachment.as_ref().map(|p| p.to_string_lossy().to_string());
+    let result = app::send(
+        &to_uid(peer), &me, message, reply_to, react, target, file.as_deref(), None, delete, None, directory,
+    );
+    if let Some(path) = &attachment {
+        let _ = std::fs::remove_file(path);
+    }
+    result?;
     Ok(json!({ "ok": true }))
 }
 
@@ -391,6 +398,28 @@ fn save_name(name: &str) -> anyhow::Result<()> {
     std::fs::write(path, name)?;
     std::env::set_var("MYCELLIUM_NAME", name);
     Ok(())
+}
+
+/// If the request carries an attachment (`file_name` + base64 `file_data`),
+/// decode it to a temp file and return its path for the engine to inline.
+fn save_upload(req: &Value) -> anyhow::Result<Option<std::path::PathBuf>> {
+    use base64::Engine;
+    let (Some(name), Some(data)) = (field(req, "file_name"), field(req, "file_data")) else {
+        return Ok(None);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| anyhow::anyhow!("could not decode the attachment"))?;
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("file");
+    let dir = store::data_dir().join("uploads");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(base);
+    std::fs::write(&path, &bytes)?;
+    Ok(Some(path))
 }
 
 fn email_path() -> std::path::PathBuf {

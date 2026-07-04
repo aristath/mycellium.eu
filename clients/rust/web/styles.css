@@ -109,7 +109,8 @@ button.ghost.danger { color: var(--danger); border-color: var(--line); }
 .day-divider { text-align: center; margin: 10px 0; }
 .day-divider span { background: var(--panel-2); color: var(--muted); font-size: 11px; padding: 3px 10px; border-radius: 999px; }
 .composer { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--line); background: var(--panel); }
-.composer input { flex: 1; }
+.composer input#msg { flex: 1; }
+.composer .attach { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 8px 10px; font-size: 16px; }
 
 /* ---- modal ---- */
 .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; padding: 16px; }

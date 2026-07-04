@@ -221,9 +221,24 @@ async function openThread(peer, quiet, name) {
       <div class="head"><button class="link" id="back">‹ Chats</button><div class="avatar">${esc(initials(label))}</div><b>${esc(label)}</b></div>
       <div class="messages" id="msgs">${bubbles || '<div class="empty">No messages yet. Say hello.</div>'}</div>
       ${state.replyTo ? `<div class="reply-banner">↩ Replying <button class="link" id="cancelReply">✕</button></div>` : ''}
-      <div class="composer"><input id="msg" placeholder="Message ${esc(label)}…" autocomplete="off" /><button id="send">Send</button></div>
+      <div class="composer">
+        <button class="attach" id="attach" title="Attach a file">📎</button>
+        <input type="file" id="file" hidden />
+        <input id="msg" placeholder="Message ${esc(label)}…" autocomplete="off" /><button id="send">Send</button>
+      </div>
     </div>`;
   byId('back').onclick = () => { state.open = null; state.replyTo = null; renderThreads(); };
+  byId('attach').onclick = () => byId('file').click();
+  byId('file').onchange = async () => {
+    const f = byId('file').files[0]; if (!f) return;
+    if (f.size > 256 * 1024) { alert('File too large (max 256 KB).'); byId('file').value = ''; return; }
+    try {
+      const data = await fileToBase64(f);
+      await api.post('threads/' + encodeURIComponent(peer), { file_name: f.name, file_data: data });
+    } catch (e) { alert(e.message); }
+    byId('file').value = '';
+    openThread(peer, true);
+  };
   if (byId('cancelReply')) byId('cancelReply').onclick = () => { state.replyTo = null; openThread(peer, true); };
   const input = byId('msg');
   const send = async () => {
@@ -265,6 +280,16 @@ function msgActions(peer, id, mine) {
     document.querySelectorAll('.chip.react').forEach((c) => (c.onclick = () => { close(); post({ react: c.dataset.e, to: id }); }));
     byId('reply').onclick = () => { close(); state.replyTo = id; openThread(peer, true); };
     if (byId('del')) byId('del').onclick = () => { close(); post({ delete: id }); };
+  });
+}
+
+// Read a File as base64 (strips the data: URL prefix).
+function fileToBase64(f) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1] || '');
+    r.onerror = rej;
+    r.readAsDataURL(f);
   });
 }
 
