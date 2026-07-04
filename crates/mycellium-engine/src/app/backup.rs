@@ -15,8 +15,11 @@ pub fn wipe(yes: bool) -> Result<()> {
 
 
 
-/// A portable backup: the encrypted identity plus every store entry (already
-/// encrypted at rest, so the bundle needs no extra protection).
+/// A portable backup: the encrypted identity plus every store entry. Each part
+/// is already encrypted at rest — the seed is Argon2id-sealed under the identity
+/// passphrase, and the history keys derive from the seed — so the bundle's
+/// security rests on that passphrase rather than a separate export layer. It is
+/// still a high-value collection: written 0600, with a safe-storage warning.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Backup {
     identity: Vec<u8>,
@@ -44,7 +47,19 @@ pub fn export_backup(path: &str) -> Result<()> {
 
     let backup = Backup { identity, store: entries };
     std::fs::write(path, wire::encode(&backup)).context("could not write backup")?;
+    // Restrict the file where the platform supports it (the bundle is a
+    // high-value collection, even though every entry is already encrypted).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     println!("exported identity + {} store entries to {path}", backup.store.len());
+    println!(
+        "  \u{26a0} this backup's security rests entirely on your identity passphrase: the seed is\n  \
+         Argon2id-sealed under it, and the history keys derive from the seed. Anyone who obtains\n  \
+         BOTH this file AND your passphrase can restore your whole account — store it safely, offline."
+    );
     Ok(())
 }
 
