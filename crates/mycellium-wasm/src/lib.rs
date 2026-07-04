@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use mycellium_core::group::{Group, GroupMessage};
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity};
@@ -242,14 +243,25 @@ impl Session {
     /// shown to the user only to transfer to their own other device (QR / link).
     pub fn link_payload(&self, dir: &str, queue: &str, handle: &str, name: &str) -> String {
         let json = serde_json::json!({ "v": 1, "m": self.identity.mnemonic(), "d": dir, "q": queue, "h": handle, "n": name });
-        B64.encode(json.to_string())
+        B64URL.encode(json.to_string())
+    }
+
+    /// A scannable QR (SVG string) encoding `text` — e.g. a device-link URL.
+    pub fn qr_svg(&self, text: &str) -> Result<String, JsValue> {
+        let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| JsValue::from_str(&format!("qr: {e}")))?;
+        Ok(code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(240, 240)
+            .dark_color(qrcode::render::svg::Color("#0b0f0c"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .build())
     }
 
     /// Adopt an account from a [`link_payload`](Self::link_payload): same seed
     /// phrase (→ same wallet) but a fresh device key, then merge this device into
     /// the account's directory record. Returns `{dir,queue,handle,name}` JSON.
     pub fn link_device(&mut self, payload_b64: &str) -> Result<String, JsValue> {
-        let bytes = B64.decode(payload_b64.trim()).map_err(|_| JsValue::from_str("invalid link"))?;
+        let bytes = B64URL.decode(payload_b64.trim()).map_err(|_| JsValue::from_str("invalid link"))?;
         let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| JsValue::from_str("invalid link"))?;
         let mnemonic = v["m"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
         let handle = v["h"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;

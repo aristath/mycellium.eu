@@ -74,7 +74,7 @@
     if (qs.get('queue')) localStorage.setItem('myc_queue', cfg.queue);
 
     let me = null, open = null, poll = null;
-    let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false, online = true;
+    let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false, showLink = false, online = true;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
@@ -85,6 +85,16 @@
       await init(); // for the test hooks below; the worker loads its own engine copy
       const stored = await rpc('get', ['myc:me']);
       me = stored ? JSON.parse(stored) : null;
+      // Adopt an account from a device-link URL (#link=<payload>).
+      const linkMatch = location.hash.match(/#link=(.+)/);
+      if (linkMatch && !me) {
+        try {
+          const c = JSON.parse(await rpc('link_device', [decodeURIComponent(linkMatch[1])]));
+          cfg.dir = c.dir; cfg.queue = c.queue; me = { handle: c.handle, name: c.name };
+          localStorage.setItem('myc_dir', cfg.dir); localStorage.setItem('myc_queue', cfg.queue);
+          history.replaceState(null, '', location.pathname + location.search);
+        } catch (e) { console.error('link failed:', e); }
+      }
       // Test hooks: the class (for standalone sessions) + the worker RPC.
       window.mycellium = { version, user_id, generate_wallet, directory_login, Session, rpc };
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
@@ -151,6 +161,7 @@
     async function render() {
       if (!cfg.dir || !cfg.queue) return renderSetup();
       if (!me) return renderRegister();
+      if (showLink) return renderLink();
       if (showSettings) return renderSettings();
       if (og) return renderGroupThread(og);
       return open ? renderThread(open) : renderList();
@@ -161,8 +172,11 @@
         <h1>Connect Mycellium</h1><p>Point this app at your directory and queue.</p>
         <label>Directory URL</label><input id="dir" placeholder="https://directory.example" value="${esc(cfg.dir)}">
         <label>Queue URL</label><input id="queue" placeholder="https://queue.example" value="${esc(cfg.queue)}">
-        <div class="row"><button id="save">Continue</button></div><div class="err" id="err"></div>
+        <div class="row"><button id="save">Continue</button></div>
+        <div class="row" style="margin-top:6px"><button class="ghost" id="linkexisting">Link an existing account</button></div>
+        <div class="err" id="err"></div>
       </div></div>`;
+      byId('linkexisting').onclick = () => linkPrompt();
       byId('save').onclick = () => {
         cfg.dir = byId('dir').value.trim().replace(/\/$/, '');
         cfg.queue = byId('queue').value.trim().replace(/\/$/, '');
@@ -227,6 +241,7 @@
         <main><div class="wrap"><div class="card">
           <label>Display name</label><input id="sname" value="${esc(me.name)}">
           <div class="row"><button id="ssave">Save</button></div>
+          <div class="row" style="margin-top:14px"><button id="linkdev" style="background:#22322a;color:#7fe0a8">📱 Link another device</button></div>
           <p style="margin-top:16px;color:var(--dim)">Username <b style="color:var(--ink)">@${esc(me.handle)}</b> — people reach you by this.</p>
           <p style="color:var(--dim)">Device key <code style="font-size:.72rem">${esc(wallet.slice(0, 24))}…</code></p>
           <hr style="border-color:var(--line);margin:18px 0">
@@ -234,6 +249,7 @@
           <p style="color:var(--dim);font-size:.8rem;margin-top:6px">Erases your identity + conversations from this browser.</p>
         </div></div></main>`;
       byId('back').onclick = () => { showSettings = false; render(); };
+      byId('linkdev').onclick = () => { showLink = true; render(); };
       byId('ssave').onclick = async () => {
         const n = byId('sname').value.trim(); if (!n) return;
         try { await rpc('register', [cfg.dir, cfg.queue, me.handle, n]); me.name = n; await rpc('put', ['myc:me', JSON.stringify(me)]); showSettings = false; render(); }
@@ -243,6 +259,46 @@
         if (!confirm('Reset this device? This erases your account + messages here.')) return;
         indexedDB.deleteDatabase('mycellium'); localStorage.clear(); location.reload();
       };
+    }
+
+    function linkPrompt() {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal">
+        <h1 style="font-size:1.1rem;margin:0 0 10px">Link a device</h1>
+        <label>Paste the link from your other device</label><input id="lp" placeholder="https://…#link=…">
+        <div class="row"><button id="lok">Link</button><button class="ghost" id="lcancel">Cancel</button></div>
+        <div class="err" id="lerr"></div>
+      </div></div></div>`);
+      const close = () => byId('bg').remove();
+      byId('lcancel').onclick = close;
+      byId('lok').onclick = async () => {
+        let v = byId('lp').value.trim();
+        const m = v.match(/#link=(.+)/); if (m) v = decodeURIComponent(m[1]);
+        if (!v) return;
+        try {
+          const c = JSON.parse(await rpc('link_device', [v]));
+          cfg.dir = c.dir; cfg.queue = c.queue; me = { handle: c.handle, name: c.name };
+          localStorage.setItem('myc_dir', cfg.dir); localStorage.setItem('myc_queue', cfg.queue);
+          close(); render(); startPolling();
+        } catch (e) { const el = byId('lerr'); if (el) el.textContent = 'Link failed: ' + e; }
+      };
+    }
+
+    async function renderLink() {
+      const payload = await rpc('link_payload', [cfg.dir, cfg.queue, me.handle, me.name]);
+      const link = location.origin + location.pathname + '#link=' + payload;
+      let qr = ''; try { qr = await rpc('qr_svg', [link]); } catch {}
+      app.innerHTML = `
+        <div class="backbar"><button class="ghost" id="back">‹ Settings</button><b>Link a device</b></div>
+        <main><div class="wrap"><div class="card">
+          <p>Scan this with your other device's camera, or open the link there — it signs that device in as <b>@${esc(me.handle)}</b>.</p>
+          <div style="background:#fff;padding:10px;border-radius:12px;max-width:260px;margin:14px auto">${qr}</div>
+          <label>Or copy this link</label>
+          <input id="link" value="${esc(link)}" readonly onclick="this.select()">
+          <div class="row"><button id="copy">Copy link</button></div>
+          <p style="color:#e8908f;font-size:.8rem;margin-top:12px">⚠ This link contains your account key — anyone with it can read your messages. Only send it to your own device.</p>
+        </div></div></main>`;
+      byId('back').onclick = () => { showLink = false; render(); };
+      byId('copy').onclick = async () => { try { await navigator.clipboard.writeText(link); byId('copy').textContent = 'Copied ✓'; } catch { byId('link').select(); } };
     }
 
     function fabMenu() {
