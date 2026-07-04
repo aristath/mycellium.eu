@@ -21,8 +21,8 @@ pub struct Vapid {
 }
 
 impl Vapid {
-    /// Generate a fresh VAPID keypair. (In-memory today; persist it in a real
-    /// deployment so existing subscriptions keep working across restarts.)
+    /// Generate a fresh VAPID keypair. Persist its [`seed`](Self::seed) so
+    /// existing browser subscriptions keep working across restarts.
     pub fn generate() -> Self {
         let signing = loop {
             let mut bytes = [0u8; 32];
@@ -31,6 +31,23 @@ impl Vapid {
                 break key;
             }
         };
+        Self::from_signing(signing)
+    }
+
+    /// Reconstruct the keypair from a persisted 32-byte private scalar.
+    pub fn from_seed(seed: &[u8; 32]) -> Option<Self> {
+        SigningKey::from_slice(seed).ok().map(Self::from_signing)
+    }
+
+    /// The 32-byte private scalar, to persist so the public key is stable.
+    pub fn seed(&self) -> [u8; 32] {
+        let bytes = self.signing.to_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        out
+    }
+
+    fn from_signing(signing: SigningKey) -> Self {
         let point = signing.verifying_key().to_encoded_point(false);
         let public_b64 = b64url(point.as_bytes());
         Vapid { signing, public_b64, subject: "mailto:push@mycellium.invalid".to_string() }

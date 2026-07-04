@@ -98,9 +98,12 @@ deployment shape, and the operational essentials** around them.
   Impossible without the seed today. Needs device-linking (QR) or email-based
   multi-device, with safety-number warnings.
 
-- [ ] **T1.4 — Web Push: verify + persist VAPID.** Confirm closed-app wake on a
-  real device; persist the VAPID keypair so subscriptions survive queue
-  restarts.
+- [~] **T1.4 — Web Push: verify + persist VAPID.** *(persist done)* The queue now
+  loads its VAPID keypair from `MYCELLIUM_DATA/vapid.key` (0600), generating +
+  persisting on first run — so the public key (browsers' `applicationServerKey`)
+  is stable and existing subscriptions keep working across restarts. Verified the
+  key is identical after a restart. *Left: confirm closed-app wake delivery on a
+  real device (needs a real vendor push round-trip; can't be done headlessly).*
 
 ---
 

@@ -232,7 +232,7 @@ impl Queue {
 pub fn serve(addr: &str) -> std::io::Result<()> {
     let server = Arc::new(bind_server(addr)?);
     let queue = Arc::new(Mutex::new(open_queue()));
-    let vapid = Arc::new(push::Vapid::generate());
+    let vapid = Arc::new(load_or_generate_vapid());
     let metrics = Arc::new(mycellium_observe::Metrics::default());
     println!("  push: VAPID enabled");
 
@@ -297,6 +297,44 @@ fn open_queue() -> Queue {
         }
     }
 }
+
+/// Load the VAPID keypair from `MYCELLIUM_DATA/vapid.key`, or generate one and
+/// persist it there (0600) so browser push subscriptions survive restarts.
+/// Without `MYCELLIUM_DATA`, use an ephemeral keypair (dev).
+fn load_or_generate_vapid() -> push::Vapid {
+    let dir = match std::env::var("MYCELLIUM_DATA") {
+        Ok(d) if !d.trim().is_empty() => d,
+        _ => return push::Vapid::generate(),
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{}/vapid.key", dir.trim_end_matches('/'));
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            if let Some(v) = push::Vapid::from_seed(&seed) {
+                println!("  push: VAPID key loaded ({path})");
+                return v;
+            }
+        }
+        eprintln!("  push: {path} is unreadable; regenerating");
+    }
+    let v = push::Vapid::generate();
+    match std::fs::write(&path, v.seed()) {
+        Ok(()) => {
+            restrict_perms(&path);
+            println!("  push: VAPID key generated + persisted ({path})");
+        }
+        Err(e) => eprintln!("  push: could not persist VAPID key ({e}); it will change on restart"),
+    }
+    v
+}
+
+#[cfg(unix)]
+fn restrict_perms(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn restrict_perms(_path: &str) {}
 
 fn handle_request(queue: &Mutex<Queue>, vapid: &Arc<push::Vapid>, metrics: &mycellium_observe::Metrics, mut request: Request) {
     let start = std::time::Instant::now();
