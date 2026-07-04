@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use mycellium_core::identity::{Handle, Identity, MessagingPublicKey, PeerId};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
@@ -50,6 +50,12 @@ pub fn text_message<P: Platform>(platform: &mut P, text: &str) -> AppMessage {
         expires_at: None,
         body: Body::Text(text.to_string()),
     }
+}
+
+/// The mailbox slot a device drains: the full hex of its key. Account-wide items
+/// (groups, control, receipts) use the `"account"` slot instead.
+pub fn device_slot(key: &DevicePublicKey) -> String {
+    hex(&key.0)
 }
 
 /// This device's directory entry (keys + signed pre-key). Pure — derived from

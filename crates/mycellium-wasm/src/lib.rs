@@ -17,7 +17,9 @@ use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
-use mycellium_engine::wireops;
+use mycellium_engine::groups::MailItem;
+use mycellium_engine::{history, wireops};
+use mycellium_queue_client::{wallet_hex, QueueClient};
 use wasm_bindgen::prelude::*;
 
 /// The build's version string — a trivial export to confirm JS↔WASM bindings.
@@ -135,6 +137,79 @@ impl Session {
             other => format!("{other:?}"),
         };
         Ok(serde_json::json!({ "from": from.as_str(), "text": text }).to_string())
+    }
+
+    /// Publish this identity's record to the directory so peers can find us.
+    pub fn register(&mut self, dir_url: &str, queue_url: &str, handle: &str, name: &str) -> Result<(), JsValue> {
+        let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let record = wireops::build_record(&mut BrowserPlatform, &self.identity, &me, name, queue_url, "");
+        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
+        let token = dir.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        dir.publish(&token, &me, &record).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(())
+    }
+
+    /// Send a text message to `peer_handle` via the directory + queue. Returns the
+    /// number of recipient devices delivered to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, text: &str) -> Result<u32, JsValue> {
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let peer = Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
+        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
+        let precord = dir.lookup(&peer).map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
+        let plaintext = wireops::text_message(&mut BrowserPlatform, text).encode();
+        let queue = QueueClient::with_transport(&precord.record.queue, Box::new(XhrTransport));
+        let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let peer_hex = wallet_hex(&precord.record.wallet);
+        let mut delivered = 0u32;
+        for device in &precord.record.devices {
+            let env = wireops::seal_to(&mut BrowserPlatform, &self.identity, &me, my_name, my_queue, device, &plaintext);
+            let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
+                delivered += 1;
+            }
+        }
+        // Record our own copy of the message in local history.
+        let sent = history::StoredMessage {
+            id: wireops::random_id(&mut BrowserPlatform),
+            from_me: true,
+            text: text.to_string(),
+            timestamp: BrowserPlatform.now_unix_secs(),
+            expires_at: None,
+        };
+        let _ = history::append(&mut self.store, peer_handle, sent);
+        Ok(delivered)
+    }
+
+    /// Drain our queue, decrypt direct messages, and store them. Returns the
+    /// number of new messages received.
+    pub fn sync(&mut self, queue_url: &str) -> Result<u32, JsValue> {
+        let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
+        let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let my_hex = wallet_hex(&self.identity.wallet_public());
+        let my_slot = wireops::device_slot(&self.identity.device_public());
+        let mut blobs = queue.collect(&qtoken, &my_hex, &my_slot).unwrap_or_default();
+        blobs.extend(queue.collect(&qtoken, &my_hex, "account").unwrap_or_default());
+        let mut received = 0u32;
+        for blob in blobs {
+            let Ok(MailItem::Direct(env)) = serde_json::from_str::<MailItem>(&blob) else { continue };
+            let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { continue };
+            let Ok(app) = AppMessage::decode(&plaintext) else { continue };
+            let text = match app.body {
+                Body::Text(t) => t,
+                other => format!("{other:?}"),
+            };
+            let msg = history::StoredMessage {
+                id: app.id,
+                from_me: false,
+                text,
+                timestamp: app.timestamp,
+                expires_at: app.expires_at,
+            };
+            let _ = history::append(&mut self.store, from.as_str(), msg);
+            received += 1;
+        }
+        Ok(received)
     }
 
     /// Store a value (UTF-8) under `key`.

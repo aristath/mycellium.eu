@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 mycellium-core = { path = "../mycellium-core" }
 # Reuse the real client logic; inject a browser transport (no ureq).
 mycellium-directory-client = { path = "../mycellium-directory-client", default-features = false }
+mycellium-queue-client = { path = "../mycellium-queue-client", default-features = false }
 # The engine's generic domain modules (history, contacts, …) without its
 # native-only orchestration.
 mycellium-engine = { path = "../mycellium-engine", default-features = false }

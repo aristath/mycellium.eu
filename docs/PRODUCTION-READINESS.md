@@ -67,15 +67,15 @@ deployment shape, and the operational essentials** around them.
     the wasm counterpart to `FileStore`) plus a `Session` that snapshots to/from
     IndexedDB — state survives page reloads. All proven by headless-Chrome tests
     (`clients/rust/e2e/wasm*.test.mjs`).
-  - [~] **Stage 3 — engine in the browser.** *(3a + 3b done)* **3a:** the
-    engine's native-only parts (`app`, `platform`) are feature-gated behind
-    `native`; its generic modules compile to wasm32, and the real `history`
-    module runs against the browser store (persists to IndexedDB). **3b:**
-    extracted the platform-agnostic sealing/opening into an ungated `wireops`
-    module (native fns are thin wrappers) — the browser now does **real X3DH +
-    Double Ratchet**: two in-browser Sessions encrypt/decrypt a message, sender
-    identity recovered from the signed record, non-recipient blocked. *Left:
-    wire send/receive to the live directory+queue (networked), then the PWA.*
+  - [x] **Stage 3 — engine in the browser.** *(done)* **3a:** native-only parts
+    (`app`, `platform`) feature-gated behind `native`; the generic modules
+    compile to wasm32 and the real `history` module runs against the browser
+    store (IndexedDB). **3b:** platform-agnostic sealing/opening extracted into an
+    ungated `wireops` module (native fns are thin wrappers). **Networked:**
+    `Session` now does `register`/`send`/`sync` — a headless-Chrome test delivers
+    a full message **browser → real directory+queue → browser** (register, X3DH
+    seal, queue deposit, collect, decrypt, history), same engine code as native.
+    Five browser suites green.
   - [ ] **Stage 4 — port the PWA** off the local server; ship as a static HTTPS
     PWA.
 

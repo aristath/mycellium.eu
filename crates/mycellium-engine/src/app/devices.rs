@@ -105,11 +105,7 @@ pub fn short_device_id(key: &DevicePublicKey) -> String {
 
 
 
-/// The mailbox slot a device drains: the full hex of its key. Account-wide
-/// items (group, control, receipts) instead use [`ACCOUNT_SLOT`].
-pub fn device_slot(key: &DevicePublicKey) -> String {
-    hex(&key.0)
-}
+pub use crate::wireops::device_slot;
 
 
 
