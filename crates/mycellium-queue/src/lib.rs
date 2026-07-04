@@ -88,12 +88,17 @@ pub const RATE_WINDOW: u64 = 60;
 /// How long a session token lives before it expires and is pruned (24 hours).
 pub const TOKEN_TTL: u64 = 24 * 3600;
 
+/// How long an unsigned login challenge stays valid (5 minutes), matching the
+/// directory. Expired challenges are pruned when a new one is issued.
+pub const CHALLENGE_TTL: u64 = 300;
+
 /// The in-memory queue state (POC). A real deployment swaps the maps for a
 /// durable store; the logic is unchanged.
 #[derive(Default)]
 pub struct Queue {
-    /// Outstanding login challenges: nonce → the wallet it was issued to.
-    challenges: HashMap<String, WalletPublicKey>,
+    /// Outstanding login challenges: nonce → (wallet, issued_at). Pruned past
+    /// `CHALLENGE_TTL` so abandoned/unsigned challenges can't accumulate.
+    challenges: HashMap<String, (WalletPublicKey, u64)>,
     /// Active sessions: token → authenticated wallet.
     tokens: HashMap<String, WalletPublicKey>,
     /// Token issue times, for `TOKEN_TTL` expiry + pruning (bounds accumulation).
@@ -129,9 +134,12 @@ impl Queue {
     }
 
     /// Step 1 of login: issue a challenge nonce for `wallet`.
-    pub fn challenge(&mut self, wallet: WalletPublicKey) -> String {
+    pub fn challenge(&mut self, wallet: WalletPublicKey, now: u64) -> String {
+        // Housekeeping: drop challenges never signed within the TTL so the map
+        // stays bounded rather than growing with every unfinished login.
+        self.challenges.retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
         let nonce = random_hex::<16>();
-        self.challenges.insert(nonce.clone(), wallet);
+        self.challenges.insert(nonce.clone(), (wallet, now));
         nonce
     }
 
@@ -144,7 +152,7 @@ impl Queue {
         now: u64,
     ) -> Result<String, ApiError> {
         match self.challenges.get(nonce) {
-            Some(w) if w == wallet => {}
+            Some((w, issued)) if w == wallet && now.saturating_sub(*issued) <= CHALLENGE_TTL => {}
             _ => return Err(ApiError::BadChallenge),
         }
         wallet
@@ -479,7 +487,7 @@ fn route(
 
         (Method::Post, ["login", "challenge"]) => {
             let req: ChallengeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            let nonce = queue.lock().unwrap().challenge(req.wallet);
+            let nonce = queue.lock().unwrap().challenge(req.wallet, now);
             Ok((200, to_json(&ChallengeResp { nonce })))
         }
         (Method::Post, ["login", "verify"]) => {
@@ -584,7 +592,7 @@ mod tests {
     }
 
     fn login(q: &mut Queue, id: &Identity) -> String {
-        let nonce = q.challenge(id.wallet_public());
+        let nonce = q.challenge(id.wallet_public(), 0);
         let sig = id.sign(&mycellium_core::login::challenge_message(&nonce));
         q.verify(&id.wallet_public(), &nonce, &sig, 0).unwrap()
     }
@@ -631,6 +639,34 @@ mod tests {
             q.deposit(&token, &bob_hex, "s", "x".into(), TOKEN_TTL + 1),
             Err(ApiError::Unauthorized),
         );
+    }
+
+    #[test]
+    fn expired_challenge_is_rejected() {
+        let mut q = Queue::new();
+        let a = Identity::generate(&mut P(7)).unwrap();
+        let nonce = q.challenge(a.wallet_public(), 0);
+        let sig = a.sign(&mycellium_core::login::challenge_message(&nonce));
+        // A signature arriving after the challenge TTL is refused.
+        assert_eq!(
+            q.verify(&a.wallet_public(), &nonce, &sig, CHALLENGE_TTL + 1),
+            Err(ApiError::BadChallenge),
+        );
+        // Within the TTL the same handshake still works.
+        let nonce2 = q.challenge(a.wallet_public(), 0);
+        let sig2 = a.sign(&mycellium_core::login::challenge_message(&nonce2));
+        assert!(q.verify(&a.wallet_public(), &nonce2, &sig2, CHALLENGE_TTL).is_ok());
+    }
+
+    #[test]
+    fn expired_challenges_are_pruned() {
+        let mut q = Queue::new();
+        let a = Identity::generate(&mut P(8)).unwrap();
+        let _ = q.challenge(a.wallet_public(), 0);
+        assert_eq!(q.challenges.len(), 1);
+        // Issuing a new challenge past the TTL prunes the stale one first.
+        let _ = q.challenge(a.wallet_public(), CHALLENGE_TTL + 1);
+        assert_eq!(q.challenges.len(), 1, "the expired challenge was pruned");
     }
 
     #[test]

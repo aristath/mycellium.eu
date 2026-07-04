@@ -80,7 +80,10 @@ subscriptions are kept in redb and reloaded on start, and the VAPID keypair is
 persisted to `MYCELLIUM_DATA/vapid.key` (0600) so the public key browsers subscribed
 against survives a restart — without it, every restart would invalidate all
 subscriptions. Deposits are rate-limited per sender wallet (`DEPOSIT_RATE_LIMIT` per
-`RATE_WINDOW`) and each mailbox is bounded (`MAX_MAILBOX`). **Web Push is
+`RATE_WINDOW`) and each mailbox is bounded (`MAX_MAILBOX`). Login state is
+self-bounding like the directory's: challenges expire after `CHALLENGE_TTL` and
+session tokens after `TOKEN_TTL`, both pruned as new logins come in (and an expired
+token is rejected on use). **Web Push is
 contentless** (RFC 8291/8292): the wake ping carries no sender and no message, only
 "you have mail" — the app fetches and decrypts the actual message itself, so the
 vendor push service learns nothing.
