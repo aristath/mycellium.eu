@@ -44,6 +44,7 @@
     .backbar { display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line); background:var(--card); }
     .modal-bg { position:fixed; inset:0; background:#000a; display:grid; place-items:center; padding:16px; }
     .modal { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; width:100%; max-width:380px; }
+    .actions { display:flex; flex-direction:column; gap:8px; } .actions button { width:100%; }
   </style>
 </head>
 <body>
@@ -193,7 +194,7 @@
         ${banner}
         <div class="composer"><input id="msg" placeholder="Message @${esc(peer)}" autocomplete="off"><button id="send">Send</button></div>`;
       byId('back').onclick = () => { open = null; replyTo = null; render(); };
-      app.querySelectorAll('.bubble[data-id]').forEach((b) => b.onclick = () => { replyTo = b.dataset.id; renderThread(peer); byId('msg').focus(); });
+      app.querySelectorAll('.bubble[data-id]').forEach((b) => b.onclick = () => msgActions(peer, b.dataset.id, b.classList.contains('me')));
       if (byId('cancelReply')) byId('cancelReply').onclick = () => { replyTo = null; renderThread(peer); };
       const send = async () => {
         const text = byId('msg').value.trim(); if (!text) return;
@@ -208,6 +209,21 @@
       byId('send').onclick = send;
       byId('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
       const m = byId('msgs'); if (m) m.scrollTop = m.scrollHeight;
+    }
+
+    function msgActions(peer, id, mine) {
+      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal"><div class="actions">
+        <button id="reply">↪ Reply</button>
+        <button id="react">👍 React</button>
+        ${mine ? '<button id="del">🗑 Delete</button>' : ''}
+        <button class="ghost" id="cancel">Cancel</button>
+      </div></div></div>`);
+      const close = () => byId('bg').remove();
+      const act = async (fn) => { close(); try { fn(); await persist(); renderThread(peer); } catch (e) { alert('Failed: ' + e); } };
+      byId('cancel').onclick = close;
+      byId('reply').onclick = () => { close(); replyTo = id; renderThread(peer); byId('msg').focus(); };
+      byId('react').onclick = () => act(() => session.react(cfg.dir, me.handle, me.name, cfg.queue, peer, id, '👍'));
+      if (byId('del')) byId('del').onclick = () => act(() => session.delete_message(cfg.dir, me.handle, me.name, cfg.queue, peer, id));
     }
 
     function newChat() {

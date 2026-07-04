@@ -203,6 +203,21 @@ impl Session {
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
+    /// React to message `target` with an emoji.
+    #[allow(clippy::too_many_arguments)]
+    pub fn react(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, target: &str, emoji: &str) -> Result<u32, JsValue> {
+        let body = Body::Reaction { to: target.to_string(), emoji: emoji.to_string() };
+        let app = wireops::app_message(&mut BrowserPlatform, body);
+        self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
+    }
+
+    /// Delete message `target` for everyone (a tombstone, applied to history).
+    pub fn delete_message(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, target: &str) -> Result<u32, JsValue> {
+        let body = Body::Delete { to: target.to_string() };
+        let app = wireops::app_message(&mut BrowserPlatform, body);
+        self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
+    }
+
     /// Drain our queue, decrypt direct messages, and store them. Returns the
     /// number of new messages received.
     pub fn sync(&mut self, queue_url: &str) -> Result<u32, JsValue> {
