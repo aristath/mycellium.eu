@@ -212,25 +212,41 @@ pub fn revoke_device(handle: &str, device_id: &str, directory: &str) -> Result<(
         bail!("'{handle}' is not your account");
     }
 
+    // Require an *unambiguous* match — the full displayed short id (8 hex chars)
+    // or the full device-key hex — and revoke exactly one device, never several.
     let wanted = device_id.to_lowercase();
-    let before = current.record.devices.len();
+    let idx = find_device(&current.record.devices, &wanted)?;
+    let target = current.record.devices[idx].device_key;
     let devices: Vec<Device> = current
         .record
         .devices
         .iter()
-        .filter(|d| !short_device_id(&d.device_key).starts_with(&wanted))
+        .filter(|d| d.device_key != target)
         .cloned()
         .collect();
-    if devices.len() == before {
-        bail!("no device matching '{device_id}'");
-    }
     if devices.is_empty() {
         bail!("cannot revoke the last device in the cluster");
     }
-    let removed = before - devices.len();
     update_devices(&client, &token, &identity, &me, devices, current.record.seq)?;
-    println!("revoked {removed} device(s) from '{handle}'");
+    println!("revoked device '{device_id}' from '{handle}'");
     Ok(())
+}
+
+/// Find the single device matching `wanted` — its full 8-char short id or its
+/// full key hex. Errors if nothing matches, or (defensively) if more than one
+/// does, rather than revoking multiple devices from an ambiguous prefix.
+fn find_device(devices: &[Device], wanted: &str) -> Result<usize> {
+    let hits: Vec<usize> = devices
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| short_device_id(&d.device_key) == wanted || hex(&d.device_key.0) == wanted)
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [] => bail!("no device matching '{wanted}' — use the full 8-character id from `devices` (or the full key)"),
+        [i] => Ok(*i),
+        _ => bail!("'{wanted}' is ambiguous ({} devices) — use the full device key", hits.len()),
+    }
 }
 
 
@@ -250,3 +266,38 @@ pub use crate::wireops::my_group_id;
 /// This device's entry for a record: its transport address plus its own
 /// (currently seed-derived) messaging keys, signed by the account wallet.
 pub use crate::wireops::this_device;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mycellium_core::identity::{DevicePublicKey, MessagingPublicKey, PeerId, Signature};
+    use mycellium_core::record::SignedPreKey;
+
+    fn dev(first4: [u8; 4], tag: u8) -> Device {
+        let mut key = [tag; 32]; // `tag` distinguishes the full key
+        key[..4].copy_from_slice(&first4);
+        Device {
+            device_key: DevicePublicKey(key),
+            peer_id: PeerId(Vec::new()),
+            id_key: MessagingPublicKey([0u8; 32]),
+            signed_pre_key: SignedPreKey { public: MessagingPublicKey([0u8; 32]), signature: Signature(vec![0u8; 64]) },
+        }
+    }
+
+    #[test]
+    fn revocation_requires_unambiguous_match() {
+        let a = dev([0xaa, 0xbb, 0xcc, 0xdd], 1); // short id "aabbccdd"
+        let b = dev([0x11, 0x22, 0x33, 0x44], 2);
+        let c = dev([0xaa, 0xbb, 0xcc, 0xdd], 3); // same short id as `a`, different full key
+
+        // Exact full short id, unique → matches.
+        assert_eq!(find_device(&[a.clone(), b.clone()], "aabbccdd").unwrap(), 0);
+        // A short prefix no longer matches (must be the full 8 chars).
+        assert!(find_device(&[a.clone(), b.clone()], "aa").is_err());
+        // Two devices share the short id → ambiguous, rejected (not both revoked).
+        assert!(find_device(&[a.clone(), c.clone()], "aabbccdd").is_err());
+        // The full device-key hex disambiguates.
+        let full = hex(&a.device_key.0);
+        assert_eq!(find_device(&[a, c], &full).unwrap(), 0);
+    }
+}
