@@ -121,11 +121,11 @@ pub fn run(
                 if let Ok(msg) = wire::decode::<RatchetMessage>(&frame) {
                     let decrypted = ratchet.lock().unwrap().decrypt(&mut platform, &msg, &ad);
                     if let Ok(plaintext) = decrypted {
-                        let text = match AppMessage::decode(&plaintext) {
-                            Ok(m) => m.summary(),
-                            Err(_) => String::from_utf8_lossy(&plaintext).into_owned(),
+                        let (id, expires_at, text) = match AppMessage::decode(&plaintext) {
+                            Ok(m) => (m.id.clone(), m.expires_at, m.summary()),
+                            Err(_) => (String::new(), None, String::from_utf8_lossy(&plaintext).into_owned()),
                         };
-                        record(&history, &peer, false, text.clone());
+                        record(&history, &peer, false, id, text.clone(), expires_at);
                         let _ = tx.send(Incoming::Message(text));
                     }
                 }
@@ -206,25 +206,23 @@ fn submit(
         model.system("waiting for the peer's first message before you can reply");
         return;
     }
-    let app = AppMessage {
-        id: String::new(),
-        timestamp: OsPlatform.now_unix_secs(),
-        expires_at: None,
-        body: mycellium_core::message::Body::Text(input.to_string()),
-    };
+    // A real id + timestamp (via text_message) so the sent message is a
+    // first-class history entry, not an empty-id stub.
+    let app = mycellium_engine::wireops::text_message(&mut OsPlatform, input);
     let msg = ratchet.lock().unwrap().encrypt(&app.encode(), ad);
     match writer.send_frame(&wire::encode(&msg)) {
         Ok(()) => {
             model.sent(input);
-            record(history, peer, true, input.to_string());
+            record(history, peer, true, app.id.clone(), input.to_string(), app.expires_at);
         }
         Err(_) => model.system("failed to send"),
     }
 }
 
-/// Persist one message to the encrypted history store (best-effort).
-fn record(history: &Arc<Mutex<FileStore>>, peer: &str, from_me: bool, text: String) {
-    let message = StoredMessage { id: String::new(), from_me, text, timestamp: OsPlatform.now_unix_secs(), expires_at: None };
+/// Persist one message to the encrypted history store (best-effort), preserving
+/// its real id + expiry.
+fn record(history: &Arc<Mutex<FileStore>>, peer: &str, from_me: bool, id: String, text: String, expires_at: Option<u64>) {
+    let message = StoredMessage { id, from_me, text, timestamp: OsPlatform.now_unix_secs(), expires_at };
     let _ = history::append(&mut *history.lock().unwrap(), peer, message);
 }
 

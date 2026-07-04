@@ -744,9 +744,9 @@ fn run_duplex(
             let decrypted = reader_ratchet.lock().unwrap().decrypt(&mut platform, &msg, &reader_ad);
             match decrypted {
                 Ok(plaintext) => {
-                    let (id, display) = render_incoming(&plaintext);
+                    let (id, expires_at, display) = render_incoming(&plaintext);
                     println!("{reader_peer}: {display}  (#{id})");
-                    record(&reader_history, &reader_peer, false, display);
+                    record(&reader_history, &reader_peer, false, id, display, expires_at);
                 }
                 Err(_) => eprintln!("(received an undecryptable message)"),
             }
@@ -767,25 +767,27 @@ fn run_duplex(
         if writer.send_frame(&wire::encode(&msg)).is_err() {
             break;
         }
-        record(&history, &peer_name, true, line);
+        record(&history, &peer_name, true, app.id.clone(), line, app.expires_at);
     }
 }
 
 
-/// Persist one message to the encrypted history store (best-effort).
-fn record(history: &Arc<Mutex<FileStore>>, peer: &str, from_me: bool, text: String) {
-    let message = StoredMessage { id: String::new(), from_me, text, timestamp: OsPlatform.now_unix_secs(), expires_at: None };
+/// Persist one message to the encrypted history store (best-effort), keeping its
+/// real id + expiry so reply/edit/delete/expiry work the same as offline mail.
+fn record(history: &Arc<Mutex<FileStore>>, peer: &str, from_me: bool, id: String, text: String, expires_at: Option<u64>) {
+    let message = StoredMessage { id, from_me, text, timestamp: OsPlatform.now_unix_secs(), expires_at };
     let _ = history::append(&mut *history.lock().unwrap(), peer, message);
 }
 
 
-/// Decode a decrypted payload into `(id, display)`, tolerating older raw text.
-fn render_incoming(bytes: &[u8]) -> (String, String) {
+/// Decode a decrypted payload into `(id, expires_at, display)`, tolerating older
+/// raw text (which has no metadata → empty id, no expiry).
+fn render_incoming(bytes: &[u8]) -> (String, Option<u64>, String) {
     match AppMessage::decode(bytes) {
         Ok(msg) => {
             let summary = msg.summary();
-            (msg.id, summary)
+            (msg.id, msg.expires_at, summary)
         }
-        Err(_) => (String::new(), String::from_utf8_lossy(bytes).into_owned()),
+        Err(_) => (String::new(), None, String::from_utf8_lossy(bytes).into_owned()),
     }
 }
