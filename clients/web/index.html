@@ -191,8 +191,8 @@
       try { threads = JSON.parse(session.peers()); } catch {}
       const items = threads.length ? threads.map((t) => `
         <button class="item" data-peer="${esc(t.peer)}">
-          <div class="avatar">${initials(t.peer)}</div>
-          <div class="body"><div class="title">${esc(t.peer)}</div>
+          <div class="avatar">${initials(t.name || t.peer)}</div>
+          <div class="body"><div class="title">${esc(t.name || t.peer)}</div>
           <div class="snippet">${t.mine ? 'You: ' : ''}${esc(t.last) || 'No messages yet'}</div></div>
         </button>`).join('') : `<div class="empty">No conversations yet.<br>Tap + to start one.</div>`;
       app.innerHTML = `
@@ -206,6 +206,7 @@
     function renderThread(peer) {
       let msgs = [];
       try { msgs = JSON.parse(session.thread(peer)); } catch {}
+      let pname = peer; try { pname = session.name_of(peer) || peer; } catch {}
       const bubbles = msgs.map((m) => {
         let inner = esc(m.text);
         let file = null; try { file = session.file(m.id); } catch {}
@@ -217,7 +218,7 @@
         ? `<div class="replybar">↪ Replying: <span>${esc(replyMsg.text.slice(0, 60))}</span><button class="ghost" id="cancelReply">✕</button></div>`
         : '';
       app.innerHTML = `
-        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b>${esc(peer)}</b></div>
+        <div class="backbar"><button class="ghost" id="back">‹ Chats</button><b>${esc(pname)}</b></div>
         <main><div class="msgs" id="msgs">${bubbles}</div></main>
         ${banner}
         <div class="composer">

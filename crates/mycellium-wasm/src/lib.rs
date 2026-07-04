@@ -20,7 +20,7 @@ use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::groups::MailItem;
-use mycellium_engine::{history, wireops};
+use mycellium_engine::{history, names, wireops};
 use mycellium_queue_client::{wallet_hex, QueueClient};
 use wasm_bindgen::prelude::*;
 
@@ -230,6 +230,11 @@ impl Session {
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
+    /// The learned display name for a peer handle, if we've seen their record.
+    pub fn name_of(&self, handle: &str) -> Option<String> {
+        names::get(&self.store, handle).ok().flatten()
+    }
+
     /// The attachment for message `id` as a `data:` URL, if any.
     pub fn file(&self, id: &str) -> Option<String> {
         self.store
@@ -266,6 +271,8 @@ impl Session {
             let Ok(MailItem::Direct(env)) = serde_json::from_str::<MailItem>(&blob) else { continue };
             let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { continue };
             let Ok(app) = AppMessage::decode(&plaintext) else { continue };
+            // Learn the sender's self-set display name (carried in their record).
+            let _ = names::note(&mut self.store, from.as_str(), &env.sender_record.record.name);
             apply_to_history(&mut self.store, from.as_str(), &app, false);
             received += 1;
         }
@@ -321,8 +328,10 @@ impl Session {
             let msgs =
                 mycellium_engine::history::load(&self.store, &peer).map_err(|_| JsValue::from_str("store error"))?;
             let last = msgs.last();
+            let name = names::get(&self.store, &peer).ok().flatten().unwrap_or_default();
             out.push(serde_json::json!({
                 "peer": peer,
+                "name": name,
                 "last": last.map(|m| m.text.clone()).unwrap_or_default(),
                 "timestamp": last.map(|m| m.timestamp).unwrap_or(0),
                 "mine": last.map(|m| m.from_me).unwrap_or(false),
@@ -356,6 +365,8 @@ impl Session {
         let peer = Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
         let precord = dir.lookup(&peer).map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
+        // Learn the peer's chosen display name from their record.
+        let _ = names::note(&mut self.store, peer_handle, &precord.record.name);
         let plaintext = app.encode();
         let queue = QueueClient::with_transport(&precord.record.queue, Box::new(XhrTransport));
         let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;

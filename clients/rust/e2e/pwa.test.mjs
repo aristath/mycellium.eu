@@ -119,6 +119,8 @@ async function main() {
 
     console.error("• Bob's PWA receives it via its own polling");
     check(await hasText(bob, '.item .snippet', 'hello bob', 20000), "conversation from alice appears in Bob's list");
+    check(await hasText(bob, '.item .title', 'Alice'), "Bob's list shows Alice's display name (not the raw username)");
+    check(await hasText(alice, '.backbar', 'Bob'), "Alice's thread header shows Bob's display name");
     check(await hasNotif(bob, 'hello bob'), "Bob's PWA raised a desktop notification");
     await jsClick(bob, '.item');
     check(await hasText(bob, '.bubble', 'hello bob — sent from the browser PWA 🍄', 10000), 'Bob opens the thread and sees the decrypted message');
