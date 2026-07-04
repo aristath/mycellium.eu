@@ -56,8 +56,14 @@ Every crate links its own README: [core](crates/mycellium-core/README.md) ·
 [storage](crates/mycellium-storage/README.md) ·
 [directory-client](crates/mycellium-directory-client/README.md) ·
 [queue-client](crates/mycellium-queue-client/README.md) ·
+[http](crates/mycellium-http/README.md) ·
+[observe](crates/mycellium-observe/README.md) ·
 [engine](crates/mycellium-engine/README.md) ·
-[cli](crates/mycellium-cli/README.md).
+[cli](crates/mycellium-cli/README.md) ·
+[wasm](crates/mycellium-wasm/README.md).
+New to the project? Start with [`docs/QUICKSTART.md`](docs/QUICKSTART.md); for the
+browser build see [`docs/BROWSER.md`](docs/BROWSER.md); to run it for real see
+[`docs/DEPLOY.md`](docs/DEPLOY.md) and [`docs/GO-LIVE.md`](docs/GO-LIVE.md).
 
 The core depends only on the `Transport`, `Storage`, and `Platform` traits, so
 the same protocol runs from a microcontroller to a desktop. The CLI ships two
@@ -83,11 +89,11 @@ the wire decoders with garbage/truncated/bit-flipped bytes (never panics, never
 accepts a tampered record) and checks the ratchet rejects replays and bounds
 skips. A `model` suite checks correctness properties over random inputs — the
 ratchet decrypts under many random two-way interleavings, and Shamir sharing
-round-trips for random thresholds/subsets. ~130 workspace tests in all, plus
-seven real-browser suites (WASM crypto, storage, networked messaging, and the
-full PWA) under [`clients/rust/e2e`](clients/rust/e2e). (The e2e suite throttles
-itself to a few concurrent subprocess-heavy tests to stay reliable under parallel
-runs.)
+round-trips for random thresholds/subsets. ~129 workspace tests in all, plus
+ten real-browser suites (WASM crypto, sealing, storage, networked messaging,
+groups, multi-device, and the full two-user PWA flow) under
+[`clients/rust/e2e`](clients/rust/e2e). (The e2e suite throttles itself to a few
+concurrent subprocess-heavy tests to stay reliable under parallel runs.)
 
 ## Browser app (PWA)
 
@@ -333,8 +339,10 @@ the directory can neither read nor forge.
 
 ## Status
 
-Proof of concept — feature-complete for its scope, ~105 tests (unit, real-binary
-e2e, fuzz/robustness, randomized model), clippy-clean, `no_std` core.
+Feature-complete for its scope, ~129 workspace tests (unit, real-binary e2e,
+fuzz/robustness, randomized model) plus ten real-browser suites, clippy-clean,
+`no_std` core. See [`docs/PRODUCTION-READINESS.md`](docs/PRODUCTION-READINESS.md)
+for the path to a public launch.
 
 **Done:** identity from a 24-word seed → BIP-44 wallet + device + messaging keys;
 the untrusted signed directory (permanent handles, anti-rollback, rate-limited
@@ -350,5 +358,13 @@ import backup; `wipe`; and **social recovery** (`guardian-split` / `-recover`).
 **Multi-device** (Layer 11) is implemented: an account runs on many devices,
 each with its own keys, wallet-signed into one record. `link-device` adds a
 device with just the seed; a message fans out per recipient device and mirrors
-to your own devices; groups fan out to each member's devices. **Deferred
-frontier:** NAT traversal (DHT/relay) and phone/email recovery factors.
+to your own devices; groups fan out to each member's devices.
+
+**Browser build** (Layer 11.1): the same engine runs as WebAssembly in an
+installable PWA ([`clients/web`](clients/web)) — 1:1 + groups, attachments,
+notifications + Web Push, multi-device linking by QR or link, all client-side. The
+directory and queue now **persist** (embedded redb), send real verification email
+with account **recovery**, terminate TLS, rate-limit, and expose `/metrics` + logs.
+
+**Deferred frontier:** NAT traversal (DHT/relay), a non-US mobile push relay, and
+an independent security audit before a public launch.

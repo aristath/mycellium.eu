@@ -20,7 +20,7 @@ rendering. No protocol logic lives here; every command dispatches straight into
 |---------|------|
 | `identity-new` | Create a new 24-word-seed identity, stored locally. |
 | `identity-show` | Show this device's public identity. |
-| `register <handle> --addr <a> [--libp2p] [--directory]` | Claim a handle and publish your signed record. |
+| `register <handle> --addr <a> [--libp2p]` | Claim a handle and publish your signed record. |
 | `link-device <handle> --addr <a> [--libp2p]` | Adopt an existing account on a fresh device (reads `MYCELLIUM_PHRASE` or stdin). |
 | `devices <handle>` | List the devices in an account's cluster. |
 | `revoke-device <handle> <device_id>` | Remove a device from your cluster. |
@@ -36,11 +36,22 @@ rendering. No protocol logic lives here; every command dispatches straight into
 | `inbox --as <me>` | Fetch and decrypt queued offline messages. |
 | `outbox` | Retry undelivered messages; show what's still waiting. |
 | `broadcast --to a,b --as <me> --message <m>` | Send one message to several peers. |
-| `forward <message_id> --from <p> --to <p> --as <me>` | Forward a stored message. |
+| `forward <message_id> --from <p> --to <p> --as <me>` | Forward a stored message to another peer. |
 | `announce --as <me>` / `presence <peer>` | Heartbeat the directory / check if a handle is online. |
 | `verify <peer>` | Show the safety number for out-of-band identity verification. |
 
-**Groups** — `group create <name> --members a,b --as <me>`, `group send <group> --as <me> [--message …]`, `group add/remove <group> --member <h> --as <me>`, `group history/info <group>`, `group leave <group> --as <me>`, `group sync --as <me>`, `group list`.
+**Groups**
+
+| Command | Does |
+|---------|------|
+| `group create <name> --members a,b --as <me>` | Create a group and invite members (auto-includes the creator). |
+| `group send <group> --as <me> [--message/--react/--to/--file/--edit/--delete/--reply-to/--expire]` | Send a message to the group (fans out to every member). |
+| `group add <group> --member <h> --as <me>` | Invite another member to an existing group. |
+| `group remove <group> --member <h> --as <me>` | Remove a member and re-key the rest. |
+| `group history <group>` / `group info <group>` | Show a group's transcript / name, id, and members. |
+| `group leave <group> --as <me>` | Leave a group (notifies the others to re-key). |
+| `group sync --as <me>` | Bootstrap your other devices into your groups. |
+| `group list` | List the groups this device knows about. |
 
 **Contacts & organization**
 
@@ -59,24 +70,56 @@ rendering. No protocol logic lives here; every command dispatches straight into
 | Command | Does |
 |---------|------|
 | `guardian-split --shares <n> --threshold <t>` | Split your identity into t-of-n social-recovery shares. |
-| `guardian-recover --share <s> …` | Recover an identity from guardian shares. |
+| `guardian-recover --share <s> …` | Recover an identity on a new device from guardian shares. |
 | `export <path>` / `import <path>` | Back up / restore identity + local data. |
 | `wipe --yes` | Erase ALL local data. Irreversible. |
+
+**Notes**
+
+- Every command that talks to the directory takes `--directory <url>`
+  (default `http://127.0.0.1:8080`); the tables omit it per row.
+- `chat`/`listen` render a line-mode session by default; pass `--tui` for the
+  full-screen ratatui UI.
+- `register`, `link-device`, `listen`, and `chat` accept `--libp2p` to advertise
+  (or dial) a libp2p multiaddr carrying a PeerId instead of a raw host:port.
+- Contacts are **TOFU-pinned**: `contact add` binds the nickname to the peer's
+  current identity on first add, and re-adding a nickname bound to a different
+  identity is refused.
+- **Backup & recovery** are two independent paths: `export`/`import` move a
+  portable, encrypted backup bundle between machines, while
+  `guardian-split`/`guardian-recover` reconstruct the seed from a Shamir t-of-n
+  set of social-recovery shares.
+
+**Environment variables**
+
+- `MYCELLIUM_QUEUE` — your queue endpoint, recorded in your signed record so
+  senders can reach you (empty = pure P2P, live-push only).
+- `MYCELLIUM_NAME` — your display name.
+- `MYCELLIUM_HOME` — where identity + local data are stored.
+- `MYCELLIUM_PASSPHRASE` — unlocks the stored identity.
 
 ## Quick start
 
 ```sh
-# 1. Start the shared services (directory + queue) — see mycellium-server.
-mycellium-server --directory-addr 127.0.0.1:8080 &
+# 1. Start the shared services (directory + queue).
+mycellium-server --addr 127.0.0.1:8080 &
+mycellium-queue  --addr 127.0.0.1:8090 &
 
 # 2. Point the client at its queue, then create + register an identity.
-export MYCELLIUM_QUEUE=http://127.0.0.1:8081
+export MYCELLIUM_QUEUE=http://127.0.0.1:8090
 mycellium identity-new
 mycellium register ari --addr 127.0.0.1:9001 --directory http://127.0.0.1:8080
 
 # 3. Queue an offline message to a peer, then drain your own inbox.
-mycellium send bob --as ari --message "hi from the shell"
-mycellium inbox --as ari
+mycellium send bob --as ari --message "hi from the shell" --directory http://127.0.0.1:8080
+mycellium inbox --as ari --directory http://127.0.0.1:8080
+```
+
+```sh
+# A group workflow: create, send, then read the transcript back.
+mycellium group create book-club --members bob,carol --as ari
+mycellium group send book-club --as ari --message "first chapter tonight?"
+mycellium group history book-club
 ```
 
 ## How it fits

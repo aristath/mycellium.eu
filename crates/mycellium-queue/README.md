@@ -22,21 +22,26 @@ wallet may collect.
 | GET    | `/health`                  | none          | Liveness check (`"ok"`).                          |
 | POST   | `/login/challenge`         | none          | Issue a login nonce for a `wallet`.              |
 | POST   | `/login/verify`            | none          | Verify the signed nonce, return a session token. |
-| POST   | `/mailbox/{wallet}/{slot}` | Bearer token  | Deposit an opaque blob (any authed sender).      |
+| POST   | `/mailbox/{wallet}/{slot}` | Bearer token  | Deposit an opaque blob (any authed sender, rate-limited). |
 | GET    | `/mailbox/{wallet}/{slot}` | Bearer token  | Collect & drain the slot (owning wallet only).   |
+| GET    | `/push/key`                | none          | The queue's VAPID public key (for `applicationServerKey`). |
+| POST   | `/push/subscribe`          | Bearer token  | Register a Web Push endpoint to be woken on new mail. |
+| GET    | `/metrics`                 | none          | Prometheus counters (via `mycellium-observe`).   |
 
 Login is the SIWE-style wallet contract from `mycellium_core::login`. The token is
 passed as `Authorization: Bearer <token>`. `{slot}` is a device id (targeted) or
-`"account"` (cluster-wide).
+`"account"` (cluster-wide). All responses carry permissive CORS headers; bodies are
+capped (413 above 1 MiB).
 
 ## Public API (library)
 
-- `Queue` — the in-memory queue state (challenges, tokens, mailboxes, rate counters).
-- `Queue::new()` — a fresh, empty queue.
+- `Queue` — the queue state (challenges, tokens, mailboxes, push subscriptions, rate counters).
+- `Queue::new()` — a fresh in-memory queue; `Queue::open(path)` — one backed by a durable redb store (mailboxes + push subscriptions reload on start).
 - `Queue::challenge(wallet)` — step 1 of login: issue a challenge nonce.
 - `Queue::verify(wallet, nonce, signature)` — step 2: verify and issue a session token.
-- `Queue::deposit(token, recipient_wallet_hex, slot, blob, now)` — deposit an opaque blob (rate-limited per sender wallet).
+- `Queue::deposit(token, recipient_wallet_hex, slot, blob, now)` — deposit an opaque blob (rate-limited per sender wallet); triggers a contentless Web Push wake to the recipient's subscriptions.
 - `Queue::collect(token, wallet_hex, slot)` — drain one slot; caller may only collect their own wallet.
+- `Queue::subscribe(token, endpoint)` / `subscriptions(wallet_hex)` — register / list Web Push endpoints for a wallet.
 - `ApiError` — a rejected request and its HTTP status (`BadChallenge`, `BadSignature`, `Unauthorized`, `Forbidden`, `RateLimited`, `MailboxFull`, `BadRequest`); `.status()` / `.reason()`.
 - `serve(addr)` — run the queue as an HTTP service on `addr` (blocks).
 - `hex33(&[u8; 33])` — lowercase hex of a 33-byte compressed wallet key.
@@ -59,8 +64,23 @@ A recipient publishes their queue endpoint in their directory record; senders de
 there via `mycellium-queue-client`. You can self-host a queue or point your record at a
 provider's — either way it reads nothing but ciphertext.
 
+## Configuration (env)
+
+| Variable | Effect |
+| -------- | ------ |
+| `MYCELLIUM_QUEUE_ADDR` | Bind address (or `--addr`, which wins). Default `127.0.0.1:8090`. |
+| `MYCELLIUM_DATA` | Directory for the durable redb store **and** the persisted `vapid.key`. Unset ⇒ in-memory + an ephemeral VAPID key. |
+| `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` | Serve HTTPS directly (PEM). Unset ⇒ plain HTTP behind a proxy. |
+| `MYCELLIUM_LOG` | Set (≠ `"0"`) for a JSON access-log line per request (5xx always logged). |
+
 ## Notes
 
-State is in-memory today (a real deployment swaps the maps for a durable store; the
-logic is unchanged). Deposits are rate-limited per sender wallet (`DEPOSIT_RATE_LIMIT`
-per `RATE_WINDOW`), and each mailbox is bounded (`MAX_MAILBOX`).
+Persistence is durable when `MYCELLIUM_DATA` is set: mailboxes and push
+subscriptions are kept in redb and reloaded on start, and the VAPID keypair is
+persisted to `MYCELLIUM_DATA/vapid.key` (0600) so the public key browsers subscribed
+against survives a restart — without it, every restart would invalidate all
+subscriptions. Deposits are rate-limited per sender wallet (`DEPOSIT_RATE_LIMIT` per
+`RATE_WINDOW`) and each mailbox is bounded (`MAX_MAILBOX`). **Web Push is
+contentless** (RFC 8291/8292): the wake ping carries no sender and no message, only
+"you have mail" — the app fetches and decrypts the actual message itself, so the
+vendor push service learns nothing.

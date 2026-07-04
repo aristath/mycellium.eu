@@ -41,3 +41,9 @@ The engine derives a 32-byte key from its loaded identity and opens a
 `FileStore` in `data_dir()` for all local persistence. A different platform
 (web, embedded) swaps this crate for its own `Storage` adapter; the core
 depends only on the trait.
+
+## Notes
+
+There is no passphrase strength policy: a one-character passphrase is accepted
+(only an empty one is rejected), so Argon2id's work factor is the sole guard on a
+weak passphrase. Choose a strong one — the seed's on-disk secrecy rests on it.

@@ -79,6 +79,42 @@ You are then responsible for certificate renewal (e.g. a certbot cron).
   (`{t, svc, method, path, status, ms}`). Paths carry only opaque ids, never
   plaintext names or emails.
 
+## Serving the browser PWA
+
+The web client ([`clients/web`](../clients/web)) is **static files** — no app server.
+
+```sh
+./clients/web/build.sh          # compile mycellium-wasm → clients/web/pkg/
+```
+
+Then serve the `clients/web/` directory as a static site over **HTTPS** (service
+workers, Web Push, and install all refuse plain HTTP off localhost). Any static host
+works; with Caddy:
+
+```
+app.example.com {
+    root * /srv/mycellium/clients/web
+    file_server
+    try_files {path} /index.html
+}
+```
+
+- Ship `index.html`, `worker.js`, `sw.js`, `manifest.json`, `icon.svg`, and the
+  generated `pkg/` (serve `.wasm` as `application/wasm`).
+- Clients discover the services from the URL query on first load —
+  `https://app.example.com/?dir=https://directory.example.com&queue=https://queue.example.com`
+  — or from the in-app Setup screen; the choice is remembered in `localStorage`.
+- The directory and queue already send permissive CORS, so a browser on a different
+  origin can call them directly.
+
+## Web Push
+
+The queue implements contentless Web Push (VAPID) to wake a closed PWA. Its VAPID
+keypair is generated once and **persisted to `MYCELLIUM_DATA/vapid.key`** (0600), so
+the public key browsers subscribed against survives restarts — set `MYCELLIUM_DATA`
+in production or every restart invalidates all existing push subscriptions. No extra
+configuration is needed; `GET /push/key` serves the public key to clients.
+
 ## Scaling notes
 
 - The **directory** is read-mostly and designed to be cloned behind a load

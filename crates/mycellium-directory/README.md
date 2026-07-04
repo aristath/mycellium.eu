@@ -22,33 +22,54 @@ Routes from `src/http.rs` (`route`):
 | ------ | ------------------- | ------ | ---------------------------------------------- |
 | POST   | `/login/challenge`  | none   | Issue a login nonce for a wallet.              |
 | POST   | `/login/verify`     | none   | Verify the signed nonce, return a session token. |
-| PUT    | `/records/{handle}` | Bearer | Publish/update a `SignedRecord` under a handle. |
+| POST   | `/auth/start`       | none   | Begin an email-verified username claim; sends a code (rate-limited per wallet + per email). |
+| POST   | `/auth/confirm`     | none   | Confirm the code to bind (or recover) a handle. |
+| POST   | `/auth/status`      | none   | Poll whether a claim has been confirmed.        |
+| PUT    | `/records/{handle}` | Bearer | Publish/update a `SignedRecord` under a handle (rate-limited per wallet). |
 | GET    | `/records/{handle}` | none   | Look up the record for a handle (404 if none). |
 | POST   | `/presence/{handle}`| Bearer | Heartbeat: the owner marks the handle online.  |
 | GET    | `/presence/{handle}`| none   | Query whether a handle is online.              |
+| GET    | `/metrics`          | none   | Prometheus counters (via `mycellium-observe`). |
 | GET    | `/health`           | none   | Liveness check (`"ok"`).                        |
+
+All responses carry permissive CORS headers (browser clients call it directly), and
+request bodies are capped (413 above 256 KiB).
 
 ## Public API (library)
 
-- `Directory` — the in-memory registry state.
-- `Directory::challenge(wallet)` — step 1 of login: issue a nonce.
-- `Directory::verify(wallet, nonce, signature)` — step 2: check the signature, return a session token.
-- `Directory::publish(token, handle, record)` — store a signed record, enforcing every directory rule.
+- `Directory` — the registry state (challenges, tokens, bindings, records, presence, rate counters, email pepper).
+- `Directory::new()` — a fresh in-memory registry; `Directory::open(path)` — one backed by a durable redb store (loads existing bindings/records/emails on start).
+- `Directory::challenge(wallet)` / `verify(wallet, nonce, signature)` — the two login steps; `verify` returns a session token.
+- `Directory::auth_start(...)` / `auth_confirm(...)` / `auth_status(...)` — the email-verified username claim + recovery flow (a code is mailed out; confirming binds or re-binds the handle).
+- `Directory::publish(token, handle, record)` — store a signed record, enforcing every directory rule (self-certification, permanent binding, `seq` anti-rollback, rate limit).
 - `Directory::lookup(handle)` — fetch the latest record; open, no auth.
-- `Directory::heartbeat(token, handle, now)` — mark the authenticated owner online.
-- `Directory::presence(handle, now)` — whether the handle was seen within `PRESENCE_TTL`.
+- `Directory::heartbeat(token, handle, now)` / `presence(handle, now)` — mark online / query within `PRESENCE_TTL`.
 - `Directory::challenge_message(nonce)` — the exact bytes a client signs.
-- `ApiError` — a rejected request plus its HTTP `status()` and `reason()`.
-- `serve(addr)` — bind `addr` and run the HTTP shell over a `Directory`.
+- `ApiError` — a rejected request plus its HTTP `status()` and `reason()` (includes `RateLimited`, `Storage`).
+- `serve(addr)` — bind `addr` and run the HTTP shell over a `Directory` (a worker pool sized to the host; honours `MYCELLIUM_DATA`, `MYCELLIUM_TLS_*`, `MYCELLIUM_SMTP_*`).
 
 ## How it fits
 
 The deployable `mycellium-server` binary serves this library over HTTP; clients
 (the engine) reach it through `mycellium-directory-client`.
 
+## Configuration (env)
+
+| Variable | Effect |
+| -------- | ------ |
+| `MYCELLIUM_DATA` | Directory for the durable redb store. Unset ⇒ in-memory (dev). |
+| `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` | Serve HTTPS directly (PEM). Unset ⇒ plain HTTP, intended behind a TLS-terminating reverse proxy. |
+| `MYCELLIUM_SMTP_HOST` / `_PORT` / `_FROM` / `_USER` / `_PASS` | Send real verification email. Unset ⇒ dev mode returns the code in the API response. |
+| `MYCELLIUM_LOG` | Set (≠ `"0"`) for a JSON access-log line per request (5xx always logged). |
+
 ## Notes
 
-State is in-memory today — plain `HashMap`s for challenges, tokens, bindings,
-records, and presence. A real deployment swaps them for a durable or replicated
-store; because each record is self-certifying, replication is safe — a replica
-cannot forge or tamper, only serve what the owner signed.
+Persistence is durable when `MYCELLIUM_DATA` is set: challenges/tokens stay
+in-memory (ephemeral by nature), while bindings, records, and email claims are
+kept in redb (see `persist.rs`) and reloaded on start. Because every record is
+self-certifying, this — and future replication — is safe: a store can withhold or
+serve stale, but can never forge or tamper. Abuse is bounded by fixed-window rate
+limits (`auth_start` per wallet + per email, `publish` per wallet) and challenge /
+token expiry pruning. Emails are never stored in the clear — a claim is keyed by a
+peppered hash, which is what makes email-proved *recovery* possible without the
+directory ever holding your address.

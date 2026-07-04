@@ -311,6 +311,8 @@ The floor for a **first-class, independent peer is the Constrained tier (ESP32 /
 
 One core, compiled and wrapped per platform: desktop (native, egui/Tauri or CLI), Android (Kotlin UI over the core via `uniffi`), iOS (Swift over FFI), web (WASM), embedded (`no_std` + esp-hal / Cortex-M HAL). The UI is per-platform; the protocol is shared and audited once.
 
+> ✅ *Two shells live.* The **CLI** (native) and the **browser PWA** ([`clients/web`](../clients/web)) both run the same engine — the PWA compiles it to WebAssembly (`mycellium-wasm`) and swaps in browser implementations of the four host ports, running every byte of crypto in the page. See [`BROWSER.md`](BROWSER.md). This is the proof that "one core, everywhere" holds: the two most divergent targets (a terminal and a sandboxed browser tab) share one engine with no forked protocol code.
+
 ---
 
 ## Layer 11 — Devices (a cluster is one identity)

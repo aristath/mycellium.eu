@@ -7,6 +7,17 @@ they land.
 The protocol and crypto are sound; the gaps are **durability, concurrency,
 deployment shape, and the operational essentials** around them.
 
+| Tier | Focus | Status |
+|------|-------|--------|
+| **T0** | Blockers (durability, concurrency, TLS, email, recovery) | ✅ complete |
+| **T1** | Reach & clients (browser PWA ✅, Web Push ✅, multi-device ✅) | ✅ core done |
+| **T2** | Hardening (rate limits, observability, caps, expiry, load) | ✅ largely done |
+| **T3** | Launch (security audit, moderation, large-group scaling) | ⛔ open |
+
+The one hard blocker to a public launch is the **independent security audit** (T3.1);
+see [`GO-LIVE.md`](GO-LIVE.md) for the full checklist and [`IMPROVEMENTS.md`](IMPROVEMENTS.md)
+for smaller refinements found in the doc audit.
+
 ---
 
 ## Tier 0 — Blockers (cannot serve real users without these)

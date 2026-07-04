@@ -30,8 +30,15 @@ cargo run -p mycellium-server -- --version   # or -V
 
 Address resolution order: `--addr HOST:PORT`, then `MYCELLIUM_DIRECTORY_ADDR`,
 then the default `127.0.0.1:8080`. On start it prints a banner listing the
-served routes (`/health`, `/login/{challenge,verify}`, `/records/{handle}`,
-`/mailbox/{handle}/{slot}`, `/presence/{handle}`).
+served routes (`/health`, `/login/{challenge,verify}`, `/auth/{start,confirm,status}`,
+`/records/{handle}`, `/presence/{handle}`, `/metrics`) — the message *blobs* live
+on the queue, a separate service, not here.
+
+Two more behaviors are handled entirely inside `mycellium-directory` and need no
+flags from this shell: set `MYCELLIUM_DATA` to a directory for durable persistence
+of the record store (otherwise state is in-memory), and set both
+`MYCELLIUM_TLS_CERT` and `MYCELLIUM_TLS_KEY` to PEM files to serve native HTTPS
+(otherwise plain HTTP).
 
 ## How it fits
 
@@ -41,7 +48,8 @@ The queue is a separate service with its own server (`mycellium-queue`).
 
 ## Notes
 
-Deliberately minimal today: plain HTTP, in-memory state, single process, no
-configuration beyond the address. A production deployment would add TLS,
-persistence for the record store, and replication (the directory is tiny and
-unforgeable, so it is designed to be cloned across many nodes).
+This shell stays minimal — its only knob is the bind address — but the directory
+underneath now supports durable persistence (`MYCELLIUM_DATA`) and native TLS
+(`MYCELLIUM_TLS_CERT`/`MYCELLIUM_TLS_KEY`); see the `mycellium-directory` README
+for the real behavior. Replication is the remaining increment (the directory is
+tiny and unforgeable, so it is designed to be cloned across many nodes).

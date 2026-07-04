@@ -21,8 +21,8 @@ Three properties drive every decision:
 - **Self-sovereign.** Your seed phrase *is* your account. Devices, names, and
   reachability all derive from keys you hold — nothing is issued to you.
 - **Portable.** The protocol core is `no_std` and depends only on traits, so the
-  same code runs from a microcontroller to a desktop to (eventually) a browser
-  via WASM.
+  same code runs from a microcontroller to a desktop to a **browser via WASM** —
+  the native CLI and the browser PWA are two shells over one engine.
 
 ---
 
@@ -37,36 +37,43 @@ a shell drives the engine.
         ┌─────────────────────────── mycellium-core ───────────────────────────┐
         │  the contract: identity, records, X3DH, Double Ratchet, group keys,   │
         │  wire codec, login challenge — plus the PORTS (traits):               │
-        │        Transport          Storage          Platform                   │
-        └───────────▲───────────────────▲────────────────────▲──────────────────┘
-                    │ implements         │ implements          │ provided by
-      ┌─────────────┴──────┐  ┌──────────┴────────┐   ┌────────┴─────────┐
-      │ mycellium-transport│  │ mycellium-storage │   │  OsPlatform      │
-      │  (TCP + libp2p)    │  │ (encrypted file KV)│   │ (in the engine)  │
-      └─────────────▲──────┘  └──────────▲────────┘   └────────▲─────────┘
-                    │                     │                     │
-        ┌───────────┴─────────────────────┴─────────────────────┴──────────────┐
+        │     Transport      Storage      Platform      HttpTransport           │
+        └──────▲──────────────▲──────────────▲───────────────▲──────────────────┘
+   implemented │              │              │               │  (client HTTP)
+     by, per   │       ┌──────┴──────┬───────┴───────┐   ┌───┴───────────────┐
+     build:    │       │             │               │   │ native: mycellium-│
+      ┌────────┴─────┐ │  ┌──────────┴───┐  ┌─────────┴─┐ │  http (ureq)      │
+      │  transport   │ │  │ native: file │  │ native:   │ │ browser: XhrTrans-│
+      │ (TCP/libp2p) │ │  │ KV / browser:│  │ OsPlatform│ │  port (in wasm)   │
+      │  *native*    │ │  │ IndexedDB    │  │ browser:  │ └───────────────────┘
+      └──────────────┘ │  │ (MemStore)   │  │ Browser…  │
+                       │  └──────────────┘  └───────────┘
+        ┌──────────────┴────────────────────────────────────────────────────────┐
         │                          mycellium-engine                             │
         │  headless peer: register, send/receive, deliver ladder, outbox,       │
-        │  groups, multi-device, contacts, history — talks to the two services  │
-        │  below through their HTTP clients                                     │
-        └───────▲───────────────────────────────────────────────▲──────────────┘
-                │ drives                                          │ HTTP clients
-        ┌───────┴────────┐                          ┌────────────┴─────────────┐
-        │ mycellium-cli  │                          │ directory-client         │
-        │ (clap + TUI)   │                          │ queue-client             │
-        └────────────────┘                          └────────────┬─────────────┘
-                                                                 │ HTTP
+        │  groups, multi-device, contacts, history. Domain modules are generic  │
+        │  and compile to wasm; native orchestration (app/*) is behind the      │
+        │  `native` feature; `wireops` is the shared, platform-agnostic crypto. │
+        └──────▲────────────────────────────────────────────────▲──────────────┘
+        drives │ (two shells over one engine)                    │ HTTP clients
+      ┌────────┴────────┐  ┌───────────────────────────┐  ┌──────┴───────────────┐
+      │ mycellium-cli   │  │ mycellium-wasm → clients/ │  │ directory-client      │
+      │ (clap + TUI)    │  │ web PWA (Web Worker + IDB)│  │ queue-client          │
+      └─────────────────┘  └───────────────────────────┘  └──────┬───────────────┘
+                                                                 │ HTTP (+ CORS, TLS)
                                     ┌────────────────────────────┴────────────┐
                                     │  mycellium-directory   mycellium-queue   │
                                     │  (names/records/       (wallet-keyed     │
-                                    │   presence)             store-forward)   │
-                                    │  served by mycellium-server              │
+                                    │   presence, redb)       store-forward,   │
+                                    │  served by              redb + Web Push) │
+                                    │  mycellium-server   +   mycellium-observe │
                                     └──────────────────────────────────────────┘
 ```
 
 The core depends on **nothing but its own traits**. Everything platform-specific
-is an adapter you can swap; the engine and shells sit on top.
+is an adapter you can swap — and the four ports are exactly what differs between
+the native and browser builds: same engine, different `Transport` / `Storage` /
+`Platform` / `HttpTransport` implementations underneath.
 
 ---
 
@@ -78,15 +85,20 @@ is an adapter you can swap; the engine and shells sit on top.
 | [`mycellium-directory`](../crates/mycellium-directory/README.md) | service (lib) | The name registry: login + signed-record store + presence. Holds only self-signed records it cannot forge. |
 | [`mycellium-server`](../crates/mycellium-server/README.md) | service (bin) | Deployable binary that serves the directory over HTTP. |
 | [`mycellium-queue`](../crates/mycellium-queue/README.md) | service (lib+bin) | Per-recipient store-and-forward mailbox, **keyed by wallet**, decoupled from the directory. Holds only ciphertext. |
-| [`mycellium-directory-client`](../crates/mycellium-directory-client/README.md) | adapter | HTTP client for the directory (login, publish, lookup, presence). |
-| [`mycellium-queue-client`](../crates/mycellium-queue-client/README.md) | adapter | HTTP client for the queue (login, deposit, collect). |
+| [`mycellium-directory-client`](../crates/mycellium-directory-client/README.md) | adapter | HTTP client for the directory (login, publish, lookup, presence, email claim). Generic over `HttpTransport`. |
+| [`mycellium-queue-client`](../crates/mycellium-queue-client/README.md) | adapter | HTTP client for the queue (login, deposit, collect, Web Push). Generic over `HttpTransport`. |
+| [`mycellium-http`](../crates/mycellium-http/README.md) | adapter | The **native** `HttpTransport` (ureq). The browser supplies its own (in `mycellium-wasm`). |
 | [`mycellium-transport`](../crates/mycellium-transport/README.md) | adapter | `Transport` implementations: framed TCP and libp2p (Noise + Yamux). |
 | [`mycellium-storage`](../crates/mycellium-storage/README.md) | adapter | `Storage` implementation: an encrypted local file KV, plus at-rest identity. |
-| [`mycellium-engine`](../crates/mycellium-engine/README.md) | engine | The headless peer — all orchestration, minus presentation. |
+| [`mycellium-observe`](../crates/mycellium-observe/README.md) | support | Zero-dependency server metrics (`/metrics`) + JSON access logs. |
+| [`mycellium-engine`](../crates/mycellium-engine/README.md) | engine | The headless peer — all orchestration, minus presentation. Domain modules compile to wasm; `app/*` is behind the `native` feature. |
 | [`mycellium-cli`](../crates/mycellium-cli/README.md) | shell | A terminal shell over the engine (clap + interactive UI). |
+| [`mycellium-wasm`](../crates/mycellium-wasm/README.md) | shell | The engine as WebAssembly: a `Session` façade + browser `HttpTransport`/`Storage`/`Platform`, driving `clients/web` (the PWA). |
 
 Dependency graph is acyclic: `core ← {directory ← server, queue, transport,
-storage, directory-client, queue-client} ← engine ← cli`.
+storage, directory-client, queue-client, http, observe} ← engine ← {cli, wasm}`.
+The servers (`directory`, `queue`) persist to embedded **redb** when `MYCELLIUM_DATA`
+is set, and share `mycellium-observe` for metrics and logs.
 
 ---
 
@@ -152,6 +164,38 @@ the key and tell members to re-key.
 
 ---
 
+## The two builds: native and browser
+
+The same engine ships as a native binary **and** as WebAssembly, because the only
+things that differ are the four ports:
+
+| Port | Native | Browser |
+|------|--------|---------|
+| `HttpTransport` | `mycellium-http` (ureq, blocking) | `XhrTransport` (sync `XMLHttpRequest`, in `mycellium-wasm`) |
+| `Storage` | encrypted file KV (`mycellium-storage`) | `MemStore` snapshotted to **IndexedDB** |
+| `Platform` | `OsPlatform` (OS RNG + clock) | `BrowserPlatform` (Web Crypto + `Date.now`) |
+| `Transport` (P2P) | TCP / libp2p | *not used* — the browser reaches peers only via the queue |
+
+The engine's **domain modules** (history, contacts, groups, blocklist, drafts,
+expiry, outbox) are generic over `Storage` and compile to `wasm32` unchanged. The
+native-only orchestration (`app/*`) and `OsPlatform` sit behind the default
+**`native`** feature; the browser build turns it off and calls the ungated
+`wireops` module (sealing, records, ids) with its own `Platform`. `mycellium-wasm`
+exposes a `Session` object; `clients/web` runs it **inside a Web Worker** (so the
+blocking XHR never touches the UI thread) and talks to it by RPC. Full walk-through:
+[`BROWSER.md`](BROWSER.md).
+
+## Persistence & observability (servers)
+
+Both services are durable when `MYCELLIUM_DATA` is set: the directory keeps
+bindings, records, and email claims in embedded **redb**; the queue keeps mailboxes,
+Web Push subscriptions, and its VAPID keypair. Both run a small worker-thread pool,
+cap request bodies, emit permissive CORS (browser clients call them directly), can
+terminate TLS natively (`MYCELLIUM_TLS_*`) or sit behind a proxy, and expose
+`/metrics` + JSON access logs via `mycellium-observe`. Because records are
+self-certifying, persistence and replication are safe — a store can withhold or
+serve stale, never forge.
+
 ## Security model
 
 - **Confidentiality & forward secrecy.** X3DH establishes a session; the Double
@@ -182,8 +226,12 @@ the key and tell members to re-key.
   seconds of compute, never money.
 - **Distribution.** The directory is designed to be cloned across many
   opportunistic nodes (it's tiny and unforgeable); the queue stays per-user.
-- **Background delivery.** Waking a backgrounded mobile app needs a small,
-  contentless **push relay** — explicitly **not** hosted by any US company, for
-  privacy. Contentless (opaque per-contact tag), so it learns nothing.
+- **Background delivery.** *(Browser: built.)* The queue implements contentless
+  **Web Push** (VAPID) to wake a closed PWA — the ping carries no sender or content.
+  The equivalent for a native mobile app (a push relay explicitly **not** hosted by
+  any US company) is still design-direction.
 
-See [`CONCEPT.md`](CONCEPT.md) for the full reasoning behind each of these.
+Already built since this doc's first draft: durable server storage (redb),
+email-verified handles + recovery, native TLS, the browser/WASM client, groups,
+multi-device linking, and Web Push. See [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md)
+for status and [`CONCEPT.md`](CONCEPT.md) for the full reasoning behind each direction.

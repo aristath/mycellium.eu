@@ -17,10 +17,24 @@ carries no argument parsing and no terminal UI. That split is deliberate — the
 same engine can back a CLI, a GUI, or a mobile shell, all driving the functions
 in [`app`](src/app).
 
+**One engine, two builds.** The domain modules (`contacts`, `history`, `groups`,
+`blocklist`, `draft`, `expiry`, `outbox`, `names`) are generic over
+`mycellium_core::Storage` and platform-agnostic, so they compile to `wasm32`
+untouched. The native orchestration (`app/*`) and OS `platform` live behind the
+default **`native`** feature; the browser build (`mycellium-wasm`) turns that off
+(`default-features = false`) and drives the same domain modules through the
+ungated [`wireops`](src/wireops.rs) module, supplying its own `Platform` (Web
+Crypto RNG + `Date.now`) and `Storage` (IndexedDB-backed). `wireops` holds the
+platform-agnostic crypto plumbing — sealing/opening envelopes, building records,
+message/id construction — taking the `Platform` explicitly instead of a singleton,
+which is exactly what makes it callable from WASM. So the native CLI and the
+browser PWA are two shells over one engine.
+
 ## Modules
 
-`app/*` is the orchestration a shell invokes; the top-level modules are the
-domain state it operates on (each generic over `mycellium_core::storage`).
+`app/*` is the orchestration a native shell invokes (behind the `native` feature,
+alongside `platform`); `wireops` and the top-level domain modules are ungated and
+compile to wasm, each generic over `mycellium_core::storage`.
 
 | Module | Owns |
 |--------|------|
@@ -32,6 +46,7 @@ domain state it operates on (each generic over `mycellium_core::storage`).
 | `app/organize` | Contacts, blocklist, drafts, expiry, and read-side views: `conversations`, `search`, `show_history`, `clear_history`. |
 | `app/backup` | `export_backup` / `import_backup` (a portable `Backup` bundle) and `wipe`. |
 | `app/util` | Shared helpers: `own_queue`, `open_history`, `build_message`, `resolve_expiry`, `associated_data`, `text_message`, attachments, hex, durations. |
+| `wireops` *(ungated)* | Platform-agnostic crypto plumbing used by both builds: `seal_to` / `open_envelope`, `build_record`, `this_device`, `device_slot`, `my_group_id`, `group_ad`, `associated_data`, `text_message` / `app_message`, `random_id`, `hex`. Takes a `Platform` argument (no singleton) so it runs under WASM. |
 | `contacts` | Encrypted address book, nickname → handle, wallet **pinned** on first add (TOFU); `resolve`, `by_handle`. |
 | `blocklist` | Handles whose messages we silently drop; `block` / `unblock` / `is_blocked`. |
 | `draft` | Per-conversation draft text. |
@@ -54,7 +69,12 @@ its own ciphertext. `deliver` walks a three-rung ladder for each device:
    *their* wallet (per-device slot from `device_slot`, or the shared
    `ACCOUNT_SLOT` for account-wide items).
 3. **Local outbox** — if neither works (offline **and** no reachable queue), the
-   sealed item is parked with `outbox::enqueue` for retry.
+   sealed item is parked with `outbox::enqueue` for retry. This covers not just the
+   initial 1:1 message but **self-sync** copies to your own devices and **group**
+   text fanned to each member — every per-device sealed item can park and retry.
+   (One gap: group *control* messages — `GroupRemove` and key re-distribution — use
+   direct cluster delivery without an outbox fallback, so they can drop on a
+   transient failure.)
 
 `flush_outbox` runs opportunistically on every `send` and `inbox` (and on an
 explicit `outbox_show`): it re-resolves each recipient's current record,

@@ -11,12 +11,12 @@ Defines the Mycellium protocol as pure logic: how a seed becomes a wallet + devi
 ## Public API
 
 **Identity** (`identity`)
-- `Identity` — the local secret: 24-word mnemonic + device seed → wallet (secp256k1), device (Ed25519), and messaging (X25519) keys. `generate`, `from_phrase`, `restore`; `sign`, `wallet_public`, `device_public`, `messaging_public`, `signed_pre_key_public`, `storage_key`. No `Debug`/`Clone`; zeroizes on drop.
+- `Identity` — the local secret: 24-word mnemonic + device seed → wallet (secp256k1), device (Ed25519), and messaging (X25519) keys. `generate`, `from_phrase`, `restore`; `sign`, `wallet_public`, `device_public`, `messaging_public`, `signed_pre_key_public`, `storage_key`; `mnemonic` / `device_seed` (the two secrets to back up or transfer to a new device), `device_secret` (Ed25519 seed for the libp2p keypair), and `peer_id`. No `Debug`/`Clone`; zeroizes on drop.
 - `Handle` — a validated lowercase `[a-z0-9_]` public name (≤ 32 bytes).
 - `WalletPublicKey` / `DevicePublicKey` / `MessagingPublicKey` / `PeerId` / `Signature` — the public key and signature types.
 
 **Records** (`record`)
-- `Record` — the unsigned body: handle, wallet, queue endpoint, device set, `seq`.
+- `Record` — the unsigned body: handle, free-form display `name`, wallet, queue endpoint, device set, `seq`.
 - `Device` / `SignedPreKey` — one device's keys in the cluster; a wallet-signed pre-key.
 - `SignedRecord` — `Record` + wallet signature; `sign` and `verify` (self-certifying: a directory can withhold but never forge).
 
@@ -31,17 +31,19 @@ Defines the Mycellium protocol as pure logic: how a seed becomes a wallet + devi
 
 **Messages & trust** (`message`, `safety`)
 - `AppMessage` / `Body` — the structured plaintext (text, reply, reaction, receipt, file, edit, delete); `encode`/`decode`, `is_expired`, `summary`.
-- `safety::safety_number` — the order-independent out-of-band verification code.
+- `safety::safety_number` — the out-of-band verification code over a pair of wallet identity keys; inputs are sorted, so both sides compute the same number regardless of who asks.
 
 **Recovery** (`shamir`)
 - `shamir::split` / `shamir::combine` / `Share` — Shamir secret sharing over GF(2^8) for social recovery of the seed.
 
-**Wire & login** (`wire`, `login`)
+**Identifiers & wire & login** (`userid`, `wire`, `login`)
+- `userid::user_id` — deterministically hash a username to the opaque `Handle` that actually travels on the wire, so a directory can resolve a name it's given without ever learning the plaintext of names it *isn't*. (An attacker who already guesses a name can confirm it — the usual hash-of-identifier caveat.)
 - `wire::canonical` — deterministic bytes that get signed (no version prefix); `wire::encode` / `wire::decode` — framed, versioned bytes for transmission.
 - `login::challenge_message` — the exact SIWE-style bytes a client signs against a login nonce.
 
-**Ports / traits** (`transport`, `storage`, `platform`)
-- `Transport` / `Connection` — dial/accept a secured, message-framed byte channel to a peer.
+**Ports / traits** (`transport`, `http`, `storage`, `platform`)
+- `Transport` / `Connection` — dial/accept a secured, message-framed byte channel to a *peer* (device-to-device).
+- `http::HttpTransport` / `HttpResponse` — an abstract *client/server* HTTP request. Native builds back it with `ureq` (`mycellium-http`); the browser backs it with `fetch`/XHR — so the directory/queue clients compile unchanged to both. A returned `Err` is a transport failure (refused/DNS/TLS); an HTTP error status is an `Ok` with `status >= 400`.
 - `Storage` — a byte-keyed `get`/`put`/`delete` KV.
 - `Platform` — host CSPRNG (`fill_random`) and wall clock (`now_unix_secs`).
 
