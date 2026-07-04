@@ -44,7 +44,7 @@ async function main() {
   await new Promise((r) => server.listen(port, '127.0.0.1', r));
 
   const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/google-chrome', headless: true,
+    executablePath: process.env.CHROME_BIN || '/usr/bin/google-chrome', headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
   try {

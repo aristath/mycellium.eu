@@ -95,7 +95,7 @@ async function main() {
   const appUrl = `http://127.0.0.1:${webPort}/index.html?dir=${encodeURIComponent(dirUrl)}&queue=${encodeURIComponent(qUrl)}`;
 
   const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/google-chrome', headless: true,
+    executablePath: process.env.CHROME_BIN || '/usr/bin/google-chrome', headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
       '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding'],
   });

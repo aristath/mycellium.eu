@@ -1,0 +1,57 @@
+name: Browser e2e
+
+# Heavier suite: compiles the engine to WASM and drives the real PWA + engine in
+# headless Chrome. Kept separate from the baseline CI gate. Runs on PRs that touch
+# the browser stack and can be dispatched manually.
+on:
+  pull_request:
+    paths:
+      - 'crates/mycellium-wasm/**'
+      - 'crates/mycellium-engine/**'
+      - 'crates/mycellium-core/**'
+      - 'clients/web/**'
+      - 'clients/rust/e2e/**'
+      - '.github/workflows/browser.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: WASM + PWA suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + wasm target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.100 --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          install-dependencies: true
+      - name: Build native binaries + WASM engine
+        run: |
+          cargo build
+          ./clients/web/build.sh
+      - name: Install e2e deps
+        working-directory: clients/rust/e2e
+        run: npm install
+      - name: Run browser suites
+        working-directory: clients/rust/e2e
+        env:
+          # setup-chrome exports the resolved binary path; the suites default to
+          # /usr/bin/google-chrome, so point them at the installed Chrome.
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          for t in wasm.test wasm-net.test wasm-seal.test wasm-message.test wasm-store.test wasm-group.test wasm-multidevice.test pwa.test http-limits.test; do
+            echo "── $t ──"
+            node "$t.mjs"
+          done

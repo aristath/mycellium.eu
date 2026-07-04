@@ -771,7 +771,7 @@ mod tests {
 
         // Gone-removal (the 404/410 path) drops dead endpoints.
         let e1 = q.subscriptions(&hex)[0].clone();
-        q.remove_endpoints(&hex, &[e1.clone()]);
+        q.remove_endpoints(&hex, std::slice::from_ref(&e1));
         assert!(!q.subscriptions(&hex).contains(&e1));
     }
 

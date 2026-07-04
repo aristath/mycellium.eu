@@ -634,7 +634,7 @@ mod tests {
         // The claim is now burned — even the CORRECT code no longer works, so an
         // attacker can't brute-force it; they must start over (rate-limited).
         assert_eq!(dir.auth_confirm(&pending, &code, 0), Err(ApiError::Stale));
-        assert!(dir.bindings.get(&username).is_none(), "no binding after a burned claim");
+        assert!(!dir.bindings.contains_key(&username), "no binding after a burned claim");
     }
 
     #[test]
