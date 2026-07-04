@@ -58,10 +58,7 @@ fn group_history_key(group_id: &str) -> Vec<u8> {
 
 /// Load a group's transcript.
 pub fn group_load<S: Storage>(store: &S, group_id: &str) -> Result<Vec<GroupStoredMessage>, S::Error> {
-    match store.get(&group_history_key(group_id))? {
-        Some(bytes) => Ok(wire::decode(&bytes).unwrap_or_default()),
-        None => Ok(Vec::new()),
-    }
+    Ok(crate::decode_or_warn(store.get(&group_history_key(group_id))?, "group transcript"))
 }
 
 /// Append one message to a group's transcript.
@@ -78,17 +75,14 @@ pub fn group_append<S: Storage>(
 
 /// Load a peer's transcript (empty if none / unreadable).
 pub fn load<S: Storage>(store: &S, peer: &str) -> Result<Vec<StoredMessage>, S::Error> {
-    match store.get(&history_key(peer))? {
-        Some(bytes) => Ok(wire::decode(&bytes).unwrap_or_default()),
-        None => Ok(Vec::new()),
-    }
+    Ok(crate::decode_or_warn(store.get(&history_key(peer))?, "1:1 transcript"))
 }
 
 const PEER_INDEX: &[u8] = b"history:peers";
 
 /// The set of peers we have 1:1 history with.
 pub fn peers<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(store.get(PEER_INDEX)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(crate::decode_or_warn(store.get(PEER_INDEX)?, "peer index"))
 }
 
 /// Append one message to a peer's transcript (and index the peer).
@@ -293,6 +287,16 @@ mod tests {
         // Alice (the author) can.
         group_delete(&mut store, "g1", "m1", "alice").unwrap();
         assert!(group_load(&store, "g1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_transcript_loads_empty_not_error() {
+        let mut store = MemStore::default();
+        store.put(&history_key("bob"), b"not valid wire bytes").unwrap();
+        // Corruption is surfaced (logged), not a hard error — the app keeps working
+        // and the raw bytes stay put for recovery.
+        let loaded = load(&store, "bob").unwrap();
+        assert!(loaded.is_empty());
     }
 
     #[test]

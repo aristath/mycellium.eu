@@ -139,12 +139,22 @@ pub fn save<S: Storage>(store: &mut S, group: &StoredGroup) -> Result<(), S::Err
 
 /// Load a group by id.
 pub fn load<S: Storage>(store: &S, id: &str) -> Result<Option<StoredGroup>, S::Error> {
-    Ok(store.get(&group_key(id))?.and_then(|b| wire::decode(&b).ok()))
+    match store.get(&group_key(id))? {
+        None => Ok(None),
+        Some(b) => match wire::decode(&b) {
+            Ok(g) => Ok(Some(g)),
+            Err(_) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("(warning: corrupt group '{id}' in local storage — treated as missing)");
+                Ok(None)
+            }
+        },
+    }
 }
 
 /// List all known group ids.
 pub fn list<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(store.get(INDEX_KEY)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(crate::decode_or_warn(store.get(INDEX_KEY)?, "group index"))
 }
 
 /// Forget a group (leaving it).

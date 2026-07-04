@@ -26,6 +26,28 @@ pub mod history;
 pub mod names;
 pub mod inbound;
 pub mod outbox;
+
+/// Decode stored bytes, distinguishing *absent* (→ default, silently) from
+/// *present-but-corrupt* (→ default, but logged loudly). This keeps local-state
+/// corruption / partial writes / format-migration failures visible instead of
+/// looking like messages/groups/contacts silently vanished. The raw bytes are
+/// left in place until the next write, so a backup/export can still recover them.
+pub(crate) fn decode_or_warn<T>(bytes: Option<Vec<u8>>, what: &str) -> T
+where
+    T: Default + serde::de::DeserializeOwned,
+{
+    match bytes {
+        None => T::default(),
+        Some(b) => mycellium_core::wire::decode(&b).unwrap_or_else(|_| {
+            // stderr isn't available under wasm32-unknown-unknown; the browser
+            // build surfaces corruption via its own error path.
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("(warning: corrupt {what} in local storage — treated as empty; back up before it is overwritten)");
+            let _ = what;
+            T::default()
+        }),
+    }
+}
 #[cfg(feature = "native")]
 pub mod platform;
 pub mod wireops;

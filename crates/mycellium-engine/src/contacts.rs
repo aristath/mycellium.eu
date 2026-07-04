@@ -45,12 +45,24 @@ pub fn save<S: Storage>(store: &mut S, contact: &Contact) -> Result<(), S::Error
 
 /// Load a contact by nickname.
 pub fn load<S: Storage>(store: &S, nickname: &str) -> Result<Option<Contact>, S::Error> {
-    Ok(store.get(&contact_key(nickname))?.and_then(|b| wire::decode(&b).ok()))
+    match store.get(&contact_key(nickname))? {
+        None => Ok(None),
+        Some(b) => match wire::decode(&b) {
+            Ok(c) => Ok(Some(c)),
+            Err(_) => {
+                // A corrupt contact must not silently vanish — contacts are TOFU
+                // pins, part of the safety model.
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("(warning: corrupt contact '{nickname}' in local storage — treated as missing)");
+                Ok(None)
+            }
+        },
+    }
 }
 
 /// All known nicknames.
 pub fn list_names<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(store.get(INDEX_KEY)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(crate::decode_or_warn(store.get(INDEX_KEY)?, "contact index"))
 }
 
 /// All contacts.
