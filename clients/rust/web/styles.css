@@ -111,3 +111,5 @@ main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 13px; }
+.mono-box { font-family: ui-monospace, monospace; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; margin-top: 4px; word-break: break-all; user-select: all; }

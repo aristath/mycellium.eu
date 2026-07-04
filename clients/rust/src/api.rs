@@ -91,6 +91,7 @@ fn status(directory: &str) -> anyhow::Result<Value> {
         // free-form display name; the UI shows the name, routes on the handle.
         "handle": read_handle(),
         "name": read_name(),
+        "email": read_email(),
         "wallet": wallet,
         "directory": directory,
         "queue": queue,
@@ -121,6 +122,7 @@ fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<
     let uid = user_id(email).as_str().to_string();
     let (pending, dev_code) = client.auth_start(&token, &uid, email)?;
     save_name(name)?;
+    save_email(email)?; // your own email, so the app can show "add me by …"
     // Remember both the id (to publish) and the name for this pending signup.
     state.lock().unwrap().pending.insert(pending.clone(), uid);
     Ok(json!({ "pending": pending, "dev_code": dev_code }))
@@ -379,6 +381,23 @@ fn save_name(name: &str) -> anyhow::Result<()> {
     }
     std::fs::write(path, name)?;
     std::env::set_var("MYCELLIUM_NAME", name);
+    Ok(())
+}
+
+fn email_path() -> std::path::PathBuf {
+    store::data_dir().join("email")
+}
+
+fn read_email() -> Option<String> {
+    std::fs::read_to_string(email_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn save_email(email: &str) -> anyhow::Result<()> {
+    let path = email_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, email)?;
     Ok(())
 }
 

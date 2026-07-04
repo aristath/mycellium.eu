@@ -131,6 +131,7 @@ function renderApp() {
     <header class="bar">
       <div class="who" id="who"></div>
       <div class="spacer"></div>
+      <button class="link" id="profile">Share</button>
       <span class="dot" id="dot" title="sync"></span>
     </header>
     <nav class="tabs">
@@ -143,6 +144,7 @@ function renderApp() {
   root.querySelectorAll('nav.tabs button').forEach((b) => {
     b.onclick = () => { state.tab = b.dataset.tab; state.open = null; renderContent(); renderBar(); };
   });
+  byId('profile').onclick = profileModal;
   renderBar();
   renderContent();
   tick();
@@ -303,6 +305,23 @@ function addContactModal() {
       const nickname = byId('cnick').value.trim() || email;
       try { await api.post('contacts', { email, nickname }); close(); renderContacts(); }
       catch (e) { setErr('err', e.message); }
+    };
+  });
+}
+
+function profileModal() {
+  const s = state.status || {};
+  modal(`
+    <h3>Your account</h3>
+    <p class="muted" style="font-size:13px">People add you by your <b>email</b> — your unique address. Your display name can repeat; your email can't.</p>
+    <label>Display name</label>
+    <div class="mono-box">${esc(s.name || '')}</div>
+    <label>Your email — share this so people can add you</label>
+    <div class="mono-box">${esc(s.email || '—')}</div>
+    <div class="actions"><button class="ghost" data-close>Close</button><button id="copy">Copy email</button></div>`, () => {
+    byId('copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(s.email || ''); byId('copy').textContent = 'Copied ✓'; }
+      catch { byId('copy').textContent = '(select to copy)'; }
     };
   });
 }
