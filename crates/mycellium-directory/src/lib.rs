@@ -373,8 +373,7 @@ impl Directory {
             }
         }
         if let Some(store) = &self.store {
-            store.put_binding(&username, &wallet).map_err(|_| ApiError::Storage)?;
-            store.put_email(&username, &hash).map_err(|_| ApiError::Storage)?;
+            store.put_binding_and_email(&username, &wallet, &hash).map_err(|_| ApiError::Storage)?;
         }
         self.bindings.insert(username.clone(), wallet);
         self.emails.insert(username.clone(), hash);
@@ -423,8 +422,7 @@ impl Directory {
 
         // Persist first, so a storage failure aborts before we mutate memory.
         if let Some(store) = &self.store {
-            store.put_binding(handle, &wallet).map_err(|_| ApiError::Storage)?;
-            store.put_record(handle, &record).map_err(|_| ApiError::Storage)?;
+            store.put_binding_and_record(handle, &wallet, &record).map_err(|_| ApiError::Storage)?;
         }
         self.bindings.insert(handle.clone(), wallet);
         self.records.insert(handle.clone(), record);
@@ -649,6 +647,26 @@ mod tests {
         let _ = dir.auth_start(&tok, &username, "alice@example.com", VERIFY_TTL + 1).unwrap();
         assert_eq!(dir.pending.len(), 1, "the expired claim was pruned; only the new one remains");
         assert_eq!(dir.auth_confirm(&pending, &code, VERIFY_TTL + 1), Err(ApiError::NotFound));
+    }
+
+    #[test]
+    fn recovery_email_and_binding_persist_together() {
+        let path = std::env::temp_dir().join(format!("myc-dir-atomic-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let username = Handle::new("alice").unwrap();
+        {
+            let mut dir = Directory::open(path_str).unwrap();
+            let tok = login(&mut dir, &a);
+            let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+            dir.auth_confirm(&pending, &code, 0).unwrap();
+        } // drop → flushed
+
+        // Reopen: binding AND email hash both came back (written in one transaction).
+        let dir2 = Directory::open(path_str).unwrap();
+        assert_eq!(dir2.bindings.get(&username), Some(&a.wallet_public()));
+        assert_eq!(dir2.emails.get(&username), Some(&dir2.email_hash("alice@example.com")));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

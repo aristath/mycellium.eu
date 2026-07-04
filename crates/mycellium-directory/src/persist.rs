@@ -89,23 +89,22 @@ impl Store {
         Ok(out)
     }
 
-    pub fn put_binding(&self, handle: &Handle, wallet: &WalletPublicKey) -> Result<(), String> {
-        self.write(|txn| {
-            txn.open_table(BINDINGS).map_err(err)?.insert(handle.as_str(), &wallet.0[..]).map_err(err)?;
-            Ok(())
-        })
-    }
-
-    pub fn put_record(&self, handle: &Handle, record: &SignedRecord) -> Result<(), String> {
+    /// Atomically write a handle's binding **and** record in one transaction, so
+    /// a crash can never leave a binding without its record (or vice versa).
+    pub fn put_binding_and_record(&self, handle: &Handle, wallet: &WalletPublicKey, record: &SignedRecord) -> Result<(), String> {
         let encoded = wire::encode(record);
         self.write(|txn| {
+            txn.open_table(BINDINGS).map_err(err)?.insert(handle.as_str(), &wallet.0[..]).map_err(err)?;
             txn.open_table(RECORDS).map_err(err)?.insert(handle.as_str(), &encoded[..]).map_err(err)?;
             Ok(())
         })
     }
 
-    pub fn put_email(&self, handle: &Handle, hash: &str) -> Result<(), String> {
+    /// Atomically write a handle's binding **and** recovery-email hash in one
+    /// transaction (for email-verified claim + recovery).
+    pub fn put_binding_and_email(&self, handle: &Handle, wallet: &WalletPublicKey, hash: &str) -> Result<(), String> {
         self.write(|txn| {
+            txn.open_table(BINDINGS).map_err(err)?.insert(handle.as_str(), &wallet.0[..]).map_err(err)?;
             txn.open_table(EMAILS).map_err(err)?.insert(handle.as_str(), hash).map_err(err)?;
             Ok(())
         })
