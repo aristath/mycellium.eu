@@ -6,6 +6,13 @@
 //! worker, which then shows a generic notification and/or syncs. The vendor push
 //! endpoint (Google/Mozilla/Apple, per the browser) thus learns only that "some
 //! device got a wake ping", never what or from whom.
+//!
+//! Because the ping is bodyless, storing **only the endpoint URL** is sufficient
+//! and intentional — the `p256dh` / `auth` keys of a `PushSubscription` are only
+//! needed to *encrypt a payload* (RFC 8291), which we deliberately never send (a
+//! payload would put content in front of the vendor). If a future change ever
+//! needs encrypted payloads, `subscribe` must also capture and store those keys
+//! (`PushSubscription.toJSON()`); until then this is a non-gap, not a limitation.
 
 use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
