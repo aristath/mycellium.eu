@@ -1,8 +1,14 @@
 //! A thin HTTP client for the directory (login, publish, lookup).
+//!
+//! The HTTP transport is injectable: native builds use `ureq` (the `native`
+//! feature, on by default); the browser build injects a `fetch`/XHR transport.
+//! The request logic here is identical across both.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
 use mycellium_core::userid::user_id;
@@ -14,6 +20,7 @@ use mycellium_core::userid::user_id;
 /// wire, so the directory only ever sees and stores opaque ids — never a name.
 pub struct DirectoryClient {
     base: String,
+    transport: Box<dyn HttpTransport>,
 }
 
 /// The directory id (hash) for a plaintext handle.
@@ -44,52 +51,44 @@ struct VerifyResp {
 }
 
 impl DirectoryClient {
-    /// Point the client at a directory base URL, e.g. `http://127.0.0.1:8080`.
+    /// Point the client at a directory base URL using the native `ureq`
+    /// transport, e.g. `http://127.0.0.1:8080`.
+    #[cfg(feature = "native")]
     pub fn new(base: impl Into<String>) -> Self {
-        DirectoryClient {
-            base: base.into().trim_end_matches('/').to_string(),
-        }
+        Self::with_transport(base, Box::new(mycellium_http::UreqTransport))
+    }
+
+    /// Point the client at a base URL with an explicit HTTP transport (used by
+    /// the browser/WASM build).
+    pub fn with_transport(base: impl Into<String>, transport: Box<dyn HttpTransport>) -> Self {
+        DirectoryClient { base: base.into().trim_end_matches('/').to_string(), transport }
     }
 
     /// Full SIWE-style login: fetch a challenge, sign it, exchange for a token.
     pub fn login(&self, identity: &Identity) -> Result<String> {
         let wallet = identity.wallet_public();
-
-        let challenge: ChallengeResp = ureq::post(&format!("{}/login/challenge", self.base))
-            .send_json(ChallengeReq { wallet })
-            .context("challenge request failed")?
-            .into_json()?;
-
+        let challenge: ChallengeResp =
+            self.json("POST", "/login/challenge", None, Some(&ChallengeReq { wallet }))?;
         let signature = identity.sign(&mycellium_core::login::challenge_message(&challenge.nonce));
-
-        let verified: VerifyResp = ureq::post(&format!("{}/login/verify", self.base))
-            .send_json(VerifyReq {
-                wallet,
-                nonce: challenge.nonce,
-                signature,
-            })
-            .context("verify request failed")?
-            .into_json()?;
-
+        let verified: VerifyResp = self.json(
+            "POST",
+            "/login/verify",
+            None,
+            Some(&VerifyReq { wallet, nonce: challenge.nonce, signature }),
+        )?;
         Ok(verified.token)
     }
 
     /// Publish a signed record under `handle` using a session `token`.
     pub fn publish(&self, token: &str, handle: &Handle, record: &SignedRecord) -> Result<()> {
-        ureq::request("PUT", &format!("{}/records/{}", self.base, id(handle)))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_json(record)
-            .context("publish request failed")?;
+        let payload = serde_json::to_vec(record)?;
+        self.call("PUT", &format!("/records/{}", id(handle)), Some(token), Some("application/json"), Some(&payload))?;
         Ok(())
     }
 
     /// Look up the signed record for `handle`.
     pub fn lookup(&self, handle: &Handle) -> Result<SignedRecord> {
-        let record: SignedRecord = ureq::get(&format!("{}/records/{}", self.base, id(handle)))
-            .call()
-            .map_err(|e| anyhow!("lookup failed: {e}"))?
-            .into_json()?;
-        Ok(record)
+        self.json::<(), _>("GET", &format!("/records/{}", id(handle)), None, None)
     }
 
     /// Begin an email-verified username claim. Returns `(pending_token,
@@ -108,11 +107,7 @@ impl DirectoryClient {
         }
         // The directory binds the *id*, never the plaintext username.
         let uid = user_id(username);
-        let resp: Resp = ureq::post(&format!("{}/auth/start", self.base))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_json(Req { username: uid.as_str(), email })
-            .map_err(|e| anyhow!("auth start failed: {e}"))?
-            .into_json()?;
+        let resp: Resp = self.json("POST", "/auth/start", Some(token), Some(&Req { username: uid.as_str(), email }))?;
         Ok((resp.pending, resp.dev_code))
     }
 
@@ -128,10 +123,7 @@ impl DirectoryClient {
         struct Resp {
             username: String,
         }
-        let resp: Resp = ureq::post(&format!("{}/auth/confirm", self.base))
-            .send_json(Req { pending, code })
-            .map_err(|e| anyhow!("verification failed: {e}"))?
-            .into_json()?;
+        let resp: Resp = self.json("POST", "/auth/confirm", None, Some(&Req { pending, code }))?;
         Ok(resp.username)
     }
 
@@ -146,19 +138,13 @@ impl DirectoryClient {
             verified: bool,
             username: String,
         }
-        let resp: Resp = ureq::post(&format!("{}/auth/status", self.base))
-            .send_json(Req { pending })
-            .map_err(|e| anyhow!("status check failed: {e}"))?
-            .into_json()?;
+        let resp: Resp = self.json("POST", "/auth/status", None, Some(&Req { pending }))?;
         Ok((resp.verified, resp.username))
     }
 
     /// Announce that we're online (heartbeat).
     pub fn announce(&self, token: &str, handle: &Handle) -> Result<()> {
-        ureq::post(&format!("{}/presence/{}", self.base, id(handle)))
-            .set("Authorization", &format!("Bearer {token}"))
-            .call()
-            .context("presence heartbeat failed")?;
+        self.call("POST", &format!("/presence/{}", id(handle)), Some(token), None, None)?;
         Ok(())
     }
 
@@ -168,11 +154,46 @@ impl DirectoryClient {
         struct Presence {
             online: bool,
         }
-        let resp: Presence = ureq::get(&format!("{}/presence/{}", self.base, id(handle)))
-            .call()
-            .map_err(|e| anyhow!("presence query failed: {e}"))?
-            .into_json()?;
+        let resp: Presence = self.json::<(), _>("GET", &format!("/presence/{}", id(handle)), None, None)?;
         Ok(resp.online)
     }
 
+    /// Perform a request and parse a JSON response body.
+    fn json<B: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&B>,
+    ) -> Result<R> {
+        let payload = body.map(serde_json::to_vec).transpose()?;
+        let content_type = payload.as_ref().map(|_| "application/json");
+        let resp = self.call(method, path, token, content_type, payload.as_deref())?;
+        serde_json::from_slice(&resp.body).map_err(|e| anyhow!("bad response from {path}: {e}"))
+    }
+
+    /// Perform a request, returning the raw response (error on HTTP >= 400).
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse> {
+        let url = format!("{}{path}", self.base);
+        let auth = token.map(|t| format!("Bearer {t}"));
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(ct) = content_type {
+            headers.push(("Content-Type", ct));
+        }
+        if let Some(a) = &auth {
+            headers.push(("Authorization", a));
+        }
+        let resp = self.transport.request(method, &url, &headers, body).map_err(|e| anyhow!("{path}: {e}"))?;
+        if resp.status >= 400 {
+            return Err(anyhow!("{path}: HTTP {}", resp.status));
+        }
+        Ok(resp)
+    }
 }

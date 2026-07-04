@@ -1,0 +1,18 @@
+[package]
+name = "mycellium-http"
+version = "0.0.0"
+description = "The native (ureq) implementation of the Mycellium HttpTransport trait"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mycellium-core = { path = "../mycellium-core" }
+ureq = "2"
+
+[lints.rust]
+unsafe_code = "forbid"

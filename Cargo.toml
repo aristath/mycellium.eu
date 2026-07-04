@@ -10,6 +10,7 @@ members = [
     "crates/mycellium-transport",
     "crates/mycellium-storage",
     "crates/mycellium-directory-client",
+    "crates/mycellium-http",
     "crates/mycellium-engine",
     "crates/mycellium-cli",
 ]

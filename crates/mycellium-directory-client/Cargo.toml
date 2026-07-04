@@ -9,9 +9,16 @@ rust-version.workspace = true
 
 [dependencies]
 mycellium-core = { path = "../mycellium-core" }
+mycellium-http = { path = "../mycellium-http", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[features]
+default = ["native"]
+# Native HTTP via ureq + the built-in `new()` constructor. Turn off (and inject
+# a transport via `with_transport`) for wasm32 builds.
+native = ["dep:mycellium-http"]
 
 [lints.rust]
 unsafe_code = "forbid"
