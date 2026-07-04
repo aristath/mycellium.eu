@@ -75,10 +75,9 @@ the full browser architecture and `clients/web/README.md` for the app.
 - **The link payload is the account key.** `link_payload` embeds the seed phrase so a
   second device can adopt the account; anyone who obtains it gains full read/write.
   The UI shows it only in the device-link flow, with a warning — never log it.
-- **Re-registering resets to a single device.** `register` (e.g. changing your display
-  name in settings) republishes the record with only the current device, dropping
-  siblings a prior `link_device` had merged. Re-link afterwards. *(Known limitation —
-  see `docs/BROWSER.md`.)*
+- **`register` merges the device list.** Renaming/re-registering looks up the current
+  record and re-appends this device, so it never drops a sibling a prior `link_device`
+  added (`publish_merged`).
 - **`sync` does network inline.** Processing a `GroupInvite` performs directory
   look-ups and queue deposits within the sync call; a slow peer slows that sync.
   Running in the worker keeps the UI responsive regardless.

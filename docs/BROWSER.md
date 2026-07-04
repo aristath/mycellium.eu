@@ -117,14 +117,10 @@ it and re-renders.
 - **One account per browser profile** — IndexedDB is per-origin, per-profile.
 - **Polling, not push, for foreground sync** — ~3 s latency; no live socket (the
   browser can't hold the engine's P2P transport).
-- **Re-registering resets to a single device.** `register` (e.g. renaming in
-  Settings) republishes the record with only the current device, dropping siblings a
-  prior `link_device` merged. Re-link afterward. *(Fixing this needs `register` to
-  merge the existing device list — a good next increment.)*
 - **`sync` does network inline for group invites** — processing a `GroupInvite`
   performs look-ups/deposits within the call; the worker keeps the UI responsive but
   the sync itself can be slow behind a slow peer.
-- **Deleted attachments aren't garbage-collected** — a `Body::Delete` tombstones the
-  message but leaves its `file:<id>` data URL in the store.
+- **A group invite can briefly give asymmetric read access** if invites arrive out of
+  order — it self-heals on the next `sync`.
 
 These are tracked in [`IMPROVEMENTS.md`](IMPROVEMENTS.md).

@@ -15,9 +15,9 @@ A pre-flight list for putting Mycellium in front of real users. Pair it with
       native). The PWA will not register a service worker or Web Push otherwise.
 - [ ] **⛔ Your own SMTP.** `MYCELLIUM_SMTP_*` pointed at infrastructure you control —
       never a US SMS/email gateway. Verify a real signup email arrives.
-- [ ] **Strip the browser test hook.** `window.mycellium` exposes the engine for
-      e2e tests; remove it from the production `index.html` build
-      (see [`IMPROVEMENTS.md`](IMPROVEMENTS.md)).
+- [x] **Browser test hook is gated.** `window.mycellium` (the engine handle for e2e
+      tests) is exposed only on `localhost`/`127.0.0.1`, so a real deployment never
+      hands the engine to page scripts — nothing to strip.
 - [ ] **Load test** (T2.4). Confirm throughput and that nothing drops under the
       concurrency you expect; watch redb file growth and memory.
 - [ ] **Back up `MYCELLIUM_DATA`.** Snapshot the redb files (and `vapid.key`) on a
@@ -56,8 +56,8 @@ A pre-flight list for putting Mycellium in front of real users. Pair it with
 ## Known gaps to disclose to early users
 
 - No independent audit yet.
-- Browser: one account per profile; new mail arrives by ~3 s polling; re-registering
-  resets to a single device (re-link afterward). See [`BROWSER.md`](BROWSER.md).
+- Browser: one account per profile; new mail arrives by ~3 s polling. See
+  [`BROWSER.md`](BROWSER.md).
 - No NAT traversal for direct P2P; delivery falls back to the queue.
 - Metadata (who talks to whom, when) is minimized but not hidden — see
   [`SECURITY.md`](SECURITY.md).

@@ -82,5 +82,3 @@ the WASM `Session` directly — `pwa.test.mjs` runs the full two-user UI flow;
 
 - One account per browser profile (IndexedDB is per-origin, per-profile).
 - New mail is discovered by **polling** `sync` (every ~3 s), not a live socket.
-- Re-registering (e.g. renaming in settings) currently resets the account to a single
-  device — re-link other devices afterward (see `docs/BROWSER.md`).
