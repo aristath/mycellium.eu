@@ -6,7 +6,8 @@
 //! Transport to swap in behind this same trait — see `docs/CONCEPT.md` Layer 10.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use mycellium_core::identity::PeerId;
 use mycellium_core::transport::{Connection, Transport};
@@ -14,13 +15,37 @@ use mycellium_core::transport::{Connection, Transport};
 /// Maximum accepted frame size (guards against absurd length prefixes).
 const MAX_FRAME: usize = 1 << 20; // 1 MiB
 
+/// How long a dial may take before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a single read/write may block before erroring — bounds a peer that
+/// connects then stalls mid-frame (it no longer pins the thread forever).
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Dial `addr` with a connect timeout, then apply read/write timeouts.
+fn dial_timed(addr: &str) -> io::Result<TcpStream> {
+    let sockaddr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address"))?;
+    let stream = TcpStream::connect_timeout(&sockaddr, CONNECT_TIMEOUT)?;
+    set_timeouts(&stream)?;
+    Ok(stream)
+}
+
+/// Apply read/write timeouts to a stream (dialed or accepted).
+fn set_timeouts(stream: &TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(())
+}
+
 /// A framed connection over one TCP stream.
 pub struct TcpConnection(TcpStream);
 
 impl TcpConnection {
     /// Connect to `addr` (`host:port`) as a framed connection.
     pub fn connect(addr: &str) -> io::Result<TcpConnection> {
-        Ok(TcpConnection(TcpStream::connect(addr)?))
+        Ok(TcpConnection(dial_timed(addr)?))
     }
 
     /// Split into independent read/write handles (a cloned socket), so a reader
@@ -79,7 +104,7 @@ impl Transport for TcpTransport {
     fn dial(&mut self, peer: &PeerId) -> io::Result<TcpConnection> {
         let addr = std::str::from_utf8(&peer.0)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "peer id is not an address"))?;
-        Ok(TcpConnection(TcpStream::connect(addr)?))
+        Ok(TcpConnection(dial_timed(addr)?))
     }
 
     fn accept(&mut self) -> io::Result<TcpConnection> {
@@ -88,6 +113,34 @@ impl Transport for TcpTransport {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "transport is dial-only"))?;
         let (stream, _peer) = listener.accept()?;
+        set_timeouts(&stream)?;
         Ok(TcpConnection(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_times_out_on_a_stalled_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A peer that sends a partial frame (length says 8, sends 2) then stalls.
+        let peer = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(&8u32.to_be_bytes()).unwrap();
+            s.write_all(&[1, 2]).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let (stream, _) = listener.accept().unwrap();
+        // Use a short read timeout so the test is fast (the real one is 30s).
+        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut conn = TcpConnection(stream);
+        // recv reads the length, then blocks on the missing body bytes → times out
+        // rather than pinning the thread forever.
+        let err = conn.recv().unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+        let _ = peer.join();
     }
 }
