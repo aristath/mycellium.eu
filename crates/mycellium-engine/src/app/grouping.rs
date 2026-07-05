@@ -123,7 +123,9 @@ pub fn distribute_key_to(
                 continue;
             };
             let item = MailItem::GroupInvite(env);
-            if !deliver(client, &handle, queue.as_ref(), device, &item) {
+            if !deliver_scored(fs, client, &handle, queue.as_ref(), device, &item, now)
+                .is_delivered()
+            {
                 let slot = device_slot(&device.device_key);
                 let _ = outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item, now);
             }
@@ -436,7 +438,16 @@ pub fn group_send(
                 let my_queue = QueueTarget::open(&identity, &my_rec.record);
                 for device in &my_rec.record.devices {
                     if device.device_key != identity.device_public()
-                        && !deliver(&client, &me, my_queue.as_ref(), device, &item)
+                        && !deliver_scored(
+                            &mut fs,
+                            &client,
+                            &me,
+                            my_queue.as_ref(),
+                            device,
+                            &item,
+                            now,
+                        )
+                        .is_delivered()
                     {
                         let slot = device_slot(&device.device_key);
                         let _ = outbox::enqueue(
@@ -550,7 +561,7 @@ pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
             let Ok(env) = seal_to(&identity, &me, device, &plaintext) else {
                 continue;
             };
-            deliver(
+            let _ = deliver(
                 &client,
                 &me,
                 my_queue.as_ref(),
@@ -648,7 +659,17 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
                 continue;
             };
             let item = MailItem::GroupLeave(env);
-            if !deliver(&client, &handle, queue.as_ref(), device, &item) {
+            if !deliver_scored(
+                &mut fs,
+                &client,
+                &handle,
+                queue.as_ref(),
+                device,
+                &item,
+                now,
+            )
+            .is_delivered()
+            {
                 let slot = device_slot(&device.device_key);
                 let _ = outbox::enqueue(&mut fs, random_id(), handle.as_str(), &slot, item, now);
             }

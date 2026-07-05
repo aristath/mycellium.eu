@@ -27,7 +27,7 @@ pub fn forward(
     let app = text_message(&forwarded);
     let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode())?;
     let queue = QueueTarget::open(&identity, &to_record.record);
-    deliver(
+    let _ = deliver(
         &client,
         &to_handle,
         queue.as_ref(),
@@ -71,27 +71,55 @@ pub fn send(
     let queue = QueueTarget::open(&identity, &peer_record.record);
     let now = OsPlatform.now_unix_secs();
     let mut delivered = 0;
+    // Per-path tally for observability (#59): how many went out live vs queued.
+    let mut direct = 0;
+    let mut queued_live = 0;
     for device in &peer_record.record.devices {
         let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else {
             continue;
         };
         let slot = device_slot(&device.device_key);
         let item = MailItem::Direct(envelope);
-        if deliver(&client, &peer_handle, queue.as_ref(), device, &item) {
-            delivered += 1;
-        } else {
-            let _ = outbox::enqueue(&mut fs, random_id(), peer_handle.as_str(), &slot, item, now);
+        let path = deliver_scored(
+            &mut fs,
+            &client,
+            &peer_handle,
+            queue.as_ref(),
+            device,
+            &item,
+            now,
+        );
+        match path {
+            DeliveryPath::Direct | DeliveryPath::Relay => {
+                direct += 1;
+                delivered += 1;
+            }
+            DeliveryPath::Queue => {
+                queued_live += 1;
+                delivered += 1;
+            }
+            DeliveryPath::Outbox | DeliveryPath::Failed => {
+                let _ =
+                    outbox::enqueue(&mut fs, random_id(), peer_handle.as_str(), &slot, item, now);
+            }
         }
     }
     let total = peer_record.record.devices.len();
-    let queued = total - delivered;
-    let note = if queued > 0 {
-        format!(" — {queued} queued for retry")
+    let outboxed = total - delivered;
+    // Keep the "queued for retry" wording (the outbox); append the live-path
+    // breakdown so the delivery path is observable (#59).
+    let note = if outboxed > 0 {
+        format!(" — {outboxed} queued for retry")
+    } else {
+        String::new()
+    };
+    let breakdown = if direct > 0 || queued_live > 0 {
+        format!(" [{direct} direct, {queued_live} queued]")
     } else {
         String::new()
     };
     println!(
-        "sent to '{}' — {delivered}/{total} device(s) (#{}){note}",
+        "sent to '{}' — {delivered}/{total} device(s) (#{}){note}{breakdown}",
         peer_handle.as_str(),
         app.id
     );
@@ -130,7 +158,9 @@ pub fn send(
                 peer: peer_handle.as_str().to_string(),
                 envelope,
             };
-            if !deliver(&client, &me, my_queue.as_ref(), device, &sync) {
+            if !deliver_scored(&mut fs, &client, &me, my_queue.as_ref(), device, &sync, now)
+                .is_delivered()
+            {
                 let slot = device_slot(&device.device_key);
                 let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, sync, now);
             }
@@ -163,7 +193,9 @@ pub fn broadcast(
                     queue.as_ref(),
                     record.record.primary(),
                     &MailItem::Direct(envelope),
-                ) {
+                )
+                .is_delivered()
+                {
                     sent += 1;
                 }
             }
@@ -255,32 +287,133 @@ impl QueueTarget {
     }
 }
 
+/// The live direct-push seam: push `item` over a direct connection to `device`,
+/// returning whether it was accepted. Factored out of the ladder so the ordering
+/// logic is unit-testable without a real network.
+///
+/// This preserves today's exact behavior: raw-TCP dial of a `host:port`
+/// `peer_id`; a multiaddr or empty `peer_id` is skipped.
+fn direct_push(device: &Device, item: &MailItem) -> bool {
+    let Ok(addr) = String::from_utf8(device.peer_id.0.clone()) else {
+        return false;
+    };
+    if addr.is_empty() {
+        return false;
+    }
+    if addr.starts_with('/') {
+        // TODO(#59): route multiaddr peers through libp2p_net (Noise) instead of
+        // skipping them. Deferred for now: the live-push receiver (`serve`) has
+        // no libp2p listener for `/mycellium/1.0` MailItem frames, and no CLI
+        // e2e exercises this path — dialing libp2p here would deliver into a
+        // void. Wire a libp2p receive path into `serve` first, then dial here
+        // (verifying the Noise peer against the pinned/record identity) and
+        // report `DeliveryPath::Direct`.
+        return false;
+    }
+    let Ok(frame) = serde_json::to_vec(item) else {
+        return false;
+    };
+    match net::TcpConnection::connect(&addr) {
+        Ok(mut conn) => conn.send_frame(&frame).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// The pure delivery ladder: consult `score` (if any) for the order of the
+/// direct band, attempt each candidate via the `attempt` seam, record every
+/// outcome, and stop at the first success. The queue is the guaranteed floor;
+/// if nothing succeeds the result is [`DeliveryPath::Failed`] and the caller
+/// parks the item in the outbox — exactly as today.
+///
+/// `online` gates the live/direct rungs: a peer whose presence is false is only
+/// offered the queue, preserving today's "offline → queue" behavior. With
+/// `score == None` no memory is consulted or recorded and the order is
+/// [`reachability::default_order`], so an unscored caller behaves exactly as
+/// before this module existed.
+fn deliver_ladder<S, F>(
+    mut score: Option<&mut S>,
+    online: bool,
+    key: &str,
+    now: u64,
+    mut attempt: F,
+) -> DeliveryPath
+where
+    S: Storage,
+    F: FnMut(DeliveryPath) -> bool,
+{
+    let order = match score.as_deref() {
+        Some(s) => reachability::best_paths(s, key, now),
+        None => reachability::default_order(),
+    };
+    for path in order {
+        // Live rungs are only worth attempting when the peer is online; the
+        // queue floor is always available.
+        if path.is_live_direct() && !online {
+            continue;
+        }
+        let ok = attempt(path);
+        if let Some(s) = score.as_deref_mut() {
+            let _ = reachability::record(s, key, path, ok, now);
+        }
+        if ok {
+            return path;
+        }
+    }
+    DeliveryPath::Failed
+}
+
+/// Shared body of [`deliver`] / [`deliver_scored`]: resolve presence, then walk
+/// the ladder with the real network seams (direct push, queue deposit).
+fn deliver_recording<S: Storage>(
+    score: Option<&mut S>,
+    dir: &DirectoryClient,
+    handle: &Handle,
+    queue: Option<&QueueTarget>,
+    device: &Device,
+    item: &MailItem,
+    now: u64,
+) -> DeliveryPath {
+    let online = dir.presence(handle).unwrap_or(false);
+    let key = device_slot(&device.device_key);
+    deliver_ladder(score, online, &key, now, |path| match path {
+        DeliveryPath::Direct => direct_push(device, item),
+        DeliveryPath::Queue => queue.map(|q| q.deposit(&key, item)).unwrap_or(false),
+        // The direct band never emits Relay yet, and Queue/Outbox/Failed aren't
+        // attempted as live rungs — nothing else to try.
+        _ => false,
+    })
+}
+
 /// Deliver `item` to one peer device: push it live over a direct connection if
 /// the peer is online (runs `serve`), else deposit into their queue (if any).
+/// Returns which [`DeliveryPath`] handled it — [`DeliveryPath::is_delivered`]
+/// recovers the old `bool`. Best-effort callers use this store-less form (no
+/// reachability memory consulted or recorded); the primary send/retry paths use
+/// [`deliver_scored`].
 pub fn deliver(
     dir: &DirectoryClient,
     handle: &Handle,
     queue: Option<&QueueTarget>,
     device: &Device,
     item: &MailItem,
-) -> bool {
-    if dir.presence(handle).unwrap_or(false) {
-        if let Ok(addr) = String::from_utf8(device.peer_id.0.clone()) {
-            if !addr.is_empty() && !addr.starts_with('/') {
-                if let Ok(frame) = serde_json::to_vec(item) {
-                    if let Ok(mut conn) = net::TcpConnection::connect(&addr) {
-                        if conn.send_frame(&frame).is_ok() {
-                            return true; // delivered live
-                        }
-                    }
-                }
-            }
-        }
-    }
-    match queue {
-        Some(q) => q.deposit(&device_slot(&device.device_key), item),
-        None => false,
-    }
+) -> DeliveryPath {
+    deliver_recording::<FileStore>(None, dir, handle, queue, device, item, 0)
+}
+
+/// Like [`deliver`], but consults and updates the local, per-device
+/// [`reachability`] score so a device known-unreachable-direct isn't made to pay
+/// a full direct-dial timeout first, and each outcome is remembered. The queue +
+/// outbox remain the guaranteed fallback.
+pub fn deliver_scored(
+    store: &mut FileStore,
+    dir: &DirectoryClient,
+    handle: &Handle,
+    queue: Option<&QueueTarget>,
+    device: &Device,
+    item: &MailItem,
+    now: u64,
+) -> DeliveryPath {
+    deliver_recording(Some(store), dir, handle, queue, device, item, now)
 }
 
 /// Deliver the *same* item to every device in a handle's cluster (Layer 11),
@@ -295,7 +428,7 @@ pub fn deliver_to_cluster(
         if rec.verify().is_ok() {
             let queue = QueueTarget::open(identity, &rec.record);
             for device in &rec.record.devices {
-                deliver(dir, handle, queue.as_ref(), device, item);
+                let _ = deliver(dir, handle, queue.as_ref(), device, item);
             }
         }
     }
@@ -316,7 +449,9 @@ pub fn deliver_to_cluster_or_queue(
         if rec.verify().is_ok() {
             let queue = QueueTarget::open(identity, &rec.record);
             for device in &rec.record.devices {
-                if !deliver(dir, handle, queue.as_ref(), device, item) {
+                if !deliver_scored(fs, dir, handle, queue.as_ref(), device, item, now)
+                    .is_delivered()
+                {
                     let slot = device_slot(&device.device_key);
                     let _ =
                         outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item.clone(), now);
@@ -369,7 +504,17 @@ pub fn flush_outbox(
             return outbox::Attempt::Drop;
         };
         let queue = QueueTarget::open(identity, &record.record);
-        if deliver(client, &handle, queue.as_ref(), device, &entry.item) {
+        if deliver_scored(
+            fs,
+            client,
+            &handle,
+            queue.as_ref(),
+            device,
+            &entry.item,
+            now,
+        )
+        .is_delivered()
+        {
             outbox::Attempt::Delivered
         } else {
             outbox::Attempt::Retry
@@ -701,7 +846,7 @@ pub fn send_receipt(
         let Ok(env) = seal_to(identity, me, device, &encoded) else {
             continue;
         };
-        deliver(client, to, queue.as_ref(), device, &MailItem::Direct(env));
+        let _ = deliver(client, to, queue.as_ref(), device, &MailItem::Direct(env));
     }
 }
 
@@ -712,4 +857,163 @@ pub fn open_envelope(
     env: &Envelope,
 ) -> Result<(Handle, Vec<u8>)> {
     crate::wireops::open_envelope(platform, identity, env)
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    //! The delivery-ladder ordering logic, exercised through the network seam
+    //! (`attempt`) with an in-memory score store — no real network. The live
+    //! push (`direct_push`) and queue deposit are the *only* network parts, and
+    //! they are provided by the mock closure here, so these assert purely on the
+    //! order the ladder tries paths and the outcome it reports.
+
+    use super::*;
+    use crate::reachability::{self, DeliveryPath};
+    use mycellium_core::storage::Storage;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+
+    #[derive(Default)]
+    struct MemStore(HashMap<Vec<u8>, Vec<u8>>);
+    impl Storage for MemStore {
+        type Error = Infallible;
+        fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, Infallible> {
+            Ok(self.0.get(k).cloned())
+        }
+        fn put(&mut self, k: &[u8], v: &[u8]) -> Result<(), Infallible> {
+            self.0.insert(k.to_vec(), v.to_vec());
+            Ok(())
+        }
+        fn delete(&mut self, k: &[u8]) -> Result<(), Infallible> {
+            self.0.remove(k);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cold_start_tries_direct_then_queue() {
+        let mut store = MemStore::default();
+        let tried = RefCell::new(Vec::new());
+        // Direct fails, queue succeeds → the ladder escalates to the queue.
+        let path = deliver_ladder(Some(&mut store), true, "dev", 1_000, |p| {
+            tried.borrow_mut().push(p);
+            matches!(p, DeliveryPath::Queue)
+        });
+        assert_eq!(path, DeliveryPath::Queue);
+        assert_eq!(
+            *tried.borrow(),
+            vec![DeliveryPath::Direct, DeliveryPath::Queue],
+            "an unknown device is tried direct-first, queue as the floor"
+        );
+    }
+
+    #[test]
+    fn direct_success_stops_before_the_queue() {
+        let mut store = MemStore::default();
+        let tried = RefCell::new(Vec::new());
+        let path = deliver_ladder(Some(&mut store), true, "dev", 1_000, |p| {
+            tried.borrow_mut().push(p);
+            true
+        });
+        assert_eq!(path, DeliveryPath::Direct);
+        assert_eq!(*tried.borrow(), vec![DeliveryPath::Direct]);
+    }
+
+    #[test]
+    fn offline_skips_direct_and_uses_the_queue() {
+        let mut store = MemStore::default();
+        let tried = RefCell::new(Vec::new());
+        let path = deliver_ladder(Some(&mut store), false, "dev", 1_000, |p| {
+            tried.borrow_mut().push(p);
+            true
+        });
+        assert_eq!(path, DeliveryPath::Queue);
+        assert_eq!(
+            *tried.borrow(),
+            vec![DeliveryPath::Queue],
+            "an offline peer must not be direct-dialed"
+        );
+    }
+
+    #[test]
+    fn seeded_dead_direct_tries_the_queue_first() {
+        let mut store = MemStore::default();
+        // Seed a demonstrably-dead direct path (several failures, no success).
+        for t in [100u64, 160, 220] {
+            reachability::record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
+        }
+        let tried = RefCell::new(Vec::new());
+        let path = deliver_ladder(Some(&mut store), true, "dev", 260, |p| {
+            tried.borrow_mut().push(p);
+            matches!(p, DeliveryPath::Queue)
+        });
+        assert_eq!(path, DeliveryPath::Queue);
+        assert_eq!(
+            tried.borrow()[0],
+            DeliveryPath::Queue,
+            "a device known-unreachable-direct must not pay the direct-dial first"
+        );
+    }
+
+    #[test]
+    fn seeded_dead_direct_still_records_and_reprobes_later() {
+        let mut store = MemStore::default();
+        for t in [100u64, 160, 220] {
+            reachability::record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
+        }
+        // After the re-probe interval, direct is offered first again.
+        let tried = RefCell::new(Vec::new());
+        let _ = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            220 + reachability::REPROBE_SECS + 1,
+            |p| {
+                tried.borrow_mut().push(p);
+                matches!(p, DeliveryPath::Direct)
+            },
+        );
+        assert_eq!(
+            tried.borrow()[0],
+            DeliveryPath::Direct,
+            "direct is never permanently abandoned — it is periodically re-probed"
+        );
+    }
+
+    #[test]
+    fn unscored_ladder_matches_the_default_order() {
+        // No score store: behaves exactly as before this module existed.
+        let tried = RefCell::new(Vec::new());
+        let path = deliver_ladder::<MemStore, _>(None, true, "dev", 0, |p| {
+            tried.borrow_mut().push(p);
+            matches!(p, DeliveryPath::Queue)
+        });
+        assert_eq!(path, DeliveryPath::Queue);
+        assert_eq!(
+            *tried.borrow(),
+            vec![DeliveryPath::Direct, DeliveryPath::Queue]
+        );
+    }
+
+    #[test]
+    fn nothing_works_reports_failed() {
+        let mut store = MemStore::default();
+        let path = deliver_ladder(Some(&mut store), true, "dev", 0, |_p| false);
+        assert_eq!(path, DeliveryPath::Failed);
+    }
+
+    #[test]
+    fn outcomes_are_recorded_into_the_score() {
+        let mut store = MemStore::default();
+        // A direct success is remembered, keeping direct first next time.
+        let _ = deliver_ladder(Some(&mut store), true, "dev", 1_000, |p| {
+            matches!(p, DeliveryPath::Direct)
+        });
+        assert_eq!(
+            reachability::best_paths(&store, "dev", 1_050),
+            reachability::default_order(),
+            "a recorded direct success keeps direct ahead of the queue"
+        );
+    }
 }

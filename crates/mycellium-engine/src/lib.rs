@@ -27,6 +27,7 @@ pub mod inbound;
 pub mod names;
 pub mod outbox;
 pub mod privacy;
+pub mod reachability;
 pub mod verified;
 
 /// Decode stored bytes, distinguishing *absent* (→ default, silently) from
