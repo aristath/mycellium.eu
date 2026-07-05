@@ -121,6 +121,46 @@ the public key browsers subscribed against survives restarts — set `MYCELLIUM_
 in production or every restart invalidates all existing push subscriptions. No extra
 configuration is needed; `GET /push/key` serves the public key to clients.
 
+## Recipient-owned queues
+
+**The queue is chosen by the recipient, not by the network.** This is a core
+architectural point, and it's why the directory and the queue are separate
+services with separate trust.
+
+- **Directory vs queue.** The **directory** is the one shared name registry
+  (`handle → signed record`) — everyone uses the same one to find each other. The
+  **queue** is a per-recipient store-and-forward mailbox, and *which* queue is
+  yours is a field in **your own signed record**. You publish your queue's URL;
+  senders read it from your record and deposit there. Changing it is a record
+  update you sign — no one else decides where your mail lands (see #53 for
+  rotation, #54 for multiple endpoints).
+
+- **Three ways to run a queue** — the protocol is identical; only who operates it
+  differs:
+  - **Self-hosted.** Run `mycellium-queue` on your own box/VPS, point your record
+    at it (`MYCELLIUM_QUEUE=https://queue.you.example` when you register). Maximum
+    control; you carry the ops.
+  - **Community / cooperative.** A collective runs one queue for its members —
+    a co-op, a server community, a family. Shared ops, shared trust boundary.
+  - **Provider-hosted.** A provider offers queues as a service; you point your
+    record at theirs. Lowest effort; you trust them with the metadata below.
+
+- **What a queue operator can and cannot see.** A queue never sees message
+  **content** (blobs are end-to-end sealed). It **does** see, for mail it handles:
+  the **sender** and **recipient** wallets (deposits are sender-authenticated),
+  the device slot, deposit/collection **timing**, approximate blob **size**, and
+  your **queue depth**. So the operator you choose learns your who-talks-to-whom
+  metadata for mail routed through them — run or pick one accordingly. Full detail
+  in [`SECURITY.md`](SECURITY.md#the-queue-observes).
+
+- **Operator responsibilities.** A queue holds only opaque blobs + push
+  subscriptions, but it is still infrastructure: terminate **TLS** (above), set
+  `MYCELLIUM_DATA` for **durable** state (it fails closed if the store can't open),
+  plan **backups** and **retention** (undelivered mail is capped per mailbox and
+  dropped past its bounds), **monitor** availability (a down queue withholds mail),
+  and handle **abuse** (deposits are rate-limited per sender wallet). A queue can
+  be operated entirely independently of the directory.
+
 ## Scaling notes
 
 - The **directory** is read-mostly and designed to be cloned behind a load
