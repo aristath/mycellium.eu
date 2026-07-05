@@ -1,9 +1,11 @@
 //! Encrypted identity storage (Layer 9 hardening).
 //!
-//! The seed phrase is the whole identity, so it must not sit in plaintext. We
-//! derive a key from a user passphrase with **Argon2id** and seal the mnemonic
-//! with **ChaCha20-Poly1305**. Losing the passphrase means losing the on-disk
-//! copy — the 24 words remain the ultimate backup (Layer 9.4/9.5).
+//! The account is a random **wallet secret** plus this device's own seed (there is
+//! no seed phrase — recovery is via email, see #6), so those 32-byte secrets must
+//! not sit in plaintext. We derive a key from a user passphrase with **Argon2id**
+//! and seal the `wallet_secret + device_seed` with **ChaCha20-Poly1305**. Losing
+//! the passphrase means losing this on-disk copy; the account is then recovered by
+//! re-binding the handle from a fresh device via email verification.
 //!
 //! The passphrase comes from `MYCELLIUM_PASSPHRASE` if set (for non-interactive
 //! use — convenient but it lands in the environment/process table, so prefer the

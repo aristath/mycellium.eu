@@ -11,8 +11,10 @@
 //! and the directory record points at its endpoint.
 //!
 //! Authentication is a SIWE-style wallet login (the shared
-//! [`mycellium_core::login`] contract). Deposits are open (anyone may drop an
-//! opaque blob for a wallet, rate-limited); only the owning wallet may collect.
+//! [`mycellium_core::login`] contract). Deposits are **sender-authenticated** —
+//! the depositor logs in with their own wallet and is rate-limited per sender —
+//! and only the owning wallet may collect. (Removing the queue's view of the
+//! sender is the separate sealed-sender lever; see docs/research/SEALED-SENDER.md.)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
