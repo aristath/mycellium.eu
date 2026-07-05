@@ -23,7 +23,9 @@ use crate::blocklist;
 use crate::contacts::{self, Contact};
 use crate::draft;
 use crate::expiry;
-use crate::groups::{self, GroupInvitePayload, GroupSyncPayload, MailItem, StoredGroup};
+use crate::groups::{
+    self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
+};
 use crate::history::{self, GroupStoredMessage, StoredMessage};
 use crate::inbound;
 use crate::names;

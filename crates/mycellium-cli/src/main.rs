@@ -437,19 +437,6 @@ enum GroupAction {
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
-    /// Remove a member from a group (re-keys the remaining members).
-    Remove {
-        /// Group id or name.
-        group: String,
-        /// The handle to remove.
-        #[arg(long)]
-        member: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
     /// Show the stored transcript of a group.
     History {
         /// Group id or name.
@@ -600,12 +587,6 @@ fn main() -> Result<()> {
                 whoami,
                 directory,
             } => group_add(&group, &member, &whoami, &directory),
-            GroupAction::Remove {
-                group,
-                member,
-                whoami,
-                directory,
-            } => group_remove(&group, &member, &whoami, &directory),
             GroupAction::History { group } => group_history(&group),
             GroupAction::Info { group } => group_info(&group),
             GroupAction::Leave {

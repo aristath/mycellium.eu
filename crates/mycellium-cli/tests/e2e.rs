@@ -1409,7 +1409,7 @@ fn group_add_reaches_new_member() {
 }
 
 #[test]
-fn group_remove_excludes_member() {
+fn group_leave_excludes_the_leaver() {
     let _throttle = throttle();
     let dir = start_directory();
     let alice = account(&dir, "alice");
@@ -1442,30 +1442,33 @@ fn group_remove_excludes_member() {
         "carol inbox",
     );
 
-    // Alice removes Carol (re-keys), Bob processes the removal.
+    // Carol *leaves* (authenticated self-removal — there is no "kick"). Alice
+    // processes it and re-keys, then Bob picks up Alice's fresh key.
     ok(
         &cli(
-            &alice,
+            &carol,
             &[
                 "group",
-                "remove",
+                "leave",
                 "team",
-                "--member",
-                "carol",
                 "--as",
-                "alice",
+                "carol",
                 "--directory",
                 &dir,
             ],
         ),
-        "group remove",
+        "carol leave",
+    );
+    ok(
+        &cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]),
+        "alice inbox after leave",
     );
     ok(
         &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
-        "bob inbox after remove",
+        "bob inbox after leave",
     );
 
-    // A message after removal reaches Bob but never Carol.
+    // A message after the re-key reaches Bob but never Carol.
     ok(
         &cli(
             &alice,
@@ -1476,7 +1479,7 @@ fn group_remove_excludes_member() {
                 "--as",
                 "alice",
                 "--message",
-                "after removal",
+                "after leave",
                 "--directory",
                 &dir,
             ],
@@ -1487,15 +1490,15 @@ fn group_remove_excludes_member() {
     let bob_in = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     let b = String::from_utf8_lossy(&bob_in.stdout);
     assert!(
-        b.contains("[team] alice: after removal"),
+        b.contains("[team] alice: after leave"),
         "bob (still a member) should receive: {b}"
     );
 
     let carol_in = cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]);
     let c = String::from_utf8_lossy(&carol_in.stdout);
     assert!(
-        !c.contains("after removal"),
-        "removed carol must NOT receive the message: {c}"
+        !c.contains("after leave"),
+        "carol left, so she must NOT receive later messages: {c}"
     );
 }
 

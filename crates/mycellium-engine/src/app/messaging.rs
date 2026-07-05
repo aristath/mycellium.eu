@@ -543,9 +543,7 @@ pub fn process_item(
         MailItem::GroupText { group_id, message } => {
             handle_group_text(blocked, fs, &group_id, &message)
         }
-        MailItem::GroupRemove { group_id, member } => {
-            handle_group_remove(identity, me, client, fs, &group_id, &member)
-        }
+        MailItem::GroupLeave(env) => handle_group_leave(identity, me, client, fs, &env),
     }
 }
 

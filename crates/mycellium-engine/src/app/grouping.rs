@@ -321,79 +321,37 @@ pub fn group_add(group: &str, member: &str, whoami: &str, directory: &str) -> Re
     Ok(())
 }
 
-pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) -> Result<()> {
-    let identity = store::load_identity()?;
-    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
-    let client = DirectoryClient::new(directory);
-    let mut fs = open_history(&identity)?;
-
-    let mut stored = resolve_group(&fs, group)?;
-    if !stored.members.iter().any(|m| m == member) {
-        bail!("'{member}' is not in '{}'", stored.name);
-    }
-    stored.members.retain(|m| m != member);
-
-    // Drop every device-sender of the removed handle, and re-key ourselves.
-    let mut session =
-        Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    for (id, handle) in &stored.sender_handles {
-        if handle == member {
-            session.remove_member(id);
-        }
-    }
-    stored.sender_handles.retain(|(_, h)| h != member);
-    session.rotate(&mut OsPlatform);
-    stored.state = session.export();
-    groups::save(&mut fs, &stored)?;
-
-    // Give the remaining members our fresh key, and tell them to re-key too.
-    distribute_key(
-        &identity,
-        &me,
-        &client,
-        &stored,
-        &session,
-        &mut fs,
-        OsPlatform.now_unix_secs(),
-    );
-    let control = MailItem::GroupRemove {
-        group_id: stored.id.clone(),
-        member: member.to_string(),
-    };
-    for m in &stored.members {
-        if m == me.as_str() {
-            continue;
-        }
-        if let Ok(handle) = Handle::new(m.clone()) {
-            deliver_to_cluster_or_queue(
-                &client,
-                &identity,
-                &handle,
-                &control,
-                &mut fs,
-                OsPlatform.now_unix_secs(),
-            );
-        }
-    }
-    println!("removed '{member}' from '{}' (re-keyed)", stored.name);
-    Ok(())
-}
-
-/// React to a removal: drop the member, re-key, and redistribute our new key.
-pub fn handle_group_remove(
+/// React to a member's **authenticated** departure: drop their sender key and
+/// re-key so they can't read future messages, then redistribute our fresh key.
+///
+/// The leaver is the envelope's authenticated sender — not a field an attacker
+/// could set — so this can only ever remove the person who actually left. There
+/// is intentionally no way to evict anyone else (block them locally instead).
+pub fn handle_group_leave(
     identity: &Identity,
     me: &Handle,
     client: &DirectoryClient,
     fs: &mut FileStore,
-    group_id: &str,
-    member: &str,
+    env: &Envelope,
 ) -> Result<()> {
-    let mut stored = match groups::load(fs, group_id)? {
+    let (from, bytes) = match open_envelope(identity, &mut OsPlatform, env) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // not for us / can't authenticate — ignore
+    };
+    let payload: GroupLeavePayload = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    let member = from.as_str(); // the authenticated leaver
+    if member == me.as_str() {
+        return Ok(());
+    }
+    let mut stored = match groups::load(fs, &payload.group_id)? {
         Some(stored) => stored,
         None => return Ok(()),
     };
-    if member == me.as_str() {
-        return Ok(()); // we were removed; nothing to re-key
+    if !stored.members.iter().any(|m| m == member) {
+        return Ok(()); // not a member of this group — nothing to do
     }
     stored.members.retain(|m| m != member);
     let mut session =
@@ -416,7 +374,7 @@ pub fn handle_group_remove(
         fs,
         OsPlatform.now_unix_secs(),
     );
-    println!("'{member}' was removed from '{}' — re-keyed", stored.name);
+    println!("'{member}' left '{}' — re-keyed", stored.name);
     Ok(())
 }
 
@@ -657,25 +615,39 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
     let client = DirectoryClient::new(directory);
     let mut fs = open_history(&identity)?;
     let stored = resolve_group(&fs, group)?;
+    let now = OsPlatform.now_unix_secs();
 
-    // Tell the remaining members we left so they drop us and re-key.
-    let control = MailItem::GroupRemove {
+    // Announce our departure, *sealed* to each member's devices so it's
+    // authenticated as ours — no one can forge someone else leaving. They drop
+    // us and re-key. (Mirrors how invites/keys are distributed.)
+    let payload = GroupLeavePayload {
         group_id: stored.id.clone(),
-        member: me.as_str().to_string(),
     };
+    let plaintext = serde_json::to_vec(&payload)?;
     for member in &stored.members {
         if member == me.as_str() {
             continue;
         }
-        if let Ok(handle) = Handle::new(member.clone()) {
-            deliver_to_cluster_or_queue(
-                &client,
-                &identity,
-                &handle,
-                &control,
-                &mut fs,
-                OsPlatform.now_unix_secs(),
-            );
+        let Ok(handle) = Handle::new(member.clone()) else {
+            continue;
+        };
+        let record = match client.lookup(&handle) {
+            Ok(r) if r.verify().is_ok() => r,
+            _ => continue,
+        };
+        let queue = QueueTarget::open(&identity, &record.record);
+        for device in &record.record.devices {
+            if device.device_key == identity.device_public() {
+                continue;
+            }
+            let Ok(env) = seal_to(&identity, &me, device, &plaintext) else {
+                continue;
+            };
+            let item = MailItem::GroupLeave(env);
+            if !deliver(&client, &handle, queue.as_ref(), device, &item) {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(&mut fs, random_id(), handle.as_str(), &slot, item, now);
+            }
         }
     }
     groups::remove(&mut fs, &stored.id)?;

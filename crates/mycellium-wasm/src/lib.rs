@@ -385,7 +385,8 @@ impl Session {
             }
             MailItem::GroupInvite(env) => self.handle_group_invite(&env),
             MailItem::GroupText { group_id, message } => self.handle_group_text(&group_id, &message),
-            // GroupSync / GroupRemove / SelfSync aren't handled in the browser yet;
+            // GroupSync / GroupLeave / SelfSync aren't handled in the browser yet
+            // (a leave still safely no-ops here rather than applying a removal);
             // treat as processed so they don't retry forever.
             _ => true,
         }

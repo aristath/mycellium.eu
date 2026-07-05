@@ -39,13 +39,21 @@ pub enum MailItem {
         /// The sender-key-encrypted message.
         message: GroupMessage,
     },
-    /// A control message: a member was removed — drop their key and re-key.
-    GroupRemove {
-        /// The group this applies to.
-        group_id: String,
-        /// The handle that was removed.
-        member: String,
-    },
+    /// A member is **leaving** the group (self-removal). Sealed device→device so
+    /// the sender is cryptographically authenticated: a member can only announce
+    /// *their own* departure. There is deliberately no "remove someone else"
+    /// control — you block a peer locally, or leave yourself. Decrypts to a
+    /// [`GroupLeavePayload`].
+    GroupLeave(Envelope),
+}
+
+/// The end-to-end payload of a [`MailItem::GroupLeave`]: which group the
+/// (authenticated) sender is leaving. The *who* is the envelope's sender, not a
+/// field here — so it can't name anyone but themselves.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupLeavePayload {
+    /// The group the sender is leaving.
+    pub group_id: String,
 }
 
 /// The end-to-end payload of a group invite: everything a member needs to join

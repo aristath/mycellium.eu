@@ -90,6 +90,7 @@ pub fn len<S: Storage>(store: &S) -> Result<usize, S::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mycellium_core::group::GroupMessage;
     use std::collections::HashMap;
     use std::convert::Infallible;
 
@@ -115,9 +116,14 @@ mod tests {
             id: id.to_string(),
             recipient: "mary".into(),
             slot: "abcd".into(),
-            item: MailItem::GroupRemove {
+            item: MailItem::GroupText {
                 group_id: "g".into(),
-                member: "x".into(),
+                message: GroupMessage {
+                    sender: vec![1],
+                    iteration: 0,
+                    ciphertext: vec![2, 3],
+                    signature: vec![4; 64],
+                },
             },
             created_at: 0,
             attempts: 0,
