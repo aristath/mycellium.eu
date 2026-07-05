@@ -102,6 +102,15 @@ pub const MAX_SUBS_PER_WALLET: usize = 20;
 /// Largest push-endpoint URL accepted (they're short HTTPS URLs in practice).
 pub const MAX_ENDPOINT_LEN: usize = 2048;
 
+/// How long a pairing rendezvous slot lives (5 minutes) before it's pruned.
+pub const PAIR_TTL: u64 = 300;
+/// Max relayed messages per rendezvous id (bounds a griefer who knows the id).
+pub const PAIR_MAX: usize = 8;
+/// Max concurrent rendezvous slots, bounding memory.
+pub const MAX_RENDEZVOUS: usize = 10_000;
+/// Largest single pairing message accepted (base64 of a small sealed payload).
+pub const MAX_PAIR_MSG: usize = 8192;
+
 /// The in-memory queue state (POC). A real deployment swaps the maps for a
 /// durable store; the logic is unchanged.
 #[derive(Default)]
@@ -120,6 +129,11 @@ pub struct Queue {
     rate: HashMap<([u8; 33], &'static str), (u64, u32)>,
     /// Web Push subscriptions: recipient wallet hex → browser push endpoints.
     subs: HashMap<String, Vec<String>>,
+    /// Device-pairing rendezvous: rendezvous id → (relayed messages, first-seen).
+    /// Ephemeral and unauthenticated — the id is the capability, the payloads are
+    /// end-to-end sealed (see `mycellium_core::pairing`), and everything is pruned
+    /// past `PAIR_TTL`, so the queue only briefly relays opaque bytes.
+    pairing: HashMap<String, (Vec<String>, u64)>,
     /// Durable backing store. `None` = in-memory (tests); `Some` = write-through.
     store: Option<persist::Store>,
 }
@@ -319,6 +333,43 @@ impl Queue {
                 .map_err(|_| ApiError::Storage)?;
         }
         Ok(drained)
+    }
+
+    /// Relay one opaque, end-to-end-sealed pairing message into rendezvous `rid`.
+    /// Unauthenticated by design (the id is the capability); bounded per id and in
+    /// total, and pruned past `PAIR_TTL`.
+    pub fn pair_post(&mut self, rid: &str, msg: String, now: u64) -> Result<(), ApiError> {
+        if !is_rendezvous_id(rid) || msg.len() > MAX_PAIR_MSG {
+            return Err(ApiError::BadRequest);
+        }
+        self.prune_pairing(now);
+        if self.pairing.len() >= MAX_RENDEZVOUS && !self.pairing.contains_key(rid) {
+            return Err(ApiError::RateLimited);
+        }
+        let entry = self
+            .pairing
+            .entry(rid.to_string())
+            .or_insert((Vec::new(), now));
+        if entry.0.len() >= PAIR_MAX {
+            return Err(ApiError::MailboxFull);
+        }
+        entry.0.push(msg);
+        Ok(())
+    }
+
+    /// Drain the messages relayed to rendezvous `rid` (one-shot).
+    pub fn pair_fetch(&mut self, rid: &str, now: u64) -> Result<Vec<String>, ApiError> {
+        if !is_rendezvous_id(rid) {
+            return Err(ApiError::BadRequest);
+        }
+        self.prune_pairing(now);
+        Ok(self.pairing.remove(rid).map(|(m, _)| m).unwrap_or_default())
+    }
+
+    /// Drop rendezvous slots older than `PAIR_TTL` so they can't accumulate.
+    fn prune_pairing(&mut self, now: u64) {
+        self.pairing
+            .retain(|_, (_, seen)| now.saturating_sub(*seen) < PAIR_TTL);
     }
 
     /// A fixed-window rate check for `(wallet, action)` at `now`.
@@ -591,6 +642,14 @@ struct PushKey {
 struct SubscribeReq {
     endpoint: String,
 }
+#[derive(Deserialize)]
+struct PairPost {
+    msg: String,
+}
+#[derive(Serialize)]
+struct PairFetch {
+    msgs: Vec<String>,
+}
 
 fn route(
     queue: &Arc<Mutex<Queue>>,
@@ -682,6 +741,18 @@ fn route(
             Ok((200, to_json(&Messages { messages })))
         }
 
+        // Device-pairing rendezvous — unauthenticated (the id is the capability;
+        // the payloads are end-to-end sealed).
+        (Method::Post, ["pair", rid]) => {
+            let req: PairPost = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
+            queue.lock().unwrap().pair_post(rid, req.msg, now)?;
+            Ok((200, "\"ok\"".into()))
+        }
+        (Method::Get, ["pair", rid]) => {
+            let msgs = queue.lock().unwrap().pair_fetch(rid, now)?;
+            Ok((200, to_json(&PairFetch { msgs })))
+        }
+
         _ => Err(ApiError::BadRequest),
     }
 }
@@ -713,6 +784,7 @@ fn redact_path(path: &str) -> String {
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     match segs.as_slice() {
         ["mailbox", _, _] => "/mailbox/:wallet/:slot".to_string(),
+        ["pair", _] => "/pair/:rid".to_string(),
         _ => path.to_string(),
     }
 }
@@ -742,6 +814,14 @@ fn is_wallet_hex(s: &str) -> bool {
 /// A slot is either the account slot or a 64-char device id (`device_slot` hex).
 fn is_slot(s: &str) -> bool {
     s == ACCOUNT_SLOT || is_lower_hex(s, 64)
+}
+
+/// A pairing rendezvous id: 16..=64 lowercase-hex chars (high-entropy capability).
+fn is_rendezvous_id(s: &str) -> bool {
+    let n = s.len();
+    (16..=64).contains(&n)
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// A plausible Web Push endpoint: a bounded HTTPS URL with a host. (Requiring
@@ -844,6 +924,25 @@ mod tests {
             q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), TOKEN_TTL + 1),
             Err(ApiError::Unauthorized),
         );
+    }
+
+    #[test]
+    fn pairing_rendezvous_relays_drains_and_expires() {
+        let mut q = Queue::new();
+        let rid = "abcdef0123456789";
+        q.pair_post(rid, "msg1".into(), 0).unwrap();
+        q.pair_post(rid, "msg2".into(), 1).unwrap();
+        // Fetch drains everything, and a second fetch is empty (one-shot).
+        assert_eq!(q.pair_fetch(rid, 2).unwrap(), vec!["msg1", "msg2"]);
+        assert!(q.pair_fetch(rid, 3).unwrap().is_empty());
+        // A malformed rendezvous id is rejected.
+        assert_eq!(
+            q.pair_post("SHORT", "x".into(), 0),
+            Err(ApiError::BadRequest)
+        );
+        // A slot older than the TTL is pruned rather than served.
+        q.pair_post(rid, "stale".into(), 0).unwrap();
+        assert!(q.pair_fetch(rid, PAIR_TTL + 1).unwrap().is_empty());
     }
 
     #[test]

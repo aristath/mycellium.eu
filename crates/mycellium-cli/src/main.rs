@@ -47,7 +47,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new identity (24-word seed) and store it locally.
+    /// Create a new identity and store it locally (no seed phrase — recovery is
+    /// via email verification; add devices with `pair`).
     IdentityNew,
     /// Show this device's public identity.
     IdentityShow,
@@ -61,6 +62,36 @@ enum Command {
         /// Advertise a libp2p multiaddr instead of a raw TCP address.
         #[arg(long)]
         libp2p: bool,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
+    /// Pair this (fresh) device with an existing account — seedless linking.
+    ///
+    /// Prints a one-time offer to run on an existing device (`pair-approve`),
+    /// then adopts the account over an authenticated pairing channel. No seed
+    /// phrase ever leaves the other device.
+    Pair {
+        /// The account handle you're joining.
+        handle: String,
+        /// Address other peers dial to reach this device.
+        #[arg(long)]
+        addr: String,
+        /// Advertise a libp2p multiaddr instead of a raw TCP address.
+        #[arg(long)]
+        libp2p: bool,
+        /// The queue URL both devices use as the pairing rendezvous.
+        #[arg(long)]
+        queue: String,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
+    /// Approve a new device's pairing offer (run on an existing device).
+    PairApprove {
+        /// The offer string printed by `pair` on the new device.
+        offer: String,
+        /// Your account handle.
+        #[arg(long = "as")]
+        whoami: String,
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
@@ -441,6 +472,18 @@ enum GroupAction {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::IdentityNew => identity_new(),
+        Command::Pair {
+            handle,
+            addr,
+            libp2p,
+            queue,
+            directory,
+        } => pair_new(&handle, &addr, libp2p, &queue, &directory),
+        Command::PairApprove {
+            offer,
+            whoami,
+            directory,
+        } => pair_approve(&offer, &whoami, &directory),
         Command::Devices { handle, directory } => list_devices(&handle, &directory),
         Command::RevokeDevice {
             handle,

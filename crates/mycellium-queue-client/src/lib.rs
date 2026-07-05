@@ -137,6 +137,28 @@ impl QueueClient {
         Ok(resp.messages)
     }
 
+    /// Relay a sealed pairing message into rendezvous `rid` (unauthenticated —
+    /// the id is the capability, the payload is end-to-end sealed).
+    pub fn pair_post(&self, rid: &str, msg: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            msg: &'a str,
+        }
+        let _: serde_json::Value =
+            self.json("POST", &format!("/pair/{rid}"), None, Some(&Req { msg }))?;
+        Ok(())
+    }
+
+    /// Drain any pairing messages relayed to rendezvous `rid`.
+    pub fn pair_fetch(&self, rid: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            msgs: Vec<String>,
+        }
+        let resp: Resp = self.json::<(), _>("GET", &format!("/pair/{rid}"), None, None)?;
+        Ok(resp.msgs)
+    }
+
     fn json<B: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,

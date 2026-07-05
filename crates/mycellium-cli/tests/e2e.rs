@@ -256,6 +256,108 @@ fn live_push_delivery_when_online() {
     );
 }
 
+/// Read the offer token the new device's `pair` prints, from its live stdout,
+/// then keep draining stdout so the still-running child never hits a broken pipe.
+fn read_pair_offer(child: &mut std::process::Child) -> String {
+    use std::io::{BufRead, BufReader};
+    let stdout = child.stdout.take().expect("pair stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut offer = None;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        if let Some(pos) = line.find("pair-approve ") {
+            let rest = &line[pos + "pair-approve ".len()..];
+            offer = Some(
+                rest.split_whitespace()
+                    .next()
+                    .expect("offer token")
+                    .to_string(),
+            );
+            break;
+        }
+        line.clear();
+    }
+    std::thread::spawn(move || {
+        let mut junk = String::new();
+        while reader.read_line(&mut junk).unwrap_or(0) > 0 {
+            junk.clear();
+        }
+    });
+    offer.expect("`pair` did not print an offer")
+}
+
+#[test]
+fn pairing_joins_a_second_device() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let queue = QUEUE_URL.get().expect("queue up").clone();
+    let alice = account(&dir, "alice"); // device 1, registered
+
+    // Device 2 is a fresh home. `pair` blocks polling the rendezvous, so run it
+    // in the background and read the offer it prints.
+    let alice2 = home("alice2");
+    let d2_addr = format!("127.0.0.1:{}", free_port());
+    let mut pair = Command::new(CLI)
+        .args([
+            "pair",
+            "alice",
+            "--addr",
+            &d2_addr,
+            "--queue",
+            &queue,
+            "--directory",
+            &dir,
+        ])
+        .env("MYCELLIUM_HOME", &alice2)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_QUEUE", &queue)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pair");
+
+    let offer = read_pair_offer(&mut pair);
+
+    // Device 1 approves — this seals its account key to the offer and relays it.
+    ok(
+        &cli(
+            &alice,
+            &["pair-approve", &offer, "--as", "alice", "--directory", &dir],
+        ),
+        "pair-approve",
+    );
+
+    // The new device should adopt the account and finish within a few poll cycles.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = pair.try_wait().expect("try_wait") {
+            if !status.success() {
+                use std::io::Read;
+                let mut err = String::new();
+                if let Some(mut e) = pair.stderr.take() {
+                    let _ = e.read_to_string(&mut err);
+                }
+                panic!("pair did not succeed: {err}");
+            }
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = pair.kill();
+            panic!("pair did not complete after approval");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Alice's record now lists two devices.
+    let devices = cli(&alice, &["devices", "alice", "--directory", &dir]);
+    let out = String::from_utf8_lossy(&devices.stdout);
+    let count = out.lines().filter(|l| l.starts_with("  ")).count();
+    assert_eq!(
+        count, 2,
+        "cluster should have 2 devices after pairing:\n{out}"
+    );
+}
+
 #[test]
 #[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn revoked_device_stops_receiving() {

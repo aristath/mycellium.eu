@@ -48,6 +48,7 @@ mod directory_ops;
 mod grouping;
 mod messaging;
 mod organize;
+mod pairing;
 mod session;
 mod util;
 
@@ -57,5 +58,6 @@ pub use directory_ops::*;
 pub use grouping::*;
 pub use messaging::*;
 pub use organize::*;
+pub use pairing::*;
 pub use session::*;
 pub use util::*;
