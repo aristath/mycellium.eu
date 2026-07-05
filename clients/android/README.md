@@ -6,12 +6,14 @@ and forwards user intent; everything else is behind the SDK boundary. This is th
 Android implementation of the shared blueprint in
 [`docs/NATIVE-CLIENTS.md`](../../docs/NATIVE-CLIENTS.md); read that first.
 
-> **Not build-verified in this repo.** The main repo CI has **no Android
-> toolchain** (no SDK/NDK/emulator), so this scaffold has never been compiled
-> here. The first `gradle build` on a dev machine with the Android toolchain is
-> the acceptance step. Everything below is written to be correct against the
-> *real* generated bindings (the Kotlin API was generated and read while writing
-> this), but treat the first local build as the source of truth.
+> **Build-verified.** `./build-rust.sh` then `gradle assembleDebug` produces a
+> working `app-debug.apk` — the `mycellium-sdk` compiles to Android (`.so` for
+> `arm64-v8a` / `armeabi-v7a` / `x86_64` via cargo-ndk), the UniFFI Kotlin binding
+> generates, and this Compose app compiles cleanly against it. Verified toolchain:
+> **JDK 17**, **Android SDK 34** + **build-tools 34.0.0**, **NDK r26d**
+> (`26.3.11579264`), **cargo-ndk 4.1.2**, **Gradle 8.9**, **AGP 8.5.2**,
+> **Kotlin 2.0.20**. It is **not** in the main repo CI (no Android toolchain there);
+> a local `gradle build` remains the per-change acceptance step.
 
 ## What it does
 
