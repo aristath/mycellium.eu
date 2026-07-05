@@ -1,0 +1,42 @@
+[package]
+name = "mycellium-sdk"
+version = "0.0.0"
+description = "The stable native SDK boundary around mycellium-engine, bound to Android/iOS/desktop clients via UniFFI (Kotlin/Swift)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+# `lib` for Rust integration tests + the bindgen build; `cdylib`/`staticlib` are
+# the artifacts Android (`.so`) and iOS (static archive) link against.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+# The bindgen entrypoint the build tooling invokes to emit Kotlin/Swift bindings.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# `cli` pulls in `uniffi_bindgen_main`, used by the `uniffi-bindgen` bin above.
+uniffi = { version = "0.28", features = ["cli"] }
+mycellium-core = { path = "../mycellium-core" }
+mycellium-engine = { path = "../mycellium-engine", features = ["native"] }
+mycellium-storage = { path = "../mycellium-storage" }
+mycellium-http = { path = "../mycellium-http" }
+mycellium-directory-client = { path = "../mycellium-directory-client" }
+mycellium-queue-client = { path = "../mycellium-queue-client" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+mycellium-directory = { path = "../mycellium-directory" }
+mycellium-queue = { path = "../mycellium-queue" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints.rust]
+# The rest of the workspace forbids `unsafe`, but UniFFI's proc-macro scaffolding
+# (`setup_scaffolding!`, the exported FFI shims) expands to `unsafe` FFI glue we
+# don't author. Scope the allowance to this one binding crate; all hand-written
+# SDK logic stays safe.
+unsafe_code = "allow"
