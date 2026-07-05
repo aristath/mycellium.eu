@@ -96,6 +96,8 @@ fn ensure_queue() {
 /// Start a directory on a fresh port, in a background thread. Returns its URL.
 /// Also ensures the shared queue is up (and `MYCELLIUM_QUEUE` exported).
 fn start_directory() -> String {
+    // The directory fails closed without SMTP unless dev auth is explicit (#47).
+    std::env::set_var("MYCELLIUM_DEV_AUTH", "1");
     ensure_queue();
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");

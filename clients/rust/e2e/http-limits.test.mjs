@@ -12,6 +12,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// The directory fails closed without SMTP unless dev auth is explicit (#47).
+process.env.MYCELLIUM_DEV_AUTH = '1';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = (n) => path.join(ROOT, 'target/debug', n);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

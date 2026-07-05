@@ -907,7 +907,9 @@ mod tests {
         let token = dir.verify(&a.wallet_public(), &nonce, &sig, 0).unwrap();
 
         // Fresh session works for the protected actions.
-        assert!(dir.publish(&token, &handle, record_for(&a, "ari", 1), 10).is_ok());
+        assert!(dir
+            .publish(&token, &handle, record_for(&a, "ari", 1), 10)
+            .is_ok());
         assert!(dir.heartbeat(&token, &handle, 10).is_ok());
 
         // Past TOKEN_TTL, the same token is rejected on each — with no prune first.

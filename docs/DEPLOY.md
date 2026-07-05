@@ -11,7 +11,7 @@ Both binaries read the same variables:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `MYCELLIUM_DATA` | Data **directory**. Each service creates its own file inside (`directory.redb` / `queue.redb`). | unset → in-memory (dev only) |
+| `MYCELLIUM_DATA` | Data **directory**. Each service creates its own file inside (`directory.redb` / `queue.redb`). | unset → in-memory (dev only). **Set = durable intent: if the store can't be opened, startup fails rather than silently running in-memory.** |
 | `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` | PEM cert + key → serve HTTPS directly. | unset → HTTP (put a proxy in front) |
 | `MYCELLIUM_LOG` | `1` → structured JSON access log per request on stdout. | unset → only 5xx are logged |
 
@@ -19,12 +19,18 @@ Directory only (signup email — see below):
 
 | Variable | Purpose |
 |---|---|
-| `MYCELLIUM_SMTP_HOST` | SMTP server (set = production; unset = dev, code is logged + returned) |
+| `MYCELLIUM_SMTP_HOST` | SMTP server. **Production requires this.** |
 | `MYCELLIUM_SMTP_PORT` | 587 (STARTTLS, default) or 465 (implicit TLS) |
 | `MYCELLIUM_SMTP_FROM` | e.g. `Mycellium <noreply@yourdomain>` |
 | `MYCELLIUM_SMTP_USER` / `MYCELLIUM_SMTP_PASS` | SMTP auth (optional) |
+| `MYCELLIUM_DEV_AUTH` | `1` → **development** mode: the verification code is logged and returned in the API response instead of emailed. For local dev only. |
 
 > **Privacy:** use your **own** SMTP server. Never a US SMS/email gateway.
+>
+> **Fail-closed:** the directory **refuses to start** unless *either* `MYCELLIUM_SMTP_HOST`
+> is configured *or* `MYCELLIUM_DEV_AUTH=1` is set explicitly. A missing SMTP config no
+> longer silently drops to the code-logging dev path — a misconfiguration is a startup
+> error, not a quiet weakening of auth.
 
 ## TLS
 

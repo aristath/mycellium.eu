@@ -394,7 +394,7 @@ impl Queue {
 /// Run the queue as an HTTP service on `addr` (blocks).
 pub fn serve(addr: &str) -> std::io::Result<()> {
     let server = Arc::new(bind_server(addr)?);
-    let queue = Arc::new(Mutex::new(open_queue()));
+    let queue = Arc::new(Mutex::new(open_queue()?));
     let vapid = Arc::new(load_or_generate_vapid());
     let metrics = Arc::new(mycellium_observe::Metrics::default());
     println!("  push: VAPID enabled");
@@ -447,26 +447,34 @@ fn bind_server(addr: &str) -> std::io::Result<Server> {
 }
 
 /// Open the queue durably from `MYCELLIUM_DATA` (a data *directory*; we use
-/// `queue.redb` inside it), falling back to in-memory.
-fn open_queue() -> Queue {
-    match std::env::var("MYCELLIUM_DATA") {
-        Ok(dir) if !dir.is_empty() => {
-            let _ = std::fs::create_dir_all(&dir);
+/// `queue.redb` inside it). Setting `MYCELLIUM_DATA` expresses durable intent, so
+/// if the store can't be opened we **fail closed** rather than silently drop to
+/// in-memory (which would look healthy while mail/subscriptions don't persist —
+/// issue #45). No `MYCELLIUM_DATA` is the explicit in-memory development mode.
+fn open_queue() -> std::io::Result<Queue> {
+    let data = std::env::var("MYCELLIUM_DATA")
+        .ok()
+        .filter(|d| !d.is_empty());
+    open_queue_at(data.as_deref())
+}
+
+/// The env-free core of [`open_queue`], so the three startup modes are testable.
+fn open_queue_at(data: Option<&str>) -> std::io::Result<Queue> {
+    match data {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)?;
             let path = format!("{}/queue.redb", dir.trim_end_matches('/'));
-            match Queue::open(&path) {
-                Ok(queue) => {
-                    println!("  persistence: {path}");
-                    queue
-                }
-                Err(e) => {
-                    eprintln!("  persistence open failed ({e}); using in-memory");
-                    Queue::new()
-                }
-            }
+            let queue = Queue::open(&path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "MYCELLIUM_DATA is set but the durable store at {path} could not be opened: {e}"
+                ))
+            })?;
+            println!("  persistence: {path}");
+            Ok(queue)
         }
-        _ => {
+        None => {
             println!("  storage: in-memory (set MYCELLIUM_DATA to persist)");
-            Queue::new()
+            Ok(Queue::new())
         }
     }
 }
@@ -924,6 +932,24 @@ mod tests {
             q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), TOKEN_TTL + 1),
             Err(ApiError::Unauthorized),
         );
+    }
+
+    #[test]
+    fn durable_open_fails_closed_on_a_bad_data_dir() {
+        // No data dir → explicit in-memory development mode.
+        assert!(super::open_queue_at(None).is_ok());
+        // A valid data dir → durable mode.
+        let good = std::env::temp_dir().join(format!("myc-q-good-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&good);
+        assert!(super::open_queue_at(Some(good.to_str().unwrap())).is_ok());
+        let _ = std::fs::remove_dir_all(&good);
+        // Configured but unusable (the path is a file, not a dir) → fail closed,
+        // never a silent in-memory fallback.
+        let bad = std::env::temp_dir().join(format!("myc-q-bad-{}", std::process::id()));
+        let _ = std::fs::remove_file(&bad);
+        std::fs::write(&bad, b"not a dir").unwrap();
+        assert!(super::open_queue_at(Some(bad.to_str().unwrap())).is_err());
+        let _ = std::fs::remove_file(&bad);
     }
 
     #[test]

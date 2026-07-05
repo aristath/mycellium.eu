@@ -20,6 +20,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
+// The directory fails closed without SMTP unless dev auth is explicit (#47).
+process.env.MYCELLIUM_DEV_AUTH = '1';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = (n) => path.join(ROOT, 'target/debug', n);
 const CHROME = '/usr/bin/google-chrome';

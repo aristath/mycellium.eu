@@ -95,8 +95,12 @@ fn now_secs() -> u64 {
 
 /// Bind `addr` and serve the directory until the process ends.
 pub fn serve(addr: &str) -> std::io::Result<()> {
+    // Fail closed on an email-auth misconfiguration (no SMTP and no explicit dev
+    // mode) rather than silently running the development auth path (issue #47).
+    crate::mailer::require_valid_config().map_err(std::io::Error::other)?;
+
     let server = Arc::new(bind_server(addr)?);
-    let directory = Arc::new(Mutex::new(open_directory()));
+    let directory = Arc::new(Mutex::new(open_directory()?));
     let metrics = Arc::new(Metrics::default());
 
     // A worker pool so many clients are served concurrently, not one-at-a-time
@@ -148,26 +152,34 @@ fn env_str(key: &str) -> Option<String> {
 }
 
 /// Open the directory durably from `MYCELLIUM_DATA` (a data *directory*; we use
-/// `directory.redb` inside it), falling back to in-memory.
-fn open_directory() -> Directory {
-    match std::env::var("MYCELLIUM_DATA") {
-        Ok(dir) if !dir.is_empty() => {
-            let _ = std::fs::create_dir_all(&dir);
+/// `directory.redb` inside it). Setting `MYCELLIUM_DATA` expresses durable intent,
+/// so if the store can't be opened we **fail closed** rather than silently drop to
+/// in-memory (which would look healthy while nothing persists — issue #45). No
+/// `MYCELLIUM_DATA` is the explicit in-memory development mode.
+fn open_directory() -> std::io::Result<Directory> {
+    let data = std::env::var("MYCELLIUM_DATA")
+        .ok()
+        .filter(|d| !d.is_empty());
+    open_directory_at(data.as_deref())
+}
+
+/// The env-free core of [`open_directory`], so the three startup modes are testable.
+fn open_directory_at(data: Option<&str>) -> std::io::Result<Directory> {
+    match data {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)?;
             let path = format!("{}/directory.redb", dir.trim_end_matches('/'));
-            match Directory::open(&path) {
-                Ok(directory) => {
-                    println!("  persistence: {path}");
-                    directory
-                }
-                Err(e) => {
-                    eprintln!("  persistence open failed ({e}); using in-memory");
-                    Directory::new()
-                }
-            }
+            let directory = Directory::open(&path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "MYCELLIUM_DATA is set but the durable store at {path} could not be opened: {e}"
+                ))
+            })?;
+            println!("  persistence: {path}");
+            Ok(directory)
         }
-        _ => {
+        None => {
             println!("  storage: in-memory (set MYCELLIUM_DATA to persist)");
-            Directory::new()
+            Ok(Directory::new())
         }
     }
 }
@@ -418,7 +430,24 @@ fn bearer_token(request: &Request) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_path;
+    use super::{open_directory_at, redact_path};
+
+    #[test]
+    fn durable_open_fails_closed_on_a_bad_data_dir() {
+        // No data dir → explicit in-memory development mode.
+        assert!(open_directory_at(None).is_ok());
+        // A valid data dir → durable mode.
+        let good = std::env::temp_dir().join(format!("myc-d-good-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&good);
+        assert!(open_directory_at(Some(good.to_str().unwrap())).is_ok());
+        let _ = std::fs::remove_dir_all(&good);
+        // Configured but unusable (the path is a file, not a dir) → fail closed.
+        let bad = std::env::temp_dir().join(format!("myc-d-bad-{}", std::process::id()));
+        let _ = std::fs::remove_file(&bad);
+        std::fs::write(&bad, b"not a dir").unwrap();
+        assert!(open_directory_at(Some(bad.to_str().unwrap())).is_err());
+        let _ = std::fs::remove_file(&bad);
+    }
 
     #[test]
     fn access_log_paths_are_redacted() {
