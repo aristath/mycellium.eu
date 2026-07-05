@@ -61,6 +61,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![crate::record::Device {
                 device_key: id.device_public(),
                 peer_id: crate::identity::PeerId(alloc::vec![]),

@@ -76,6 +76,7 @@ pub fn update_devices(
         name: display_name_for(handle),
         wallet: identity.wallet_public(),
         queue: own_queue(),
+        queues: vec![],
         devices,
         seq,
     };

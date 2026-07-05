@@ -689,6 +689,7 @@ impl Session {
             name: name.to_string(),
             wallet: self.identity.wallet_public(),
             queue: queue_url.to_string(),
+            queues: vec![],
             devices,
             seq,
         };

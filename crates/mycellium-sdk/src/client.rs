@@ -917,8 +917,23 @@ impl MyceliumClient {
         let _ = names::note(&mut inner.store, peer.as_str(), &precord.record.name);
 
         let encoded = app.encode();
-        let queue = QueueClient::with_transport(&precord.record.queue, Box::new(UreqTransport));
-        let qtoken = queue.login(&inner.identity).map_err(SdkError::network)?;
+        // Log in to each of the peer's queue endpoints in preference order
+        // (primary `queue` then `queues`), so a deposit can fail over from a
+        // down primary to a backup (#54). Unreachable endpoints are skipped; we
+        // only surface the error if *none* of them are reachable.
+        let mut sessions: Vec<(QueueClient, String)> = Vec::new();
+        let mut last_err: Option<SdkError> = None;
+        for url in precord.record.endpoints() {
+            let q = QueueClient::with_transport(url, Box::new(UreqTransport));
+            match q.login(&inner.identity) {
+                Ok(t) => sessions.push((q, t)),
+                Err(e) => last_err = Some(SdkError::network(e)),
+            }
+        }
+        if sessions.is_empty() {
+            return Err(last_err
+                .unwrap_or_else(|| SdkError::network("recipient advertises no queue endpoint")));
+        }
         let peer_hex = wallet_hex(&precord.record.wallet);
         let my_name = inner.config.name.clone();
         let my_queue = inner.config.queue_url.clone();
@@ -937,14 +952,11 @@ impl MyceliumClient {
                 continue;
             };
             let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(SdkError::crypto)?;
-            if queue
-                .deposit(
-                    &qtoken,
-                    &peer_hex,
-                    &wireops::device_slot(&device.device_key),
-                    &blob,
-                )
-                .is_ok()
+            let slot = wireops::device_slot(&device.device_key);
+            // Try each endpoint until one accepts this device's copy (#54).
+            if sessions
+                .iter()
+                .any(|(q, t)| q.deposit(t, &peer_hex, &slot, &blob).is_ok())
             {
                 delivered += 1;
             }
@@ -1138,6 +1150,7 @@ fn publish_merged(
         name: name.to_string(),
         wallet: identity.wallet_public(),
         queue: queue_url.to_string(),
+        queues: vec![],
         devices,
         seq,
     };

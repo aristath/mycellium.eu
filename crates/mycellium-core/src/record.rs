@@ -20,6 +20,8 @@ pub const MAX_QUEUE_LEN: usize = 512;
 pub const MAX_PEER_ID_LEN: usize = 256;
 /// Max devices in one account's record.
 pub const MAX_DEVICES: usize = 32;
+/// Max additional (failover) queue endpoints beyond the primary `queue`.
+pub const MAX_QUEUES: usize = 8;
 
 use crate::identity::{
     DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId, Signature, WalletPublicKey,
@@ -79,6 +81,9 @@ pub struct Record {
     /// This account's message-queue endpoint — where senders deposit offline
     /// mail for it. Empty = no queue (pure P2P). Decoupled from the directory.
     pub queue: String,
+    /// Additional queue endpoints for redundancy/failover, tried in order after
+    /// the primary `queue`. Recipient-owned; senders fail over on delivery error.
+    pub queues: Vec<String>,
     /// The account's devices. One entry today; a cluster once linking lands.
     pub devices: Vec<Device>,
     /// Monotonic sequence number — freshness and anti-rollback (Layer 9.4).
@@ -95,6 +100,27 @@ impl Record {
     /// Find a device in the cluster by its key.
     pub fn device(&self, key: &DevicePublicKey) -> Option<&Device> {
         self.devices.iter().find(|d| &d.device_key == key)
+    }
+
+    /// This account's queue endpoints in preference order (Layer 8.2, #54): the
+    /// primary [`queue`](Self::queue) first, then each [`queues`](Self::queues)
+    /// failover entry, skipping empties and duplicates. Senders deposit to the
+    /// first endpoint that accepts and fail over to the next on error; the
+    /// recipient owns and rotates this set.
+    pub fn endpoints(&self) -> impl Iterator<Item = &str> {
+        // `no_std`: dedup against a small `Vec` of already-yielded URLs rather
+        // than a hash set. The list is tiny (bounded by `MAX_QUEUES + 1`).
+        let mut seen: Vec<&str> = Vec::new();
+        core::iter::once(self.queue.as_str())
+            .chain(self.queues.iter().map(String::as_str))
+            .filter(move |url| {
+                if url.is_empty() || seen.contains(url) {
+                    false
+                } else {
+                    seen.push(url);
+                    true
+                }
+            })
     }
 
     /// The canonical byte encoding that is signed and verified.
@@ -115,7 +141,13 @@ impl Record {
 }
 
 /// Domain + schema-version tag prefixed to a record's signed bytes.
-const RECORD_DOMAIN: &[u8] = b"mycellium-record-v1\0";
+///
+/// v2 added the `queues` failover-endpoint list (#54). Because the signed form
+/// is `RECORD_DOMAIN + wire::canonical(record)` and postcard is not
+/// self-describing, adding a field is an incompatible schema change — bumping
+/// the version is the codebase's "clean break": v1-signed records simply no
+/// longer verify and everything re-publishes under v2.
+const RECORD_DOMAIN: &[u8] = b"mycellium-record-v2\0";
 /// Domain + schema-version tag prefixed to a signed pre-key's signed bytes.
 const PREKEY_DOMAIN: &[u8] = b"mycellium-prekey-v1\0";
 
@@ -163,6 +195,9 @@ impl SignedRecord {
         if r.name.len() > MAX_NAME_LEN || r.queue.len() > MAX_QUEUE_LEN {
             return Err(Error::Malformed);
         }
+        if r.queues.len() > MAX_QUEUES || r.queues.iter().any(|q| q.len() > MAX_QUEUE_LEN) {
+            return Err(Error::Malformed);
+        }
         for device in &r.devices {
             if device.peer_id.0.len() > MAX_PEER_ID_LEN {
                 return Err(Error::Malformed);
@@ -201,6 +236,7 @@ mod tests {
             name: String::new(),
             wallet: WalletPublicKey([2u8; 33]),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![Device {
                 device_key: DevicePublicKey([1u8; 32]),
                 peer_id: PeerId(alloc::vec![3u8; 34]),
@@ -268,6 +304,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![Device {
                 device_key: id.device_public(),
                 peer_id: id.peer_id(),
@@ -286,6 +323,102 @@ mod tests {
     }
 
     #[test]
+    fn record_with_queues_verifies_and_is_tamper_evident() {
+        let mut p = TestPlatform;
+        let id = Identity::generate(&mut p).unwrap();
+
+        // A record advertising a primary plus two failover endpoints (#54).
+        let record = Record {
+            handle: Handle::new("ari").unwrap(),
+            name: String::new(),
+            wallet: id.wallet_public(),
+            queue: String::from("https://primary.example"),
+            queues: alloc::vec![
+                String::from("https://backup-a.example"),
+                String::from("https://backup-b.example"),
+            ],
+            devices: alloc::vec![Device {
+                device_key: id.device_public(),
+                peer_id: id.peer_id(),
+                id_key: id.messaging_public(),
+                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+            }],
+            seq: 1,
+        };
+        let signed = SignedRecord::sign(record, &id);
+        assert!(
+            signed.verify().is_ok(),
+            "record with failover queues must verify"
+        );
+
+        // `queues` is inside the signed canonical bytes — tampering breaks it.
+        let mut tampered = signed.clone();
+        tampered.record.queues[0] = String::from("https://attacker.example");
+        assert!(
+            tampered.verify().is_err(),
+            "tampering with a queues entry must fail verification"
+        );
+
+        // Adding an endpoint the owner never signed is also caught.
+        let mut appended = signed.clone();
+        appended
+            .record
+            .queues
+            .push(String::from("https://attacker.example"));
+        assert!(
+            appended.verify().is_err(),
+            "appending an unsigned queues entry must fail verification"
+        );
+    }
+
+    #[test]
+    fn endpoints_are_ordered_deduped_and_skip_empties() {
+        // Primary first, then failovers in order; empties and duplicates dropped.
+        let mut r = sample_record(1);
+        r.queue = String::from("primary");
+        r.queues = alloc::vec![
+            String::from("primary"), // dup of the primary — skipped
+            String::new(),           // empty — skipped
+            String::from("backup-a"),
+            String::from("backup-a"), // dup of a prior failover — skipped
+            String::from("backup-b"),
+        ];
+        let got: alloc::vec::Vec<&str> = r.endpoints().collect();
+        assert_eq!(got, alloc::vec!["primary", "backup-a", "backup-b"]);
+
+        // An empty primary is skipped but failovers still surface.
+        let mut r2 = sample_record(1);
+        r2.queue = String::new();
+        r2.queues = alloc::vec![String::from("only-backup")];
+        let got2: alloc::vec::Vec<&str> = r2.endpoints().collect();
+        assert_eq!(got2, alloc::vec!["only-backup"]);
+    }
+
+    #[test]
+    fn too_many_queues_is_rejected() {
+        let mut p = TestPlatform;
+        let id = Identity::generate(&mut p).unwrap();
+        let record = Record {
+            handle: Handle::new("ari").unwrap(),
+            name: String::new(),
+            wallet: id.wallet_public(),
+            queue: String::from("primary"),
+            queues: alloc::vec![String::from("x"); MAX_QUEUES + 1],
+            devices: alloc::vec![Device {
+                device_key: id.device_public(),
+                peer_id: id.peer_id(),
+                id_key: id.messaging_public(),
+                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
+            }],
+            seq: 1,
+        };
+        assert_eq!(
+            SignedRecord::sign(record, &id).verify(),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
     fn oversized_record_is_rejected() {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
@@ -301,6 +434,7 @@ mod tests {
             name: "x".repeat(MAX_NAME_LEN + 1),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![device.clone()],
             seq: 1,
         };
@@ -315,6 +449,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![device; MAX_DEVICES + 1],
             seq: 1,
         };
@@ -341,6 +476,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![
                 Device {
                     device_key: id.device_public(),
@@ -368,6 +504,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![],
             seq: 1,
         };
@@ -383,6 +520,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: alloc::vec![],
             devices: alloc::vec![Device {
                 device_key: id.device_public(),
                 peer_id: id.peer_id(),

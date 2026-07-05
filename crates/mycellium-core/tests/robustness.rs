@@ -50,6 +50,7 @@ fn valid_signed_record(p: &mut SeededPlatform) -> SignedRecord {
         name: String::new(),
         wallet: id.wallet_public(),
         queue: String::new(),
+        queues: vec![],
         devices: vec![Device {
             device_key: id.device_public(),
             peer_id: PeerId(vec![1, 2, 3, 4]),

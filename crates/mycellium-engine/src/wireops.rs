@@ -106,6 +106,8 @@ pub fn build_record<P: Platform>(
         name: name.to_string(),
         wallet: identity.wallet_public(),
         queue: queue.to_string(),
+        // No failover endpoints from this builder yet; single-queue as before.
+        queues: vec![],
         devices: vec![this_device(identity, addr)],
         seq: platform.now_unix_secs(),
     };

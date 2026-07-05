@@ -193,40 +193,65 @@ pub fn seal_to(
     )
 }
 
-/// A logged-in deposit target: a recipient's queue plus their wallet key. Built
-/// from the recipient's record (the queue lives at the endpoint *they* publish,
-/// keyed by *their* wallet) — decoupled from the directory.
-pub struct QueueTarget {
+/// A recipient's queue endpoints in preference order (#54): the primary
+/// `record.queue` first, then each `record.queues` entry, skipping empties and
+/// duplicates. Senders deposit to the first endpoint that accepts and fail over
+/// to the next on error — the recipient owns and rotates this set. Thin wrapper
+/// over [`Record::endpoints`] so the sender-side deposit loop reads naturally.
+pub fn endpoints(record: &Record) -> impl Iterator<Item = &str> {
+    record.endpoints()
+}
+
+/// One logged-in queue session: a live client plus its auth token.
+struct QueueSession {
     client: QueueClient,
     token: String,
+}
+
+/// A logged-in deposit target: a recipient's reachable queue endpoints plus
+/// their wallet key. Built from the recipient's record (the queues live at the
+/// endpoints *they* publish, keyed by *their* wallet) — decoupled from the
+/// directory. Holds one session per reachable endpoint so a deposit can fail
+/// over from a down primary to a backup (#54).
+pub struct QueueTarget {
+    /// Logged-in sessions in preference order (primary first, then failovers).
+    sessions: Vec<QueueSession>,
     wallet_hex: String,
 }
 
 impl QueueTarget {
-    /// Open a session to the queue named in `record` (None if it lists no queue
-    /// or login fails).
+    /// Open a session to each endpoint named in `record`, in preference order
+    /// (`queue` then `queues`). Unreachable endpoints (login fails) are skipped;
+    /// returns None only if the record lists no endpoint we could log in to.
     pub fn open(identity: &Identity, record: &Record) -> Option<QueueTarget> {
-        if record.queue.is_empty() {
+        let mut sessions = Vec::new();
+        for url in endpoints(record) {
+            let client = QueueClient::new(url);
+            if let Ok(token) = client.login(identity) {
+                sessions.push(QueueSession { client, token });
+            }
+        }
+        if sessions.is_empty() {
             return None;
         }
-        let client = QueueClient::new(&record.queue);
-        let token = client.login(identity).ok()?;
         Some(QueueTarget {
-            client,
-            token,
+            sessions,
             wallet_hex: wallet_hex(&record.wallet),
         })
     }
 
-    /// Deposit `item` into `slot` of this recipient's mailbox.
+    /// Deposit `item` into `slot` of this recipient's mailbox, trying each
+    /// endpoint in order until one accepts. Returns true on the first success;
+    /// only if *every* endpoint fails does the caller fall back to the outbox.
     pub fn deposit(&self, slot: &str, item: &MailItem) -> bool {
-        match serde_json::to_string(item) {
-            Ok(json) => self
-                .client
-                .deposit(&self.token, &self.wallet_hex, slot, &json)
-                .is_ok(),
-            Err(_) => false,
-        }
+        let Ok(json) = serde_json::to_string(item) else {
+            return false;
+        };
+        self.sessions.iter().any(|s| {
+            s.client
+                .deposit(&s.token, &self.wallet_hex, slot, &json)
+                .is_ok()
+        })
     }
 }
 
@@ -322,7 +347,13 @@ pub fn flush_outbox(
             Ok(h) => h,
             Err(_) => return outbox::Attempt::Drop, // unparseable recipient — drop it
         };
-        // Re-resolve the recipient's current record (queue/devices may have moved).
+        // Re-resolve the recipient's current record (queue/devices may have
+        // moved). This is the safe-rotation path (#53): a stale endpoint that
+        // failed is never reused from a cache — every retry does a fresh
+        // directory lookup, so once the recipient re-publishes a rotated
+        // `queue`/`queues` set, senders pick it up automatically. The grace
+        // period is implicit: a rotating recipient keeps draining its old
+        // endpoint until in-flight senders have re-resolved to the new one.
         let record = match client.lookup(&handle) {
             Ok(r) if r.verify().is_ok() => r,
             // Couldn't resolve/verify: bump and keep unless spent.

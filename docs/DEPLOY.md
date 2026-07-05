@@ -140,6 +140,24 @@ services with separate trust.
   update you sign — no one else decides where your mail lands (see #53 for
   rotation, #54 for multiple endpoints).
 
+- **Advertising multiple endpoints (#54).** Your record carries a primary
+  `queue` plus an ordered `queues` failover list. Senders deposit to the primary
+  first and fall over to each backup in order, parking mail in their outbox only
+  if *every* endpoint is down. Advertise a second endpoint on a different
+  operator/box for redundancy: a single queue outage then no longer blocks your
+  mail. Keep the list short (bounded at `MAX_QUEUES` = 8) and order it by
+  preference — the first that accepts a deposit wins.
+
+- **Rotating safely (#53).** To move to a new queue, publish an updated record
+  with the new endpoint(s) — and **keep the old queue running for a grace
+  period**. Senders cache nothing across a delivery failure: every retry does a
+  fresh directory lookup and picks up your new endpoint set, but in-flight
+  senders may still be draining the old one until they re-resolve. Once traffic
+  to the old queue has died down (past your senders' retry cadence), you can
+  retire it. A zero-downtime rotation is: (1) add the new endpoint to `queues`,
+  (2) wait for senders to re-resolve, (3) promote it to `queue`, (4) drop the
+  old one on a later update.
+
 - **Three ways to run a queue** — the protocol is identical; only who operates it
   differs:
   - **Self-hosted.** Run `mycellium-queue` on your own box/VPS, point your record

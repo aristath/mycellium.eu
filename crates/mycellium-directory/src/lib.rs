@@ -567,6 +567,7 @@ mod tests {
             name: String::new(),
             wallet: id.wallet_public(),
             queue: String::new(),
+            queues: vec![],
             devices: vec![Device {
                 device_key: id.device_public(),
                 peer_id: id.peer_id(),

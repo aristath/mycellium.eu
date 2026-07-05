@@ -32,5 +32,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = { version = "0.2", optional = true }
 
+[dev-dependencies]
+# Spin up a real in-process queue server to exercise endpoint failover (#54).
+mycellium-queue = { path = "../mycellium-queue" }
+mycellium-queue-client = { path = "../mycellium-queue-client" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
 [lints.rust]
 unsafe_code = "forbid"

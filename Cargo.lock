@@ -2517,12 +2517,14 @@ dependencies = [
  "getrandom 0.2.17",
  "mycellium-core",
  "mycellium-directory-client",
+ "mycellium-queue",
  "mycellium-queue-client",
  "mycellium-storage",
  "mycellium-transport",
  "rpassword",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
