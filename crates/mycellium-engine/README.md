@@ -41,7 +41,8 @@ compile to wasm, each generic over `mycellium_core::storage`.
 | `app/session` | Live-connection handshakes: `handshake_initiator` / `handshake_responder` build a `Session` (ratchet + AEAD `ad` + peer name). |
 | `app/messaging` | The heart: `send`, `broadcast`, `forward`, `serve`, `inbox`, `deliver`, `QueueTarget`, `flush_outbox`, `outbox_show`, `process_item`, `handle_direct`, `handle_self_sync`, `send_receipt`, `seal_to`, `open_envelope`. |
 | `app/grouping` | Groups over sender keys: `group_create` / `_add` / `_remove` / `_send` / `_leave` / `_sync` / `_list` / `_info` / `_history`, `distribute_key`, and the `handle_group_*` receivers. |
-| `app/devices` | Identity + cluster: `identity_new` / `_show`, `register`, `link_device`, `list_devices`, `revoke_device`, `update_devices`, `guardian_split` / `_recover`, `build_record`, `this_device`, `device_slot`, `my_group_id`. |
+| `app/devices` | Identity + cluster: `identity_new` / `_show`, `register`, `list_devices`, `revoke_device`, `update_devices`, `build_record`, `this_device`, `device_slot`, `my_group_id`. |
+| `app/pairing` | Seedless device pairing: `pair_new` (new device offers + adopts), `pair_approve` (existing device seals the account key to an offer). |
 | `app/directory_ops` | `announce`, `verify`, `presence`, and `lookup_verified` (nickname → handle → TOFU wallet-pin check). |
 | `app/organize` | Contacts, blocklist, drafts, expiry, and read-side views: `conversations`, `search`, `show_history`, `clear_history`. |
 | `app/backup` | `export_backup` / `import_backup` (a portable `Backup` bundle) and `wipe`. |

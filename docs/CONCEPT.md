@@ -228,16 +228,11 @@ Because this sits above the transport, a compromised or relaying intermediary in
 
 There is no "sign up" here — no email, no password, no server-created account. A keypair *is* an account. So **registration is three steps**: create your identity, claim a handle, publish your record.
 
-### 9.1 The seed is the identity
+### 9.1 Your key is your identity
 
-Your identity secret is generated from a **24-word BIP-39 seed phrase** (256 bits of entropy — beyond brute force, permanently). The seed derives your root **wallet key**; the wallet key is who you are.
+Your identity secret is a random **secp256k1 wallet key** drawn from the OS CSPRNG — 256 bits of entropy, beyond brute force. The wallet key is who you are: it signs your records and authenticates you at login. There is **no seed phrase**. The key is never rendered as words or shown to you; it lives encrypted at rest, and it reaches another device only over the authenticated pairing channel (Layer 11), never as a copyable string.
 
-Deliberate choices, all in the name of "secure by default, and always recoverable":
-
-- **24 words**, always. No 12-word option — we don't offer a weaker setting.
-- **A single standard wordlist** (the user's locale, English as the interoperable default). Standard BIP-39 is what *guarantees* the phrase can always be restored; that reliability is the point.
-- **No custom words** — a human-chosen phrase is a "brain wallet," guessable and drainable. Memorable names are the *handle's* job (9.2), never the seed's.
-- **No custom passphrase, no word-count or mixing options.** 256 bits is already an unbreakable secret; extra knobs add recovery risk and non-standard fragility without adding real security.
+Why no seed phrase? A written phrase is a permanent, transferable *bearer* secret — its own worst enemy. It leaks through screenshots, cloud backups, and "enter your 24 words" prompts, and (as the earlier device-link design showed) it tends to end up riding inside a QR or URL payload where a single capture is game over. Dropping it removes that whole class of exposure. The cost is that self-sovereign, *stable-identity* recovery is no longer automatic — see 9.4 for the trade-off we accept instead.
 
 ### 9.2 Claiming a handle (permanent, by design)
 
@@ -252,18 +247,17 @@ Together these make the fear "someone takes my identity while I'm away" *cryptog
 
 Sign your record (Layer 8.2) with the wallet key and publish it to the directory. You are now findable and reachable.
 
-### 9.4 Recovery — and why the seed preserves the identity chain
+### 9.4 Recovery and the identity chain
 
-New phone, or a month away: install the app, **enter your 24 words**, and your root wallet key is *re-derived* — not replaced. This is the quiet superpower of seed-phrase recovery:
+Two cases, with different guarantees:
 
-- Your **root identity is restored, not rotated.** The wallet key is exactly the same one, so `ari`'s handle binding still verifies and your contacts see the *same* signing identity — **no "safety number changed" alarm.**
-- Only the **device-level keys rotate** (a new phone means a new libp2p key / PeerID and messaging key). You simply re-sign a fresh record — `seq`-bumped — with the unchanged wallet key. Because the root vouches for the new device keys, the chain of trust is intact end to end.
+- **You still have a device.** Add more by **pairing** (Layer 11): the new device generates its own keys and shows a one-time offer; an existing device confirms and transfers the account key over an authenticated, single-use channel. Your wallet is **unchanged**, so `ari`'s handle binding still verifies and your contacts see the *same* signing identity — **no "safety number changed" alarm**. Only the new device's keys are new, re-signed into the `seq`-bumped record under the same wallet. The root vouches for the device keys, so the chain of trust stays intact end to end.
 
-This is a genuine advantage of leading with the seed over phone/email recovery, which would *rotate* the root key and force every contact to re-verify.
+- **You have lost every device.** Recover through the directory's **email verification** (Layer 6 auth): prove control of a registered email and re-bind your handle. Here the identity **rotates** — the handle now points at a *new* wallet, so contacts see a new key and re-verify the safety number. This is the deliberate trade-off of dropping the seed: we accept an identity-rotating recovery, with a *visible* re-verify, in exchange for never handling a transferable seed secret at all.
 
-### 9.5 The one accepted limit
+### 9.5 The accepted limit
 
-If you lose the seed **and** every device that holds the key, the identity goes **permanently dormant** — unrecoverable by you, and unclaimable by anyone else (nobody can forge your signature). That is the price of pure self-custody, and we accept it for the POC. The later recovery factors (social recovery, phone, email — all deferred) exist precisely to give people a softer landing than "the words or nothing."
+If you register no recovery email and then lose every device, the identity goes **permanently dormant** — unrecoverable by you, and unclaimable by anyone else (nobody can forge your signature). That is the price of self-custody. A verified recovery email is the one softer landing, and it is the recommended default.
 
 ---
 
@@ -324,12 +318,12 @@ One core, compiled and wrapped per platform: desktop (native, egui/Tauri or CLI)
 
 ## Layer 11 — Devices (a cluster is one identity)
 
-*Implemented.* Per-device keys, seed self-authorizes a new device, per-device
+*Implemented.* Per-device keys, **pairing** authorizes a new device, per-device
 mailbox delivery + cluster fan-out, and sent-message self-sync all work end to
-end (see the `link-device` / `devices` / `revoke-device` commands and the
+end (see the `pair` / `pair-approve` / `devices` / `revoke-device` commands and the
 multi-device e2e tests). The remaining nuance is noted in 11.6.
 
-Your account is your seed/wallet. You may run it on several devices — phone,
+Your account is your wallet. You may run it on several devices — phone,
 laptop, tablet. They form a **cluster** that looks like one identity to the
 outside world, while each device holds its *own* message keys. The goal is the
 "normal app" feel — *add a device and my messages show up there* — without
@@ -343,17 +337,18 @@ key, messaging + pre-keys }`, where the **device-id is derived from the device's
 own public key** (self-certifying, no central assignment). The wallet signature
 over the set is what proves every listed device belongs to the account.
 
-- **Adding a device needs no ceremony.** Install, enter the seed → the device
-  derives the wallet, generates its *own random* message keys, signs itself into
-  the record (the seed is the authority), and republishes (`seq++`). No QR scan
-  from an old phone — the seed *is* the permission, the same property that lets
-  it recover the identity (9.4).
+- **Adding a device pairs it in.** The new device generates its *own random*
+  message keys and shows a one-time offer; an existing device confirms and hands
+  over the account key across an authenticated, single-use channel. The new
+  device then signs itself into the record and republishes (`seq++`). The QR/scan
+  *is* the ceremony — a deliberate change from the old "enter the seed" flow,
+  which put the account secret into a copyable payload.
 - **Removing a device** republishes the set without it (`seq++`). Anti-rollback
   (9.4) already stops a dropped device from re-appearing with a stale record.
-- Per-device keys mean a **seed leak lets an attacker authorize a new device**
-  (identity compromise — revocable) **but never retroactively decrypts past
-  traffic**, because message keys are device-local, not seed-derived. Wallet =
-  authority; per-device keys = confidentiality.
+- Per-device keys mean an **account-key leak lets an attacker authorize a new
+  device** (identity compromise — revocable) **but never retroactively decrypts
+  past traffic**, because message keys are device-local, not derived from the
+  account key. Wallet = authority; per-device keys = confidentiality.
 
 ### 11.2 A conversation is a group of *devices*
 
@@ -445,7 +440,7 @@ What remains is no longer concept — it's building and hardening:
 - **Build the POC** — ✅ *done.* The **Rust core** (`mycellium-core`: seed/keys, handle, record sign/verify, X3DH + Double Ratchet, wire codec, behind the Transport/Storage/Platform traits), the **directory service** (`mycellium-directory`: login + signed-KV + anti-rollback + permanent binding), and a **Full-tier shell** (`mycellium-cli`) that runs the whole flow — register → look up → direct connect → X3DH → ratchet → E2E messages — over a TCP transport. See [`../README.md`](../README.md) to run it.
 - **libp2p transport** — ✅ *done.* A `Transport` impl over rust-libp2p (TCP + Noise + Yamux, PeerId derived from the device key, a `/mycellium/1.0` byte-stream protocol) sits behind the same trait as the TCP transport; `mycellium-cli` selects it with `--libp2p` and auto-detects it from the peer's multiaddr. **NAT traversal** (DHT, relay, DCUtR) is the remaining increment — added in the swarm, with no change to the app above.
 - **Live delivery with mailbox fallback** — ✅ *done.* A member runs `serve` to stay online (it announces presence). When sending (1:1, group, broadcast, forward), the client checks each recipient's presence and **pushes the message directly over a live connection if they're online**, falling back to the offline mailbox otherwise. Group messages therefore reach online members live and offline ones via their mailbox — one `deliver` path, verified by an e2e live-push test. (Full 1:1 *interactive* chat still uses the dedicated `chat`/`listen` ratchet path.)
-- **Multi-device (device clusters)** — ✅ *done.* An account (seed/wallet) runs on many devices, each with its own message keys, all wallet-signed into one record (Layer 11). `link-device` adds a device with just the seed — no ceremony; `devices` / `revoke-device` manage the cluster. A message is sealed and delivered per recipient device, mirrored to your own other devices, and group messages/invites fan out to each member's devices — so *add a device and your messages show up there*. A device linked *after* you joined a group is bootstrapped into it (send *and* receive — sender keys are keyed by device) with `group sync`. Verified by eight multi-device e2e tests (link/revoke, recipient fan-out, self-sync, group fan-out, receipts, revocation, group bootstrap, second-device group send).
+- **Multi-device (device clusters)** — ✅ *done.* An account (wallet) runs on many devices, each with its own message keys, all wallet-signed into one record (Layer 11). A new device **pairs** in (`pair` / `pair-approve` — the account key moves over an authenticated one-time channel, never a copyable seed); `devices` / `revoke-device` manage the cluster. A message is sealed and delivered per recipient device, mirrored to your own other devices, and group messages/invites fan out to each member's devices — so *add a device and your messages show up there*. A device paired *after* you joined a group is bootstrapped into it (send *and* receive — sender keys are keyed by device) with `group sync`. Verified by multi-device e2e tests (pairing/revoke, recipient fan-out, self-sync, group fan-out, receipts, group bootstrap, second-device group send) plus the browser pairing suites.
 - **Conversations overview** — ✅ *done.* `conversations` lists every peer and group with a last-message preview (pruning expired).
 - **Full-duplex chat** — ✅ *done.* Live chat is bidirectional: the connection is split into read/write halves, the ratchet is shared under a mutex, and a reader thread prints incoming messages while the main thread sends. Works identically over TCP and libp2p (the responder starts replying once it has received the first message). A `--tui` flag gives a full-screen terminal interface.
 - **Directory rate limiting** — ✅ *done.* Mailbox deposits are capped per authenticated wallet in a fixed time window (anti-spam), returning `429` when exceeded — a first abuse control on the one hosted piece.
@@ -459,7 +454,7 @@ What remains is no longer concept — it's building and hardening:
 - **Local message history** — ✅ *done.* The `Storage` trait now has an implementation: an encrypted file-backed key-value store (key derived from the identity via HKDF). Transcripts are persisted per peer, encrypted at rest, replayed when a chat opens, and viewable with `history <peer>`. `search <query>` scans all local 1:1 and group transcripts (case-insensitive, pruning expired as it goes).
 - **Group messaging (core)** — ✅ *protocol done.* Groups use **sender keys** (the WhatsApp/Signal-groups design): each member has a per-group symmetric chain + Ed25519 signing key, distributed to the others *once* over the pairwise Double-Ratchet channel; thereafter a member encrypts each message **once** with its chain and signs it, and every holder of that sender key decrypts and verifies. This gives forward secrecy within a sender's chain and authenticates the true sender, at the cost of no post-compromise recovery and a re-key (fresh sender key) on membership change — the standard sender-keys trade-off, chosen so a group message is encrypted once rather than per-recipient. The `mycellium-core::group` module implements it (3-member flow, out-of-order, forgery/non-member rejection all tested), and the CLI wires it end to end over the offline mailbox: `group create` invites members (sender keys distributed inside pairwise E2E envelopes), `inbox` processes invites and does the mesh key exchange, and `group send` fans a single ciphertext out to every member. Verified by a 3-member e2e test. **Membership changes** are handled too: `group add` invites a newcomer and propagates the updated roster (existing members send it their keys); `group remove` drops the member, **rotates** every remaining member's sender key, and redistributes — so a removed member, who still holds the old keys, can read nothing further (verified by add/remove e2e tests). The directory sees only that someone deposits to several mailboxes (group membership is metadata it can observe — the same honest limit as 1:1); message content stays end-to-end.
 - **Trust hardening** — ✅ *done.* Out-of-band **safety numbers** (Layer 5): a short code derived from both peers' wallet identities, shown after the handshake, that catches a dishonest directory.
-- **More recovery factors** — ✅ **social recovery** done: Shamir *t-of-n* guardian shares (`guardian-split` / `guardian-recover`) reconstruct a lost seed from a threshold of guardians, softening the 9.5 "words or nothing" limit; no single guardian can impersonate you. Phone/email as *combined* factors remain future. (Seed at rest is also encrypted — Argon2id + ChaCha20-Poly1305.)
+- **Recovery** — ✅ **email verification** is the recovery path (Layer 6 auth): prove control of a registered email to re-bind your handle to a fresh wallet (an identity-rotating recovery — see 9.4). Seed phrases and Shamir guardian recovery were **removed** with the seedless pivot, since they reintroduced a transferable bearer secret; email is the one recovery factor. (The account key at rest is encrypted — Argon2id + ChaCha20-Poly1305.)
 - **Offline** — ✅ *done.* Async X3DH (against the recipient's published `signedPreKey`) + a per-handle **mailbox** in the directory. The sender seals an [`Envelope`] the mailbox stores but cannot read; the recipient drains and decrypts it later. `mycellium-cli send` / `inbox`.
 
   **A deliberate, documented softening of Layer 3.** Offline delivery is the one place the directory *holds* a message rather than merely brokering discovery. We keep it honest: it stores only opaque, end-to-end-encrypted envelopes (it can't read them), any authenticated sender may deposit, and only the handle's owner may collect. This is the trade-off Layer 4 deferred, now made explicit — the directory is still not a hub that owns your conversation, but it does briefly *carry* sealed messages for peers who aren't online.
@@ -468,7 +463,7 @@ What remains is no longer concept — it's building and hardening:
 
 - **No NAT traversal yet** — the libp2p direct line works, but peers still reach each other by an address published in the record; DHT/relay/DCUtR is the next step.
 - **`PeerId` in the record is a location string** — the core carries the transport address (TCP `host:port` or a libp2p multiaddr) in the record's `peer_id` field; a cleaner split of identity vs. reachability is future work.
-- **Multi-device** — ✅ *done* (Layer 11). Record is a wallet-signed device set; device/messaging keys are per-device (the wallet stays seed-derived); `link-device` self-authorizes a new device via the seed; the mailbox is keyed per-device; `send` fans out one sealed copy per recipient device and mirrors to your own other devices (self-sync); group messages and invites fan out to each member's devices. Remaining nuance: 1:1 uses per-device X3DH rather than sender keys (simpler + stronger post-compromise security for small clusters); receipts still use the shared account slot.
+- **Multi-device** — ✅ *done* (Layer 11). Record is a wallet-signed device set; device/messaging keys are per-device; a new device **pairs** in (the account key is sealed to a one-time ephemeral key and relayed, not shared as a seed); the mailbox is keyed per-device; `send` fans out one sealed copy per recipient device and mirrors to your own other devices (self-sync); group messages and invites fan out to each member's devices. Remaining nuance: 1:1 uses per-device X3DH rather than sender keys (simpler + stronger post-compromise security for small clusters); receipts still use the shared account slot.
 - **Reactions/edits are best-effort and flattened in history** — they mutate the stored transcript rather than being aggregated onto their target in a structured UI.
 
-(The wallet key now uses standard **BIP-44** (`m/44'/60'/0'/0/0`), verified against a known vector, so a Mycellium seed imports into external wallets. Device/messaging keys stay on HKDF, as X25519 has no external HD standard.)
+(The wallet key is a raw random secp256k1 secret — no BIP-39 seed or BIP-32/44 derivation — held encrypted at rest and moved between devices only over the pairing channel. Device/messaging keys derive from a per-device random seed via HKDF.)

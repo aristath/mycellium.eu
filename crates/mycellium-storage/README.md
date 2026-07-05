@@ -11,11 +11,12 @@ directory-backed key-value store implementing the core `Storage` port: every
 value the engine persists — message history, contacts, groups, drafts, outbox —
 is written as one file per key, encrypted at rest. Each entry is stored as
 `nonce || ChaCha20-Poly1305(value)` under a 32-byte key derived from the
-identity (via `Identity::storage_key`), so on-disk data stays consistent with
-the seed. A separate `store` module seals the identity itself: the account
-mnemonic and this device's seed are serialized, then encrypted under a key that
-Argon2id derives from a user passphrase and a random salt — losing the
-passphrase loses only the on-disk copy, since the 24 words remain the backup.
+identity (via `Identity::storage_key`), so on-disk data stays consistent with the
+account. A separate `store` module seals the identity itself: the account
+`wallet_secret` and this device's seed are serialized, then encrypted under a key
+that Argon2id derives from a user passphrase and a random salt. There is no seed
+phrase — account recovery after losing every device is via the directory's email
+verification, and more devices are added by pairing.
 
 ## Public API
 
@@ -24,7 +25,7 @@ passphrase loses only the on-disk copy, since the 24 words remain the backup.
 - `get` / `put` / `delete` — the core `Storage` trait: read, write, and remove values; keys map to hex-named files.
 
 **`store`** — the identity at rest.
-- `save_identity(&Identity)` — Argon2id + ChaCha20-Poly1305 seal the mnemonic and device seed under a passphrase.
+- `save_identity(&Identity)` — Argon2id + ChaCha20-Poly1305 seal the wallet secret and device seed under a passphrase.
 - `load_identity() -> Identity` — decrypt and restore the same device from disk.
 - `data_dir()` — the data-directory root, for other local state.
 - `path()` — path to the encrypted identity file (`identity.enc`).

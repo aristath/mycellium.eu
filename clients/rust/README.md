@@ -15,9 +15,9 @@ crypto, delivery, and storage lives in the engine.
 
 Four features, all backed by existing engine functions (no protocol logic here):
 
-- **Login / registration** — create an identity (shows your 24-word seed once),
-  claim a handle, or unlock/restore an existing one. It's a *local* app, so
-  "login" means unlocking your on-disk identity with your passphrase.
+- **Login / registration** — create an identity (a random wallet key, no seed
+  phrase), claim a handle, or unlock/restore an existing one. It's a *local* app,
+  so "login" means unlocking your on-disk identity with your passphrase.
 - **Contacts** — add (pins the peer's wallet, TOFU), list, remove.
 - **Threads** — 1:1 conversations with message bubbles and a composer.
 - **Groups** — create, list, open, and message groups.

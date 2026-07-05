@@ -13,7 +13,7 @@ self-healing, or a by-design trade-off. Separate from
   removal or re-key isn't silently lost on a transient failure.
   (`crates/mycellium-engine/src/app/grouping.rs`)
 - **Browser `register` merges the device list.** Renaming/re-registering no longer
-  drops a device a prior `link_device` added — both share a `publish_merged` helper
+  drops a device a prior pairing added — both share a `publish_merged` helper
   that looks up the current record, appends this device, and bumps `seq`. Covered by
   `wasm-multidevice.test.mjs`. (`crates/mycellium-wasm/src/lib.rs`)
 - **Deleted attachments are garbage-collected.** Applying a `Body::Delete` now also

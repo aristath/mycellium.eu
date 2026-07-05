@@ -15,7 +15,7 @@ Split by responsibility (ports-and-adapters), so one engine can back many shells
 
 ```
 crates/
-  mycellium-core/               the contract: identity (seed → keys), records,
+  mycellium-core/               the contract: identity (wallet → keys), records,
                                 X3DH + Double Ratchet, group sender keys, wire,
                                 login challenge, and the host-port *traits*
                                 (Transport / Storage / Platform). no_std-capable.
@@ -88,10 +88,9 @@ both transports and the offline mailbox. A separate `robustness` suite fuzzes
 the wire decoders with garbage/truncated/bit-flipped bytes (never panics, never
 accepts a tampered record) and checks the ratchet rejects replays and bounds
 skips. A `model` suite checks correctness properties over random inputs — the
-ratchet decrypts under many random two-way interleavings, and Shamir sharing
-round-trips for random thresholds/subsets. ~129 workspace tests in all, plus
-ten real-browser suites (WASM crypto, sealing, storage, networked messaging,
-groups, multi-device, and the full two-user PWA flow) under
+ratchet decrypts under many random two-way interleavings. ~160 workspace tests in
+all, plus ten real-browser suites (WASM crypto, sealing, storage, networked
+messaging, groups, multi-device pairing, and the full two-user PWA flow) under
 [`clients/rust/e2e`](clients/rust/e2e). (The e2e suite throttles itself to a few
 concurrent subprocess-heavy tests to stay reliable under parallel runs.)
 
@@ -131,7 +130,7 @@ direct connection, brokered only by the directory.
 # 1. Start the directory (login + lookup; never sees message content)
 cargo run -p mycellium-server -- --addr 127.0.0.1:8078 &
 
-# The seed is encrypted at rest; set a passphrase (or you'll be prompted).
+# The account key is encrypted at rest; set a passphrase (or you'll be prompted).
 export MYCELLIUM_PASSPHRASE="a strong passphrase"
 
 # 2. Bob: create an identity, register a handle, and listen
@@ -219,28 +218,33 @@ MYCELLIUM_HOME=/tmp/new   cargo run -p mycellium-cli -- import ./mycellium-backu
 
 ### Multiple devices
 
-Your seed is your account; add as many devices as you like. On a **fresh**
-device home, `link-device` adopts the account with the seed (no ceremony — the
-seed is the authority) and adds itself to your record. From then on, messages
-fan out to every device, and what you send from one device shows up on the rest.
+Add as many devices as you like — there is **no seed phrase to copy**. A new
+device **pairs** with your account over an authenticated, one-time channel: the
+new device shows an offer (a QR/code), an existing device approves it, and the
+account key is transferred without ever riding in a copyable payload. From then
+on, messages fan out to every device, and what you send from one shows up on the
+rest.
 
 ```sh
 # On your first device you already ran `identity-new` + `register mary ...`.
-# On a new device (fresh MYCELLIUM_HOME), link it with the same seed:
-MYCELLIUM_PHRASE="<your 24 words>" \
+# On the NEW device (a fresh MYCELLIUM_HOME), start pairing — it prints an offer:
 MYCELLIUM_HOME=/tmp/mary-laptop cargo run -p mycellium-cli -- \
-    link-device mary --addr 127.0.0.1:9101 --directory http://127.0.0.1:8078
+    pair mary --addr 127.0.0.1:9101 --queue http://127.0.0.1:8090 --directory http://127.0.0.1:8078
+
+# On your EXISTING device, approve the offer it printed:
+MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- \
+    pair-approve <offer> --as mary --directory http://127.0.0.1:8078
 
 # See and manage the cluster:
 MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- devices mary
 MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- revoke-device mary <short-id>
 
-# Bring a newly linked device into groups you already joined (send + receive):
+# Bring a newly paired device into groups you already joined (send + receive):
 MYCELLIUM_HOME=/tmp/mary cargo run -p mycellium-cli -- group sync --as mary
 ```
 
-A newly linked device starts fresh (no back-history) and has its **own** message
-keys — so a seed leak lets someone add a device going forward, but never
+A newly paired device starts fresh (no back-history) and has its **own** message
+keys — so an account-key leak lets someone add a device going forward, but never
 decrypts your past traffic.
 
 ### Group messaging
@@ -319,18 +323,13 @@ mycellium expire set alice 1h     # new messages to alice default to 1h (clear/s
 Disappearing messages are best-effort: our client deletes on schedule, but it
 can't stop a modified peer client from keeping a copy.
 
-### Social recovery
+### Recovery
 
-Split your identity across guardians so a lost seed can be reconstructed from a
-threshold of them:
-
-```sh
-mycellium guardian-split --shares 3 --threshold 2      # hand one share to each guardian
-# ...later, on a new device, with any 2 of the 3 shares:
-mycellium guardian-recover --share <s1> --share <s2>   # restores and re-encrypts the identity
-```
-
-No single guardian can impersonate you; any two together can restore you.
+There is no seed phrase to lose. If you still have a device, add more by
+[pairing](#multiple-devices). If you lose every device, recover through the
+directory's **email verification**: prove control of a registered email and
+re-bind your handle. (Trade-off: an email rebind points your handle at a **new**
+wallet, so peers re-verify your safety number — see [`docs/SECURITY.md`](docs/SECURITY.md).)
 
 What happens under the hood: Alice looks up Bob's **self-signed record**, opens a
 **direct TCP line**, both sides **verify each other's records**, run **X3DH** to
@@ -339,26 +338,27 @@ the directory can neither read nor forge.
 
 ## Status
 
-Feature-complete for its scope, ~129 workspace tests (unit, real-binary e2e,
+Feature-complete for its scope, ~160 workspace tests (unit, real-binary e2e,
 fuzz/robustness, randomized model) plus ten real-browser suites, clippy-clean,
 `no_std` core. See [`docs/PRODUCTION-READINESS.md`](docs/PRODUCTION-READINESS.md)
 for the path to a public launch.
 
-**Done:** identity from a 24-word seed → BIP-44 wallet + device + messaging keys;
-the untrusted signed directory (permanent handles, anti-rollback, rate-limited
-mailbox, presence); X3DH + Double Ratchet E2E; group sender keys (create / send /
-add / remove / leave / info / history with re-keying); 1:1 chat over **TCP** and
-**libp2p** (full-duplex, line or `--tui`); **live push delivery** with mailbox
-fallback (`serve`); typed messages (reply, react, file, edit, delete, forward,
-broadcast); disappearing messages; encrypted history with search / conversations
-/ clear; contacts with TOFU pinning; out-of-band safety numbers (`verify`); block
-list; drafts; encrypted-at-rest seed (Argon2id + ChaCha20-Poly1305); export /
-import backup; `wipe`; and **social recovery** (`guardian-split` / `-recover`).
+**Done:** seedless identity — a random secp256k1 wallet + per-device + messaging
+keys, no seed phrase (email-verified recovery); the untrusted signed directory
+(permanent handles, anti-rollback, rate-limited mailbox, presence); X3DH + Double
+Ratchet E2E; group sender keys (create / send / add / self-leave / info / history
+with re-keying); 1:1 chat over **TCP** and **libp2p** (full-duplex, line or
+`--tui`); **live push delivery** with mailbox fallback (`serve`); typed messages
+(reply, react, file, edit, delete, forward, broadcast); disappearing messages;
+encrypted history with search / conversations / clear; contacts with TOFU pinning;
+out-of-band safety numbers (`verify`); block list; drafts; encrypted-at-rest
+account key (Argon2id + ChaCha20-Poly1305); export / import backup; and `wipe`.
 
-**Multi-device** (Layer 11) is implemented: an account runs on many devices,
-each with its own keys, wallet-signed into one record. `link-device` adds a
-device with just the seed; a message fans out per recipient device and mirrors
-to your own devices; groups fan out to each member's devices.
+**Multi-device** (Layer 11) is implemented: an account runs on many devices, each
+with its own keys, wallet-signed into one record. A new device **pairs** in over
+an authenticated, single-use channel (`pair` / `pair-approve` — the account key
+never rides in a copyable payload); a message fans out per recipient device and
+mirrors to your own devices; groups fan out to each member's devices.
 
 **Browser build** (Layer 11.1): the same engine runs as WebAssembly in an
 installable PWA ([`clients/web`](clients/web)) — 1:1 + groups, attachments,

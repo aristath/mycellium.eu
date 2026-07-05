@@ -11,7 +11,7 @@ Defines the Mycellium protocol as pure logic: how a seed becomes a wallet + devi
 ## Public API
 
 **Identity** (`identity`)
-- `Identity` — the local secret: 24-word mnemonic + device seed → wallet (secp256k1), device (Ed25519), and messaging (X25519) keys. `generate`, `from_phrase`, `restore`; `sign`, `wallet_public`, `device_public`, `messaging_public`, `signed_pre_key_public`, `storage_key`; `mnemonic` / `device_seed` (the two secrets to back up or transfer to a new device), `device_secret` (Ed25519 seed for the libp2p keypair), and `peer_id`. No `Debug`/`Clone`; zeroizes on drop.
+- `Identity` — the local secret: a random `wallet_secret` (secp256k1) + device seed → wallet, device (Ed25519), and messaging (X25519) keys. **No seed phrase.** `generate` (fresh account), `adopt` (an existing account key onto a new device, via pairing), `from_wallet_secret` (reload from persisted secrets); `sign`, `wallet_public`, `device_public`, `messaging_public`, `signed_pre_key_public`, `storage_key`; `wallet_secret` / `device_seed` (the two secrets to persist encrypted or transfer over pairing), `device_secret` (Ed25519 seed for the libp2p keypair), and `peer_id`. No `Debug`/`Clone`; zeroizes on drop.
 - `Handle` — a validated lowercase `[a-z0-9_]` public name (≤ 32 bytes).
 - `WalletPublicKey` / `DevicePublicKey` / `MessagingPublicKey` / `PeerId` / `Signature` — the public key and signature types.
 
@@ -33,8 +33,8 @@ Defines the Mycellium protocol as pure logic: how a seed becomes a wallet + devi
 - `AppMessage` / `Body` — the structured plaintext (text, reply, reaction, receipt, file, edit, delete); `encode`/`decode`, `is_expired`, `summary`.
 - `safety::safety_number` — the out-of-band verification code over a pair of wallet identity keys; inputs are sorted, so both sides compute the same number regardless of who asks.
 
-**Recovery** (`shamir`)
-- `shamir::split` / `shamir::combine` / `Share` — Shamir secret sharing over GF(2^8) for social recovery of the seed.
+**Device pairing** (`pairing`)
+- `pairing` — seedless device pairing: an ephemeral-ECDH, in-person-QR-authenticated channel that transfers the account key to a new device (`PairingResponder`, `seal_provisioning`). Contributory (all-zero) DH outputs are rejected.
 
 **Identifiers & wire & login** (`userid`, `wire`, `login`)
 - `userid::user_id` — deterministically hash a username to the opaque `Handle` that actually travels on the wire, so a directory can resolve a name it's given without ever learning the plaintext of names it *isn't*. (An attacker who already guesses a name can confirm it — the usual hash-of-identifier caveat.)
@@ -57,4 +57,4 @@ The adapter crates (`mycellium-transport`, `mycellium-storage`) implement its po
 
 `no_std`-capable: it is `no_std` with `extern crate alloc`, and `std` is on only by default. Build for a constrained target with `--no-default-features` (turns off `std` across every crypto dependency); `std` merely adds `std::error::Error` for `Error` and the `std` features of the deps.
 
-Crypto is assembled from vetted primitives, never invented: **X3DH** and the **Signal Double Ratchet** over **X25519**; **Ed25519** device and group-signing keys; **secp256k1** (`k256`) wallet identity; **BIP-39** mnemonics with **BIP-32/44** (`m/44'/60'/0'/0/0`, external-wallet compatible) for the wallet key; **HKDF-SHA512** domain-separated derivation of device/messaging keys; **HMAC-SHA256** chain KDF and **HKDF-SHA256** root KDF; **ChaCha20-Poly1305** message AEAD; **Shamir secret sharing** (GF(2^8)) for social recovery. Secret material is held in types that `zeroize` on drop; `unsafe_code` is forbidden.
+Crypto is assembled from vetted primitives, never invented: **X3DH** and the **Signal Double Ratchet** over **X25519**; **Ed25519** device and group-signing keys; **secp256k1** (`k256`) wallet identity (a raw random key, no BIP-39 seed / BIP-32 derivation); **HKDF-SHA512** domain-separated derivation of device/messaging keys; **HMAC-SHA256** chain KDF and **HKDF-SHA256** root KDF; **ChaCha20-Poly1305** message AEAD; and an ephemeral-**X25519**-ECDH pairing channel for seedless device onboarding. Secret material is held in types that `zeroize` on drop; `unsafe_code` is forbidden.

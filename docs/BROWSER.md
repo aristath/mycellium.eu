@@ -75,23 +75,29 @@ with an AES-GCM key kept non-extractable in IndexedDB (transparent — no passph
 prompt); see [`SECURITY.md`](SECURITY.md) for the residual limitation. "Reset this device" in Settings deletes the IndexedDB database +
 `localStorage` and reloads.
 
-## Multi-device: QR and link
+## Multi-device: seedless pairing
 
-A second device **adopts** the account rather than sharing a key:
+A second device **adopts** the account over an authenticated, one-time channel —
+the account key never rides in a copyable payload:
 
-1. Device A → Settings → *Link another device* calls `link_payload(...)`, which
-   returns base64 JSON **containing the seed phrase** plus the dir/queue/handle/name.
-2. The app renders it two ways: a `qr_svg(url)` **QR code** and a copyable
-   `…/#link=<payload>` **URL**.
-3. Device B scans the QR with its camera (opening the URL) or pastes the link. On
-   load the app sees `#link=`, calls `link_device(payload)` → a **new device key on
-   the same seed**, which it merges into the directory record (looks up the current
-   record, appends its device, re-signs, publishes).
+1. The **new** device chooses *Join an existing account*; the app calls
+   `pair_offer(queue)`, which mints an ephemeral X25519 keypair and returns a
+   one-time **offer** (a rendezvous id + its public key). The app renders it as a
+   `qr_svg(offer)` QR and a copyable code, then polls `pair_poll(queue)`.
+2. The **existing** device (Settings → *Approve a device*) pastes/scans the offer
+   and calls `pair_approve(offer, handle, dir)`, which **seals the account key** to
+   the offer's ephemeral key over ECDH and relays it through a short-lived queue
+   rendezvous.
+3. `pair_poll` on the new device decrypts it (only the scanner can), adopts the
+   account with **fresh device keys**, and merges itself into the directory record
+   (looks up the current record, appends its device, re-signs, publishes).
 4. A message to the account now fans out to *both* device slots; each device
    decrypts its own copy. (Verified by `wasm-multidevice.test.mjs`.)
 
-**Security:** the link payload *is* the account key — anyone holding it gains full
-read/write. The UI shows it only in this flow, with a warning, and never logs it.
+**Security:** the offer's ephemeral public key is authenticated by the existing
+device *scanning it* (out of band), so a malicious rendezvous can't substitute it;
+the offer is single-use and worthless after pairing, and only ciphertext sealed to
+that key is ever relayed. No seed phrase, and nothing reusable is left behind.
 
 ## Web Push (waking a closed app)
 

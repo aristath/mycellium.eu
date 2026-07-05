@@ -54,9 +54,10 @@ Multi-device & push:
 
 | Method | Purpose |
 | ------ | ------- |
-| `link_payload(dir, queue, handle, name)` | A base64 device-link payload **carrying the account seed** — shown only for QR/link to your own second device. |
-| `qr_svg(text)` | Render `text` (the link URL) as a scannable QR (SVG). |
-| `link_device(payload)` | Adopt an account: same seed → same wallet, a fresh device key, merged into the directory record. |
+| `pair_offer(queue)` | On a **new** device: mint an ephemeral key + return a one-time pairing offer (show as QR/code), then poll. |
+| `qr_svg(text)` | Render `text` (the pairing offer) as a scannable QR (SVG). |
+| `pair_approve(offer, handle, dir)` | On an **existing** device: seal the account key to the offer and relay it via the queue rendezvous. |
+| `pair_poll(queue)` | On the new device: adopt the account once approved; returns `{dir,queue,handle,name}` or `undefined`. |
 | `push_key(queue)` / `push_subscribe(queue, endpoint)` | Fetch the VAPID key / register a Web Push endpoint. |
 
 Free functions (`version`, `user_id`, `generate_wallet`, `directory_login`) and
@@ -72,15 +73,14 @@ the full browser architecture and `clients/web/README.md` for the app.
 
 ## Notes
 
-- **The link payload is the account key.** `link_payload` embeds the seed phrase so a
-  second device can adopt the account; anyone who obtains it gains full read/write.
-  The UI shows it only in the device-link flow, with a warning — never log it. The
-  payload carries a 10-minute expiry (`LINK_TTL`) that `link_device` enforces, so a
-  stale link/QR can't add a device later — but note this bounds the *flow* only, not
-  the seed inside it. The complete fix (a pairing protocol that transfers an
-  ephemeral secret instead of the seed) is tracked as a follow-up.
+- **Seedless pairing, no copyable secret.** A new device runs `pair_offer(queue)`
+  (mints an ephemeral key, returns a one-time offer); an existing device runs
+  `pair_approve(offer, handle, dir)` (seals the account key to the offer over ECDH,
+  relays it via a queue rendezvous); the new device `pair_poll(queue)`s, decrypts,
+  and adopts the account with fresh device keys. The account key never rides in a
+  transferable payload, and the offer is single-use — see `mycellium_core::pairing`.
 - **`register` merges the device list.** Renaming/re-registering looks up the current
-  record and re-appends this device, so it never drops a sibling a prior `link_device`
+  record and re-appends this device, so it never drops a sibling a prior pairing
   added (`publish_merged`).
 - **`sync` does network inline.** Processing a `GroupInvite` performs directory
   look-ups and queue deposits within the sync call; a slow peer slows that sync.

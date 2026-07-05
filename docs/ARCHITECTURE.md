@@ -9,8 +9,8 @@ detailed API; this document is the map that ties them together.
 ## What Mycellium is
 
 A peer-to-peer, end-to-end-encrypted messenger with no central server in the
-path of a conversation. Your identity is a **wallet** (a seed phrase you own);
-messages travel **device→device**; the only shared infrastructure is a thin,
+path of a conversation. Your identity is a **wallet key** you hold (no seed
+phrase); messages travel **device→device**; the only shared infrastructure is a thin,
 untrusted **directory** (names → signed records) and, optionally, a **queue**
 (per-recipient store-and-forward) that only ever holds ciphertext.
 
@@ -18,8 +18,9 @@ Three properties drive every decision:
 
 - **No trusted middle.** Shared services can withhold data but can never read or
   forge it. Every record is wallet-signed; every message is E2E-encrypted.
-- **Self-sovereign.** Your seed phrase *is* your account. Devices, names, and
-  reachability all derive from keys you hold — nothing is issued to you.
+- **Self-sovereign.** Your wallet key *is* your account (held encrypted, never a
+  copyable seed). Devices, names, and reachability all derive from keys you hold —
+  nothing is issued to you.
 - **Portable.** The protocol core is `no_std` and depends only on traits, so the
   same code runs from a microcontroller to a desktop to a **browser via WASM** —
   the native CLI and the browser PWA are two shells over one engine.
@@ -104,10 +105,11 @@ is set, and share `mycellium-observe` for metrics and logs.
 
 ## Core concepts
 
-**Identity.** A 24-word BIP-39 seed derives the **wallet** (secp256k1, the root
-identity that signs) and, per device, a random-but-persisted set of **device
-keys** (Ed25519 for transport identity, X25519 for messaging). The seed is the
-authority; devices add themselves to the account rather than sharing keys.
+**Identity.** A random **wallet** key (secp256k1, the root identity that signs) —
+no seed phrase — plus, per device, a random-but-persisted set of **device keys**
+(Ed25519 for transport identity, X25519 for messaging). The wallet is the
+authority; a new device **pairs** in (the account key moves over an authenticated
+one-time channel) and adds itself to the account rather than sharing message keys.
 
 **Device cluster.** An account is a *set* of devices. Each carries its own
 messaging keys; the wallet's single signature over the record vouches for the

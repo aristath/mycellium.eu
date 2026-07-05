@@ -18,10 +18,11 @@ rendering. No protocol logic lives here; every command dispatches straight into
 
 | Command | Does |
 |---------|------|
-| `identity-new` | Create a new 24-word-seed identity, stored locally. |
+| `identity-new` | Create a new identity (random wallet key, no seed phrase), stored locally. |
 | `identity-show` | Show this device's public identity. |
 | `register <handle> --addr <a> [--libp2p]` | Claim a handle and publish your signed record. |
-| `link-device <handle> --addr <a> [--libp2p]` | Adopt an existing account on a fresh device (reads `MYCELLIUM_PHRASE` or stdin). |
+| `pair <handle> --addr <a> --queue <url> [--libp2p]` | On a **fresh** device: print a one-time pairing offer and adopt the account once approved. |
+| `pair-approve <offer> --as <handle>` | On an **existing** device: approve a new device's offer (seals the account key to it). |
 | `devices <handle>` | List the devices in an account's cluster. |
 | `revoke-device <handle> <device_id>` | Remove a device from your cluster. |
 
@@ -69,10 +70,12 @@ rendering. No protocol logic lives here; every command dispatches straight into
 
 | Command | Does |
 |---------|------|
-| `guardian-split --shares <n> --threshold <t>` | Split your identity into t-of-n social-recovery shares. |
-| `guardian-recover --share <s> …` | Recover an identity on a new device from guardian shares. |
 | `export <path>` / `import <path>` | Back up / restore identity + local data. |
 | `wipe --yes` | Erase ALL local data. Irreversible. |
+
+Account recovery after losing every device is via the directory's **email
+verification** (re-bind your handle to a new wallet), not a seed phrase or
+guardian shares — see [`docs/SECURITY.md`](../../docs/SECURITY.md).
 
 **Notes**
 
@@ -80,15 +83,15 @@ rendering. No protocol logic lives here; every command dispatches straight into
   (default `http://127.0.0.1:8080`); the tables omit it per row.
 - `chat`/`listen` render a line-mode session by default; pass `--tui` for the
   full-screen ratatui UI.
-- `register`, `link-device`, `listen`, and `chat` accept `--libp2p` to advertise
+- `register`, `pair`, `listen`, and `chat` accept `--libp2p` to advertise
   (or dial) a libp2p multiaddr carrying a PeerId instead of a raw host:port.
 - Contacts are **TOFU-pinned**: `contact add` binds the nickname to the peer's
   current identity on first add, and re-adding a nickname bound to a different
   identity is refused.
-- **Backup & recovery** are two independent paths: `export`/`import` move a
-  portable, encrypted backup bundle between machines, while
-  `guardian-split`/`guardian-recover` reconstruct the seed from a Shamir t-of-n
-  set of social-recovery shares.
+- Adding a device uses **pairing** (`pair` on the new device, `pair-approve` on
+  an existing one): the account key moves over an authenticated, single-use
+  channel, never as a copyable seed. `export`/`import` move a portable, encrypted
+  backup bundle between machines.
 
 **Environment variables**
 
