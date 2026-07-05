@@ -33,8 +33,8 @@ use mycellium_storage::filestore::FileStore;
 
 use crate::secrets::{PlaintextFileSecretStore, SecretStore};
 use crate::types::{
-    Account, Contact, Conversation, DeliveryState, EventListener, Group, Message, SdkError,
-    TrustLevel,
+    Account, Contact, Conversation, DeliveryState, EmailVerification, EventListener, Group,
+    Message, SdkError, TrustLevel,
 };
 
 /// Maximum inline attachment size, matching the engine/wasm cap. Attachments
@@ -43,8 +43,9 @@ const MAX_ATTACHMENT: usize = 256 * 1024;
 
 // TODO(#64 follow-up): the C-ABI desktop surface (a `cdylib`/`staticlib` shim
 // for desktop clients) and smoke tests that load the *generated* Kotlin/Swift
-// bindings. The Rust messaging/contacts/verification/pairing/groups/backup
-// surface below is complete and covered by `tests/sdk.rs`.
+// bindings. The Rust messaging/contacts/verification/pairing/groups/backup and
+// email-verified onboarding surface below is complete and covered by
+// `tests/sdk.rs`.
 //
 // #65 is addressed: the identity secret is now held behind a `SecretStore`
 // (see `secrets.rs`), which platform apps back with the OS keystore. The
@@ -225,6 +226,63 @@ impl MyceliumClient {
             handle,
             name,
         };
+        Ok(())
+    }
+
+    /// **Onboarding step 1.** Begin an email-verified claim of `handle` for this
+    /// wallet: log into `dir_url` with this identity, then ask the directory to
+    /// start a verification for `email`. Returns an [`EmailVerification`] carrying
+    /// the `pending` token to complete the flow, and a `dev_code` **only** when the
+    /// directory runs in dev mode (no SMTP) — in production the code is emailed and
+    /// `dev_code` is `None`.
+    ///
+    /// Intended onboarding order:
+    /// [`start_email_verification`](Self::start_email_verification) → user enters
+    /// the code they were emailed →
+    /// [`confirm_email_verification`](Self::confirm_email_verification) →
+    /// [`register`](Self::register) (publish the record). This is also the
+    /// account-recovery path: confirming re-binds the handle to this wallet.
+    pub fn start_email_verification(
+        &self,
+        dir_url: String,
+        handle: String,
+        email: String,
+    ) -> Result<EmailVerification, SdkError> {
+        if handle.trim().is_empty() {
+            return Err(SdkError::invalid("handle must not be empty"));
+        }
+        if email.trim().is_empty() {
+            return Err(SdkError::invalid("email must not be empty"));
+        }
+        let inner = self.lock();
+        let dir = DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport));
+        let token = dir.login(&inner.identity).map_err(SdkError::network)?;
+        let (pending, dev_code) = dir
+            .auth_start(&token, &handle, &email)
+            .map_err(SdkError::network)?;
+        Ok(EmailVerification { pending, dev_code })
+    }
+
+    /// **Onboarding step 2.** Confirm the emailed (or dev-mode) `code` for the
+    /// `pending` claim returned by
+    /// [`start_email_verification`](Self::start_email_verification). On success the
+    /// directory binds (or re-binds, for recovery) the handle to this wallet; the
+    /// caller then proceeds to [`register`](Self::register) to publish the record.
+    pub fn confirm_email_verification(
+        &self,
+        dir_url: String,
+        pending: String,
+        code: String,
+    ) -> Result<(), SdkError> {
+        if pending.trim().is_empty() {
+            return Err(SdkError::invalid("pending token must not be empty"));
+        }
+        if code.trim().is_empty() {
+            return Err(SdkError::invalid("code must not be empty"));
+        }
+        let dir = DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport));
+        dir.auth_confirm(&pending, &code)
+            .map_err(SdkError::network)?;
         Ok(())
     }
 

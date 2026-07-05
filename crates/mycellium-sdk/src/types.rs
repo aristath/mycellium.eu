@@ -99,6 +99,20 @@ pub struct Group {
     pub members: Vec<String>,
 }
 
+/// The handle-off from [`start_email_verification`](crate::MyceliumClient::start_email_verification):
+/// a `pending` token to carry into `confirm_email_verification`, plus a `dev_code`
+/// that is present **only** when the directory runs in dev mode (no SMTP) and
+/// echoes the code back so local flows work without a real inbox. In production
+/// `dev_code` is always `None` and the code arrives by email.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EmailVerification {
+    /// The opaque pending-claim token to pass to `confirm_email_verification`.
+    pub pending: String,
+    /// The verification code, echoed only in the directory's dev mode; `None`
+    /// otherwise (the user reads it from their email).
+    pub dev_code: Option<String>,
+}
+
 /// This device's own account, for the profile/settings screen.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Account {

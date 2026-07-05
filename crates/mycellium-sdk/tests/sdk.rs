@@ -357,6 +357,56 @@ fn reply_and_react_round_trip() {
     assert!(got2[0].text.contains("👍"));
 }
 
+#[test]
+fn email_verified_registration() {
+    // The in-process directory runs with MYCELLIUM_DEV_AUTH=1 (set by
+    // start_directory), so auth_start echoes the code back as dev_code — the
+    // local flow needs no real inbox.
+    let dir = start_directory();
+    let queue = ensure_queue();
+
+    let dave =
+        MyceliumClient::new(data_dir("dave").to_string_lossy().into_owned()).expect("open dave");
+
+    // Step 1: start the email-verified claim. Dev mode returns both a pending
+    // token and the code.
+    let verification = dave
+        .start_email_verification(dir.clone(), "dave".into(), "dave@example.com".into())
+        .expect("start email verification");
+    assert!(
+        !verification.pending.is_empty(),
+        "a pending token must come back"
+    );
+    let code = verification
+        .dev_code
+        .expect("dev mode must echo the verification code");
+    assert!(!code.is_empty(), "the dev code must not be empty");
+
+    // Step 2: confirm the code — the directory binds the handle to this wallet.
+    dave.confirm_email_verification(dir.clone(), verification.pending, code)
+        .expect("confirm email verification");
+
+    // Step 3: register (publish the record) now that the handle is verified.
+    dave.register(dir.clone(), queue.clone(), "dave".into(), "Dave".into())
+        .expect("dave register");
+
+    // The published record is looked-up-able: a peer can find and message dave.
+    let eve =
+        MyceliumClient::new(data_dir("eve").to_string_lossy().into_owned()).expect("open eve");
+    eve.register(dir.clone(), queue.clone(), "eve".into(), "Eve".into())
+        .expect("eve register");
+    eve.add_contact("davey".into(), "dave".into())
+        .expect("eve resolves dave's published record");
+
+    // And a message round-trips end-to-end to the verified account.
+    eve.send_text("dave".into(), "welcome aboard".into())
+        .expect("eve send");
+    let inbound = dave.sync().expect("dave sync");
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].text, "welcome aboard");
+    assert_eq!(inbound[0].sender, "eve");
+}
+
 /// A newtype so the callback-interface `Box<dyn EventListener>` can wrap our
 /// `Arc<Recorder>` (which we also keep a handle to for assertions).
 struct RecorderHandle(Arc<Recorder>);
