@@ -63,6 +63,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # RUSTSEC-2026-0118/-0119 are hickory-proto DoS advisories reachable only
+      # through libp2p's OPTIONAL dns/mdns features, which this workspace does not
+      # enable — the crates sit in Cargo.lock but are never compiled (`cargo tree
+      # -i hickory-proto` is empty). No current libp2p release avoids listing them,
+      # so we ignore the advisories for those uncompiled deps rather than mask a
+      # real one. Any other advisory still fails the job.
+      # (Using `cargo audit` directly, not rustsec/audit-check, so no check-run API
+      # permission is needed.)
+      - name: Audit
+        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
