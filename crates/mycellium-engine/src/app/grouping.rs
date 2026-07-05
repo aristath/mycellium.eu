@@ -227,8 +227,10 @@ pub fn handle_group_text(
     let mut stored = match groups::load(fs, group_id)? {
         Some(stored) => stored,
         None => {
-            eprintln!("(group message for an unknown group)");
-            return Ok(());
+            // We don't have this group yet (its invite/sync hasn't been processed).
+            // Return an error so the inbound retry store keeps the item and re-tries
+            // it once we know the group, rather than dropping it as handled.
+            bail!("group message for a group we don't have yet");
         }
     };
     // Map the device-keyed sender id back to a handle for display/block checks.
@@ -286,7 +288,9 @@ pub fn handle_group_text(
             let _ = history::group_append(fs, group_id, entry);
         }
         Err(_) => {
-            eprintln!("(a group message could not be decrypted yet — missing that sender's key)")
+            // Can't decrypt yet — we're missing this sender's key (their invite
+            // hasn't arrived). Keep the item for retry rather than dropping it.
+            bail!("group message not decryptable yet — missing that sender's key");
         }
     }
     Ok(())
@@ -684,4 +688,27 @@ pub fn resolve_group(fs: &FileStore, key: &str) -> Result<StoredGroup> {
         }
     }
     bail!("no such group '{key}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_text_for_unknown_group_is_kept_for_retry() {
+        // A group message that arrives before we have the group must NOT be
+        // treated as handled — it returns an error so the inbound retry store
+        // keeps it and re-tries once the group's invite/sync arrives (issue #46).
+        let dir = std::env::temp_dir().join(format!("myc-gt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut fs = FileStore::open(dir.join("h"), [9u8; 32]).unwrap();
+        let msg = GroupMessage {
+            sender: vec![1],
+            iteration: 0,
+            ciphertext: vec![2, 3],
+            signature: vec![4; 64],
+        };
+        assert!(handle_group_text(&[], &mut fs, "no-such-group", &msg).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
