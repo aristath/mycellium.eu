@@ -147,15 +147,6 @@ fn field(stdout: &[u8], label: &str) -> String {
         .to_string()
 }
 
-/// The guardian share hex strings printed by `guardian-split`.
-fn shares(stdout: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .filter(|l| l.trim_start().starts_with("share "))
-        .filter_map(|l| l.split_whitespace().last().map(str::to_string))
-        .collect()
-}
-
 /// The safety-number value from a chat/listen output line.
 fn safety_number(stdout: &str) -> String {
     stdout
@@ -286,6 +277,54 @@ fn read_pair_offer(child: &mut std::process::Child) -> String {
     offer.expect("`pair` did not print an offer")
 }
 
+/// Pair a fresh device into `handle`'s account (approved from the `existing`
+/// device) and return the new device's home — the seedless replacement for the
+/// old `link-device` setup in multi-device tests.
+fn pair_device(existing: &PathBuf, handle: &str, tag: &str, dir: &str) -> PathBuf {
+    let queue = QUEUE_URL.get().expect("queue up").clone();
+    let new_home = home(tag);
+    let addr = format!("127.0.0.1:{}", free_port());
+    let mut pair = Command::new(CLI)
+        .args([
+            "pair",
+            handle,
+            "--addr",
+            &addr,
+            "--queue",
+            &queue,
+            "--directory",
+            dir,
+        ])
+        .env("MYCELLIUM_HOME", &new_home)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_QUEUE", &queue)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pair");
+    let offer = read_pair_offer(&mut pair);
+    ok(
+        &cli(
+            existing,
+            &["pair-approve", &offer, "--as", handle, "--directory", dir],
+        ),
+        "pair-approve",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = pair.try_wait().expect("try_wait") {
+            assert!(status.success(), "pair-into-{tag} did not succeed");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = pair.kill();
+            panic!("pair-into-{tag} did not complete");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    new_home
+}
+
 #[test]
 fn pairing_joins_a_second_device() {
     let _throttle = throttle();
@@ -359,20 +398,13 @@ fn pairing_joins_a_second_device() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn revoked_device_stops_receiving() {
     let _throttle = throttle();
     let dir = start_directory();
     let john = account(&dir, "john");
 
     let mary_a = home("rev-a");
-    let created = cli(&mary_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&mary_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &mary_a,
@@ -387,32 +419,16 @@ fn revoked_device_stops_receiving() {
         ),
         "register",
     );
-    let mary_b = home("rev-b");
-    ok(
-        &Command::new(CLI)
-            .args([
-                "link-device",
-                "mary",
-                "--addr",
-                "127.0.0.1:6402",
-                "--directory",
-                &dir,
-            ])
-            .env("MYCELLIUM_HOME", &mary_b)
-            .env("MYCELLIUM_PASSPHRASE", PASS)
-            .env("MYCELLIUM_PHRASE", &phrase)
-            .stdin(Stdio::null())
-            .output()
-            .expect("link-device"),
-        "link-device",
-    );
+    let mary_b = pair_device(&mary_a, "mary", "rev-b", &dir);
 
-    // Revoke device B (by short id).
+    // Revoke device B (by short id) — it's the listed device that ISN'T device A
+    // (A registered at :6401; B paired in on a random port).
     let devs = cli(&mary_a, &["devices", "mary", "--directory", &dir]);
     let text = String::from_utf8_lossy(&devs.stdout);
     let b_id = text
         .lines()
-        .find(|l| l.contains("6402"))
+        .filter(|l| l.starts_with("  "))
+        .find(|l| !l.contains("6401"))
         .and_then(|l| l.split_whitespace().next())
         .expect("device B id")
         .to_string();
@@ -456,7 +472,6 @@ fn revoked_device_stops_receiving() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn read_receipt_reaches_sender_cluster() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -464,13 +479,7 @@ fn read_receipt_reaches_sender_cluster() {
 
     // Mary: device A registers, device B links.
     let mary_a = home("rcpt-a");
-    let created = cli(&mary_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&mary_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &mary_a,
@@ -485,25 +494,7 @@ fn read_receipt_reaches_sender_cluster() {
         ),
         "register",
     );
-    let mary_b = home("rcpt-b");
-    ok(
-        &Command::new(CLI)
-            .args([
-                "link-device",
-                "mary",
-                "--addr",
-                "127.0.0.1:6302",
-                "--directory",
-                &dir,
-            ])
-            .env("MYCELLIUM_HOME", &mary_b)
-            .env("MYCELLIUM_PASSPHRASE", PASS)
-            .env("MYCELLIUM_PHRASE", &phrase)
-            .stdin(Stdio::null())
-            .output()
-            .expect("link-device"),
-        "link-device",
-    );
+    let _mary_b = pair_device(&mary_a, "mary", "rcpt-b", &dir);
 
     // Mary sends from device A; John reads it, returning a receipt to the cluster.
     ok(
@@ -537,20 +528,13 @@ fn read_receipt_reaches_sender_cluster() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn bootstrapped_device_can_send_to_group() {
     let _throttle = throttle();
     let dir = start_directory();
     let alice = account(&dir, "alice");
 
     let mary_a = home("gsend-a");
-    let created = cli(&mary_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&mary_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &mary_a,
@@ -591,25 +575,7 @@ fn bootstrapped_device_can_send_to_group() {
         "alice mesh",
     );
 
-    let mary_b = home("gsend-b");
-    ok(
-        &Command::new(CLI)
-            .args([
-                "link-device",
-                "mary",
-                "--addr",
-                "127.0.0.1:6602",
-                "--directory",
-                &dir,
-            ])
-            .env("MYCELLIUM_HOME", &mary_b)
-            .env("MYCELLIUM_PASSPHRASE", PASS)
-            .env("MYCELLIUM_PHRASE", &phrase)
-            .stdin(Stdio::null())
-            .output()
-            .expect("link-device"),
-        "link-device",
-    );
+    let mary_b = pair_device(&mary_a, "mary", "gsend-b", &dir);
 
     // Sync groups to B; B bootstraps and announces its own key to the members.
     ok(
@@ -665,7 +631,6 @@ fn bootstrapped_device_can_send_to_group() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn new_device_bootstraps_into_group() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -673,13 +638,7 @@ fn new_device_bootstraps_into_group() {
 
     // Mary device A creates her account and joins Alice's group.
     let mary_a = home("gsync-a");
-    let created = cli(&mary_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&mary_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &mary_a,
@@ -721,25 +680,7 @@ fn new_device_bootstraps_into_group() {
     );
 
     // Link device B *after* the group exists — it has no group state yet.
-    let mary_b = home("gsync-b");
-    ok(
-        &Command::new(CLI)
-            .args([
-                "link-device",
-                "mary",
-                "--addr",
-                "127.0.0.1:6502",
-                "--directory",
-                &dir,
-            ])
-            .env("MYCELLIUM_HOME", &mary_b)
-            .env("MYCELLIUM_PASSPHRASE", PASS)
-            .env("MYCELLIUM_PHRASE", &phrase)
-            .stdin(Stdio::null())
-            .output()
-            .expect("link-device"),
-        "link-device",
-    );
+    let mary_b = pair_device(&mary_a, "mary", "gsync-b", &dir);
 
     // Sync groups from A to the cluster; B bootstraps into "team".
     ok(
@@ -806,7 +747,6 @@ fn new_device_bootstraps_into_group() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn group_reaches_all_member_devices() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -814,13 +754,7 @@ fn group_reaches_all_member_devices() {
 
     // Bob: device A registers, device B links.
     let bob_a = home("grp-a");
-    let created = cli(&bob_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&bob_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &bob_a,
@@ -835,25 +769,7 @@ fn group_reaches_all_member_devices() {
         ),
         "register",
     );
-    let bob_b = home("grp-b");
-    ok(
-        &Command::new(CLI)
-            .args([
-                "link-device",
-                "bob",
-                "--addr",
-                "127.0.0.1:6202",
-                "--directory",
-                &dir,
-            ])
-            .env("MYCELLIUM_HOME", &bob_b)
-            .env("MYCELLIUM_PASSPHRASE", PASS)
-            .env("MYCELLIUM_PHRASE", &phrase)
-            .stdin(Stdio::null())
-            .output()
-            .expect("link-device"),
-        "link-device",
-    );
+    let bob_b = pair_device(&bob_a, "bob", "grp-b", &dir);
 
     // Alice creates the group; both Bob devices pick up the sender key.
     ok(
@@ -915,21 +831,14 @@ fn group_reaches_all_member_devices() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn sent_messages_sync_to_own_devices() {
     let _throttle = throttle();
     let dir = start_directory();
     let _john = account(&dir, "john");
 
-    // Mary: device A registers, device B links.
+    // Mary: device A registers, device B pairs in (seedless).
     let mary_a = home("sync-a");
-    let created = cli(&mary_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&mary_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &mary_a,
@@ -944,24 +853,7 @@ fn sent_messages_sync_to_own_devices() {
         ),
         "register",
     );
-
-    let mary_b = home("sync-b");
-    let linked = Command::new(CLI)
-        .args([
-            "link-device",
-            "mary",
-            "--addr",
-            "127.0.0.1:6102",
-            "--directory",
-            &dir,
-        ])
-        .env("MYCELLIUM_HOME", &mary_b)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_PHRASE", &phrase)
-        .stdin(Stdio::null())
-        .output()
-        .expect("link-device");
-    ok(&linked, "link-device");
+    let mary_b = pair_device(&mary_a, "mary", "sync-b", &dir);
 
     // Mary sends to John from device A.
     ok(
@@ -997,7 +889,6 @@ fn sent_messages_sync_to_own_devices() {
 }
 
 #[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn message_reaches_all_recipient_devices() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -1005,13 +896,7 @@ fn message_reaches_all_recipient_devices() {
 
     // Mary: device A registers the account, device B links to it.
     let mary_a = home("mary-a");
-    let created = cli(&mary_a, &["identity-new"]);
-    ok(&created, "mary identity-new");
-    let phrase = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("mnemonic");
+    ok(&cli(&mary_a, &["identity-new"]), "identity-new");
     ok(
         &cli(
             &mary_a,
@@ -1026,24 +911,7 @@ fn message_reaches_all_recipient_devices() {
         ),
         "register",
     );
-
-    let mary_b = home("mary-b");
-    let linked = Command::new(CLI)
-        .args([
-            "link-device",
-            "mary",
-            "--addr",
-            "127.0.0.1:6002",
-            "--directory",
-            &dir,
-        ])
-        .env("MYCELLIUM_HOME", &mary_b)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_PHRASE", &phrase)
-        .stdin(Stdio::null())
-        .output()
-        .expect("link-device");
-    ok(&linked, "link-device");
+    let mary_b = pair_device(&mary_a, "mary", "mary-b", &dir);
 
     // John sends once to "mary" — his client fans out to her whole cluster.
     ok(
@@ -1075,98 +943,6 @@ fn message_reaches_all_recipient_devices() {
         String::from_utf8_lossy(&b.stdout).contains("hi cluster"),
         "device B missed it: {}",
         String::from_utf8_lossy(&b.stdout)
-    );
-}
-
-#[test]
-#[ignore = "multi-device e2e pending the pairing flow (#6)"]
-fn link_device_joins_and_revoke_removes() {
-    let _throttle = throttle();
-    let dir = start_directory();
-
-    // Device A: create the account and register it.
-    let dev_a = home("dev-a");
-    let created = cli(&dev_a, &["identity-new"]);
-    ok(&created, "identity-new");
-    let mnemonic = String::from_utf8_lossy(&created.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| l.split_whitespace().count() == 24)
-        .expect("24-word mnemonic in output");
-    ok(
-        &cli(
-            &dev_a,
-            &[
-                "register",
-                "ari",
-                "--addr",
-                "127.0.0.1:5551",
-                "--directory",
-                &dir,
-            ],
-        ),
-        "register",
-    );
-
-    // Device B (fresh home): link to the same account via the seed phrase.
-    let dev_b = home("dev-b");
-    let linked = Command::new(CLI)
-        .args([
-            "link-device",
-            "ari",
-            "--addr",
-            "127.0.0.1:5552",
-            "--directory",
-            &dir,
-        ])
-        .env("MYCELLIUM_HOME", &dev_b)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_PHRASE", &mnemonic)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run link-device");
-    ok(&linked, "link-device");
-
-    // The cluster now has both devices.
-    let devs = cli(&dev_a, &["devices", "ari", "--directory", &dir]);
-    let text = String::from_utf8_lossy(&devs.stdout);
-    assert!(
-        text.contains("5551") && text.contains("5552"),
-        "both devices should be listed: {text}"
-    );
-
-    // `identity-show` on device B reports a device-id that appears in the list.
-    let b_show = cli(&dev_b, &["identity-show"]);
-    let b_show_out = String::from_utf8_lossy(&b_show.stdout);
-    let b_self_id = b_show_out
-        .lines()
-        .find(|l| l.trim_start().starts_with("device-id:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .expect("device-id line");
-    assert!(
-        text.contains(b_self_id),
-        "device B's own id not in the listing: {b_self_id}"
-    );
-
-    // Revoke device B (by its short id) and confirm it's gone.
-    let b_id = text
-        .lines()
-        .find(|l| l.contains("5552"))
-        .and_then(|l| l.split_whitespace().next())
-        .expect("device B id")
-        .to_string();
-    ok(
-        &cli(
-            &dev_a,
-            &["revoke-device", "ari", &b_id, "--directory", &dir],
-        ),
-        "revoke-device",
-    );
-    let after = cli(&dev_a, &["devices", "ari", "--directory", &dir]);
-    let after = String::from_utf8_lossy(&after.stdout);
-    assert!(
-        after.contains("5551") && !after.contains("5552"),
-        "B should be revoked: {after}"
     );
 }
 
@@ -2559,50 +2335,6 @@ fn handle_squatting_is_rejected() {
     assert!(
         !out.status.success(),
         "squatting a taken handle must be rejected"
-    );
-}
-
-#[test]
-#[ignore = "guardian/seed recovery removed; email recovery is the model (#6)"]
-fn social_recovery_round_trip() {
-    let _throttle = throttle();
-    // Create an identity and note its wallet.
-    let orig = home("orig");
-    ok(&cli(&orig, &["identity-new"]), "identity-new");
-    let original_wallet = field(&cli(&orig, &["identity-show"]).stdout, "wallet:");
-
-    // Split 2-of-3 and recover on a fresh device from two shares under a NEW passphrase.
-    let split = cli(
-        &orig,
-        &["guardian-split", "--shares", "3", "--threshold", "2"],
-    );
-    ok(&split, "guardian-split");
-    let parts = shares(&split.stdout);
-    assert_eq!(parts.len(), 3, "expected 3 shares");
-
-    let recovered = home("recovered");
-    ok(
-        &cli_pass(
-            &recovered,
-            "new-passphrase",
-            &[
-                "guardian-recover",
-                "--share",
-                &parts[0],
-                "--share",
-                &parts[2],
-            ],
-        ),
-        "guardian-recover",
-    );
-
-    let recovered_wallet = field(
-        &cli_pass(&recovered, "new-passphrase", &["identity-show"]).stdout,
-        "wallet:",
-    );
-    assert_eq!(
-        original_wallet, recovered_wallet,
-        "recovered identity must match the original"
     );
 }
 
