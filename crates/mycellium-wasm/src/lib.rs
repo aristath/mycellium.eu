@@ -341,31 +341,54 @@ impl Session {
         let my_slot = wireops::device_slot(&self.identity.device_public());
         let mut blobs = queue.collect(&qtoken, &my_hex, &my_slot).unwrap_or_default();
         blobs.extend(queue.collect(&qtoken, &my_hex, "account").unwrap_or_default());
-        let mut received = 0u32;
+
+        // Collecting drained these from the queue. Merge them with anything still
+        // pending from a prior sync, then process; keep only failures for retry
+        // (e.g. a group message that arrived before its sender key). Bounded by
+        // attempts/TTL so a permanently-bad item dead-letters. (Mirrors the native
+        // inbound store; see docs / issue #42.)
+        let now = BrowserPlatform.now_unix_secs();
+        let mut pending = mycellium_engine::inbound::load(&self.store).unwrap_or_default();
         for blob in blobs {
-            let Ok(item) = serde_json::from_str::<MailItem>(&blob) else { continue };
-            match item {
-                MailItem::Direct(env) => {
-                    let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { continue };
-                    let Ok(app) = AppMessage::decode(&plaintext) else { continue };
-                    // Learn the sender's self-set display name (carried in their record).
-                    let _ = names::note(&mut self.store, from.as_str(), &env.sender_record.record.name);
-                    apply_to_history(&mut self.store, from.as_str(), &app, false);
-                    received += 1;
-                }
-                MailItem::GroupInvite(env) => {
-                    self.handle_group_invite(&env);
-                    received += 1;
-                }
-                MailItem::GroupText { group_id, message } => {
-                    self.handle_group_text(&group_id, &message);
-                    received += 1;
-                }
-                // GroupSync / GroupRemove / SelfSync aren't handled in the browser yet.
-                _ => {}
+            pending.push(mycellium_engine::inbound::PendingItem { blob, created_at: now, attempts: 0 });
+        }
+
+        let mut received = 0u32;
+        let mut survivors = Vec::new();
+        for mut entry in pending {
+            if entry.is_expired(now) {
+                continue; // dead-letter: give up
+            }
+            if self.process_blob(&entry.blob) {
+                received += 1;
+            } else {
+                entry.attempts += 1;
+                survivors.push(entry);
             }
         }
+        let _ = mycellium_engine::inbound::save(&mut self.store, &survivors);
         Ok(received)
+    }
+
+    /// Process one collected blob; returns whether it was handled (false ⇒ keep
+    /// it in the retry store for a later sync — e.g. its group key hasn't arrived).
+    fn process_blob(&mut self, blob: &str) -> bool {
+        let Ok(item) = serde_json::from_str::<MailItem>(blob) else { return false };
+        match item {
+            MailItem::Direct(env) => {
+                let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { return false };
+                let Ok(app) = AppMessage::decode(&plaintext) else { return false };
+                // Learn the sender's self-set display name (carried in their record).
+                let _ = names::note(&mut self.store, from.as_str(), &env.sender_record.record.name);
+                apply_to_history(&mut self.store, from.as_str(), &app, false);
+                true
+            }
+            MailItem::GroupInvite(env) => self.handle_group_invite(&env),
+            MailItem::GroupText { group_id, message } => self.handle_group_text(&group_id, &message),
+            // GroupSync / GroupRemove / SelfSync aren't handled in the browser yet;
+            // treat as processed so they don't retry forever.
+            _ => true,
+        }
     }
 
     /// Create a group with `members` (a JSON array of handles) and distribute our
@@ -657,15 +680,16 @@ impl Session {
 
     /// Process a received group invite: join the group (or learn a member's key)
     /// and record the sender key so we can decrypt their messages.
-    fn handle_group_invite(&mut self, env: &Envelope) {
-        let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env) else { return };
-        let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else { return };
+    /// Returns whether the invite was processed (false ⇒ keep it for retry).
+    fn handle_group_invite(&mut self, env: &Envelope) -> bool {
+        let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env) else { return false };
+        let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else { return false };
         let sender_id = payload.sender_id.clone();
         let (dir, name, queue, mine) = (self.cfg(b"myc:dir"), self.cfg(b"myc:name"), self.cfg(b"myc:queue"), self.cfg(b"myc:handle"));
-        let Ok(me) = Handle::new(mine.clone()) else { return };
+        let Ok(me) = Handle::new(mine.clone()) else { return false };
         match groups::load(&self.store, &payload.group_id).ok().flatten() {
             Some(mut stored) => {
-                let Ok(mut group) = Group::import(stored.state.clone()) else { return };
+                let Ok(mut group) = Group::import(stored.state.clone()) else { return false };
                 let _ = group.add_member(sender_id.clone(), &payload.distribution);
                 stored.note_sender(sender_id, from.as_str());
                 // Learn any members we didn't know about, and send them our key.
@@ -697,17 +721,20 @@ impl Session {
                 let _ = self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &targets);
             }
         }
+        true
     }
 
-    /// Decrypt a received group message and store it.
-    fn handle_group_text(&mut self, group_id: &str, message: &GroupMessage) {
-        let Some(mut stored) = groups::load(&self.store, group_id).ok().flatten() else { return };
+    /// Decrypt a received group message and store it. Returns whether it was
+    /// processed (false ⇒ we don't have the group/sender key yet — keep for retry).
+    fn handle_group_text(&mut self, group_id: &str, message: &GroupMessage) -> bool {
+        let Some(mut stored) = groups::load(&self.store, group_id).ok().flatten() else { return false };
         let sender = stored
             .handle_of(&message.sender)
             .map(str::to_string)
             .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
-        let Ok(mut group) = Group::import(stored.state.clone()) else { return };
-        if let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) {
+        let Ok(mut group) = Group::import(stored.state.clone()) else { return false };
+        let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) else { return false };
+        {
             stored.state = group.export();
             let _ = groups::save(&mut self.store, &stored);
             if let Ok(app) = AppMessage::decode(&plaintext) {
@@ -732,6 +759,7 @@ impl Session {
                 }
             }
         }
+        true
     }
 }
 
