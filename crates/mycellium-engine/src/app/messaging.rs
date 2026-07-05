@@ -314,47 +314,36 @@ pub fn flush_outbox(
         return Ok((0, 0));
     }
     let now = OsPlatform.now_unix_secs();
-    let mut delivered = 0;
-    let mut remaining: Vec<outbox::OutboxEntry> = Vec::new();
-    for mut entry in entries {
+    // Deposit every entry whose delay has elapsed; not-yet-due entries are left
+    // for a later flush by `flush_pass` (never counted as an attempt). Batching
+    // is implicit: all currently-due entries go out in this one pass.
+    let (delivered, remaining) = outbox::flush_pass(entries, now, |entry| {
         let handle = match Handle::new(entry.recipient.clone()) {
             Ok(h) => h,
-            Err(_) => continue, // unparseable recipient — drop it
+            Err(_) => return outbox::Attempt::Drop, // unparseable recipient — drop it
         };
         // Re-resolve the recipient's current record (queue/devices may have moved).
         let record = match client.lookup(&handle) {
-            Ok(r) if r.verify().is_ok() => Some(r),
-            _ => None,
+            Ok(r) if r.verify().is_ok() => r,
+            // Couldn't resolve/verify: bump and keep unless spent.
+            _ => return outbox::Attempt::Retry,
         };
-        let delivered_now = record.as_ref().and_then(|record| {
-            // The device this copy was sealed for; if it's gone, we drop the entry.
-            let device = record
-                .record
-                .devices
-                .iter()
-                .find(|d| device_slot(&d.device_key) == entry.slot)?;
-            let queue = QueueTarget::open(identity, &record.record);
-            Some(deliver(
-                client,
-                &handle,
-                queue.as_ref(),
-                device,
-                &entry.item,
-            ))
-        });
-        match delivered_now {
-            Some(true) => delivered += 1,
-            // The target device is gone — nothing to retry; drop the entry.
-            None if record.is_some() => {}
-            // Still undeliverable (or couldn't resolve): bump and keep unless spent.
-            _ => {
-                entry.attempts += 1;
-                if !entry.is_expired(now) {
-                    remaining.push(entry);
-                }
-            }
+        // The device this copy was sealed for; if it's gone, drop the entry.
+        let Some(device) = record
+            .record
+            .devices
+            .iter()
+            .find(|d| device_slot(&d.device_key) == entry.slot)
+        else {
+            return outbox::Attempt::Drop;
+        };
+        let queue = QueueTarget::open(identity, &record.record);
+        if deliver(client, &handle, queue.as_ref(), device, &entry.item) {
+            outbox::Attempt::Delivered
+        } else {
+            outbox::Attempt::Retry
         }
-    }
+    });
     let waiting = remaining.len();
     outbox::save(fs, &remaining)?;
     Ok((delivered, waiting))
