@@ -14,7 +14,10 @@ path = "src/lib.rs"
 mycellium-core = { path = "../mycellium-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+# tiny_http's rustls backend currently resolves to an old rustls/ring stack
+# flagged by cargo-audit; use the OpenSSL-backed TLS feature until the server
+# shell is moved to a maintained HTTPS stack or TLS is delegated to a proxy.
+tiny_http = { version = "0.12", features = ["ssl"] }
 getrandom = "0.2"
 sha2 = "0.10"
 redb = "2"
