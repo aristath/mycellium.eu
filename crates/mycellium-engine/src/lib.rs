@@ -26,6 +26,7 @@ pub mod history;
 pub mod inbound;
 pub mod names;
 pub mod outbox;
+pub mod verified;
 
 /// Decode stored bytes, distinguishing *absent* (→ default, silently) from
 /// *present-but-corrupt* (→ default, but logged loudly). This keeps local-state

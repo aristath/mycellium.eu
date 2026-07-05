@@ -153,8 +153,8 @@ fn field(stdout: &[u8], label: &str) -> String {
 fn safety_number(stdout: &str) -> String {
     stdout
         .lines()
-        .find(|l| l.contains("safety number"))
-        .and_then(|l| l.split("): ").nth(1))
+        .find(|l| l.trim_start().starts_with("safety number:"))
+        .and_then(|l| l.split(": ").nth(1))
         .map(|s| s.trim().to_string())
         .expect("no safety-number line")
 }
@@ -1830,7 +1830,7 @@ fn verify_shows_matching_safety_numbers() {
     let extract = |out: &[u8]| -> String {
         String::from_utf8_lossy(out)
             .lines()
-            .find(|l| l.contains("safety number with"))
+            .find(|l| l.trim_start().starts_with("safety number:"))
             .and_then(|l| l.split(": ").nth(1))
             .map(|s| s.trim().to_string())
             .expect("safety number line")
@@ -1839,6 +1839,37 @@ fn verify_shows_matching_safety_numbers() {
         extract(&a.stdout),
         extract(&b.stdout),
         "safety numbers must match"
+    );
+}
+
+#[test]
+fn verify_confirm_marks_a_peer_verified() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let alice = account(&dir, "alice");
+    let _bob = account(&dir, "bob");
+
+    // Before confirming, a first-seen peer reads as unverified.
+    let before = cli(&alice, &["verify", "bob", "--directory", &dir]);
+    let b = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        b.contains("unverified"),
+        "first contact should be unverified: {b}"
+    );
+
+    // Confirm after (notionally) comparing the number out of band.
+    let confirmed = cli(&alice, &["verify", "bob", "--confirm", "--directory", &dir]);
+    assert!(
+        String::from_utf8_lossy(&confirmed.stdout).contains("marked 'bob' as verified"),
+        "confirm should mark verified",
+    );
+
+    // Now it reads as verified, both in `verify` and the contact-less state.
+    let after = cli(&alice, &["verify", "bob", "--directory", &dir]);
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("✓ verified"),
+        "peer should now be verified: {}",
+        String::from_utf8_lossy(&after.stdout)
     );
 }
 

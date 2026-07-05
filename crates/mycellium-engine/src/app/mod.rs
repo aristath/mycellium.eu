@@ -30,6 +30,7 @@ use crate::inbound;
 use crate::names;
 use crate::outbox;
 use crate::platform::OsPlatform;
+use crate::verified::{self, TrustLevel};
 use mycellium_directory_client::DirectoryClient;
 use mycellium_queue_client::{wallet_hex, QueueClient};
 use mycellium_storage::filestore::FileStore;

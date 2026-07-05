@@ -270,6 +270,9 @@ enum Command {
     Verify {
         /// The peer (handle or nickname).
         peer: String,
+        /// After comparing the safety number out of band, mark the peer verified.
+        #[arg(long)]
+        confirm: bool,
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
@@ -615,7 +618,11 @@ fn main() -> Result<()> {
         Command::Blocked => list_blocked(),
         Command::Announce { whoami, directory } => announce(&whoami, &directory),
         Command::Presence { peer, directory } => presence(&peer, &directory),
-        Command::Verify { peer, directory } => verify(&peer, &directory),
+        Command::Verify {
+            peer,
+            confirm,
+            directory,
+        } => verify(&peer, &directory, confirm),
         Command::Expire { action } => match action {
             ExpireAction::Set { target, duration } => expire_set(&target, &duration),
             ExpireAction::Clear { target } => expire_clear(&target),

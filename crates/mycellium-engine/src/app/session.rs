@@ -42,7 +42,7 @@ pub fn handshake_initiator(
         location
     );
     println!(
-        "safety number (verify with '{}' out of band): {sn}",
+        "safety number: {sn}\n(compare it out of band, then `verify {} --confirm` to remember it)",
         peer_handle.as_str()
     );
     println!("Type messages (Ctrl-D to quit):");
@@ -73,7 +73,7 @@ pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<S
 
     let sn = safety::safety_number(&identity.wallet_public(), &peer_record.record.wallet);
     println!("connected with '{who}' — end-to-end encrypted.");
-    println!("safety number (verify with '{who}' out of band): {sn}");
+    println!("safety number: {sn}\n(compare it out of band, then `verify {who} --confirm` to remember it)");
     println!("Type messages (Ctrl-D to quit):");
 
     Ok(Session {

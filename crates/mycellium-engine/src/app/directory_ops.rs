@@ -11,16 +11,35 @@ pub fn announce(whoami: &str, directory: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn verify(peer: &str, directory: &str) -> Result<()> {
+pub fn verify(peer: &str, directory: &str, confirm: bool) -> Result<()> {
     let identity = store::load_identity()?;
-    let fs = open_history(&identity)?;
+    let mut fs = open_history(&identity)?;
     let client = DirectoryClient::new(directory);
     let (peer_handle, peer_record) = lookup_verified(&client, &fs, peer)?;
-    let sn = safety::safety_number(&identity.wallet_public(), &peer_record.record.wallet);
-    println!("safety number with '{}': {sn}", peer_handle.as_str());
-    println!(
-        "compare it with them out of band — if it matches, no one is impersonating either of you."
-    );
+    let wallet = peer_record.record.wallet;
+    let sn = safety::safety_number(&identity.wallet_public(), &wallet);
+    let level = verified::level(&fs, peer_handle.as_str(), &wallet);
+
+    println!("'{}' — {}", peer_handle.as_str(), level.label());
+    println!("safety number: {sn}");
+
+    if confirm {
+        verified::mark(&mut fs, peer_handle.as_str(), &wallet)?;
+        println!(
+            "✓ marked '{}' as verified. Its wallet is pinned; if it ever changes you'll be warned.",
+            peer_handle.as_str()
+        );
+    } else if level != TrustLevel::Verified {
+        // Plain-language explanation of what a safety number is and how to use it.
+        println!(
+            "\nA safety number is a short code both of you can see. Read it aloud (or compare\n\
+             it in person / over a call you trust) with '{}'. If the two numbers match, no one\n\
+             is sitting in the middle impersonating either of you.\n\
+             If it matches, run:  verify {} --confirm   to remember it as verified.",
+            peer_handle.as_str(),
+            peer
+        );
+    }
     Ok(())
 }
 
@@ -53,13 +72,19 @@ pub fn lookup_verified(
         .verify()
         .map_err(|_| anyhow!("peer's record failed verification"))?;
 
-    if let Some(contact) = contacts::by_handle(fs, handle.as_str())? {
-        if contact.wallet != record.record.wallet {
-            bail!(
-                "'{}' identity CHANGED since you added it — refusing (possible impersonation)",
-                handle.as_str()
-            );
-        }
+    // Fail closed if the current wallet doesn't match a pinned or verified one:
+    // either the peer re-registered (e.g. after email recovery) or someone is
+    // impersonating them. Either way, don't silently trust the new identity.
+    if verified::level(fs, handle.as_str(), &record.record.wallet) == TrustLevel::Changed {
+        bail!(
+            "⚠ IDENTITY CHANGED for '{h}'.\n   \
+             The wallet the directory returned does NOT match the one you {verb} — someone may be\n   \
+             impersonating '{h}', or '{h}' recovered/re-registered with a new key.\n   \
+             Do NOT trust it until you re-check the safety number out of band, then run:\n   \
+             verify {h} --confirm   (to accept the new identity), or `contact add` to re-pin.",
+            h = handle.as_str(),
+            verb = if verified::get(fs, handle.as_str())?.is_some() { "verified" } else { "pinned" },
+        );
     }
     Ok((handle, record))
 }

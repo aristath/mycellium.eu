@@ -39,7 +39,7 @@ rendering. No protocol logic lives here; every command dispatches straight into
 | `broadcast --to a,b --as <me> --message <m>` | Send one message to several peers. |
 | `forward <message_id> --from <p> --to <p> --as <me>` | Forward a stored message to another peer. |
 | `announce --as <me>` / `presence <peer>` | Heartbeat the directory / check if a handle is online. |
-| `verify <peer>` | Show the safety number for out-of-band identity verification. |
+| `verify <peer> [--confirm]` | Show the safety number + trust state (unverified / pinned / verified / **changed**); `--confirm` marks the peer verified after you compare it out of band. |
 
 **Groups**
 

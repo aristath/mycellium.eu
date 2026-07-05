@@ -123,7 +123,17 @@ pub fn contact_list() -> Result<()> {
         return Ok(());
     }
     for c in list {
-        println!("{} → {}", c.nickname, c.handle);
+        // Offline view: a contact is at least TOFU-pinned; show ✓ if you've also
+        // verified its wallet out of band. (A wallet *change* only shows once you
+        // reach the peer over the network — see `verify`.)
+        let verified_here =
+            verified::get(&fs, &c.handle).ok().flatten().as_ref() == Some(&c.wallet);
+        let mark = if verified_here {
+            "✓ verified"
+        } else {
+            "• pinned (not verified)"
+        };
+        println!("{} → {}   [{mark}]", c.nickname, c.handle);
     }
     Ok(())
 }
