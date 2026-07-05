@@ -17,7 +17,9 @@ libp2p = ["dep:libp2p", "dep:libp2p-stream", "dep:tokio", "dep:futures"]
 mycellium-core = { path = "../mycellium-core" }
 anyhow = "1"
 # libp2p transport (production direct line): tcp + noise + yamux + streams.
-libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "macros", "ed25519"], optional = true }
+# Disable libp2p's broad default feature set so unused DNS/mDNS/QUIC/UPnP
+# dependencies are not pulled into the native build/audit surface.
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "macros", "ed25519"], optional = true }
 libp2p-stream = { version = "0.4.0-alpha", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
 futures = { version = "0.3", optional = true }
