@@ -362,7 +362,21 @@ impl Session {
 
     /// Drain our queue, decrypt direct messages, and store them. Returns the
     /// number of new messages received.
+    /// Collect + process in one call (direct callers/tests). The worker instead
+    /// calls [`sync_collect`](Self::sync_collect) then [`sync_process`](Self::sync_process)
+    /// with a durable snapshot in between, so a crash after the server-side drain
+    /// can't lose mail (issue #43).
     pub fn sync(&mut self, queue_url: &str) -> Result<u32, JsValue> {
+        self.sync_collect(queue_url)?;
+        self.sync_process()
+    }
+
+    /// **Phase 1** — drain the queue into the durable inbound store, *before* any
+    /// local handling. Collecting removes the items server-side, so persisting them
+    /// here (the worker snapshots after this returns) is the checkpoint that lets a
+    /// later `sync_process` retry them instead of losing them on a crash. Returns
+    /// how many blobs were collected.
+    pub fn sync_collect(&mut self, queue_url: &str) -> Result<u32, JsValue> {
         let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
         let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let my_hex = wallet_hex(&self.identity.wallet_public());
@@ -370,17 +384,23 @@ impl Session {
         let mut blobs = queue.collect(&qtoken, &my_hex, &my_slot).unwrap_or_default();
         blobs.extend(queue.collect(&qtoken, &my_hex, "account").unwrap_or_default());
 
-        // Collecting drained these from the queue. Merge them with anything still
-        // pending from a prior sync, then process; keep only failures for retry
-        // (e.g. a group message that arrived before its sender key). Bounded by
-        // attempts/TTL so a permanently-bad item dead-letters. (Mirrors the native
-        // inbound store; see docs / issue #42.)
         let now = BrowserPlatform.now_unix_secs();
         let mut pending = mycellium_engine::inbound::load(&self.store).unwrap_or_default();
+        let collected = blobs.len() as u32;
         for blob in blobs {
             pending.push(mycellium_engine::inbound::PendingItem { blob, created_at: now, attempts: 0 });
         }
+        let _ = mycellium_engine::inbound::save(&mut self.store, &pending);
+        Ok(collected)
+    }
 
+    /// **Phase 2** — process the durable inbound store, keeping only failures for
+    /// retry (e.g. a group message that arrived before its sender key); bounded by
+    /// attempts/TTL so a permanently-bad item dead-letters. Returns how many items
+    /// were successfully handled.
+    pub fn sync_process(&mut self) -> Result<u32, JsValue> {
+        let now = BrowserPlatform.now_unix_secs();
+        let pending = mycellium_engine::inbound::load(&self.store).unwrap_or_default();
         let mut received = 0u32;
         let mut survivors = Vec::new();
         for mut entry in pending {

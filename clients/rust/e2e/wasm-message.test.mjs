@@ -78,10 +78,21 @@ async function main() {
         try { alice.send_file(dir, 'alice', 'Alice', q, 'bob', 'big.png', 'image/png', 'A'.repeat(350000)); }
         catch { oversizeRejected = true; }
 
+        // #43: durable sync checkpoint. A crash *between* draining the queue and
+        // handling the mail must not lose it. Bob collects (drains + stores), we
+        // snapshot (what the worker persists) and restore a fresh session from it
+        // — simulating a crash/reload *before* processing — and that revived
+        // session still delivers the message.
+        alice.send(dir, 'alice', 'Alice', q, 'bob', 'survives a crash');
+        const collected = bob.sync_collect(q);
+        const revived = S.restore(bob.export());
+        const revivedGot = revived.sync_process();
+
         return {
-          delivered, received, oversizeRejected,
+          delivered, received, oversizeRejected, collected, revivedGot,
           bobThread: JSON.parse(bob.thread('alice')),
           aliceThread: JSON.parse(alice.thread('bob')),
+          revivedThread: JSON.parse(revived.thread('alice')).map((m) => m.text),
         };
       } catch (e) { return { error: String(e) }; }
     }, dirUrl, qUrl);
@@ -92,7 +103,10 @@ async function main() {
     check(r.received === 1, `recipient synced 1 new message (got ${r.received})`);
     check(r.bobThread?.length === 1 && r.bobThread[0].text === 'hello bob, from alice 🍄', 'recipient decrypted the exact plaintext');
     check(r.bobThread?.[0]?.from_me === false, 'recipient sees it as incoming');
-    check(r.aliceThread?.length === 1 && r.aliceThread[0].from_me === true, "sender kept its own copy in history");
+    check(r.collected === 1, `sync_collect drained 1 blob into the durable store (got ${r.collected})`);
+    check(r.revivedGot === 1, `a session restored after 'crashing' between collect and process still delivered (got ${r.revivedGot})`);
+    check(r.revivedThread?.includes('survives a crash'), 'checkpointed mail survives a crash between collect and process (#43)');
+    check(r.aliceThread?.length === 2 && r.aliceThread.every((m) => m.from_me === true), "sender kept its own copies in history");
   } finally {
     await browser.close();
     web.close();

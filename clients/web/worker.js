@@ -65,7 +65,7 @@ const save = async (bytes) => {
 // nothing calls them over RPC (save() uses session.export() directly), and they
 // dump/replace the whole store (seed included), so they stay off the wire.
 const READS = new Set(['peers', 'groups', 'thread', 'group_thread', 'wallet', 'file', 'name_of', 'get', 'push_key', 'qr_svg', 'version']);
-const WRITES = new Set(['register', 'send', 'reply', 'react', 'delete_message', 'send_file', 'sync', 'group_create', 'group_send', 'group_add', 'group_leave', 'push_subscribe', 'put', 'del', 'add_message', 'pair_offer', 'pair_poll', 'pair_approve']);
+const WRITES = new Set(['register', 'send', 'reply', 'react', 'delete_message', 'send_file', 'sync', 'sync_collect', 'sync_process', 'group_create', 'group_send', 'group_add', 'group_leave', 'push_subscribe', 'put', 'del', 'add_message', 'pair_offer', 'pair_poll', 'pair_approve']);
 
 let session = null;
 const ready = (async () => {
@@ -87,6 +87,18 @@ self.onmessage = async (e) => {
     await ready;
     if (!READS.has(op) && !WRITES.has(op)) {
       self.postMessage({ id, ok: false, err: `unknown op: ${op}` });
+      return;
+    }
+    // `sync` is two durable phases: drain the queue into the inbound store and
+    // SNAPSHOT it before any local handling, then process. So a crash after the
+    // server-side collect can't lose mail — the next process picks it up (#43).
+    if (op === 'sync') {
+      const q = (args || [])[0];
+      session.sync_collect(q);
+      await save(session.export()); // checkpoint: collected mail is now durable
+      const result = session.sync_process();
+      await save(session.export());
+      self.postMessage({ id, ok: true, result });
       return;
     }
     const result = session[op](...(args || []));
