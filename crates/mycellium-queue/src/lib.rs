@@ -19,8 +19,33 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub mod native_push;
 mod persist;
 mod push;
+
+/// A wake target for one device — a **tagged, versioned** push subscription.
+///
+/// This replaces the bare endpoint `String` the queue used to store per wallet,
+/// so a single per-wallet list can hold browser Web Push, native APNs/FCM, and
+/// de-Googled UnifiedPush registrations side by side. The wake to every variant
+/// is **contentless** (see [`native_push`] and [`push`]); only the transport
+/// differs. Serialized with an internal `kind` tag; existing bare-string
+/// web-push records are upgraded to [`Subscription::WebPush`] on load
+/// (`persist::load_subs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Subscription {
+    /// Browser Web Push (VAPID, RFC 8292) — the original, still-shipping form.
+    /// `endpoint` is the browser push service URL.
+    WebPush { endpoint: String },
+    /// Apple Push Notification service. `token` is the device token; `topic` is
+    /// the app bundle id.
+    Apns { token: String, topic: String },
+    /// Firebase Cloud Messaging (HTTP v1). `token` is the registration token.
+    Fcm { token: String },
+    /// UnifiedPush / ntfy — a VAPID-style HTTPS endpoint (de-Googled Android).
+    UnifiedPush { endpoint: String },
+}
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -100,13 +125,18 @@ pub const TOKEN_TTL: u64 = 24 * 3600;
 /// directory. Expired challenges are pruned when a new one is issued.
 pub const CHALLENGE_TTL: u64 = 300;
 
-/// Web Push endpoints kept per wallet. Generous for a multi-device account;
+/// Push subscriptions kept per wallet. Generous for a multi-device account;
 /// the oldest is evicted past this, so the list (and per-deposit fan-out) is
-/// bounded no matter how many endpoints a client registers.
+/// bounded no matter how many subscriptions a client registers.
 pub const MAX_SUBS_PER_WALLET: usize = 20;
 
 /// Largest push-endpoint URL accepted (they're short HTTPS URLs in practice).
 pub const MAX_ENDPOINT_LEN: usize = 2048;
+
+/// Largest native push token / APNs topic accepted. APNs device tokens are short
+/// hex; FCM registration tokens are longer opaque strings — this bounds both so a
+/// client can't wedge storage with an oversized token.
+pub const MAX_TOKEN_LEN: usize = 4096;
 
 /// How long a pairing rendezvous slot lives (5 minutes) before it's pruned.
 pub const PAIR_TTL: u64 = 300;
@@ -133,8 +163,9 @@ pub struct Queue {
     mailboxes: HashMap<(String, String), Vec<String>>,
     /// Fixed-window rate counters: (wallet, action) → (window_start, count).
     rate: HashMap<([u8; 33], &'static str), (u64, u32)>,
-    /// Web Push subscriptions: recipient wallet hex → browser push endpoints.
-    subs: HashMap<String, Vec<String>>,
+    /// Push subscriptions: recipient wallet hex → tagged per-device wake targets
+    /// (Web Push / APNs / FCM / UnifiedPush). Each wake is contentless.
+    subs: HashMap<String, Vec<Subscription>>,
     /// Device-pairing rendezvous: rendezvous id → (relayed messages, first-seen).
     /// Ephemeral and unauthenticated — the id is the capability, the payloads are
     /// end-to-end sealed (see `mycellium_core::pairing`), and everything is pruned
@@ -218,18 +249,20 @@ impl Queue {
         Ok(wallet)
     }
 
-    /// Register a browser push endpoint for the logged-in wallet (idempotent).
-    pub fn subscribe(&mut self, token: &str, endpoint: String, now: u64) -> Result<(), ApiError> {
+    /// Register a push subscription for the logged-in wallet (idempotent). The
+    /// subscription is validated per variant (§2.2); a duplicate is a no-op, so a
+    /// device re-registering a rotated token stays a single entry.
+    pub fn subscribe(&mut self, token: &str, sub: Subscription, now: u64) -> Result<(), ApiError> {
         let wallet = self.authed(token, now)?;
-        if !is_push_endpoint(&endpoint) {
+        if !is_valid_subscription(&sub) {
             return Err(ApiError::BadRequest);
         }
         let wallet_hex = hex33(&wallet.0);
         let list = self.subs.entry(wallet_hex.clone()).or_default();
-        if !list.contains(&endpoint) {
-            list.push(endpoint);
+        if !list.contains(&sub) {
+            list.push(sub);
             // Cap per wallet by evicting the oldest, so a device rotating its
-            // endpoint doesn't wedge the list and a client can't grow it forever.
+            // token doesn't wedge the list and a client can't grow it forever.
             while list.len() > MAX_SUBS_PER_WALLET {
                 list.remove(0);
             }
@@ -242,13 +275,18 @@ impl Queue {
         Ok(())
     }
 
-    /// Remove a push endpoint for the logged-in wallet (explicit unsubscribe).
-    pub fn unsubscribe(&mut self, token: &str, endpoint: &str, now: u64) -> Result<(), ApiError> {
+    /// Remove a push subscription for the logged-in wallet (explicit unsubscribe).
+    pub fn unsubscribe(
+        &mut self,
+        token: &str,
+        sub: &Subscription,
+        now: u64,
+    ) -> Result<(), ApiError> {
         let wallet = self.authed(token, now)?;
         let wallet_hex = hex33(&wallet.0);
         if let Some(list) = self.subs.get_mut(&wallet_hex) {
             let before = list.len();
-            list.retain(|e| e != endpoint);
+            list.retain(|s| s != sub);
             if list.len() != before {
                 if let Some(store) = &self.store {
                     store
@@ -260,13 +298,14 @@ impl Queue {
         Ok(())
     }
 
-    /// Drop endpoints a push service reported as gone (404/410). Called off the
-    /// request path after a deposit's fan-out, so dead endpoints don't linger and
-    /// waste a POST on every future deposit.
-    pub fn remove_endpoints(&mut self, wallet_hex: &str, gone: &[String]) {
+    /// Drop subscriptions a transport reported as gone (Web Push 404/410, APNs
+    /// `Unregistered`, FCM `UNREGISTERED`). Called off the request path after a
+    /// deposit's fan-out, so dead subscriptions don't linger and waste a send on
+    /// every future deposit.
+    pub fn remove_subs(&mut self, wallet_hex: &str, gone: &[Subscription]) {
         if let Some(list) = self.subs.get_mut(wallet_hex) {
             let before = list.len();
-            list.retain(|e| !gone.contains(e));
+            list.retain(|s| !gone.contains(s));
             if list.len() != before {
                 if let Some(store) = &self.store {
                     let _ = store.put_subs(wallet_hex, list);
@@ -275,8 +314,8 @@ impl Queue {
         }
     }
 
-    /// The push endpoints registered for a recipient wallet.
-    pub fn subscriptions(&self, wallet_hex: &str) -> Vec<String> {
+    /// The push subscriptions registered for a recipient wallet.
+    pub fn subscriptions(&self, wallet_hex: &str) -> Vec<Subscription> {
         self.subs.get(wallet_hex).cloned().unwrap_or_default()
     }
 
@@ -397,23 +436,89 @@ impl Queue {
     }
 }
 
-/// Both pieces of shared state the queue handlers need. axum threads a single
-/// `State` type, so the queue and its VAPID keypair travel together.
+/// The shared state the queue handlers need. axum threads a single `State`
+/// type, so the queue, its VAPID keypair, and the native-push transports travel
+/// together.
 #[derive(Clone)]
 pub struct QueueState {
     queue: Arc<Mutex<Queue>>,
     vapid: Arc<push::Vapid>,
+    native: Arc<native_push::NativePush>,
 }
 
 /// Bind `addr` and serve the queue until a shutdown signal arrives.
 pub async fn serve(addr: &str) -> std::io::Result<()> {
-    let queue = Arc::new(Mutex::new(open_queue()?));
+    serve_with(addr, Arc::new(Mutex::new(open_queue()?))).await
+}
+
+/// Serve the queue over an **externally-owned** queue handle, so an embedder or
+/// test can seed/observe the same [`Queue`] the routes mutate. Uses the
+/// persisted-or-generated VAPID key and env-configured native push, exactly like
+/// [`serve`].
+pub async fn serve_with(addr: &str, queue: Arc<Mutex<Queue>>) -> std::io::Result<()> {
     let vapid = Arc::new(load_or_generate_vapid());
+    let native = Arc::new(native_push::NativePush::from_env());
     println!("  push: VAPID enabled");
-    let state = QueueState { queue, vapid };
+    let state = QueueState {
+        queue,
+        vapid,
+        native,
+    };
     mycellium_serve::Server::new("queue", MAX_BODY)
         .run(addr, router(state))
         .await
+}
+
+/// Build the queue's [`Router`] over an externally-owned queue handle, with an
+/// ephemeral VAPID key and env-configured native push. For in-process embedding
+/// and tests that want a handle to the same [`Queue`] the routes mutate.
+pub fn router_for(queue: Arc<Mutex<Queue>>) -> Router {
+    router(QueueState {
+        queue,
+        vapid: Arc::new(push::Vapid::generate()),
+        native: Arc::new(native_push::NativePush::from_env()),
+    })
+}
+
+/// Dispatches a contentless wake to the right transport for a [`Subscription`].
+/// Abstracted so the fan-out is unit-testable with a stub in place of the real
+/// VAPID / APNs / FCM senders.
+trait Waker {
+    /// Wake one device via its subscription's transport. `None` means that
+    /// transport isn't configured at this operator, so it's skipped (mail stays
+    /// queued — the reliability invariant).
+    fn wake(&self, sub: &Subscription, now: u64) -> Option<push::SendResult>;
+}
+
+/// The live dispatcher: Web Push / UnifiedPush over VAPID (the shipping path),
+/// APNs / FCM over the native transports.
+struct LiveWaker {
+    vapid: Arc<push::Vapid>,
+    native: Arc<native_push::NativePush>,
+}
+
+impl Waker for LiveWaker {
+    fn wake(&self, sub: &Subscription, now: u64) -> Option<push::SendResult> {
+        match sub {
+            Subscription::WebPush { endpoint } | Subscription::UnifiedPush { endpoint } => {
+                Some(self.vapid.send(endpoint, now))
+            }
+            Subscription::Apns { .. } | Subscription::Fcm { .. } => self.native.wake(sub, now),
+        }
+    }
+}
+
+/// Wake every subscription for a recipient and return the ones a transport
+/// reported `Gone` (to be pruned via [`Queue::remove_subs`]). Pure over the
+/// [`Waker`], so it's testable without touching the network.
+fn wake_all(subs: Vec<Subscription>, waker: &dyn Waker, now: u64) -> Vec<Subscription> {
+    let mut gone = Vec::new();
+    for sub in subs {
+        if waker.wake(&sub, now) == Some(push::SendResult::Gone) {
+            gone.push(sub);
+        }
+    }
+    gone
 }
 
 /// The queue's routes, over already-constructed state. Split out so tests can
@@ -540,7 +645,7 @@ async fn push_subscribe(
     st.queue
         .lock()
         .unwrap()
-        .subscribe(token, req.endpoint, now_secs())?;
+        .subscribe(token, req.into_subscription(), now_secs())?;
     Ok(ok())
 }
 
@@ -554,7 +659,7 @@ async fn push_unsubscribe(
     st.queue
         .lock()
         .unwrap()
-        .unsubscribe(token, &req.endpoint, now_secs())?;
+        .unsubscribe(token, &req.into_subscription(), now_secs())?;
     Ok(ok())
 }
 
@@ -571,22 +676,22 @@ async fn mailbox_post(
         .unwrap()
         .deposit(token, &wallet, &slot, body, now)?;
     // Wake the recipient's devices — contentless, and off the lock/thread so a
-    // slow push endpoint never stalls the queue.
-    let endpoints = st.queue.lock().unwrap().subscriptions(&wallet);
-    if !endpoints.is_empty() {
-        let vapid = Arc::clone(&st.vapid);
+    // slow push transport never stalls the queue. Each subscription dispatches
+    // to its transport (Web Push / UnifiedPush over VAPID, APNs / FCM over the
+    // native transports, skipped when the operator hasn't configured them).
+    let subs = st.queue.lock().unwrap().subscriptions(&wallet);
+    if !subs.is_empty() {
+        let waker = LiveWaker {
+            vapid: Arc::clone(&st.vapid),
+            native: Arc::clone(&st.native),
+        };
         let queue = Arc::clone(&st.queue);
         std::thread::spawn(move || {
-            let mut gone = Vec::new();
-            for endpoint in endpoints {
-                if vapid.send(&endpoint, now) == push::SendResult::Gone {
-                    gone.push(endpoint);
-                }
-            }
-            // Prune subscriptions the push service says are gone, so we don't
-            // POST to them on every future deposit.
+            // Prune the subscriptions a transport says are gone, so we don't
+            // wake them on every future deposit.
+            let gone = wake_all(subs, &waker, now);
             if !gone.is_empty() {
-                queue.lock().unwrap().remove_endpoints(&wallet, &gone);
+                queue.lock().unwrap().remove_subs(&wallet, &gone);
             }
         });
     }
@@ -656,9 +761,29 @@ struct Messages {
 struct PushKey {
     key: String,
 }
+/// The `/push/subscribe` + `/push/unsubscribe` request body — a **superset** of
+/// the legacy shape, so existing PWA clients keep working across the upgrade:
+///
+/// - `{ "kind": "apns", "token": "…", "topic": "…" }` (and the other tagged
+///   variants) — the versioned native/web form.
+/// - `{ "endpoint": "https://…" }` — the legacy bare web-push endpoint.
+///
+/// `Tagged` is tried first so a `unified_push` (which also carries an `endpoint`)
+/// isn't misread as web push; a body with no `kind` falls through to `Legacy`.
 #[derive(Deserialize)]
-struct SubscribeReq {
-    endpoint: String,
+#[serde(untagged)]
+enum SubscribeReq {
+    Tagged(Subscription),
+    Legacy { endpoint: String },
+}
+
+impl SubscribeReq {
+    fn into_subscription(self) -> Subscription {
+        match self {
+            SubscribeReq::Tagged(sub) => sub,
+            SubscribeReq::Legacy { endpoint } => Subscription::WebPush { endpoint },
+        }
+    }
 }
 #[derive(Deserialize)]
 struct PairPost {
@@ -751,6 +876,32 @@ fn is_push_endpoint(e: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Validate a [`Subscription`] per variant before it can enter storage, so a
+/// malformed client can't wedge the subs map. Endpoint variants reuse the HTTPS
+/// URL check; native tokens are bounded (APNs tokens are hex, FCM tokens are
+/// opaque printable ASCII, the APNs topic is a bounded bundle id).
+fn is_valid_subscription(sub: &Subscription) -> bool {
+    match sub {
+        Subscription::WebPush { endpoint } | Subscription::UnifiedPush { endpoint } => {
+            is_push_endpoint(endpoint)
+        }
+        Subscription::Apns { token, topic } => is_apns_token(token) && is_bounded_token(topic),
+        Subscription::Fcm { token } => is_bounded_token(token),
+    }
+}
+
+/// An APNs device token: non-empty, bounded, all hex (32 bytes → 64 chars in
+/// practice, but accept any bounded hex to tolerate platform differences).
+fn is_apns_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_TOKEN_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A bounded opaque token/topic: non-empty printable ASCII, no whitespace or
+/// control characters (covers FCM tokens and APNs bundle-id topics).
+fn is_bounded_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_TOKEN_LEN && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
 fn random_hex<const N: usize>() -> String {
     let mut bytes = [0u8; N];
     getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
@@ -801,15 +952,23 @@ mod tests {
             q.deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0)
                 .unwrap();
             let btoken = login(&mut q, &bob);
-            q.subscribe(&btoken, "https://push.example/abc".into(), 0)
-                .unwrap();
+            q.subscribe(
+                &btoken,
+                Subscription::WebPush {
+                    endpoint: "https://push.example/abc".into(),
+                },
+                0,
+            )
+            .unwrap();
         } // drop → flushed
 
         // Reopen: the queued blob and the push subscription are both still there.
         let mut q2 = Queue::open(path_str).unwrap();
         assert_eq!(
             q2.subscriptions(&bob_hex),
-            vec!["https://push.example/abc".to_string()]
+            vec![Subscription::WebPush {
+                endpoint: "https://push.example/abc".into()
+            }]
         );
         let btoken = login(&mut q2, &bob);
         assert_eq!(
@@ -891,7 +1050,13 @@ mod tests {
 
         // Fresh token works for both collect and subscribe.
         assert!(q
-            .subscribe(&token, "https://push.example/ok".into(), 10)
+            .subscribe(
+                &token,
+                Subscription::WebPush {
+                    endpoint: "https://push.example/ok".into()
+                },
+                10
+            )
             .is_ok());
         assert!(q.collect(&token, &bob_hex, ACCOUNT_SLOT, 10).is_ok());
 
@@ -901,13 +1066,31 @@ mod tests {
             Err(ApiError::Unauthorized),
         );
         assert_eq!(
-            q.subscribe(&token, "https://push.example/late".into(), TOKEN_TTL + 1),
+            q.subscribe(
+                &token,
+                Subscription::WebPush {
+                    endpoint: "https://push.example/late".into()
+                },
+                TOKEN_TTL + 1
+            ),
             Err(ApiError::Unauthorized),
         );
         assert_eq!(
-            q.unsubscribe(&token, "https://push.example/ok", TOKEN_TTL + 1),
+            q.unsubscribe(
+                &token,
+                &Subscription::WebPush {
+                    endpoint: "https://push.example/ok".into()
+                },
+                TOKEN_TTL + 1
+            ),
             Err(ApiError::Unauthorized),
         );
+    }
+
+    fn web(endpoint: &str) -> Subscription {
+        Subscription::WebPush {
+            endpoint: endpoint.into(),
+        }
     }
 
     #[test]
@@ -917,39 +1100,198 @@ mod tests {
         let token = login(&mut q, &a);
         let hex = hex33(&a.wallet_public().0);
 
-        // Non-HTTPS / malformed endpoints are refused.
+        // Non-HTTPS / malformed web-push endpoints are refused.
         assert_eq!(
-            q.subscribe(&token, "http://insecure/x".into(), 0),
+            q.subscribe(&token, web("http://insecure/x"), 0),
             Err(ApiError::BadRequest)
         );
         assert_eq!(
-            q.subscribe(&token, "not a url".into(), 0),
+            q.subscribe(&token, web("not a url"), 0),
+            Err(ApiError::BadRequest)
+        );
+        // UnifiedPush reuses the HTTPS check; a plain-HTTP one is refused too.
+        assert_eq!(
+            q.subscribe(
+                &token,
+                Subscription::UnifiedPush {
+                    endpoint: "http://insecure/up".into()
+                },
+                0
+            ),
+            Err(ApiError::BadRequest)
+        );
+        // Native tokens are validated: an APNs token must be hex, an FCM/topic
+        // token must be non-empty printable ASCII.
+        assert_eq!(
+            q.subscribe(
+                &token,
+                Subscription::Apns {
+                    token: "not-hex!".into(),
+                    topic: "eu.mycellium.app".into()
+                },
+                0
+            ),
+            Err(ApiError::BadRequest)
+        );
+        assert_eq!(
+            q.subscribe(&token, Subscription::Fcm { token: "".into() }, 0),
             Err(ApiError::BadRequest)
         );
 
-        // Duplicate subscribes are idempotent.
-        q.subscribe(&token, "https://push.example/a".into(), 0)
+        // Valid variants of every kind are accepted and stored side by side.
+        q.subscribe(&token, web("https://push.example/a"), 0)
             .unwrap();
-        q.subscribe(&token, "https://push.example/a".into(), 0)
+        q.subscribe(
+            &token,
+            Subscription::Apns {
+                token: "abcdef0123456789".into(),
+                topic: "eu.mycellium.app".into(),
+            },
+            0,
+        )
+        .unwrap();
+        q.subscribe(
+            &token,
+            Subscription::Fcm {
+                token: "fcm-registration-token".into(),
+            },
+            0,
+        )
+        .unwrap();
+        q.subscribe(
+            &token,
+            Subscription::UnifiedPush {
+                endpoint: "https://ntfy.example/up".into(),
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(q.subscriptions(&hex).len(), 4);
+
+        // Duplicate subscribes are idempotent, per variant (a re-registered
+        // token stays a single entry).
+        q.subscribe(&token, web("https://push.example/a"), 0)
             .unwrap();
-        assert_eq!(q.subscriptions(&hex).len(), 1);
+        q.subscribe(
+            &token,
+            Subscription::Fcm {
+                token: "fcm-registration-token".into(),
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(q.subscriptions(&hex).len(), 4);
 
         // The list is capped, evicting the oldest.
         for i in 0..MAX_SUBS_PER_WALLET + 5 {
-            q.subscribe(&token, format!("https://push.example/{i}"), 0)
+            q.subscribe(&token, web(&format!("https://push.example/{i}")), 0)
                 .unwrap();
         }
         assert_eq!(q.subscriptions(&hex).len(), MAX_SUBS_PER_WALLET);
 
-        // Explicit unsubscribe removes an endpoint.
-        let e0 = q.subscriptions(&hex)[0].clone();
-        q.unsubscribe(&token, &e0, 0).unwrap();
-        assert!(!q.subscriptions(&hex).contains(&e0));
+        // Explicit unsubscribe removes exactly the matching subscription.
+        let s0 = q.subscriptions(&hex)[0].clone();
+        q.unsubscribe(&token, &s0, 0).unwrap();
+        assert!(!q.subscriptions(&hex).contains(&s0));
 
-        // Gone-removal (the 404/410 path) drops dead endpoints.
-        let e1 = q.subscriptions(&hex)[0].clone();
-        q.remove_endpoints(&hex, std::slice::from_ref(&e1));
-        assert!(!q.subscriptions(&hex).contains(&e1));
+        // Gone-removal (the Gone/Unregistered path) drops dead subscriptions.
+        let s1 = q.subscriptions(&hex)[0].clone();
+        q.remove_subs(&hex, std::slice::from_ref(&s1));
+        assert!(!q.subscriptions(&hex).contains(&s1));
+    }
+
+    #[test]
+    fn fan_out_selects_transport_per_variant_and_collects_gone() {
+        // A stub Waker records how each variant is dispatched, and reports Gone
+        // for chosen entries + None (skip) for an unconfigured native transport.
+        struct Stub;
+        impl Waker for Stub {
+            fn wake(&self, sub: &Subscription, _now: u64) -> Option<push::SendResult> {
+                match sub {
+                    // A dead web-push endpoint is Gone (to be pruned).
+                    Subscription::WebPush { endpoint } if endpoint.ends_with("dead") => {
+                        Some(push::SendResult::Gone)
+                    }
+                    Subscription::WebPush { .. } | Subscription::UnifiedPush { .. } => {
+                        Some(push::SendResult::Ok)
+                    }
+                    // APNs here stands in for an unconfigured transport → skipped.
+                    Subscription::Apns { .. } => None,
+                    // FCM here reports Gone (an UNREGISTERED token).
+                    Subscription::Fcm { .. } => Some(push::SendResult::Gone),
+                }
+            }
+        }
+
+        let subs = vec![
+            web("https://push.example/live"),
+            web("https://push.example/dead"),
+            Subscription::UnifiedPush {
+                endpoint: "https://ntfy.example/up".into(),
+            },
+            Subscription::Apns {
+                token: "abcd".into(),
+                topic: "eu.mycellium.app".into(),
+            },
+            Subscription::Fcm {
+                token: "dead-fcm".into(),
+            },
+        ];
+
+        let gone = wake_all(subs, &Stub, 0);
+        // Only the dead web-push and the UNREGISTERED FCM are collected for
+        // pruning; the live/skipped ones are left in place.
+        assert_eq!(
+            gone,
+            vec![
+                web("https://push.example/dead"),
+                Subscription::Fcm {
+                    token: "dead-fcm".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn subscribe_req_parses_legacy_and_tagged_forms() {
+        // Legacy bare endpoint → WebPush.
+        let legacy: SubscribeReq =
+            serde_json::from_str(r#"{"endpoint":"https://push.example/x"}"#).unwrap();
+        assert_eq!(legacy.into_subscription(), web("https://push.example/x"));
+        // Tagged web push.
+        let wp: SubscribeReq =
+            serde_json::from_str(r#"{"kind":"web_push","endpoint":"https://push.example/y"}"#)
+                .unwrap();
+        assert_eq!(wp.into_subscription(), web("https://push.example/y"));
+        // Tagged UnifiedPush must NOT be misread as web push (it also has an
+        // endpoint) — the `kind` tag wins.
+        let up: SubscribeReq =
+            serde_json::from_str(r#"{"kind":"unified_push","endpoint":"https://ntfy.example/u"}"#)
+                .unwrap();
+        assert_eq!(
+            up.into_subscription(),
+            Subscription::UnifiedPush {
+                endpoint: "https://ntfy.example/u".into()
+            }
+        );
+        // Tagged APNs + FCM.
+        let apns: SubscribeReq =
+            serde_json::from_str(r#"{"kind":"apns","token":"abcd","topic":"eu.mycellium.app"}"#)
+                .unwrap();
+        assert_eq!(
+            apns.into_subscription(),
+            Subscription::Apns {
+                token: "abcd".into(),
+                topic: "eu.mycellium.app".into()
+            }
+        );
+        let fcm: SubscribeReq = serde_json::from_str(r#"{"kind":"fcm","token":"tok"}"#).unwrap();
+        assert_eq!(
+            fcm.into_subscription(),
+            Subscription::Fcm {
+                token: "tok".into()
+            }
+        );
     }
 
     #[test]

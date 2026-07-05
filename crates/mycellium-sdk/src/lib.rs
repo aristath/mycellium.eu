@@ -45,5 +45,5 @@ pub use client::MyceliumClient;
 pub use secrets::{PassphraseFileSecretStore, PlaintextFileSecretStore, SecretStore};
 pub use types::{
     Account, Contact, Conversation, DeliveryState, EmailVerification, EventListener, Group,
-    Message, SdkError, TrustLevel,
+    Message, PushPlatform, SdkError, TrustLevel,
 };

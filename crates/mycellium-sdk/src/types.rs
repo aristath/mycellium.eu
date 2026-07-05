@@ -124,6 +124,26 @@ pub struct Account {
     pub wallet_address: String,
 }
 
+/// Which native/web push transport a device token belongs to, for
+/// [`register_push`](crate::MyceliumClient::register_push). The SDK tags the
+/// subscription it registers with the account's queue accordingly; the queue
+/// then wakes this device **contentlessly** on deposit.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PushPlatform {
+    /// Browser Web Push (VAPID). The token is the browser push endpoint URL.
+    WebPush,
+    /// Apple Push Notification service. The token is the APNs device token;
+    /// `topic` is the app bundle id the wake is addressed to.
+    Apns {
+        /// The app bundle id (APNs `apns-topic`).
+        topic: String,
+    },
+    /// Firebase Cloud Messaging. The token is the FCM registration token.
+    Fcm,
+    /// UnifiedPush / ntfy (de-Googled). The token is the distributor endpoint URL.
+    UnifiedPush,
+}
+
 /// Every error that can cross the boundary. Internal `anyhow`/engine errors are
 /// mapped into one of these variants; the underlying error is never leaked.
 #[derive(Debug, uniffi::Error)]

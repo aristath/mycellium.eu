@@ -26,7 +26,7 @@ use mycellium_engine::groups::{
 use mycellium_engine::platform::OsPlatform;
 use mycellium_engine::{contacts, history, inbound, names, verified, wireops};
 use mycellium_http::UreqTransport;
-use mycellium_queue_client::{wallet_hex, QueueClient};
+use mycellium_queue_client::{wallet_hex, PushSub, QueueClient};
 
 use mycellium_core::platform::Platform;
 use mycellium_storage::filestore::FileStore;
@@ -34,7 +34,7 @@ use mycellium_storage::filestore::FileStore;
 use crate::secrets::{PlaintextFileSecretStore, SecretStore};
 use crate::types::{
     Account, Contact, Conversation, DeliveryState, EmailVerification, EventListener, Group,
-    Message, SdkError, TrustLevel,
+    Message, PushPlatform, SdkError, TrustLevel,
 };
 
 /// Maximum inline attachment size, matching the engine/wasm cap. Attachments
@@ -419,6 +419,49 @@ impl MyceliumClient {
     /// Register (or replace) the listener the SDK pushes incoming events to.
     pub fn set_listener(&self, listener: Box<dyn EventListener>) {
         self.lock().listener = Some(Arc::from(listener));
+    }
+
+    /// Register this device's native/web push token with the account's queue, so
+    /// the queue can wake this device **contentlessly** on deposit. `platform`
+    /// selects the transport (Web Push / APNs / FCM / UnifiedPush) and `token` is
+    /// the OS-issued token (or, for Web Push / UnifiedPush, the endpoint URL).
+    /// Idempotent server-side: re-registering the same token is a no-op. Logs the
+    /// queue in with this device identity, like `sync`. Returns
+    /// [`SdkError::NotRegistered`] if no queue is configured yet.
+    ///
+    /// The wake carries no sender or content; messages are decrypted on this
+    /// device by `sync()` (decrypt-then-display). The push provider only learns
+    /// that a device was woken and when.
+    pub fn register_push(&self, platform: PushPlatform, token: String) -> Result<(), SdkError> {
+        let inner = self.lock();
+        if inner.config.queue_url.is_empty() {
+            return Err(SdkError::NotRegistered);
+        }
+        let sub = platform_to_sub(platform, token);
+        let queue = QueueClient::with_transport(&inner.config.queue_url, Box::new(UreqTransport));
+        let qtoken = queue.login(&inner.identity).map_err(SdkError::network)?;
+        queue
+            .push_subscribe_sub(&qtoken, &sub)
+            .map_err(SdkError::network)?;
+        Ok(())
+    }
+
+    /// Remove this device's push registration from the queue (user disabled
+    /// notifications, or the device is being removed). Safe to call when none
+    /// exists. Mail still queues and arrives on the next `sync()` — disabling
+    /// notifications never drops messages.
+    pub fn unregister_push(&self, platform: PushPlatform, token: String) -> Result<(), SdkError> {
+        let inner = self.lock();
+        if inner.config.queue_url.is_empty() {
+            return Err(SdkError::NotRegistered);
+        }
+        let sub = platform_to_sub(platform, token);
+        let queue = QueueClient::with_transport(&inner.config.queue_url, Box::new(UreqTransport));
+        let qtoken = queue.login(&inner.identity).map_err(SdkError::network)?;
+        queue
+            .push_unsubscribe_sub(&qtoken, &sub)
+            .map_err(SdkError::network)?;
+        Ok(())
     }
 
     /// The conversation list, newest first.
@@ -1275,6 +1318,18 @@ fn publish_merged(
     dir.publish(&token, &me, &signed)
         .map_err(SdkError::network)?;
     Ok(())
+}
+
+/// Map a [`PushPlatform`] + OS token into the queue's tagged subscription. For
+/// Web Push / UnifiedPush the `token` is the endpoint URL; for APNs / FCM it's
+/// the device/registration token (APNs also carries the app bundle `topic`).
+fn platform_to_sub(platform: PushPlatform, token: String) -> PushSub {
+    match platform {
+        PushPlatform::WebPush => PushSub::WebPush { endpoint: token },
+        PushPlatform::UnifiedPush => PushSub::UnifiedPush { endpoint: token },
+        PushPlatform::Fcm => PushSub::Fcm { token },
+        PushPlatform::Apns { topic } => PushSub::Apns { token, topic },
+    }
 }
 
 /// The outcome of processing one inbound blob.

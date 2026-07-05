@@ -20,6 +20,23 @@ pub struct QueueClient {
     transport: Box<dyn HttpTransport>,
 }
 
+/// A push subscription in the queue's tagged wire form (mirrors the queue's
+/// `Subscription`). Kept as a small local type so this thin client doesn't have
+/// to depend on the queue crate. Serialized with an internal `kind` tag matching
+/// the queue: `web_push` / `apns` / `fcm` / `unified_push`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PushSub {
+    /// Browser Web Push (VAPID). `endpoint` is the browser push URL.
+    WebPush { endpoint: String },
+    /// Apple Push Notification service. `token` device token, `topic` bundle id.
+    Apns { token: String, topic: String },
+    /// Firebase Cloud Messaging. `token` is the registration token.
+    Fcm { token: String },
+    /// UnifiedPush / ntfy — a VAPID-style HTTPS endpoint.
+    UnifiedPush { endpoint: String },
+}
+
 #[derive(Serialize)]
 struct ChallengeReq {
     wallet: WalletPublicKey,
@@ -107,7 +124,8 @@ impl QueueClient {
         Ok(resp.key)
     }
 
-    /// Register a browser push endpoint for the logged-in wallet.
+    /// Register a browser push endpoint for the logged-in wallet (legacy
+    /// bare-endpoint form; the queue stores it as a Web Push subscription).
     pub fn push_subscribe(&self, token: &str, endpoint: &str) -> Result<()> {
         #[derive(Serialize)]
         struct Req<'a> {
@@ -119,6 +137,20 @@ impl QueueClient {
             Some(token),
             Some(&Req { endpoint }),
         )?;
+        Ok(())
+    }
+
+    /// Register a **tagged** push subscription (Web Push / APNs / FCM /
+    /// UnifiedPush) for the logged-in wallet. Idempotent server-side.
+    pub fn push_subscribe_sub(&self, token: &str, sub: &PushSub) -> Result<()> {
+        let _: serde_json::Value = self.json("POST", "/push/subscribe", Some(token), Some(sub))?;
+        Ok(())
+    }
+
+    /// Remove a **tagged** push subscription for the logged-in wallet.
+    pub fn push_unsubscribe_sub(&self, token: &str, sub: &PushSub) -> Result<()> {
+        let _: serde_json::Value =
+            self.json("POST", "/push/unsubscribe", Some(token), Some(sub))?;
         Ok(())
     }
 

@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
 use mycellium_sdk::{
-    DeliveryState, EventListener, Message, MyceliumClient, PassphraseFileSecretStore, SdkError,
-    SecretStore, TrustLevel,
+    DeliveryState, EventListener, Message, MyceliumClient, PassphraseFileSecretStore, PushPlatform,
+    SdkError, SecretStore, TrustLevel,
 };
+
+use mycellium_queue::{Queue, Subscription};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -58,6 +60,24 @@ fn ensure_queue() -> String {
             format!("http://{addr}")
         })
         .clone()
+}
+
+/// Start a queue whose `Queue` handle the test also holds, so it can observe the
+/// subscriptions the routes store. Returns the queue URL and the shared handle.
+fn start_inspectable_queue() -> (String, Arc<Mutex<Queue>>) {
+    let queue = Arc::new(Mutex::new(Queue::new()));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let serve_addr = addr.clone();
+    let served = queue.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let _ = mycellium_queue::serve_with(&serve_addr, served).await;
+        });
+    });
+    wait_port(port);
+    (format!("http://{addr}"), queue)
 }
 
 /// Start a directory on a fresh port. Returns its URL.
@@ -405,6 +425,61 @@ fn email_verified_registration() {
     assert_eq!(inbound.len(), 1);
     assert_eq!(inbound[0].text, "welcome aboard");
     assert_eq!(inbound[0].sender, "eve");
+}
+
+#[test]
+fn register_push_stores_a_subscription_in_the_queue() {
+    let dir = start_directory();
+    let (queue_url, queue) = start_inspectable_queue();
+
+    let client = MyceliumClient::new(data_dir("pusher").to_string_lossy().into_owned())
+        .expect("open pusher");
+
+    // register_push before a queue is configured is NotRegistered.
+    assert!(matches!(
+        client.register_push(PushPlatform::Fcm, "tok".into()),
+        Err(SdkError::NotRegistered)
+    ));
+
+    client
+        .register(dir, queue_url, "pusher".into(), "Pusher".into())
+        .expect("register");
+    let wallet = client.wallet_address();
+
+    // Register an FCM token; the queue stores it as a tagged Fcm subscription.
+    client
+        .register_push(PushPlatform::Fcm, "fcm-token-abc".into())
+        .expect("register fcm push");
+    assert_eq!(
+        queue.lock().unwrap().subscriptions(&wallet),
+        vec![Subscription::Fcm {
+            token: "fcm-token-abc".into()
+        }]
+    );
+
+    // An APNs registration carries its bundle-id topic through untouched.
+    client
+        .register_push(
+            PushPlatform::Apns {
+                topic: "eu.mycellium.app".into(),
+            },
+            "abcdef0123456789".into(),
+        )
+        .expect("register apns push");
+    let subs = queue.lock().unwrap().subscriptions(&wallet);
+    assert!(subs.contains(&Subscription::Apns {
+        token: "abcdef0123456789".into(),
+        topic: "eu.mycellium.app".into()
+    }));
+    assert_eq!(subs.len(), 2);
+
+    // Unregister removes exactly the FCM entry, leaving APNs in place.
+    client
+        .unregister_push(PushPlatform::Fcm, "fcm-token-abc".into())
+        .expect("unregister fcm push");
+    let subs = queue.lock().unwrap().subscriptions(&wallet);
+    assert_eq!(subs.len(), 1);
+    assert!(matches!(subs[0], Subscription::Apns { .. }));
 }
 
 /// A newtype so the callback-interface `Box<dyn EventListener>` can wrap our
