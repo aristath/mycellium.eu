@@ -18,6 +18,7 @@ use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
+use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Record, SignedRecord};
 use mycellium_core::storage::Storage;
@@ -91,6 +92,9 @@ impl Storage for MemStore {
 pub struct Session {
     store: MemStore,
     identity: Identity,
+    /// Pending device-pairing (new-device side): the ephemeral responder and its
+    /// rendezvous id, kept in memory between `pair_offer` and `pair_poll`.
+    pairing: Option<(mycellium_core::pairing::PairingResponder, String)>,
 }
 
 /// The device identity's persistable secret (mnemonic + device seed), from which
@@ -121,7 +125,7 @@ impl Session {
         let identity = Identity::generate(&mut BrowserPlatform).expect("browser CSPRNG must be available");
         let mut store = MemStore::default();
         store_identity(&mut store, &identity);
-        Session { store, identity }
+        Session { store, identity, pairing: None }
     }
 
     /// Restore a session — **the same device identity** and all state — from a
@@ -139,7 +143,7 @@ impl Session {
             serde_json::from_slice(&raw).map_err(|e| JsValue::from_str(&format!("corrupt identity: {e}")))?;
         let identity = Identity::from_wallet_secret(secret.wallet_secret, secret.device_seed)
             .map_err(|_| JsValue::from_str("stored identity is invalid"))?;
-        Ok(Session { store, identity })
+        Ok(Session { store, identity, pairing: None })
     }
 
     /// This session's wallet public key (hex) — a stable id for the device.
@@ -255,6 +259,78 @@ impl Session {
             .dark_color(qrcode::render::svg::Color("#0b0f0c"))
             .light_color(qrcode::render::svg::Color("#ffffff"))
             .build())
+    }
+
+    /// New device: create a one-time pairing **offer** (show it / render a QR for
+    /// an existing device to scan). Keeps the ephemeral secret in the session so
+    /// [`pair_poll`](Self::pair_poll) can complete it. `queue` is the rendezvous.
+    pub fn pair_offer(&mut self, queue: &str) -> Result<String, JsValue> {
+        let responder = PairingResponder::new(&mut BrowserPlatform);
+        let mut rid = [0u8; 16];
+        getrandom::getrandom(&mut rid).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        let rid = hex(&rid);
+        let offer = hex(
+            serde_json::json!({ "r": rid, "k": hex(&responder.public().0), "q": queue })
+                .to_string()
+                .as_bytes(),
+        );
+        self.pairing = Some((responder, rid));
+        Ok(offer)
+    }
+
+    /// New device: poll the rendezvous once. On success, adopt the account, join
+    /// its record, and return `{dir,queue,handle,name}` JSON; otherwise
+    /// `undefined` (keep polling).
+    pub fn pair_poll(&mut self, queue: &str) -> Result<Option<String>, JsValue> {
+        let rid = match &self.pairing {
+            Some((_, rid)) => rid.clone(),
+            None => return Err(JsValue::from_str("call pair_offer first")),
+        };
+        let qclient = QueueClient::with_transport(queue, Box::new(XhrTransport));
+        let msgs = qclient.pair_fetch(&rid).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        for m in msgs {
+            let Ok(raw) = from_hex(&m) else { continue };
+            let Ok(pm) = wire::decode::<PairingMessage>(&raw) else { continue };
+            let opened = self.pairing.as_ref().and_then(|(r, _)| r.open(&pm).ok());
+            if let Some(payload) = opened {
+                return self.adopt_from_payload(&payload).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Existing device: seal our account key to a pairing `offer` and relay it, so
+    /// the new device can adopt the account. Shares the account key — confirm the
+    /// user really means to add a device before calling this.
+    pub fn pair_approve(&mut self, offer: &str, handle: &str, dir: &str) -> Result<(), JsValue> {
+        let bytes = from_hex(offer.trim())?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| JsValue::from_str("invalid pairing offer"))?;
+        let rid = v["r"].as_str().ok_or_else(|| JsValue::from_str("bad offer"))?;
+        let k = from_hex(v["k"].as_str().ok_or_else(|| JsValue::from_str("bad offer"))?)?;
+        let k: [u8; 32] = k
+            .as_slice()
+            .try_into()
+            .map_err(|_| JsValue::from_str("bad ephemeral key"))?;
+        let queue = v["q"].as_str().ok_or_else(|| JsValue::from_str("bad offer"))?;
+        let payload = serde_json::json!({
+            "ws": hex(&self.identity.wallet_secret()),
+            "h": handle,
+            "n": self.cfg(b"myc:name"),
+            "d": dir,
+            "q": self.cfg(b"myc:queue"),
+        })
+        .to_string();
+        let msg = pairing::seal_provisioning(
+            &mut BrowserPlatform,
+            &PairingResponderPublic(k),
+            payload.as_bytes(),
+        )
+        .map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        QueueClient::with_transport(queue, Box::new(XhrTransport))
+            .pair_post(rid, &hex(&wire::encode(&msg)))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(())
     }
 
     /// The learned display name for a peer handle, if we've seen their record.
@@ -542,6 +618,38 @@ impl Session {
 }
 
 impl Session {
+    /// Adopt the account carried in a decrypted pairing payload: replace this
+    /// device's identity with the received account (fresh device keys), join its
+    /// record, persist config, and return `{dir,queue,handle,name}` JSON.
+    fn adopt_from_payload(&mut self, payload: &[u8]) -> Result<String, JsValue> {
+        let v: serde_json::Value =
+            serde_json::from_slice(payload).map_err(|_| JsValue::from_str("bad provisioning"))?;
+        let ws = from_hex(v["ws"].as_str().ok_or_else(|| JsValue::from_str("bad provisioning"))?)?;
+        let ws: [u8; 32] = ws
+            .as_slice()
+            .try_into()
+            .map_err(|_| JsValue::from_str("bad account key"))?;
+        let handle = v["h"].as_str().ok_or_else(|| JsValue::from_str("bad provisioning"))?;
+        let name = v["n"].as_str().filter(|s| !s.is_empty()).unwrap_or(handle);
+        let dir = v["d"].as_str().unwrap_or("");
+        let queue = v["q"].as_str().unwrap_or("");
+
+        self.identity =
+            Identity::adopt(&mut BrowserPlatform, ws).map_err(|_| JsValue::from_str("invalid account key"))?;
+        store_identity(&mut self.store, &self.identity);
+        self.publish_merged(dir, handle, name, queue)?;
+        let _ = self.store.put(b"myc:handle", handle.as_bytes());
+        let _ = self.store.put(b"myc:name", name.as_bytes());
+        let _ = self.store.put(b"myc:dir", dir.as_bytes());
+        let _ = self.store.put(b"myc:queue", queue.as_bytes());
+        let _ = self.store.put(
+            b"myc:me",
+            serde_json::json!({ "handle": handle, "name": name }).to_string().as_bytes(),
+        );
+        self.pairing = None;
+        Ok(serde_json::json!({ "dir": dir, "queue": queue, "handle": handle, "name": name }).to_string())
+    }
+
     /// Publish our record, **merging** this device into any record that already
     /// exists for the handle, so re-registering or linking never drops sibling
     /// devices. Bumps `seq` past the existing one.
@@ -804,4 +912,13 @@ fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+fn from_hex(s: &str) -> Result<Vec<u8>, JsValue> {
+    if !s.len().is_multiple_of(2) {
+        return Err(JsValue::from_str("odd-length hex"));
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| JsValue::from_str("bad hex")))
+        .collect()
 }

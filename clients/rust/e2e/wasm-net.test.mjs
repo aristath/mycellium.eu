@@ -56,7 +56,7 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(`http://127.0.0.1:${webPort}/index.html`, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium !== undefined, { timeout: 15000, polling: 100 });
 
     console.error('• in-browser WASM engine logs into a real directory (cross-origin)');
     const result = await page.evaluate((url) => {

@@ -51,7 +51,7 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium !== undefined, { timeout: 15000, polling: 100 });
     const r = await page.evaluate(() => {
       const m = window.mycellium;
       return {

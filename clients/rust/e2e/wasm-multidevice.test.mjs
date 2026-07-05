@@ -1,12 +1,7 @@
-// Multi-device: a second in-browser device adopts an account and both receive a
-// message. SKIPPED pending the seedless pairing flow (#6) — seed-phrase device
-// linking (link_payload/link_device) has been removed, so this must be rewritten
-// to drive the pairing protocol once the browser pairing UI lands.
+// Multi-device: a second in-browser device adopts an account via the **seedless
+// pairing** flow (new device offers, existing device approves, no seed anywhere),
+// and a message to the account then fans out to BOTH devices.
 
-console.log('SKIP wasm-multidevice: pending seedless pairing flow (#6)');
-process.exit(0);
-
-// eslint-disable-next-line no-unreachable
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
@@ -55,25 +50,26 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(`http://127.0.0.1:${webPort}/index.html`, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.Session !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.Session !== undefined, { timeout: 15000, polling: 100 });
 
-    console.error('• device B adopts Alice via a link; a message reaches both devices');
+    console.error('• device B pairs into Alice (seedless); a message reaches both devices');
     const r = await page.evaluate((dir, q) => {
       try {
         const S = window.mycellium.Session;
         const a = new S(), b = new S(), carol = new S();
         a.register(dir, q, 'alice', 'Alice');
         carol.register(dir, q, 'carol', 'Carol');
-        const payload = a.link_payload(dir, q, 'alice', 'Alice');
 
-        // A link whose exp is in the past must be refused (checked before the
-        // seed is even read). Craft one with URL-safe base64.
-        const b64url = (s) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-        const stale = b64url(JSON.stringify({ v: 1, m: 'x', d: dir, q, h: 'alice', n: 'Alice', exp: 1 }));
-        let expiredRejected = false;
-        try { new S().link_device(stale); } catch { expiredRejected = true; }
+        // Seedless pairing: B (a fresh device) makes a one-time offer, A approves
+        // it (sealing the account key to it), B polls and adopts the account.
+        const offer = b.pair_offer(q);
+        a.pair_approve(offer, 'alice', dir);
+        let cfg = null;
+        for (let i = 0; i < 5 && !cfg; i++) {
+          const res = b.pair_poll(q);
+          if (res) cfg = JSON.parse(res);
+        }
 
-        b.link_device(payload); // B: same seed, fresh device, merges into the record
         carol.send(dir, 'carol', 'Carol', q, 'alice', 'hi alice on all devices');
         a.sync(q); b.sync(q);
 
@@ -84,8 +80,8 @@ async function main() {
         a.sync(q); b.sync(q);
 
         return {
-          payloadLen: payload.length,
-          expiredRejected,
+          paired: !!cfg && cfg.handle === 'alice',
+          offerLen: offer.length,
           walletA: a.wallet(), walletB: b.wallet(),
           threadA: JSON.parse(a.thread('carol')).map((m) => m.text),
           threadB: JSON.parse(b.thread('carol')).map((m) => m.text),
@@ -94,9 +90,9 @@ async function main() {
     }, dirUrl, qUrl);
 
     check(!r.error, `no error (${r.error || 'ok'})`);
-    check(r.payloadLen > 40, 'link payload generated');
-    check(r.expiredRejected, 'an expired device link is rejected');
-    check(r.walletA === r.walletB, 'both devices share the account wallet (same seed)');
+    check(r.offerLen > 40, 'pairing offer generated');
+    check(r.paired, 'device B adopted the account via pairing');
+    check(r.walletA === r.walletB, 'both devices share the account wallet (adopted, no seed)');
     check(r.threadA.includes('hi alice on all devices'), "device A received the message");
     check(r.threadB.includes('hi alice on all devices'), "device B received the message (multi-device fan-out)");
     check(r.threadB.includes('still on both after rename'), "device B still reachable after A re-registered (no device drop)");

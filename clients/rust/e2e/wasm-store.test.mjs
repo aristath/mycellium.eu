@@ -41,7 +41,7 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(url, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000, polling: 100 });
 
     console.error('• write engine state and snapshot it to IndexedDB');
     const before = await page.evaluate(async () => {
@@ -75,7 +75,7 @@ async function main() {
 
     console.error('• reload the page — a fresh WASM instance restores from IndexedDB');
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000, polling: 100 });
     const after = await page.evaluate(async () => ({
       name: await window.mycellium.rpc('get', ['name']),
       greeting: await window.mycellium.rpc('get', ['greeting']),
@@ -96,7 +96,7 @@ async function main() {
     check(thread[0].text === 'hi bob' && thread[0].from_me === true, 'sent message fields correct');
     check(thread[1].from_me === false, 'received message flagged');
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000, polling: 100 });
     const threadAfter = await page.evaluate(async () => JSON.parse(await window.mycellium.rpc('thread', ['bob'])));
     check(threadAfter.length === 2, 'conversation survived reload (engine history + IndexedDB)');
 
@@ -119,7 +119,7 @@ async function main() {
     });
     check(afterDel === null, 'deleted key is gone');
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000, polling: 100 });
     const gone = await page.evaluate(async () => (await window.mycellium.rpc('get', ['greeting'])) ?? null);
     check(gone === null, 'deletion survived the reload');
   } finally {

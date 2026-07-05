@@ -56,7 +56,7 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.error('  [pageerror]', e.message));
     await page.goto(`http://127.0.0.1:${webPort}/index.html`, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => window.mycellium?.Session !== undefined, { timeout: 15000 });
+    await page.waitForFunction(() => window.mycellium?.Session !== undefined, { timeout: 15000, polling: 100 });
 
     console.error('• two browser identities register, one messages the other through real servers');
     const r = await page.evaluate((dir, q) => {

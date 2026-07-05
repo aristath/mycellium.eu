@@ -183,19 +183,26 @@ async function main() {
     await jsClick(alice, '#ssave');
     check(await hasText(alice, 'header .who', 'Alice Cooper', 8000), 'display name updated in the header');
 
-    console.error('• Alice links a second device (QR + link flow)');
-    await jsClick(alice, '#settings');
-    await jsClick(alice, '#linkdev');
-    await alice.waitForSelector('#link', { timeout: 10000 });
-    const link = await alice.evaluate(() => document.getElementById('link')?.value || '');
-    check(/#link=/.test(link), 'device-link URL generated');
-    check(await alice.evaluate(() => !!document.querySelector('svg')), 'QR code rendered');
+    console.error('• Alice pairs a second device (seedless offer → approve)');
+    // Device B: a fresh browser context joins the account and shows a pairing offer.
     const ctxAB = await browser.createBrowserContext();
     const aliceB = await ctxAB.newPage();
     aliceB.on('dialog', (d) => d.dismiss().catch(() => {}));
-    await aliceB.goto(link, { waitUntil: 'domcontentloaded' });
-    await aliceB.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000 });
-    check(await hasText(aliceB, 'header .who', 'Alice', 15000), 'device B signed in as Alice from the link');
+    await aliceB.goto(appUrl, { waitUntil: 'domcontentloaded' });
+    await aliceB.waitForFunction(() => window.mycellium?.rpc !== undefined, { timeout: 15000, polling: 100 });
+    await jsClick(aliceB, '#joininstead');
+    await aliceB.waitForSelector('#offer', { timeout: 10000 });
+    const offer = await aliceB.evaluate(() => document.getElementById('offer')?.value || '');
+    check(offer.length > 40, 'device B produced a pairing offer');
+    check(await aliceB.evaluate(() => !!document.querySelector('svg')), 'QR code rendered');
+    // Device A approves the offer (seals its account key to it).
+    await jsClick(alice, '#settings');
+    await jsClick(alice, '#linkdev');
+    await alice.waitForSelector('#offer', { timeout: 10000 });
+    await alice.evaluate((o) => { document.getElementById('offer').value = o; }, offer);
+    await jsClick(alice, '#approve');
+    // Device B polls, adopts the account, and signs in as Alice — no seed involved.
+    check(await hasText(aliceB, 'header .who', 'Alice', 20000), 'device B signed in as Alice via pairing');
     await jsClick(alice, '#back'); await jsClick(alice, '#back'); // return Alice to the chat list
 
     console.error('• Web Push wiring (key + subscribe path; live delivery needs a real device)');

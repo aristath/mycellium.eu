@@ -75,6 +75,7 @@
 
     let me = null, open = null, poll = null;
     let seen = {}, firstScan = true, replyTo = null, og = null, showSettings = false, showLink = false, online = true;
+    let pairNew = false, pairPollTimer = null;
     const app = document.getElementById('app');
     const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
     const initials = (s) => (s || '?').trim().slice(0, 2).toUpperCase();
@@ -85,16 +86,6 @@
       await init(); // for the test hooks below; the worker loads its own engine copy
       const stored = await rpc('get', ['myc:me']);
       me = stored ? JSON.parse(stored) : null;
-      // Adopt an account from a device-link URL (#link=<payload>).
-      const linkMatch = location.hash.match(/#link=(.+)/);
-      if (linkMatch && !me) {
-        try {
-          const c = JSON.parse(await rpc('link_device', [decodeURIComponent(linkMatch[1])]));
-          cfg.dir = c.dir; cfg.queue = c.queue; me = { handle: c.handle, name: c.name };
-          localStorage.setItem('myc_dir', cfg.dir); localStorage.setItem('myc_queue', cfg.queue);
-          history.replaceState(null, '', location.pathname + location.search);
-        } catch (e) { console.error('link failed:', e); }
-      }
       // Test/dev hook only — exposes the engine for the e2e suites. Gated to
       // localhost so a real deployment never hands the engine to page scripts.
       if (['localhost', '127.0.0.1', ''].includes(location.hostname)) {
@@ -163,8 +154,8 @@
 
     async function render() {
       if (!cfg.dir || !cfg.queue) return renderSetup();
-      if (!me) return renderRegister();
-      if (showLink) return renderLink();
+      if (!me) return pairNew ? renderPairNew() : renderRegister();
+      if (showLink) return renderPairApprove();
       if (showSettings) return renderSettings();
       if (og) return renderGroupThread(og);
       return open ? renderThread(open) : renderList();
@@ -176,10 +167,16 @@
         <label>Directory URL</label><input id="dir" placeholder="https://directory.example" value="${esc(cfg.dir)}">
         <label>Queue URL</label><input id="queue" placeholder="https://queue.example" value="${esc(cfg.queue)}">
         <div class="row"><button id="save">Continue</button></div>
-        <div class="row" style="margin-top:6px"><button class="ghost" id="linkexisting">Link an existing account</button></div>
+        <div class="row" style="margin-top:6px"><button class="ghost" id="linkexisting">Join an existing account</button></div>
         <div class="err" id="err"></div>
       </div></div>`;
-      byId('linkexisting').onclick = () => linkPrompt();
+      byId('linkexisting').onclick = () => {
+        cfg.dir = byId('dir').value.trim().replace(/\/$/, '');
+        cfg.queue = byId('queue').value.trim().replace(/\/$/, '');
+        if (!cfg.dir || !cfg.queue) return setErr('Enter your directory + queue first.');
+        localStorage.setItem('myc_dir', cfg.dir); localStorage.setItem('myc_queue', cfg.queue);
+        pairNew = true; render();
+      };
       byId('save').onclick = () => {
         cfg.dir = byId('dir').value.trim().replace(/\/$/, '');
         cfg.queue = byId('queue').value.trim().replace(/\/$/, '');
@@ -194,8 +191,11 @@
         <h1>Pick a username</h1><p>Others reach you by this name. It runs entirely in your browser.</p>
         <label>Username</label><input id="u" placeholder="alice" autocapitalize="off">
         <label>Display name</label><input id="n" placeholder="Alice">
-        <div class="row"><button id="go">Create account</button></div><div class="err" id="err"></div>
+        <div class="row"><button id="go">Create account</button></div>
+        <div class="row" style="margin-top:6px"><button class="ghost" id="joininstead">Join an existing account</button></div>
+        <div class="err" id="err"></div>
       </div></div>`;
+      byId('joininstead').onclick = () => { pairNew = true; render(); };
       byId('go').onclick = async () => {
         const handle = byId('u').value.trim().toLowerCase();
         const name = byId('n').value.trim() || handle;
@@ -244,7 +244,7 @@
         <main><div class="wrap"><div class="card">
           <label>Display name</label><input id="sname" value="${esc(me.name)}">
           <div class="row"><button id="ssave">Save</button></div>
-          <div class="row" style="margin-top:14px"><button id="linkdev" style="background:#22322a;color:#7fe0a8">📱 Link another device</button></div>
+          <div class="row" style="margin-top:14px"><button id="linkdev" style="background:#22322a;color:#7fe0a8">📱 Approve a device</button></div>
           <p style="margin-top:16px;color:var(--dim)">Username <b style="color:var(--ink)">@${esc(me.handle)}</b> — people reach you by this.</p>
           <p style="color:var(--dim)">Device key <code style="font-size:.72rem">${esc(wallet.slice(0, 24))}…</code></p>
           <hr style="border-color:var(--line);margin:18px 0">
@@ -264,44 +264,63 @@
       };
     }
 
-    function linkPrompt() {
-      app.insertAdjacentHTML('beforeend', `<div class="modal-bg" id="bg"><div class="modal">
-        <h1 style="font-size:1.1rem;margin:0 0 10px">Link a device</h1>
-        <label>Paste the link from your other device</label><input id="lp" placeholder="https://…#link=…">
-        <div class="row"><button id="lok">Link</button><button class="ghost" id="lcancel">Cancel</button></div>
-        <div class="err" id="lerr"></div>
-      </div></div></div>`);
-      const close = () => byId('bg').remove();
-      byId('lcancel').onclick = close;
-      byId('lok').onclick = async () => {
-        let v = byId('lp').value.trim();
-        const m = v.match(/#link=(.+)/); if (m) v = decodeURIComponent(m[1]);
-        if (!v) return;
-        try {
-          const c = JSON.parse(await rpc('link_device', [v]));
-          cfg.dir = c.dir; cfg.queue = c.queue; me = { handle: c.handle, name: c.name };
+    // New device: show a one-time pairing code + QR, and poll until an existing
+    // device approves it (which delivers the account over the pairing channel —
+    // no seed phrase, and the code is worthless once used or after it expires).
+    async function renderPairNew() {
+      let offer;
+      try { offer = await rpc('pair_offer', [cfg.queue]); }
+      catch (e) { app.innerHTML = `<div class="wrap"><div class="card"><p class="err">Could not start pairing: ${esc('' + e)}</p><div class="row"><button id="back">Back</button></div></div></div>`; byId('back').onclick = () => { pairNew = false; render(); }; return; }
+      let qr = ''; try { qr = await rpc('qr_svg', [offer]); } catch {}
+      app.innerHTML = `
+        <div class="backbar"><button class="ghost" id="back">‹ Cancel</button><b>Join an account</b></div>
+        <main><div class="wrap"><div class="card">
+          <p>On a device already signed in, open <b>Settings → Approve a device</b> and scan this — or paste the code below. Keep this screen open.</p>
+          <div style="background:#fff;padding:10px;border-radius:12px;max-width:260px;margin:14px auto">${qr}</div>
+          <label>Pairing code</label>
+          <textarea id="offer" rows="3" readonly onclick="this.select()">${esc(offer)}</textarea>
+          <div class="row"><button id="copy">Copy code</button></div>
+          <p id="status" style="color:#8aa;font-size:.85rem;margin-top:12px">Waiting for approval…</p>
+        </div></div></main>`;
+      byId('back').onclick = () => { if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; } pairNew = false; render(); };
+      byId('copy').onclick = async () => { try { await navigator.clipboard.writeText(offer); byId('copy').textContent = 'Copied ✓'; } catch { byId('offer').select(); } };
+      if (pairPollTimer) clearInterval(pairPollTimer);
+      pairPollTimer = setInterval(async () => {
+        let res;
+        try { res = await rpc('pair_poll', [cfg.queue]); } catch { return; }
+        if (res) {
+          clearInterval(pairPollTimer); pairPollTimer = null;
+          const c = JSON.parse(res);
+          cfg.dir = c.dir || cfg.dir; cfg.queue = c.queue || cfg.queue;
+          me = { handle: c.handle, name: c.name };
           localStorage.setItem('myc_dir', cfg.dir); localStorage.setItem('myc_queue', cfg.queue);
-          close(); render(); startPolling();
-        } catch (e) { const el = byId('lerr'); if (el) el.textContent = 'Link failed: ' + e; }
-      };
+          await rpc('put', ['myc:me', JSON.stringify(me)]);
+          pairNew = false; render(); startPolling();
+        }
+      }, 2000);
     }
 
-    async function renderLink() {
-      const payload = await rpc('link_payload', [cfg.dir, cfg.queue, me.handle, me.name]);
-      const link = location.origin + location.pathname + '#link=' + payload;
-      let qr = ''; try { qr = await rpc('qr_svg', [link]); } catch {}
+    // Existing device: paste the new device's pairing code and approve it.
+    async function renderPairApprove() {
       app.innerHTML = `
-        <div class="backbar"><button class="ghost" id="back">‹ Settings</button><b>Link a device</b></div>
+        <div class="backbar"><button class="ghost" id="back">‹ Settings</button><b>Approve a device</b></div>
         <main><div class="wrap"><div class="card">
-          <p>Scan this with your other device's camera, or open the link there — it signs that device in as <b>@${esc(me.handle)}</b>.</p>
-          <div style="background:#fff;padding:10px;border-radius:12px;max-width:260px;margin:14px auto">${qr}</div>
-          <label>Or copy this link</label>
-          <input id="link" value="${esc(link)}" readonly onclick="this.select()">
-          <div class="row"><button id="copy">Copy link</button></div>
-          <p style="color:#e8908f;font-size:.8rem;margin-top:12px">⚠ This link contains your account key — anyone with it can read your messages. Only send it to your own device.</p>
+          <p>On your <b>new</b> device, choose "Join an existing account". Paste the pairing code it shows here to add it to <b>@${esc(me.handle)}</b>.</p>
+          <label>Pairing code from the new device</label><textarea id="offer" rows="3" placeholder="paste the code…"></textarea>
+          <div class="row"><button id="approve">Approve device</button></div>
+          <p style="color:#e8908f;font-size:.8rem;margin-top:12px">⚠ Only approve a device you physically control — this shares your account key with it.</p>
+          <div class="err" id="aerr"></div>
         </div></div></main>`;
       byId('back').onclick = () => { showLink = false; render(); };
-      byId('copy').onclick = async () => { try { await navigator.clipboard.writeText(link); byId('copy').textContent = 'Copied ✓'; } catch { byId('link').select(); } };
+      byId('approve').onclick = async () => {
+        const offer = byId('offer').value.trim();
+        if (!offer) return;
+        byId('approve').disabled = true;
+        try {
+          await rpc('pair_approve', [offer, me.handle, cfg.dir]);
+          byId('approve').textContent = 'Approved ✓ — finish on the new device';
+        } catch (e) { byId('aerr').textContent = 'Approve failed: ' + e; byId('approve').disabled = false; }
+      };
     }
 
     function fabMenu() {
