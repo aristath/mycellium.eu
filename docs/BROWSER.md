@@ -107,6 +107,25 @@ read/write. The UI shows it only in this flow, with a warning, and never logs it
 Delivery can't be verified headlessly (it needs a real vendor round-trip); the e2e
 suite verifies the *wiring* (VAPID key + subscribe) instead.
 
+### Contentless-push interoperability matrix (manual QA)
+
+Real delivery must be verified manually against each vendor's push service — it
+can't run in headless CI. Endpoint-only storage (see `push.rs`) is sufficient for
+these contentless VAPID pings; the `p256dh`/`auth` keys would only be needed if we
+ever sent encrypted payloads (we don't). Verify a bodyless VAPID ping wakes the
+service worker and shows a notification, with only the endpoint stored:
+
+| Browser / service      | Contentless VAPID ping | Notes |
+|------------------------|------------------------|-------|
+| Chrome / FCM           | ☐ not yet verified     | primary target |
+| Edge / Windows (WNS)   | ☐ not yet verified     | Chromium; expected same as Chrome |
+| Firefox / Mozilla push | ☐ not yet verified     |       |
+| Safari / APNs (macOS)  | ☐ not yet verified     | web push needs macOS 13+/iOS 16.4+; may be unsupported |
+
+Update this table (and the "Known limitations" list) as each is confirmed on
+staging. Until a vendor row is checked, treat its push delivery as unverified.
+Tracked in issue #30.
+
 ## Offline
 
 The service worker caches the shell (`index.html`, manifest, icon, `pkg/`), so the
