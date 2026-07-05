@@ -184,6 +184,12 @@ class AndroidKeystoreSecretStore(
             } catch (e: Throwable) {
                 // Some devices advertise but mis-handle StrongBox; fall back.
             }
+            // The Builder is mutable and shared, so the attempt above left
+            // `isStrongBoxBacked = true` on it — turn it back OFF, or the fallback
+            // build() re-requests StrongBox and throws again on every device (and
+            // every emulator) that lacks the secure element. Only reachable on
+            // API 28+, so calling this setter here is safe (it was added in 28).
+            builder.setIsStrongBoxBacked(false)
         }
         generator.init(builder.build())
         return generator.generateKey()
