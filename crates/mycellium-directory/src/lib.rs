@@ -319,6 +319,18 @@ impl Directory {
         Ok(token)
     }
 
+    /// Resolve a session token to its wallet, rejecting one past `TOKEN_TTL` —
+    /// so session lifetime is enforced at every protected action, not only when
+    /// housekeeping happens to prune it.
+    fn authed(&self, token: &str, now: u64) -> Result<WalletPublicKey, ApiError> {
+        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let issued = self.token_times.get(token).copied().unwrap_or(0);
+        if now.saturating_sub(issued) > TOKEN_TTL {
+            return Err(ApiError::Unauthorized);
+        }
+        Ok(wallet)
+    }
+
     /// Begin an email-verified username claim for the logged-in wallet.
     ///
     /// Returns `(pending_token, code)`. The code is what the verification email
@@ -331,7 +343,7 @@ impl Directory {
         email: &str,
         now: u64,
     ) -> Result<(String, String), ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let wallet = self.authed(token, now)?;
         // Note: we do *not* reject an already-bound username here. Starting the
         // flow only sends a code to the caller's email; whether they may claim or
         // re-bind (recovery) the name is decided at `auth_confirm`, which requires
@@ -450,7 +462,7 @@ impl Directory {
         record: SignedRecord,
         now: u64,
     ) -> Result<(), ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let wallet = self.authed(token, now)?;
         if !self.allow(hex(&wallet.0), "publish", PUBLISH_PER_WALLET, now) {
             return Err(ApiError::RateLimited);
         }
@@ -492,7 +504,7 @@ impl Directory {
 
     /// Record a heartbeat: the authenticated owner of `handle` is online at `now`.
     pub fn heartbeat(&mut self, token: &str, handle: &Handle, now: u64) -> Result<(), ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let wallet = self.authed(token, now)?;
         match self.bindings.get(handle) {
             Some(owner) if *owner == wallet => {}
             _ => return Err(ApiError::Forbidden),
@@ -879,6 +891,36 @@ mod tests {
         dir.challenge(a.wallet_public(), TOKEN_TTL + 1);
         assert_eq!(
             dir.publish(&token, &handle, record_for(&a, "ari", 2), TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn old_sessions_are_rejected_on_every_protected_action() {
+        // Session age must be enforced at each action, not only when housekeeping
+        // happens to prune the token first (issue #44).
+        let mut dir = Directory::new();
+        let a = Identity::generate(&mut OsPlatform).unwrap();
+        let handle = Handle::new("ari").unwrap();
+        let nonce = dir.challenge(a.wallet_public(), 0);
+        let sig = a.sign(&Directory::challenge_message(&nonce));
+        let token = dir.verify(&a.wallet_public(), &nonce, &sig, 0).unwrap();
+
+        // Fresh session works for the protected actions.
+        assert!(dir.publish(&token, &handle, record_for(&a, "ari", 1), 10).is_ok());
+        assert!(dir.heartbeat(&token, &handle, 10).is_ok());
+
+        // Past TOKEN_TTL, the same token is rejected on each — with no prune first.
+        assert_eq!(
+            dir.publish(&token, &handle, record_for(&a, "ari", 2), TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized)
+        );
+        assert_eq!(
+            dir.heartbeat(&token, &handle, TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized)
+        );
+        assert_eq!(
+            dir.auth_start(&token, &handle, "a@b.com", TOKEN_TTL + 1),
             Err(ApiError::Unauthorized)
         );
     }
