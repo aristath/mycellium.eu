@@ -46,10 +46,19 @@ clients/
                                 WASM in the page, no local binary
 ```
 
-Two ways to use it: the **CLI** (below) and a **browser PWA** ([`clients/web`](clients/web)) —
-open a link, pick a username, and message someone with the whole client (identity,
-X3DH + Double Ratchet, delivery, history) running as WebAssembly in the page. See
-[the browser app](#browser-app-pwa).
+**Product direction — native-first.** The target clients are **native apps**
+(Android, iOS, macOS, Linux, Windows): thin, platform-native UI shells over the shared
+Rust core + engine, bound through a native SDK (`mycellium-sdk` — UniFFI for
+Kotlin/Swift, a C-ABI for desktop). Native is where a messenger's essentials live — OS
+secure storage, native push/wake, background delivery, direct P2P reachability, and
+platform-native UX. **These apps don't exist yet**; they're the roadmap (native client
+roadmap, #74).
+
+What runs **today** is two shells over that same engine: the **CLI** (below) and a
+**browser PWA** ([`clients/web`](clients/web)) — open a link, pick a username, and
+message someone with the whole client (identity, X3DH + Double Ratchet, delivery,
+history) running as WebAssembly in the page. The PWA is a **proof-of-concept /
+fallback / demo** surface, not the primary product; see [the browser app](#browser-app-pwa).
 
 Every crate links its own README: [core](crates/mycellium-core/README.md) ·
 [directory](crates/mycellium-directory/README.md) ·
@@ -369,6 +378,13 @@ installable PWA ([`clients/web`](clients/web)) — 1:1 + groups, attachments,
 notifications + Web Push, multi-device linking by QR or link, all client-side. The
 directory and queue now **persist** (embedded redb), send real verification email
 with account **recovery**, terminate TLS, rate-limit, and expose `/metrics` + logs.
+
+**Native clients (the product frontier):** the native apps are the target surface and
+**don't exist yet**. The roadmap is a `mycellium-sdk` (UniFFI + C-ABI over the shared
+engine, #64), OS secure storage (Keychain / Keystore / DPAPI / libsecret, #65), native
+push/wake (APNs / FCM, #71), and the platform apps (Android #67, iOS #68, macOS #69,
+Linux #70, Windows #72) — tracked as the native client roadmap (#74). Privacy /
+metadata / trust direction is #48.
 
 **Deferred frontier:** NAT traversal (DHT/relay), a non-US mobile push relay, and
 an independent security audit before a public launch.

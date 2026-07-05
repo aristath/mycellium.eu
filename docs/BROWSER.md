@@ -6,6 +6,14 @@ ciphertext. This is the companion to [`ARCHITECTURE.md`](ARCHITECTURE.md) for th
 web target; the crates are [`mycellium-wasm`](../crates/mycellium-wasm/README.md)
 and the app is [`clients/web`](../clients/web/README.md).
 
+> **Positioning.** Mycellium is **native-first**: the target clients are native apps
+> (Android, iOS, macOS, Linux, Windows) over a shared native SDK — see the native
+> client roadmap (#74) and
+> [Clients: native-first](ARCHITECTURE.md#clients-native-first-the-product-target).
+> The browser PWA documented here is a **proof-of-concept / fallback / demo /
+> test-harness** surface — real and useful, but **not** the primary product. Everything
+> below is accurate; just read it as a secondary surface, not the main client.
+
 ## Why WASM, not a rewrite
 
 The engine is written once. The browser is "just another platform" — it implements

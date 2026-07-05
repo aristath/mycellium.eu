@@ -7,6 +7,16 @@ they land.
 The protocol and crypto are sound; the gaps are **durability, concurrency,
 deployment shape, and the operational essentials** around them.
 
+**Two separate readiness questions.** This doc has always tracked **protocol &
+service readiness** — the directory, queue, crypto, and their operational essentials
+— which is largely done (tiers T0–T2 below). **Native-client readiness** is a
+distinct, mostly-open track: Mycellium is **native-first**, and the native apps that
+are the target product don't exist yet. That frontier — the native SDK, OS secure
+storage, native push/wake, and the platform apps — is tracked separately (see
+[Native-client readiness](#native-client-readiness-the-new-frontier) below and the
+native client roadmap, #74). The tiers here concern the shared services and engine;
+they are what the native clients will build on.
+
 | Tier | Focus | Status |
 |------|-------|--------|
 | **T0** | Blockers (durability, concurrency, TLS, email, recovery) | ✅ complete |
@@ -165,6 +175,30 @@ for smaller refinements found in the doc audit.
 - [ ] **T3.2 — Moderation & safety at scale** — blocking, key-change warnings in
   the UI, reporting.
 - [ ] **T3.3 — Large-group scalability** — fan-out is O(members × devices).
+
+---
+
+## Native-client readiness (the new frontier)
+
+Separate from the protocol/service readiness above: the **native apps are the primary
+product and are not built yet**. What runs today is the CLI and the browser PWA (a
+POC/fallback surface). This track is what turns "the service works" into "there's an
+app people install." Tracked as the native client roadmap (**#74**); privacy /
+metadata / trust work is **#48**.
+
+- [ ] **N1 — Native SDK.** A `mycellium-sdk` crate over the shared core + engine:
+  **UniFFI** bindings for Kotlin/Swift and a **C-ABI** for desktop, so every platform
+  UI binds to one implementation (no protocol/crypto in app code). (#64)
+- [ ] **N2 — OS secure storage.** Hold the account key in the platform keystore —
+  Keychain (iOS/macOS), Keystore (Android), DPAPI (Windows), libsecret (Linux) —
+  instead of a plain file / IndexedDB snapshot. (#65)
+- [ ] **N3 — Native push / wake.** Wake a closed app via **APNs / FCM** (through a
+  push relay explicitly **not** hosted by a US company), the native counterpart to the
+  PWA's contentless Web Push. (#71)
+- [ ] **N4 — Platform apps.** Thin platform-native UI shells over the SDK:
+  **Android (#67)**, **iOS (#68)**, **macOS (#69)**, **Linux (#70)**, **Windows (#72)**.
+- [ ] **N5 — Direct P2P reachability.** NAT traversal / relay so native peers reach
+  each other directly where possible. (#59/#60)
 
 ---
 

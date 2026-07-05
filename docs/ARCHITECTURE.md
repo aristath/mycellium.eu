@@ -22,8 +22,11 @@ Three properties drive every decision:
   copyable seed). Devices, names, and reachability all derive from keys you hold —
   nothing is issued to you.
 - **Portable.** The protocol core is `no_std` and depends only on traits, so the
-  same code runs from a microcontroller to a desktop to a **browser via WASM** —
-  the native CLI and the browser PWA are two shells over one engine.
+  same code runs from a microcontroller to a desktop to a **browser via WASM**. Every
+  client is a thin shell over **one shared engine** — no protocol or crypto logic
+  lives in UI code. Today that's the native CLI and the browser PWA; the **product
+  target is native apps** (Android, iOS, macOS, Linux, Windows) over a native SDK —
+  see [Clients: native-first](#clients-native-first-the-product-target) below.
 
 ---
 
@@ -75,6 +78,32 @@ The core depends on **nothing but its own traits**. Everything platform-specific
 is an adapter you can swap — and the four ports are exactly what differs between
 the native and browser builds: same engine, different `Transport` / `Storage` /
 `Platform` / `HttpTransport` implementations underneath.
+
+---
+
+## Clients: native-first (the product target)
+
+The engine is the shared **brain**; every client is a thin shell over it. Architecturally
+the shells are **peers** — the CLI, the PWA, and the coming native apps all drive the
+same engine through the same ports — but they are not peers in *product priority*:
+
+- **Native apps — the target product (roadmap, not yet built).** Android, iOS, macOS,
+  Linux, and Windows apps, each a thin platform-native UI over the same core + engine,
+  bound through a **native SDK** (`mycellium-sdk`: **UniFFI** for Kotlin/Swift, a
+  **C-ABI** for desktop — #64). Native is where the things a real messenger needs
+  live: OS secure storage (Keychain / Keystore / DPAPI / libsecret — #65), native
+  push/wake (APNs / FCM — #71), background delivery, direct P2P reachability
+  (#59/#60), and platform-native UX. Tracked as the native client roadmap (#74):
+  Android #67, iOS #68, macOS #69, Linux #70, Windows #72.
+- **The CLI** ([`mycellium-cli`](../crates/mycellium-cli/README.md)) — a native
+  terminal shell; what runs today for development and power use.
+- **The browser PWA** ([`clients/web`](../clients/web/README.md)) — the WASM build; a
+  **proof-of-concept / fallback / demo / test-harness** surface, not the primary
+  product. Full walk-through in [`BROWSER.md`](BROWSER.md).
+
+No protocol or crypto logic lives in any UI: shells call the engine, the engine owns
+the contract. Adding a platform means implementing the four ports for it, never
+reimplementing the protocol. Privacy / metadata / trust direction is tracked in #48.
 
 ---
 
