@@ -198,8 +198,8 @@ impl Queue {
     }
 
     /// Register a browser push endpoint for the logged-in wallet (idempotent).
-    pub fn subscribe(&mut self, token: &str, endpoint: String) -> Result<(), ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+    pub fn subscribe(&mut self, token: &str, endpoint: String, now: u64) -> Result<(), ApiError> {
+        let wallet = self.authed(token, now)?;
         if !is_push_endpoint(&endpoint) {
             return Err(ApiError::BadRequest);
         }
@@ -220,8 +220,8 @@ impl Queue {
     }
 
     /// Remove a push endpoint for the logged-in wallet (explicit unsubscribe).
-    pub fn unsubscribe(&mut self, token: &str, endpoint: &str) -> Result<(), ApiError> {
-        let wallet = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+    pub fn unsubscribe(&mut self, token: &str, endpoint: &str, now: u64) -> Result<(), ApiError> {
+        let wallet = self.authed(token, now)?;
         let wallet_hex = hex33(&wallet.0);
         if let Some(list) = self.subs.get_mut(&wallet_hex) {
             let before = list.len();
@@ -293,11 +293,12 @@ impl Queue {
         token: &str,
         wallet_hex: &str,
         slot: &str,
+        now: u64,
     ) -> Result<Vec<String>, ApiError> {
         if !is_slot(slot) {
             return Err(ApiError::BadRequest);
         }
-        let caller = *self.tokens.get(token).ok_or(ApiError::Unauthorized)?;
+        let caller = self.authed(token, now)?;
         if hex33(&caller.0) != wallet_hex {
             return Err(ApiError::Forbidden);
         }
@@ -572,13 +573,13 @@ fn route(
         (Method::Post, ["push", "subscribe"]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            queue.lock().unwrap().subscribe(token, req.endpoint)?;
+            queue.lock().unwrap().subscribe(token, req.endpoint, now)?;
             Ok((200, "\"ok\"".into()))
         }
         (Method::Post, ["push", "unsubscribe"]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            queue.lock().unwrap().unsubscribe(token, &req.endpoint)?;
+            queue.lock().unwrap().unsubscribe(token, &req.endpoint, now)?;
             Ok((200, "\"ok\"".into()))
         }
 
@@ -610,7 +611,7 @@ fn route(
         }
         (Method::Get, ["mailbox", wallet_hex, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
-            let messages = queue.lock().unwrap().collect(token, wallet_hex, slot)?;
+            let messages = queue.lock().unwrap().collect(token, wallet_hex, slot, now)?;
             Ok((200, to_json(&Messages { messages })))
         }
 
@@ -731,19 +732,19 @@ mod tests {
             let atoken = login(&mut q, &alice);
             q.deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0).unwrap();
             let btoken = login(&mut q, &bob);
-            q.subscribe(&btoken, "https://push.example/abc".into()).unwrap();
+            q.subscribe(&btoken, "https://push.example/abc".into(), 0).unwrap();
         } // drop → flushed
 
         // Reopen: the queued blob and the push subscription are both still there.
         let mut q2 = Queue::open(path_str).unwrap();
         assert_eq!(q2.subscriptions(&bob_hex), vec!["https://push.example/abc".to_string()]);
         let btoken = login(&mut q2, &bob);
-        assert_eq!(q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT).unwrap(), vec!["sealed".to_string()]);
+        assert_eq!(q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT, 0).unwrap(), vec!["sealed".to_string()]);
         // ...and after collecting, the drain is persisted (empty on next reopen).
         drop(q2);
         let mut q3 = Queue::open(path_str).unwrap();
         let btoken2 = login(&mut q3, &bob);
-        assert!(q3.collect(&btoken2, &bob_hex, ACCOUNT_SLOT).unwrap().is_empty());
+        assert!(q3.collect(&btoken2, &bob_hex, ACCOUNT_SLOT, 0).unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
     }
@@ -763,6 +764,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_token_cannot_collect_or_subscribe() {
+        // Token TTL must be enforced on *every* authenticated op, not just deposit.
+        let mut q = Queue::new();
+        let bob = Identity::generate(&mut P(21)).unwrap();
+        let bob_hex = hex33(&bob.wallet_public().0);
+        let token = login(&mut q, &bob); // issued at now = 0
+
+        // Fresh token works for both collect and subscribe.
+        assert!(q.subscribe(&token, "https://push.example/ok".into(), 10).is_ok());
+        assert!(q.collect(&token, &bob_hex, ACCOUNT_SLOT, 10).is_ok());
+
+        // Past TOKEN_TTL the same token is rejected for every authenticated op.
+        assert_eq!(
+            q.collect(&token, &bob_hex, ACCOUNT_SLOT, TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized),
+        );
+        assert_eq!(
+            q.subscribe(&token, "https://push.example/late".into(), TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized),
+        );
+        assert_eq!(
+            q.unsubscribe(&token, "https://push.example/ok", TOKEN_TTL + 1),
+            Err(ApiError::Unauthorized),
+        );
+    }
+
+    #[test]
     fn push_subscriptions_are_validated_capped_and_removable() {
         let mut q = Queue::new();
         let a = Identity::generate(&mut P(11)).unwrap();
@@ -770,23 +798,23 @@ mod tests {
         let hex = hex33(&a.wallet_public().0);
 
         // Non-HTTPS / malformed endpoints are refused.
-        assert_eq!(q.subscribe(&token, "http://insecure/x".into()), Err(ApiError::BadRequest));
-        assert_eq!(q.subscribe(&token, "not a url".into()), Err(ApiError::BadRequest));
+        assert_eq!(q.subscribe(&token, "http://insecure/x".into(), 0), Err(ApiError::BadRequest));
+        assert_eq!(q.subscribe(&token, "not a url".into(), 0), Err(ApiError::BadRequest));
 
         // Duplicate subscribes are idempotent.
-        q.subscribe(&token, "https://push.example/a".into()).unwrap();
-        q.subscribe(&token, "https://push.example/a".into()).unwrap();
+        q.subscribe(&token, "https://push.example/a".into(), 0).unwrap();
+        q.subscribe(&token, "https://push.example/a".into(), 0).unwrap();
         assert_eq!(q.subscriptions(&hex).len(), 1);
 
         // The list is capped, evicting the oldest.
         for i in 0..MAX_SUBS_PER_WALLET + 5 {
-            q.subscribe(&token, format!("https://push.example/{i}")).unwrap();
+            q.subscribe(&token, format!("https://push.example/{i}"), 0).unwrap();
         }
         assert_eq!(q.subscriptions(&hex).len(), MAX_SUBS_PER_WALLET);
 
         // Explicit unsubscribe removes an endpoint.
         let e0 = q.subscriptions(&hex)[0].clone();
-        q.unsubscribe(&token, &e0).unwrap();
+        q.unsubscribe(&token, &e0, 0).unwrap();
         assert!(!q.subscriptions(&hex).contains(&e0));
 
         // Gone-removal (the 404/410 path) drops dead endpoints.
@@ -859,12 +887,12 @@ mod tests {
 
         // A non-owner can't collect Bob's mailbox.
         let alice_hex = hex33(&alice.wallet_public().0);
-        assert_eq!(q.collect(&alice_token, &alice_hex, ACCOUNT_SLOT).unwrap(), Vec::<String>::new());
+        assert_eq!(q.collect(&alice_token, &alice_hex, ACCOUNT_SLOT, 0).unwrap(), Vec::<String>::new());
 
         // Bob collects his own, then it's drained.
         let bob_token = login(&mut q, &bob);
-        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT).unwrap(), vec!["sealed".to_string()]);
-        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT).unwrap(), Vec::<String>::new());
+        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(), vec!["sealed".to_string()]);
+        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(), Vec::<String>::new());
     }
 
     #[test]
