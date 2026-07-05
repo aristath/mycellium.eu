@@ -67,9 +67,16 @@ const AD: &[u8] = b"a|b";
 fn established(p: &mut SeededPlatform) -> (Ratchet, Ratchet) {
     let alice = Identity::generate(p).unwrap();
     let bob = Identity::generate(p).unwrap();
-    let initiated = x3dh::initiate(p, &alice, &bob.messaging_public(), &bob.signed_pre_key_public()).unwrap();
+    let initiated = x3dh::initiate(
+        p,
+        &alice,
+        &bob.messaging_public(),
+        &bob.signed_pre_key_public(),
+    )
+    .unwrap();
     let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
-    let a = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
+    let a =
+        Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
     let b = Ratchet::new_responder(&bob_sk, &bob);
     (a, b)
 }
@@ -139,7 +146,10 @@ fn ratchet_rejects_replays() {
     let msg = alice.encrypt(b"exactly once", AD);
     assert_eq!(bob.decrypt(&mut p, &msg, AD).unwrap(), b"exactly once");
     // Replaying the same message must fail (its key was consumed).
-    assert!(bob.decrypt(&mut p, &msg, AD).is_err(), "replay was accepted");
+    assert!(
+        bob.decrypt(&mut p, &msg, AD).is_err(),
+        "replay was accepted"
+    );
 }
 
 #[test]

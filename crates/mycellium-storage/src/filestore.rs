@@ -48,7 +48,10 @@ impl Storage for FileStore {
             Err(e) => return Err(e),
         };
         if blob.len() < 12 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt store entry"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt store entry",
+            ));
         }
         let (nonce, ciphertext) = blob.split_at(12);
         let key_ga: Key = self.key.into();
@@ -62,8 +65,7 @@ impl Storage for FileStore {
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), io::Error> {
         let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce)
-            .map_err(|_| io::Error::other("RNG failure"))?;
+        getrandom::getrandom(&mut nonce).map_err(|_| io::Error::other("RNG failure"))?;
         let key_ga: Key = self.key.into();
         let nonce_ga: Nonce = nonce.into();
         let ciphertext = ChaCha20Poly1305::new(&key_ga)
@@ -94,7 +96,11 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("mycellium-store-test-{}-{}", std::process::id(), tag));
+        p.push(format!(
+            "mycellium-store-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
         let _ = fs::remove_dir_all(&p);
         p
     }
@@ -119,11 +125,17 @@ mod tests {
 
         assert_eq!(store.get(b"missing").unwrap(), None);
         store.put(b"k", b"secret value").unwrap();
-        assert_eq!(store.get(b"k").unwrap().as_deref(), Some(&b"secret value"[..]));
+        assert_eq!(
+            store.get(b"k").unwrap().as_deref(),
+            Some(&b"secret value"[..])
+        );
 
         // The bytes on disk must not be the plaintext.
         let raw = fs::read(store.path(b"k")).unwrap();
-        assert!(!raw.windows(6).any(|w| w == b"secret"), "value stored in the clear");
+        assert!(
+            !raw.windows(6).any(|w| w == b"secret"),
+            "value stored in the clear"
+        );
 
         store.delete(b"k").unwrap();
         assert_eq!(store.get(b"k").unwrap(), None);

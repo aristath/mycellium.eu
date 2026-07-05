@@ -31,15 +31,11 @@ pub fn open_history(identity: &Identity) -> Result<FileStore> {
         .context("could not open local history store")
 }
 
-
-
 /// Truncate a preview string to a readable length.
 pub fn preview(text: &str) -> String {
     let text: String = text.chars().take(48).collect();
     text
 }
-
-
 
 /// Bind both peers' messaging identities into the AEAD associated data, so a
 /// ciphertext is cryptographically tied to *this* pair. Initiator's key first.
@@ -56,8 +52,6 @@ pub fn random_id() -> String {
 pub fn text_message(text: &str) -> AppMessage {
     crate::wireops::text_message(&mut OsPlatform, text)
 }
-
-
 
 /// Parse a duration like `30s`, `10m`, `1h`, `7d` into seconds.
 pub fn parse_duration(s: &str) -> Result<u64> {
@@ -80,8 +74,6 @@ pub fn parse_duration(s: &str) -> Result<u64> {
     Ok(value * mult)
 }
 
-
-
 /// Maximum attachment size (kept small since attachments ride inline).
 const MAX_ATTACHMENT: usize = 256 * 1024;
 
@@ -98,10 +90,15 @@ pub fn build_message(
     expires_at: Option<u64>,
 ) -> Result<AppMessage> {
     let body = if let Some(target) = delete {
-        Body::Delete { to: target.to_string() }
+        Body::Delete {
+            to: target.to_string(),
+        }
     } else if let Some(target) = edit {
         let text = message.ok_or_else(|| anyhow!("--edit requires --message"))?;
-        Body::Edit { to: target.to_string(), text: text.to_string() }
+        Body::Edit {
+            to: target.to_string(),
+            text: text.to_string(),
+        }
     } else if let Some(path) = file {
         let data = std::fs::read(path).with_context(|| format!("could not read '{path}'"))?;
         if data.len() > MAX_ATTACHMENT {
@@ -112,20 +109,37 @@ pub fn build_message(
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        Body::File { mime: guess_mime(&name), name, data }
+        Body::File {
+            mime: guess_mime(&name),
+            name,
+            data,
+        }
     } else if let Some(emoji) = react {
         let to = to.ok_or_else(|| anyhow!("--react requires --to <message-id>"))?;
-        Body::Reaction { to: to.to_string(), emoji: emoji.to_string() }
+        Body::Reaction {
+            to: to.to_string(),
+            emoji: emoji.to_string(),
+        }
     } else if let Some(target) = reply_to {
         let text = message.ok_or_else(|| anyhow!("--reply-to requires --message"))?;
-        Body::Reply { to: target.to_string(), text: text.to_string() }
+        Body::Reply {
+            to: target.to_string(),
+            text: text.to_string(),
+        }
     } else {
-        Body::Text(message.ok_or_else(|| anyhow!("--message is required"))?.to_string())
+        Body::Text(
+            message
+                .ok_or_else(|| anyhow!("--message is required"))?
+                .to_string(),
+        )
     };
-    Ok(AppMessage { id: random_id(), timestamp: OsPlatform.now_unix_secs(), expires_at, body })
+    Ok(AppMessage {
+        id: random_id(),
+        timestamp: OsPlatform.now_unix_secs(),
+        expires_at,
+        body,
+    })
 }
-
-
 
 /// Resolve an expiry timestamp for a conversation `key`: an explicit `--expire`
 /// duration, else the stored per-conversation default, else none.
@@ -136,8 +150,6 @@ pub fn resolve_expiry(fs: &FileStore, key: &str, expire: Option<&str>) -> Result
     };
     Ok(ttl.map(|secs| OsPlatform.now_unix_secs() + secs))
 }
-
-
 
 /// A best-effort MIME type from a file name's extension.
 pub fn guess_mime(name: &str) -> String {
@@ -154,8 +166,6 @@ pub fn guess_mime(name: &str) -> String {
     mime.to_string()
 }
 
-
-
 /// Save an attachment to `MYCELLIUM_HOME/downloads` (name sanitized to a basename).
 pub fn save_attachment(name: &str, data: &[u8]) -> Result<std::path::PathBuf> {
     let dir = store::data_dir().join("downloads");
@@ -165,7 +175,11 @@ pub fn save_attachment(name: &str, data: &[u8]) -> Result<std::path::PathBuf> {
 /// Save `data` under a sanitized basename in `dir`, **never overwriting**: if the
 /// name is taken, append " (n)" until a free name is found (and `create_new` so a
 /// race can't clobber an existing file either).
-fn save_attachment_in(dir: &std::path::Path, name: &str, data: &[u8]) -> Result<std::path::PathBuf> {
+fn save_attachment_in(
+    dir: &std::path::Path,
+    name: &str,
+    data: &[u8],
+) -> Result<std::path::PathBuf> {
     use std::io::Write;
     let safe = std::path::Path::new(name)
         .file_name()
@@ -178,8 +192,16 @@ fn save_attachment_in(dir: &std::path::Path, name: &str, data: &[u8]) -> Result<
         _ => (safe.to_string(), String::new()),
     };
     for n in 0..10_000 {
-        let candidate = if n == 0 { dir.join(safe) } else { dir.join(format!("{stem} ({n}){ext}")) };
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        let candidate = if n == 0 {
+            dir.join(safe)
+        } else {
+            dir.join(format!("{stem} ({n}){ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(mut f) => {
                 f.write_all(data)?;
                 return Ok(candidate);
@@ -191,8 +213,6 @@ fn save_attachment_in(dir: &std::path::Path, name: &str, data: &[u8]) -> Result<
     anyhow::bail!("too many attachments named '{safe}'")
 }
 
-
-
 /// If the message is a file, save it and return where.
 pub fn maybe_save_attachment(app: &AppMessage) -> Option<std::path::PathBuf> {
     if let Body::File { name, data, .. } = &app.body {
@@ -203,8 +223,6 @@ pub fn maybe_save_attachment(app: &AppMessage) -> Option<std::path::PathBuf> {
     }
     None
 }
-
-
 
 pub fn from_hex(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {

@@ -70,7 +70,10 @@ impl Connection for TcpConnection {
         self.0.read_exact(&mut len)?;
         let n = u32::from_be_bytes(len) as usize;
         if n > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         let mut buf = vec![0u8; n];
         self.0.read_exact(&mut buf)?;
@@ -102,8 +105,9 @@ impl Transport for TcpTransport {
     type Error = io::Error;
 
     fn dial(&mut self, peer: &PeerId) -> io::Result<TcpConnection> {
-        let addr = std::str::from_utf8(&peer.0)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "peer id is not an address"))?;
+        let addr = std::str::from_utf8(&peer.0).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "peer id is not an address")
+        })?;
         Ok(TcpConnection(dial_timed(addr)?))
     }
 
@@ -135,12 +139,17 @@ mod tests {
         });
         let (stream, _) = listener.accept().unwrap();
         // Use a short read timeout so the test is fast (the real one is 30s).
-        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let mut conn = TcpConnection(stream);
         // recv reads the length, then blocks on the missing body bytes → times out
         // rather than pinning the thread forever.
         let err = conn.recv().unwrap_err();
-        assert!(matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
         let _ = peer.join();
     }
 }

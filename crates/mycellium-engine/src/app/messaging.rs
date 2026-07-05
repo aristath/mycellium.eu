@@ -1,7 +1,13 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
-pub fn forward(message_id: &str, from: &str, to: &str, whoami: &str, directory: &str) -> Result<()> {
+pub fn forward(
+    message_id: &str,
+    from: &str,
+    to: &str,
+    whoami: &str,
+    directory: &str,
+) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let fs = open_history(&identity)?;
@@ -21,12 +27,16 @@ pub fn forward(message_id: &str, from: &str, to: &str, whoami: &str, directory: 
     let app = text_message(&forwarded);
     let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode())?;
     let queue = QueueTarget::open(&identity, &to_record.record);
-    deliver(&client, &to_handle, queue.as_ref(), to_record.record.primary(), &MailItem::Direct(envelope));
+    deliver(
+        &client,
+        &to_handle,
+        queue.as_ref(),
+        to_record.record.primary(),
+        &MailItem::Direct(envelope),
+    );
     println!("forwarded #{message_id} to '{}'", to_handle.as_str());
     Ok(())
 }
-
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn send(
@@ -62,7 +72,9 @@ pub fn send(
     let now = OsPlatform.now_unix_secs();
     let mut delivered = 0;
     for device in &peer_record.record.devices {
-        let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else { continue };
+        let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else {
+            continue;
+        };
         let slot = device_slot(&device.device_key);
         let item = MailItem::Direct(envelope);
         if deliver(&client, &peer_handle, queue.as_ref(), device, &item) {
@@ -73,8 +85,16 @@ pub fn send(
     }
     let total = peer_record.record.devices.len();
     let queued = total - delivered;
-    let note = if queued > 0 { format!(" — {queued} queued for retry") } else { String::new() };
-    println!("sent to '{}' — {delivered}/{total} device(s) (#{}){note}", peer_handle.as_str(), app.id);
+    let note = if queued > 0 {
+        format!(" — {queued} queued for retry")
+    } else {
+        String::new()
+    };
+    println!(
+        "sent to '{}' — {delivered}/{total} device(s) (#{}){note}",
+        peer_handle.as_str(),
+        app.id
+    );
 
     // Record our own copy in this device's transcript, so the conversation shows
     // what we sent (edits/deletes apply to it; other kinds append).
@@ -103,8 +123,13 @@ pub fn send(
             if device.device_key == my_key {
                 continue;
             }
-            let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else { continue };
-            let sync = MailItem::SelfSync { peer: peer_handle.as_str().to_string(), envelope };
+            let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else {
+                continue;
+            };
+            let sync = MailItem::SelfSync {
+                peer: peer_handle.as_str().to_string(),
+                envelope,
+            };
             if !deliver(&client, &me, my_queue.as_ref(), device, &sync) {
                 let slot = device_slot(&device.device_key);
                 let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, sync, now);
@@ -114,9 +139,12 @@ pub fn send(
     Ok(())
 }
 
-
-
-pub fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: &str) -> Result<()> {
+pub fn broadcast(
+    recipients: &[String],
+    whoami: &str,
+    message: &str,
+    directory: &str,
+) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
@@ -129,7 +157,13 @@ pub fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: 
                 let app = text_message(message);
                 let envelope = seal_to(&identity, &me, record.record.primary(), &app.encode())?;
                 let queue = QueueTarget::open(&identity, &record.record);
-                if deliver(&client, &handle, queue.as_ref(), record.record.primary(), &MailItem::Direct(envelope)) {
+                if deliver(
+                    &client,
+                    &handle,
+                    queue.as_ref(),
+                    record.record.primary(),
+                    &MailItem::Direct(envelope),
+                ) {
                     sent += 1;
                 }
             }
@@ -140,15 +174,24 @@ pub fn broadcast(recipients: &[String], whoami: &str, message: &str, directory: 
     Ok(())
 }
 
-
-
 /// Asynchronously X3DH-seal `plaintext` for `peer` (offline, one-shot session).
 /// Fails if the recipient device published a low-order key.
-pub fn seal_to(identity: &Identity, me: &Handle, device: &Device, plaintext: &[u8]) -> Result<Envelope> {
-    crate::wireops::seal_to(&mut OsPlatform, identity, me, &display_name_for(me), &own_queue(), device, plaintext)
+pub fn seal_to(
+    identity: &Identity,
+    me: &Handle,
+    device: &Device,
+    plaintext: &[u8],
+) -> Result<Envelope> {
+    crate::wireops::seal_to(
+        &mut OsPlatform,
+        identity,
+        me,
+        &display_name_for(me),
+        &own_queue(),
+        device,
+        plaintext,
+    )
 }
-
-
 
 /// A logged-in deposit target: a recipient's queue plus their wallet key. Built
 /// from the recipient's record (the queue lives at the endpoint *they* publish,
@@ -168,13 +211,20 @@ impl QueueTarget {
         }
         let client = QueueClient::new(&record.queue);
         let token = client.login(identity).ok()?;
-        Some(QueueTarget { client, token, wallet_hex: wallet_hex(&record.wallet) })
+        Some(QueueTarget {
+            client,
+            token,
+            wallet_hex: wallet_hex(&record.wallet),
+        })
     }
 
     /// Deposit `item` into `slot` of this recipient's mailbox.
     pub fn deposit(&self, slot: &str, item: &MailItem) -> bool {
         match serde_json::to_string(item) {
-            Ok(json) => self.client.deposit(&self.token, &self.wallet_hex, slot, &json).is_ok(),
+            Ok(json) => self
+                .client
+                .deposit(&self.token, &self.wallet_hex, slot, &json)
+                .is_ok(),
             Err(_) => false,
         }
     }
@@ -210,7 +260,12 @@ pub fn deliver(
 
 /// Deliver the *same* item to every device in a handle's cluster (Layer 11),
 /// via their queue for the offline devices.
-pub fn deliver_to_cluster(dir: &DirectoryClient, identity: &Identity, handle: &Handle, item: &MailItem) {
+pub fn deliver_to_cluster(
+    dir: &DirectoryClient,
+    identity: &Identity,
+    handle: &Handle,
+    item: &MailItem,
+) {
     if let Ok(rec) = dir.lookup(handle) {
         if rec.verify().is_ok() {
             let queue = QueueTarget::open(identity, &rec.record);
@@ -238,14 +293,13 @@ pub fn deliver_to_cluster_or_queue(
             for device in &rec.record.devices {
                 if !deliver(dir, handle, queue.as_ref(), device, item) {
                     let slot = device_slot(&device.device_key);
-                    let _ = outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item.clone(), now);
+                    let _ =
+                        outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item.clone(), now);
                 }
             }
         }
     }
 }
-
-
 
 /// Retry every parked outbox item once: re-resolve the recipient, re-attempt
 /// live/queue delivery, drop the delivered and the expired, bump the rest.
@@ -274,9 +328,19 @@ pub fn flush_outbox(
         };
         let delivered_now = record.as_ref().and_then(|record| {
             // The device this copy was sealed for; if it's gone, we drop the entry.
-            let device = record.record.devices.iter().find(|d| device_slot(&d.device_key) == entry.slot)?;
+            let device = record
+                .record
+                .devices
+                .iter()
+                .find(|d| device_slot(&d.device_key) == entry.slot)?;
             let queue = QueueTarget::open(identity, &record.record);
-            Some(deliver(client, &handle, queue.as_ref(), device, &entry.item))
+            Some(deliver(
+                client,
+                &handle,
+                queue.as_ref(),
+                device,
+                &entry.item,
+            ))
         });
         match delivered_now {
             Some(true) => delivered += 1,
@@ -314,7 +378,13 @@ pub fn outbox_show(directory: &str) -> Result<()> {
     println!("{} message(s) waiting to send:", entries.len());
     for e in &entries {
         let age = now.saturating_sub(e.created_at);
-        println!("  → {}  (device {}, {}s old, {} attempt(s))", e.recipient, &e.slot[..8.min(e.slot.len())], age, e.attempts);
+        println!(
+            "  → {}  (device {}, {}s old, {} attempt(s))",
+            e.recipient,
+            &e.slot[..8.min(e.slot.len())],
+            age,
+            e.attempts
+        );
     }
     Ok(())
 }
@@ -347,7 +417,10 @@ pub fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
     let blocked = blocklist::load(&fs)?;
 
     let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
-    println!("serving on {addr} as {} — receiving live messages", me.as_str());
+    println!(
+        "serving on {addr} as {} — receiving live messages",
+        me.as_str()
+    );
     let mut platform = OsPlatform;
     loop {
         let mut conn = match transport.accept() {
@@ -356,13 +429,19 @@ pub fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
         };
         while let Ok(frame) = conn.recv_frame() {
             if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
-                let _ = process_item(&identity, &me, &client, &blocked, &mut platform, &mut fs, item);
+                let _ = process_item(
+                    &identity,
+                    &me,
+                    &client,
+                    &blocked,
+                    &mut platform,
+                    &mut fs,
+                    item,
+                );
             }
         }
     }
 }
-
-
 
 pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -378,8 +457,14 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     if !queue_url.is_empty() {
         let queue = QueueClient::new(&queue_url);
         if let Ok(qtoken) = queue.login(&identity) {
-            blobs = queue.collect(&qtoken, &my_hex, &my_slot).unwrap_or_default();
-            blobs.extend(queue.collect(&qtoken, &my_hex, ACCOUNT_SLOT).unwrap_or_default());
+            blobs = queue
+                .collect(&qtoken, &my_hex, &my_slot)
+                .unwrap_or_default();
+            blobs.extend(
+                queue
+                    .collect(&qtoken, &my_hex, ACCOUNT_SLOT)
+                    .unwrap_or_default(),
+            );
         }
     }
     let mut fs = open_history(&identity)?;
@@ -394,7 +479,11 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     // error can then be retried next time instead of being lost.
     let mut pending = inbound::load(&fs).unwrap_or_default();
     for blob in blobs {
-        pending.push(inbound::PendingItem { blob, created_at: now, attempts: 0 });
+        pending.push(inbound::PendingItem {
+            blob,
+            created_at: now,
+            attempts: 0,
+        });
     }
     let _ = inbound::save(&mut fs, &pending);
 
@@ -411,7 +500,16 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
             continue; // dead-letter: drop
         }
         let processed = match serde_json::from_str::<MailItem>(&entry.blob) {
-            Ok(item) => process_item(&identity, &me, &client, &blocked, &mut platform, &mut fs, item).is_ok(),
+            Ok(item) => process_item(
+                &identity,
+                &me,
+                &client,
+                &blocked,
+                &mut platform,
+                &mut fs,
+                item,
+            )
+            .is_ok(),
             Err(_) => false, // unparseable — keep retrying until it dead-letters
         };
         if !processed {
@@ -423,8 +521,6 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     let _ = inbound::save(&mut fs, &survivors);
     Ok(())
 }
-
-
 
 /// Handle one mailbox/pushed item (shared by `inbox` and `serve`).
 #[allow(clippy::too_many_arguments)]
@@ -439,17 +535,19 @@ pub fn process_item(
 ) -> Result<()> {
     match item {
         MailItem::Direct(env) => handle_direct(identity, me, client, blocked, platform, fs, &env),
-        MailItem::SelfSync { peer, envelope } => handle_self_sync(identity, platform, fs, &peer, &envelope),
+        MailItem::SelfSync { peer, envelope } => {
+            handle_self_sync(identity, platform, fs, &peer, &envelope)
+        }
         MailItem::GroupSync(env) => handle_group_sync(identity, me, client, platform, fs, &env),
         MailItem::GroupInvite(env) => handle_group_invite(identity, me, client, fs, platform, &env),
-        MailItem::GroupText { group_id, message } => handle_group_text(blocked, fs, &group_id, &message),
+        MailItem::GroupText { group_id, message } => {
+            handle_group_text(blocked, fs, &group_id, &message)
+        }
         MailItem::GroupRemove { group_id, member } => {
             handle_group_remove(identity, me, client, fs, &group_id, &member)
         }
     }
 }
-
-
 
 /// Process a mirror of a message *this account* sent from another device: record
 /// it in the peer's transcript as our own outgoing message (Layer 11 self-sync).
@@ -483,8 +581,6 @@ pub fn handle_self_sync(
     }
     Ok(())
 }
-
-
 
 /// Decrypt and act on a one-to-one offline message: display + persist real
 /// messages (and reply with a read receipt), or show an incoming receipt.
@@ -545,17 +641,27 @@ pub fn handle_direct(
             // Older/raw payloads: best-effort display.
             let text = String::from_utf8_lossy(&bytes).into_owned();
             println!("from {}: {text}", from.as_str());
-            let entry = StoredMessage { id: String::new(), from_me: false, text, timestamp: OsPlatform.now_unix_secs(), expires_at: None };
+            let entry = StoredMessage {
+                id: String::new(),
+                from_me: false,
+                text,
+                timestamp: OsPlatform.now_unix_secs(),
+                expires_at: None,
+            };
             history::append(fs, from.as_str(), entry)?;
         }
     }
     Ok(())
 }
 
-
-
 /// Send a read receipt for `message_id` back to `to` (best-effort).
-pub fn send_receipt(identity: &Identity, me: &Handle, client: &DirectoryClient, to: &Handle, message_id: &str) {
+pub fn send_receipt(
+    identity: &Identity,
+    me: &Handle,
+    client: &DirectoryClient,
+    to: &Handle,
+    message_id: &str,
+) {
     let record = match client.lookup(to) {
         Ok(r) if r.verify().is_ok() => r,
         _ => return,
@@ -564,21 +670,28 @@ pub fn send_receipt(identity: &Identity, me: &Handle, client: &DirectoryClient, 
         id: random_id(),
         timestamp: OsPlatform.now_unix_secs(),
         expires_at: None,
-        body: Body::Receipt { message_id: message_id.to_string(), read: true },
+        body: Body::Receipt {
+            message_id: message_id.to_string(),
+            read: true,
+        },
     };
     // Fan the receipt out to every device of the original sender (Layer 11), so
     // whichever device they sent from sees the read status.
     let encoded = receipt.encode();
     let queue = QueueTarget::open(identity, &record.record);
     for device in &record.record.devices {
-        let Ok(env) = seal_to(identity, me, device, &encoded) else { continue };
+        let Ok(env) = seal_to(identity, me, device, &encoded) else {
+            continue;
+        };
         deliver(client, to, queue.as_ref(), device, &MailItem::Direct(env));
     }
 }
 
-
-
 /// Authenticate the sender and decrypt one offline envelope to raw bytes.
-pub fn open_envelope(identity: &Identity, platform: &mut OsPlatform, env: &Envelope) -> Result<(Handle, Vec<u8>)> {
+pub fn open_envelope(
+    identity: &Identity,
+    platform: &mut OsPlatform,
+    env: &Envelope,
+) -> Result<(Handle, Vec<u8>)> {
     crate::wireops::open_envelope(platform, identity, env)
 }

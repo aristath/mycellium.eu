@@ -43,7 +43,8 @@ impl Store {
             let (k, v) = entry.map_err(err)?;
             if let Some((wallet, slot)) = k.value().split_once('\0') {
                 if let Ok(blobs) = serde_json::from_slice::<Vec<String>>(v.value()) {
-                    out.mailboxes.insert((wallet.to_string(), slot.to_string()), blobs);
+                    out.mailboxes
+                        .insert((wallet.to_string(), slot.to_string()), blobs);
                 }
             }
         }
@@ -62,7 +63,10 @@ impl Store {
         let key = format!("{wallet}\0{slot}");
         let json = serde_json::to_vec(blobs).map_err(err)?;
         self.write(|txn| {
-            txn.open_table(MAILBOX).map_err(err)?.insert(key.as_str(), &json[..]).map_err(err)?;
+            txn.open_table(MAILBOX)
+                .map_err(err)?
+                .insert(key.as_str(), &json[..])
+                .map_err(err)?;
             Ok(())
         })
     }
@@ -70,7 +74,10 @@ impl Store {
     pub fn del_mailbox(&self, wallet: &str, slot: &str) -> Result<(), String> {
         let key = format!("{wallet}\0{slot}");
         self.write(|txn| {
-            txn.open_table(MAILBOX).map_err(err)?.remove(key.as_str()).map_err(err)?;
+            txn.open_table(MAILBOX)
+                .map_err(err)?
+                .remove(key.as_str())
+                .map_err(err)?;
             Ok(())
         })
     }
@@ -78,12 +85,18 @@ impl Store {
     pub fn put_subs(&self, wallet: &str, endpoints: &[String]) -> Result<(), String> {
         let json = serde_json::to_vec(endpoints).map_err(err)?;
         self.write(|txn| {
-            txn.open_table(SUBS).map_err(err)?.insert(wallet, &json[..]).map_err(err)?;
+            txn.open_table(SUBS)
+                .map_err(err)?
+                .insert(wallet, &json[..])
+                .map_err(err)?;
             Ok(())
         })
     }
 
-    fn write(&self, f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>) -> Result<(), String> {
+    fn write(
+        &self,
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>,
+    ) -> Result<(), String> {
         let txn = self.db.begin_write().map_err(err)?;
         f(&txn)?;
         txn.commit().map_err(err)

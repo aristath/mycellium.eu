@@ -37,7 +37,10 @@ pub fn split<P: Platform>(
     }
 
     let mut out: Vec<Share> = (1..=shares)
-        .map(|index| Share { index, body: Vec::with_capacity(secret.len()) })
+        .map(|index| Share {
+            index,
+            body: Vec::with_capacity(secret.len()),
+        })
         .collect();
 
     let mut coeffs = alloc::vec![0u8; threshold as usize];
@@ -161,9 +164,18 @@ mod tests {
         let shares = split(SECRET, 2, 3, &mut p).unwrap();
 
         // Every 2-of-3 combination reconstructs the secret.
-        assert_eq!(combine(&[shares[0].clone(), shares[1].clone()]).unwrap(), SECRET);
-        assert_eq!(combine(&[shares[0].clone(), shares[2].clone()]).unwrap(), SECRET);
-        assert_eq!(combine(&[shares[1].clone(), shares[2].clone()]).unwrap(), SECRET);
+        assert_eq!(
+            combine(&[shares[0].clone(), shares[1].clone()]).unwrap(),
+            SECRET
+        );
+        assert_eq!(
+            combine(&[shares[0].clone(), shares[2].clone()]).unwrap(),
+            SECRET
+        );
+        assert_eq!(
+            combine(&[shares[1].clone(), shares[2].clone()]).unwrap(),
+            SECRET
+        );
         // All three also work.
         assert_eq!(combine(&shares).unwrap(), SECRET);
     }
@@ -185,7 +197,10 @@ mod tests {
         assert!(split(b"", 2, 3, &mut p).is_err());
         assert!(combine(&[]).is_err());
 
-        let dup = Share { index: 1, body: alloc::vec![1, 2] };
+        let dup = Share {
+            index: 1,
+            body: alloc::vec![1, 2],
+        };
         assert!(combine(&[dup.clone(), dup]).is_err()); // duplicate indices
     }
 

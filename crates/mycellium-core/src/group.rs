@@ -72,7 +72,11 @@ impl SenderKey {
         platform.fill_random(&mut signing_seed);
         let signing = SigningKey::from_bytes(&signing_seed);
         signing_seed.zeroize();
-        SenderKey { chain_key, iteration: 0, signing }
+        SenderKey {
+            chain_key,
+            iteration: 0,
+            signing,
+        }
     }
 
     fn distribution(&self) -> SenderKeyDistribution {
@@ -197,7 +201,8 @@ impl Group {
 
     /// Accept another member's distribution so we can decrypt their messages.
     pub fn add_member(&mut self, id: Vec<u8>, dist: &SenderKeyDistribution) -> Result<(), Error> {
-        self.members.insert(id, ReceiverKey::from_distribution(dist)?);
+        self.members
+            .insert(id, ReceiverKey::from_distribution(dist)?);
         Ok(())
     }
 
@@ -312,7 +317,11 @@ impl Group {
                 },
             );
         }
-        Ok(Group { own_id: state.own_id, own, members })
+        Ok(Group {
+            own_id: state.own_id,
+            own,
+            members,
+        })
     }
 }
 
@@ -420,7 +429,10 @@ mod tests {
         let (mut a, mut b, _c) = three_members();
         let mut msg = a.encrypt(b"authentic", AD);
         msg.signature[0] ^= 0xff;
-        assert!(b.decrypt(&msg, AD).is_err(), "a forged signature must not verify");
+        assert!(
+            b.decrypt(&msg, AD).is_err(),
+            "a forged signature must not verify"
+        );
     }
 
     #[test]
@@ -451,7 +463,10 @@ mod tests {
         // Alice re-keys. Bob still has her OLD key, so new messages fail...
         a.rotate(&mut SeededPlatform(240));
         let stale = a.encrypt(b"after rotate", AD);
-        assert!(b.decrypt(&stale, AD).is_err(), "old key must not read new messages");
+        assert!(
+            b.decrypt(&stale, AD).is_err(),
+            "old key must not read new messages"
+        );
 
         // ...until Bob learns the new key.
         b.add_member(b"alice".to_vec(), &a.distribution()).unwrap();
@@ -464,7 +479,10 @@ mod tests {
         let (mut a, mut b, _c) = three_members();
         a.remove_member(b"bob");
         let from_b = b.encrypt(b"still here?", AD);
-        assert!(a.decrypt(&from_b, AD).is_err(), "a removed member must be rejected");
+        assert!(
+            a.decrypt(&from_b, AD).is_err(),
+            "a removed member must be rejected"
+        );
     }
 
     #[test]

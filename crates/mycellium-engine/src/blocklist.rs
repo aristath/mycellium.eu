@@ -10,7 +10,10 @@ const KEY: &[u8] = b"blocklist";
 
 /// Load the set of blocked handles.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(store.get(KEY)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(store
+        .get(KEY)?
+        .and_then(|b| wire::decode(&b).ok())
+        .unwrap_or_default())
 }
 
 /// Block a handle (idempotent).

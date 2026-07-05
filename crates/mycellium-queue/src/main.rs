@@ -11,7 +11,10 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8090";
 
 fn main() {
     let addr = resolve_addr();
-    println!("mycellium-queue {} — store-and-forward on http://{addr}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "mycellium-queue {} — store-and-forward on http://{addr}",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  routes: /health · /login/{{challenge,verify}} · /mailbox/{{wallet}}/{{slot}}");
     println!("  holds opaque E2E blobs keyed by wallet; reads nothing");
     if let Err(err) = mycellium_queue::serve(&addr) {

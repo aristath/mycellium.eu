@@ -15,19 +15,18 @@ pub fn identity_new() -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn identity_show() -> Result<()> {
     let identity = store::load_identity()?;
     println!("wallet:      {}", hex(&identity.wallet_public().0));
     println!("device:      {}", hex(&identity.device_public().0));
-    println!("device-id:   {}  (this device, as shown by `devices`)", short_device_id(&identity.device_public()));
+    println!(
+        "device-id:   {}  (this device, as shown by `devices`)",
+        short_device_id(&identity.device_public())
+    );
     println!("messaging:   {}", hex(&identity.messaging_public().0));
     println!("signed-pk:   {}", hex(&identity.signed_pre_key_public().0));
     Ok(())
 }
-
-
 
 pub fn register(handle: &str, addr: &str, libp2p: bool, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -49,13 +48,16 @@ pub fn register(handle: &str, addr: &str, libp2p: bool, directory: &str) -> Resu
     Ok(())
 }
 
-
-
 pub fn guardian_split(shares: u8, threshold: u8) -> Result<()> {
     let identity = store::load_identity()?;
     let mut platform = OsPlatform;
-    let parts = shamir::split(identity.mnemonic().as_bytes(), threshold, shares, &mut platform)
-        .map_err(|_| anyhow!("invalid --shares/--threshold (need 1 <= threshold <= shares)"))?;
+    let parts = shamir::split(
+        identity.mnemonic().as_bytes(),
+        threshold,
+        shares,
+        &mut platform,
+    )
+    .map_err(|_| anyhow!("invalid --shares/--threshold (need 1 <= threshold <= shares)"))?;
 
     println!("{threshold}-of-{shares} social recovery. Give one share to each guardian:\n");
     for part in &parts {
@@ -68,8 +70,6 @@ pub fn guardian_split(shares: u8, threshold: u8) -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn guardian_recover(share_strs: &[String]) -> Result<()> {
     if store::exists() {
         bail!("an identity already exists at {}", store::path().display());
@@ -80,21 +80,23 @@ pub fn guardian_recover(share_strs: &[String]) -> Result<()> {
         if bytes.len() < 2 {
             bail!("a share is too short");
         }
-        shares.push(Share { index: bytes[0], body: bytes[1..].to_vec() });
+        shares.push(Share {
+            index: bytes[0],
+            body: bytes[1..].to_vec(),
+        });
     }
 
     let secret = shamir::combine(&shares).map_err(|_| anyhow!("could not combine shares"))?;
     let phrase = String::from_utf8(secret).map_err(|_| anyhow!("recovered data is not text"))?;
-    let identity = Identity::from_phrase(phrase.trim(), &mut OsPlatform)
-        .map_err(|_| anyhow!("recovered phrase is invalid — wrong shares, or fewer than the threshold"))?;
+    let identity = Identity::from_phrase(phrase.trim(), &mut OsPlatform).map_err(|_| {
+        anyhow!("recovered phrase is invalid — wrong shares, or fewer than the threshold")
+    })?;
 
     store::save_identity(&identity)?;
     println!("identity recovered on this device (a fresh device in your cluster).");
     println!("wallet: {}", hex(&identity.wallet_public().0));
     Ok(())
 }
-
-
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -103,12 +105,7 @@ pub fn short_device_id(key: &DevicePublicKey) -> String {
     hex(&key.0[..4])
 }
 
-
-
 pub use crate::wireops::device_slot;
-
-
-
 
 /// Read the account's seed phrase from `MYCELLIUM_PHRASE` or stdin.
 pub fn read_phrase() -> Result<String> {
@@ -119,8 +116,6 @@ pub fn read_phrase() -> Result<String> {
     let line = rpassword::prompt_password("Enter your 24-word seed phrase: ")?;
     Ok(line.trim().to_string())
 }
-
-
 
 /// Re-sign and publish a record with a new device set (seq bumped past `prev`).
 pub fn update_devices(
@@ -145,15 +140,13 @@ pub fn update_devices(
     client.publish(token, handle, &signed)
 }
 
-
-
 pub fn link_device(handle: &str, addr: &str, libp2p: bool, directory: &str) -> Result<()> {
     if store::exists() {
         bail!("an identity already exists here — link-device runs on a fresh device (a new MYCELLIUM_HOME)");
     }
     let phrase = read_phrase()?;
-    let identity =
-        Identity::from_phrase(phrase.trim(), &mut OsPlatform).map_err(|_| anyhow!("invalid seed phrase"))?;
+    let identity = Identity::from_phrase(phrase.trim(), &mut OsPlatform)
+        .map_err(|_| anyhow!("invalid seed phrase"))?;
     store::save_identity(&identity)?;
 
     let me = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
@@ -164,10 +157,12 @@ pub fn link_device(handle: &str, addr: &str, libp2p: bool, directory: &str) -> R
     };
     let client = DirectoryClient::new(directory);
     let token = client.login(&identity)?;
-    let current = client
-        .lookup(&me)
-        .map_err(|_| anyhow!("no record for '{handle}' — register it on your first device first"))?;
-    current.verify().map_err(|_| anyhow!("existing record failed verification"))?;
+    let current = client.lookup(&me).map_err(|_| {
+        anyhow!("no record for '{handle}' — register it on your first device first")
+    })?;
+    current
+        .verify()
+        .map_err(|_| anyhow!("existing record failed verification"))?;
     if current.record.wallet != identity.wallet_public() {
         bail!("'{handle}' belongs to a different account (wallet mismatch)");
     }
@@ -185,21 +180,23 @@ pub fn link_device(handle: &str, addr: &str, libp2p: bool, directory: &str) -> R
     Ok(())
 }
 
-
-
 pub fn list_devices(handle: &str, directory: &str) -> Result<()> {
     let me = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
     let client = DirectoryClient::new(directory);
     let record = client.lookup(&me)?;
-    record.verify().map_err(|_| anyhow!("record failed verification"))?;
+    record
+        .verify()
+        .map_err(|_| anyhow!("record failed verification"))?;
     println!("devices for '{handle}':");
     for d in &record.record.devices {
-        println!("  {}  {}", short_device_id(&d.device_key), String::from_utf8_lossy(&d.peer_id.0));
+        println!(
+            "  {}  {}",
+            short_device_id(&d.device_key),
+            String::from_utf8_lossy(&d.peer_id.0)
+        );
     }
     Ok(())
 }
-
-
 
 pub fn revoke_device(handle: &str, device_id: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -207,7 +204,9 @@ pub fn revoke_device(handle: &str, device_id: &str, directory: &str) -> Result<(
     let client = DirectoryClient::new(directory);
     let token = client.login(&identity)?;
     let current = client.lookup(&me)?;
-    current.verify().map_err(|_| anyhow!("record failed verification"))?;
+    current
+        .verify()
+        .map_err(|_| anyhow!("record failed verification"))?;
     if current.record.wallet != identity.wallet_public() {
         bail!("'{handle}' is not your account");
     }
@@ -249,19 +248,20 @@ fn find_device(devices: &[Device], wanted: &str) -> Result<usize> {
     }
 }
 
-
-
 pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecord {
     // Supply the OS platform, plus the display name and queue from the
     // environment; the platform-agnostic core lives in `crate::wireops`.
-    crate::wireops::build_record(&mut OsPlatform, identity, handle, &display_name_for(handle), &own_queue(), addr)
+    crate::wireops::build_record(
+        &mut OsPlatform,
+        identity,
+        handle,
+        &display_name_for(handle),
+        &own_queue(),
+        addr,
+    )
 }
 
-
-
 pub use crate::wireops::my_group_id;
-
-
 
 /// This device's entry for a record: its transport address plus its own
 /// (currently seed-derived) messaging keys, signed by the account wallet.
@@ -280,7 +280,10 @@ mod tests {
             device_key: DevicePublicKey(key),
             peer_id: PeerId(Vec::new()),
             id_key: MessagingPublicKey([0u8; 32]),
-            signed_pre_key: SignedPreKey { public: MessagingPublicKey([0u8; 32]), signature: Signature(vec![0u8; 64]) },
+            signed_pre_key: SignedPreKey {
+                public: MessagingPublicKey([0u8; 32]),
+                signature: Signature(vec![0u8; 64]),
+            },
         }
     }
 

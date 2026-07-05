@@ -105,7 +105,11 @@ pub struct StoredGroup {
 impl StoredGroup {
     /// Record (or update) the handle behind a sender's device id.
     pub fn note_sender(&mut self, sender_id: Vec<u8>, handle: &str) {
-        if let Some(entry) = self.sender_handles.iter_mut().find(|(id, _)| *id == sender_id) {
+        if let Some(entry) = self
+            .sender_handles
+            .iter_mut()
+            .find(|(id, _)| *id == sender_id)
+        {
             entry.1 = handle.to_string();
         } else {
             self.sender_handles.push((sender_id, handle.to_string()));
@@ -114,7 +118,10 @@ impl StoredGroup {
 
     /// The handle behind a sender's device id, if known.
     pub fn handle_of(&self, sender_id: &[u8]) -> Option<&str> {
-        self.sender_handles.iter().find(|(id, _)| id == sender_id).map(|(_, h)| h.as_str())
+        self.sender_handles
+            .iter()
+            .find(|(id, _)| id == sender_id)
+            .map(|(_, h)| h.as_str())
     }
 }
 

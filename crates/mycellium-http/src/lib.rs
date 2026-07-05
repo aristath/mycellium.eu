@@ -58,7 +58,10 @@ fn read_response(resp: ureq::Response, max: usize) -> Result<HttpResponse, Strin
     let status = resp.status();
     let mut body = Vec::new();
     // Read one byte past the cap so we can distinguish "at cap" from "over cap".
-    resp.into_reader().take(max as u64 + 1).read_to_end(&mut body).map_err(|e| e.to_string())?;
+    resp.into_reader()
+        .take(max as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
     if body.len() > max {
         return Err(format!("response body exceeds {max} bytes"));
     }
@@ -73,7 +76,10 @@ mod tests {
 
     #[test]
     fn endpoint_response_caps() {
-        assert_eq!(max_response_for("http://q/mailbox/abc/account"), MAX_RESPONSE_MAILBOX);
+        assert_eq!(
+            max_response_for("http://q/mailbox/abc/account"),
+            MAX_RESPONSE_MAILBOX
+        );
         assert_eq!(max_response_for("http://d/records/abc"), MAX_RESPONSE_SMALL);
         assert_eq!(max_response_for("http://d/auth/status"), MAX_RESPONSE_SMALL);
     }
@@ -98,8 +104,14 @@ mod tests {
             }
         });
         match UreqTransport.request("GET", &format!("http://{addr}/records/x"), &[], None) {
-            Err(e) => assert!(e.contains("exceeds"), "oversized response should be rejected, got: {e}"),
-            Ok(r) => panic!("oversized response should be rejected, got {} bytes", r.body.len()),
+            Err(e) => assert!(
+                e.contains("exceeds"),
+                "oversized response should be rejected, got: {e}"
+            ),
+            Ok(r) => panic!(
+                "oversized response should be rejected, got {} bytes",
+                r.body.len()
+            ),
         }
     }
 }

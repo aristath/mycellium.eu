@@ -167,7 +167,10 @@ impl SignedRecord {
             if device.peer_id.0.len() > MAX_PEER_ID_LEN {
                 return Err(Error::Malformed);
             }
-            wallet.verify(&prekey_signing_bytes(&device.signed_pre_key.public), &device.signed_pre_key.signature)?;
+            wallet.verify(
+                &prekey_signing_bytes(&device.signed_pre_key.public),
+                &device.signed_pre_key.signature,
+            )?;
         }
         Ok(())
     }
@@ -226,7 +229,10 @@ mod tests {
 
     #[test]
     fn signing_bytes_change_with_seq() {
-        assert_ne!(sample_record(1).signing_bytes(), sample_record(2).signing_bytes());
+        assert_ne!(
+            sample_record(1).signing_bytes(),
+            sample_record(2).signing_bytes()
+        );
     }
 
     #[test]
@@ -297,7 +303,10 @@ mod tests {
             devices: alloc::vec![device.clone()],
             seq: 1,
         };
-        assert_eq!(SignedRecord::sign(big_name, &id).verify(), Err(Error::Malformed));
+        assert_eq!(
+            SignedRecord::sign(big_name, &id).verify(),
+            Err(Error::Malformed)
+        );
 
         // Too many devices is also rejected (the count check fires before per-key verify).
         let too_many = Record {
@@ -308,7 +317,10 @@ mod tests {
             devices: alloc::vec![device; MAX_DEVICES + 1],
             seq: 1,
         };
-        assert_eq!(SignedRecord::sign(too_many, &id).verify(), Err(Error::Malformed));
+        assert_eq!(
+            SignedRecord::sign(too_many, &id).verify(),
+            Err(Error::Malformed)
+        );
     }
 
     #[test]
@@ -384,6 +396,9 @@ mod tests {
         let decoded: SignedRecord = crate::wire::decode(&bytes).unwrap();
 
         assert_eq!(decoded, signed);
-        assert!(decoded.verify().is_ok(), "record must still verify after the wire round trip");
+        assert!(
+            decoded.verify().is_ok(),
+            "record must still verify after the wire round trip"
+        );
     }
 }

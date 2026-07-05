@@ -183,7 +183,10 @@ pub fn is_valid_email(email: &str) -> bool {
     let mut parts = email.split('@');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(local), Some(domain), None) => {
-            !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
         }
         _ => false,
     }
@@ -200,7 +203,10 @@ pub const PUBLISH_PER_WALLET: u32 = 30;
 impl Directory {
     /// A fresh, in-memory directory with a random email-hash pepper (tests).
     pub fn new() -> Self {
-        Self { pepper: random_bytes::<32>(), ..Default::default() }
+        Self {
+            pepper: random_bytes::<32>(),
+            ..Default::default()
+        }
     }
 
     /// Open a **durable** directory backed by the store at `path`, loading any
@@ -234,7 +240,8 @@ impl Directory {
         // fully elapsed (they'd reset on next use anyway), so never-reused buckets
         // can't accumulate forever.
         if self.rate.len() > RATE_PRUNE_AT {
-            self.rate.retain(|_, (start, _)| now.saturating_sub(*start) < RATE_WINDOW);
+            self.rate
+                .retain(|_, (start, _)| now.saturating_sub(*start) < RATE_WINDOW);
         }
         let entry = self.rate.entry((bucket, action)).or_insert((now, 0));
         if now.saturating_sub(entry.0) >= RATE_WINDOW {
@@ -271,7 +278,8 @@ impl Directory {
     pub fn challenge(&mut self, wallet: WalletPublicKey, now: u64) -> String {
         // Housekeeping: drop challenges never signed in time, and expired
         // sessions, so both maps stay bounded rather than growing forever.
-        self.challenges.retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
+        self.challenges
+            .retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
         let expired: Vec<String> = self
             .token_times
             .iter()
@@ -345,7 +353,8 @@ impl Directory {
         }
         // Opportunistic housekeeping: drop claims past their TTL so `pending`
         // can't grow without bound over a long-running process.
-        self.pending.retain(|_, p| now.saturating_sub(p.created) <= VERIFY_TTL);
+        self.pending
+            .retain(|_, p| now.saturating_sub(p.created) <= VERIFY_TTL);
         let pending_token = random_hex::<24>();
         let code = format!("{:06}", u32::from_le_bytes(random_bytes::<4>()) % 1_000_000);
         // The email is sent by the caller, off the lock — see the HTTP route.
@@ -367,8 +376,16 @@ impl Directory {
 
     /// Confirm an email code (typed, or embedded in the one-tap link). On
     /// success the name is bound to the wallet and the recovery email stored.
-    pub fn auth_confirm(&mut self, pending_token: &str, code: &str, now: u64) -> Result<Handle, ApiError> {
-        let p = self.pending.get_mut(pending_token).ok_or(ApiError::NotFound)?;
+    pub fn auth_confirm(
+        &mut self,
+        pending_token: &str,
+        code: &str,
+        now: u64,
+    ) -> Result<Handle, ApiError> {
+        let p = self
+            .pending
+            .get_mut(pending_token)
+            .ok_or(ApiError::NotFound)?;
         // Expired, or already consumed (confirmed once, or burned by too many
         // guesses): the code no longer verifies — no replay, no brute-force oracle.
         if now.saturating_sub(p.created) > VERIFY_TTL {
@@ -406,7 +423,9 @@ impl Directory {
             }
         }
         if let Some(store) = &self.store {
-            store.put_binding_and_email(&username, &wallet, &hash).map_err(|_| ApiError::Storage)?;
+            store
+                .put_binding_and_email(&username, &wallet, &hash)
+                .map_err(|_| ApiError::Storage)?;
         }
         self.bindings.insert(username.clone(), wallet);
         self.emails.insert(username.clone(), hash);
@@ -415,7 +434,9 @@ impl Directory {
 
     /// Poll a pending claim: `(verified, username)`.
     pub fn auth_status(&self, pending_token: &str) -> Option<(bool, String)> {
-        self.pending.get(pending_token).map(|p| (p.verified, p.username.as_str().to_string()))
+        self.pending
+            .get(pending_token)
+            .map(|p| (p.verified, p.username.as_str().to_string()))
     }
 
     /// Publish (or update) a signed record under `handle`.
@@ -455,7 +476,9 @@ impl Directory {
 
         // Persist first, so a storage failure aborts before we mutate memory.
         if let Some(store) = &self.store {
-            store.put_binding_and_record(handle, &wallet, &record).map_err(|_| ApiError::Storage)?;
+            store
+                .put_binding_and_record(handle, &wallet, &record)
+                .map_err(|_| ApiError::Storage)?;
         }
         self.bindings.insert(handle.clone(), wallet);
         self.records.insert(handle.clone(), record);
@@ -509,7 +532,6 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,7 +580,8 @@ mod tests {
         let handle = Handle::new("ari").unwrap();
 
         let token = login(&mut dir, &ari);
-        dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0).unwrap();
+        dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0)
+            .unwrap();
 
         let got = dir.lookup(&handle).expect("record present");
         assert!(got.verify().is_ok());
@@ -577,7 +600,8 @@ mod tests {
             let mut dir = Directory::open(path_str).unwrap();
             pepper1 = dir.email_hash("x@y.z"); // captures the pepper indirectly
             let token = login(&mut dir, &ari);
-            dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0).unwrap();
+            dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0)
+                .unwrap();
         } // drop → store flushed/closed
 
         // A fresh process re-opening the same file sees the record, the binding,
@@ -585,7 +609,11 @@ mod tests {
         let dir2 = Directory::open(path_str).unwrap();
         let got = dir2.lookup(&handle).expect("record survived restart");
         assert_eq!(got.record.wallet, ari.wallet_public());
-        assert_eq!(dir2.email_hash("x@y.z"), pepper1, "pepper must be stable across restarts");
+        assert_eq!(
+            dir2.email_hash("x@y.z"),
+            pepper1,
+            "pepper must be stable across restarts"
+        );
         // Binding is enforced after reopen: a different wallet can't take the name.
         let mut dir2 = dir2;
         let mallory = Identity::generate(&mut OsPlatform).unwrap();
@@ -625,8 +653,13 @@ mod tests {
         // An attacker with a DIFFERENT email cannot take it over.
         let c = Identity::generate(&mut OsPlatform).unwrap();
         let tok_c = login(&mut dir, &c);
-        let (pending_c, code_c) = dir.auth_start(&tok_c, &username, "attacker@evil.com", 2).unwrap();
-        assert_eq!(dir.auth_confirm(&pending_c, &code_c, 2), Err(ApiError::HandleTaken));
+        let (pending_c, code_c) = dir
+            .auth_start(&tok_c, &username, "attacker@evil.com", 2)
+            .unwrap();
+        assert_eq!(
+            dir.auth_confirm(&pending_c, &code_c, 2),
+            Err(ApiError::HandleTaken)
+        );
         assert_eq!(
             dir.bindings.get(&username),
             Some(&b.wallet_public()),
@@ -640,7 +673,9 @@ mod tests {
         let a = Identity::generate(&mut OsPlatform).unwrap();
         let tok = login(&mut dir, &a);
         let username = Handle::new("alice").unwrap();
-        let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+        let (pending, code) = dir
+            .auth_start(&tok, &username, "alice@example.com", 0)
+            .unwrap();
 
         assert!(dir.auth_confirm(&pending, &code, 0).is_ok());
         // The same token + code cannot be replayed once consumed.
@@ -655,17 +690,25 @@ mod tests {
         let a = Identity::generate(&mut OsPlatform).unwrap();
         let tok = login(&mut dir, &a);
         let username = Handle::new("alice").unwrap();
-        let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+        let (pending, code) = dir
+            .auth_start(&tok, &username, "alice@example.com", 0)
+            .unwrap();
         let wrong = if code == "000000" { "111111" } else { "000000" };
 
         // Exhaust the guess budget with wrong codes.
         for _ in 0..MAX_CONFIRM_ATTEMPTS {
-            assert_eq!(dir.auth_confirm(&pending, wrong, 0), Err(ApiError::BadSignature));
+            assert_eq!(
+                dir.auth_confirm(&pending, wrong, 0),
+                Err(ApiError::BadSignature)
+            );
         }
         // The claim is now burned — even the CORRECT code no longer works, so an
         // attacker can't brute-force it; they must start over (rate-limited).
         assert_eq!(dir.auth_confirm(&pending, &code, 0), Err(ApiError::Stale));
-        assert!(!dir.bindings.contains_key(&username), "no binding after a burned claim");
+        assert!(
+            !dir.bindings.contains_key(&username),
+            "no binding after a burned claim"
+        );
     }
 
     #[test]
@@ -674,12 +717,23 @@ mod tests {
         let a = Identity::generate(&mut OsPlatform).unwrap();
         let tok = login(&mut dir, &a);
         let username = Handle::new("alice").unwrap();
-        let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+        let (pending, code) = dir
+            .auth_start(&tok, &username, "alice@example.com", 0)
+            .unwrap();
 
         // A later auth_start (past the TTL) prunes the stale claim before inserting.
-        let _ = dir.auth_start(&tok, &username, "alice@example.com", VERIFY_TTL + 1).unwrap();
-        assert_eq!(dir.pending.len(), 1, "the expired claim was pruned; only the new one remains");
-        assert_eq!(dir.auth_confirm(&pending, &code, VERIFY_TTL + 1), Err(ApiError::NotFound));
+        let _ = dir
+            .auth_start(&tok, &username, "alice@example.com", VERIFY_TTL + 1)
+            .unwrap();
+        assert_eq!(
+            dir.pending.len(),
+            1,
+            "the expired claim was pruned; only the new one remains"
+        );
+        assert_eq!(
+            dir.auth_confirm(&pending, &code, VERIFY_TTL + 1),
+            Err(ApiError::NotFound)
+        );
     }
 
     #[test]
@@ -691,14 +745,19 @@ mod tests {
         {
             let mut dir = Directory::open(path_str).unwrap();
             let tok = login(&mut dir, &a);
-            let (pending, code) = dir.auth_start(&tok, &username, "alice@example.com", 0).unwrap();
+            let (pending, code) = dir
+                .auth_start(&tok, &username, "alice@example.com", 0)
+                .unwrap();
             dir.auth_confirm(&pending, &code, 0).unwrap();
         } // drop → flushed
 
         // Reopen: binding AND email hash both came back (written in one transaction).
         let dir2 = Directory::open(path_str).unwrap();
         assert_eq!(dir2.bindings.get(&username), Some(&a.wallet_public()));
-        assert_eq!(dir2.emails.get(&username), Some(&dir2.email_hash("alice@example.com")));
+        assert_eq!(
+            dir2.emails.get(&username),
+            Some(&dir2.email_hash("alice@example.com"))
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -710,21 +769,38 @@ mod tests {
         let tok = login(&mut dir, &a);
 
         // Register with a messy-cased/whitespace email.
-        let (pending, code) = dir.auth_start(&tok, &username, "  Alice@Example.COM  ", 0).unwrap();
+        let (pending, code) = dir
+            .auth_start(&tok, &username, "  Alice@Example.COM  ", 0)
+            .unwrap();
         dir.auth_confirm(&pending, &code, 0).unwrap();
         // Stored recovery hash is the canonical form.
-        assert_eq!(dir.emails.get(&username), Some(&dir.email_hash("alice@example.com")));
+        assert_eq!(
+            dir.emails.get(&username),
+            Some(&dir.email_hash("alice@example.com"))
+        );
 
         // Recovery from a new device using the same address in different case works.
         let b = Identity::generate(&mut OsPlatform).unwrap();
         let tok_b = login(&mut dir, &b);
-        let (p2, c2) = dir.auth_start(&tok_b, &username, "ALICE@example.com", 1).unwrap();
+        let (p2, c2) = dir
+            .auth_start(&tok_b, &username, "ALICE@example.com", 1)
+            .unwrap();
         dir.auth_confirm(&p2, &c2, 1).unwrap();
-        assert_eq!(dir.bindings.get(&username), Some(&b.wallet_public()), "recovery matched despite case");
+        assert_eq!(
+            dir.bindings.get(&username),
+            Some(&b.wallet_public()),
+            "recovery matched despite case"
+        );
 
         // Stricter validation rejects malformed addresses.
-        assert_eq!(dir.auth_start(&tok, &username, "no-at-sign", 2), Err(ApiError::BadRequest));
-        assert_eq!(dir.auth_start(&tok, &username, "a@b", 2), Err(ApiError::BadRequest)); // no dotted domain
+        assert_eq!(
+            dir.auth_start(&tok, &username, "no-at-sign", 2),
+            Err(ApiError::BadRequest)
+        );
+        assert_eq!(
+            dir.auth_start(&tok, &username, "a@b", 2),
+            Err(ApiError::BadRequest)
+        ); // no dotted domain
     }
 
     #[test]
@@ -737,7 +813,11 @@ mod tests {
         assert!(dir.rate.len() > RATE_PRUNE_AT);
         // A call a full window later prunes the now-expired buckets.
         dir.allow("fresh".into(), "probe", 5, RATE_WINDOW + 1);
-        assert!(dir.rate.len() < 10, "expired buckets should be pruned, got {}", dir.rate.len());
+        assert!(
+            dir.rate.len() < 10,
+            "expired buckets should be pruned, got {}",
+            dir.rate.len()
+        );
     }
 
     #[test]
@@ -753,7 +833,10 @@ mod tests {
             assert!(dir.auth_start(&tok, &handle, email, 0).is_ok());
         }
         // The next send to that address is refused — no SMTP spam.
-        assert_eq!(dir.auth_start(&tok, &handle, email, 0), Err(ApiError::RateLimited));
+        assert_eq!(
+            dir.auth_start(&tok, &handle, email, 0),
+            Err(ApiError::RateLimited)
+        );
         // A fresh window resets the counter.
         assert!(dir.auth_start(&tok, &handle, email, RATE_WINDOW).is_ok());
     }
@@ -766,7 +849,9 @@ mod tests {
         // Signed within the TTL → accepted.
         let nonce = dir.challenge(a.wallet_public(), 0);
         let sig = a.sign(&Directory::challenge_message(&nonce));
-        assert!(dir.verify(&a.wallet_public(), &nonce, &sig, CHALLENGE_TTL).is_ok());
+        assert!(dir
+            .verify(&a.wallet_public(), &nonce, &sig, CHALLENGE_TTL)
+            .is_ok());
 
         // A fresh challenge signed after the TTL → rejected as stale.
         let nonce2 = dir.challenge(a.wallet_public(), 1000);
@@ -786,7 +871,9 @@ mod tests {
         let nonce = dir.challenge(a.wallet_public(), 0);
         let sig = a.sign(&Directory::challenge_message(&nonce));
         let token = dir.verify(&a.wallet_public(), &nonce, &sig, 0).unwrap();
-        assert!(dir.publish(&token, &handle, record_for(&a, "ari", 1), 0).is_ok());
+        assert!(dir
+            .publish(&token, &handle, record_for(&a, "ari", 1), 0)
+            .is_ok());
 
         // A housekeeping pass past TOKEN_TTL prunes the session.
         dir.challenge(a.wallet_public(), TOKEN_TTL + 1);
@@ -828,7 +915,8 @@ mod tests {
         let handle = Handle::new("ari").unwrap();
 
         let ari_token = login(&mut dir, &ari);
-        dir.publish(&ari_token, &handle, record_for(&ari, "ari", 1), 0).unwrap();
+        dir.publish(&ari_token, &handle, record_for(&ari, "ari", 1), 0)
+            .unwrap();
 
         // Mallory logs in and tries to steal "ari".
         let mal_token = login(&mut dir, &mallory);
@@ -844,7 +932,8 @@ mod tests {
         let bob = Identity::generate(&mut OsPlatform).unwrap();
         let handle = Handle::new("bob").unwrap();
         let token = login(&mut dir, &bob);
-        dir.publish(&token, &handle, record_for(&bob, "bob", 1), 0).unwrap();
+        dir.publish(&token, &handle, record_for(&bob, "bob", 1), 0)
+            .unwrap();
 
         // Never heard of: offline.
         assert!(!dir.presence(&handle, 1000));
@@ -863,10 +952,14 @@ mod tests {
         let mallory = Identity::generate(&mut OsPlatform).unwrap();
         let handle = Handle::new("bob").unwrap();
         let bob_token = login(&mut dir, &bob);
-        dir.publish(&bob_token, &handle, record_for(&bob, "bob", 1), 0).unwrap();
+        dir.publish(&bob_token, &handle, record_for(&bob, "bob", 1), 0)
+            .unwrap();
 
         let mal_token = login(&mut dir, &mallory);
-        assert_eq!(dir.heartbeat(&mal_token, &handle, 5), Err(ApiError::Forbidden));
+        assert_eq!(
+            dir.heartbeat(&mal_token, &handle, 5),
+            Err(ApiError::Forbidden)
+        );
     }
 
     #[test]
@@ -876,9 +969,11 @@ mod tests {
         let handle = Handle::new("ari").unwrap();
         let token = login(&mut dir, &ari);
 
-        dir.publish(&token, &handle, record_for(&ari, "ari", 5), 0).unwrap();
+        dir.publish(&token, &handle, record_for(&ari, "ari", 5), 0)
+            .unwrap();
         // Newer seq is fine.
-        dir.publish(&token, &handle, record_for(&ari, "ari", 6), 0).unwrap();
+        dir.publish(&token, &handle, record_for(&ari, "ari", 6), 0)
+            .unwrap();
         // Replaying an old seq is not.
         assert_eq!(
             dir.publish(&token, &handle, record_for(&ari, "ari", 6), 0),

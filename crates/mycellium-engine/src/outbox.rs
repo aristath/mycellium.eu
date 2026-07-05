@@ -50,7 +50,10 @@ impl OutboxEntry {
 
 /// Load the whole outbox.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<OutboxEntry>, S::Error> {
-    Ok(store.get(KEY)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(store
+        .get(KEY)?
+        .and_then(|b| wire::decode(&b).ok())
+        .unwrap_or_default())
 }
 
 /// Persist the whole outbox.
@@ -112,7 +115,10 @@ mod tests {
             id: id.to_string(),
             recipient: "mary".into(),
             slot: "abcd".into(),
-            item: MailItem::GroupRemove { group_id: "g".into(), member: "x".into() },
+            item: MailItem::GroupRemove {
+                group_id: "g".into(),
+                member: "x".into(),
+            },
             created_at: 0,
             attempts: 0,
         }
@@ -124,11 +130,23 @@ mod tests {
         assert_eq!(len(&store).unwrap(), 0);
 
         let e = sample("1");
-        enqueue(&mut store, e.id.clone(), &e.recipient, &e.slot, e.item.clone(), 0).unwrap();
+        enqueue(
+            &mut store,
+            e.id.clone(),
+            &e.recipient,
+            &e.slot,
+            e.item.clone(),
+            0,
+        )
+        .unwrap();
         assert_eq!(len(&store).unwrap(), 1);
 
         // Remove by rewriting without it.
-        let kept: Vec<OutboxEntry> = load(&store).unwrap().into_iter().filter(|x| x.id != "1").collect();
+        let kept: Vec<OutboxEntry> = load(&store)
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.id != "1")
+            .collect();
         save(&mut store, &kept).unwrap();
         assert_eq!(len(&store).unwrap(), 0);
     }

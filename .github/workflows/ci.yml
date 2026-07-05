@@ -17,11 +17,8 @@ jobs:
       - name: Install Rust (stable + rustfmt + clippy)
         run: rustup toolchain install stable --profile minimal --component rustfmt clippy
       - uses: Swatinem/rust-cache@v2
-      # Informational until a one-time `cargo fmt` sweep lands (the tree predates
-      # rustfmt). Flip `continue-on-error` off once it's clean to make it a gate.
-      - name: Format check (informational)
+      - name: Format check
         run: cargo fmt --all --check
-        continue-on-error: true
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test

@@ -49,23 +49,51 @@ impl QueueClient {
 
     /// Point the client at a base URL with an explicit HTTP transport (browser).
     pub fn with_transport(base: impl Into<String>, transport: Box<dyn HttpTransport>) -> Self {
-        QueueClient { base: base.into().trim_end_matches('/').to_string(), transport }
+        QueueClient {
+            base: base.into().trim_end_matches('/').to_string(),
+            transport,
+        }
     }
 
     /// SIWE-style login: fetch a challenge, sign it, exchange for a token.
     pub fn login(&self, identity: &Identity) -> Result<String> {
         let wallet = identity.wallet_public();
-        let challenge: ChallengeResp = self.json("POST", "/login/challenge", None, Some(&ChallengeReq { wallet }))?;
+        let challenge: ChallengeResp = self.json(
+            "POST",
+            "/login/challenge",
+            None,
+            Some(&ChallengeReq { wallet }),
+        )?;
         let signature = identity.sign(&mycellium_core::login::challenge_message(&challenge.nonce));
-        let verified: VerifyResp =
-            self.json("POST", "/login/verify", None, Some(&VerifyReq { wallet, nonce: challenge.nonce, signature }))?;
+        let verified: VerifyResp = self.json(
+            "POST",
+            "/login/verify",
+            None,
+            Some(&VerifyReq {
+                wallet,
+                nonce: challenge.nonce,
+                signature,
+            }),
+        )?;
         Ok(verified.token)
     }
 
     /// Deposit an opaque blob into `recipient_wallet_hex`'s mailbox `slot`.
-    pub fn deposit(&self, token: &str, recipient_wallet_hex: &str, slot: &str, blob: &str) -> Result<()> {
+    pub fn deposit(
+        &self,
+        token: &str,
+        recipient_wallet_hex: &str,
+        slot: &str,
+        blob: &str,
+    ) -> Result<()> {
         let path = format!("/mailbox/{recipient_wallet_hex}/{slot}");
-        self.call("POST", &path, Some(token), Some("text/plain; charset=utf-8"), Some(blob.as_bytes()))?;
+        self.call(
+            "POST",
+            &path,
+            Some(token),
+            Some("text/plain; charset=utf-8"),
+            Some(blob.as_bytes()),
+        )?;
         Ok(())
     }
 
@@ -85,7 +113,12 @@ impl QueueClient {
         struct Req<'a> {
             endpoint: &'a str,
         }
-        let _: serde_json::Value = self.json("POST", "/push/subscribe", Some(token), Some(&Req { endpoint }))?;
+        let _: serde_json::Value = self.json(
+            "POST",
+            "/push/subscribe",
+            Some(token),
+            Some(&Req { endpoint }),
+        )?;
         Ok(())
     }
 
@@ -95,7 +128,12 @@ impl QueueClient {
         struct Messages {
             messages: Vec<String>,
         }
-        let resp: Messages = self.json::<(), _>("GET", &format!("/mailbox/{wallet_hex}/{slot}"), Some(token), None)?;
+        let resp: Messages = self.json::<(), _>(
+            "GET",
+            &format!("/mailbox/{wallet_hex}/{slot}"),
+            Some(token),
+            None,
+        )?;
         Ok(resp.messages)
     }
 
@@ -129,7 +167,10 @@ impl QueueClient {
         if let Some(a) = &auth {
             headers.push(("Authorization", a));
         }
-        let resp = self.transport.request(method, &url, &headers, body).map_err(|e| anyhow!("{path}: {e}"))?;
+        let resp = self
+            .transport
+            .request(method, &url, &headers, body)
+            .map_err(|e| anyhow!("{path}: {e}"))?;
         if resp.status >= 400 {
             return Err(anyhow!("{path}: HTTP {}", resp.status));
         }

@@ -20,7 +20,11 @@ impl Platform for OsPlatform {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn start() -> String {
@@ -76,20 +80,25 @@ fn malformed_json_is_rejected() {
     let result = ureq::post(&format!("{base}/login/challenge"))
         .set("Content-Type", "application/json")
         .send_string("this is not json");
-    assert!((400..500).contains(&status(result)), "malformed body should be a 4xx");
+    assert!(
+        (400..500).contains(&status(result)),
+        "malformed body should be a 4xx"
+    );
 }
 
 #[test]
 fn unknown_record_is_404() {
     let base = start();
-    assert_eq!(status(ureq::get(&format!("{base}/records/nobody")).call()), 404);
+    assert_eq!(
+        status(ureq::get(&format!("{base}/records/nobody")).call()),
+        404
+    );
 }
 
 #[test]
 fn publish_without_auth_is_401() {
     let base = start();
-    let result = ureq::request("PUT", &format!("{base}/records/alice"))
-        .send_string("{}");
+    let result = ureq::request("PUT", &format!("{base}/records/alice")).send_string("{}");
     assert_eq!(status(result), 401);
 }
 

@@ -53,7 +53,13 @@ pub(crate) fn aead_encrypt(mk: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Vec<u
     let nonce_ga: Nonce = nonce.into();
     let cipher = ChaCha20Poly1305::new(&key_ga);
     let out = cipher
-        .encrypt(&nonce_ga, Payload { msg: plaintext, aad })
+        .encrypt(
+            &nonce_ga,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("ChaCha20-Poly1305 encryption is infallible for valid keys");
     key.zeroize();
     out
@@ -65,7 +71,13 @@ pub(crate) fn aead_decrypt(mk: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> Resu
     let key_ga: Key = key.into();
     let nonce_ga: Nonce = nonce.into();
     let cipher = ChaCha20Poly1305::new(&key_ga);
-    let result = cipher.decrypt(&nonce_ga, Payload { msg: ciphertext, aad });
+    let result = cipher.decrypt(
+        &nonce_ga,
+        Payload {
+            msg: ciphertext,
+            aad,
+        },
+    );
     key.zeroize();
     result.map_err(|_| Error::DecryptFailed)
 }

@@ -14,7 +14,10 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 fn main() {
     let addr = resolve_addr();
-    println!("mycellium-server {} — hosting the directory on http://{addr}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "mycellium-server {} — hosting the directory on http://{addr}",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  routes: /health · /login/{{challenge,verify}} · /auth/{{start,confirm,status}} · /records/{{handle}} · /presence/{{handle}} · /metrics");
     println!("  untrusted: stores signed records + presence; holds no keys, reads no content");
     if let Err(err) = mycellium_directory::serve(&addr) {

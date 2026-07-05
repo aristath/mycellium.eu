@@ -91,7 +91,13 @@ impl Libp2pNode {
             Ok::<_, anyhow::Error>((control, incoming))
         })?;
 
-        Ok(Libp2pNode { rt, control, incoming, dial_tx, peer_id })
+        Ok(Libp2pNode {
+            rt,
+            control,
+            incoming,
+            dial_tx,
+            peer_id,
+        })
     }
 
     /// This node's PeerId (derived from the device key).
@@ -126,14 +132,20 @@ impl Libp2pNode {
             Err(anyhow!("could not open a stream to {peer}"))
         })?;
 
-        Ok(Libp2pConnection { handle: self.rt.handle().clone(), stream })
+        Ok(Libp2pConnection {
+            handle: self.rt.handle().clone(),
+            stream,
+        })
     }
 
     /// Wait for an inbound `/mycellium/1.0` stream and return it as a connection.
     pub fn accept(&mut self) -> Result<Libp2pConnection> {
         let next = self.rt.block_on(self.incoming.next());
         let (_peer, stream) = next.ok_or_else(|| anyhow!("stream listener closed"))?;
-        Ok(Libp2pConnection { handle: self.rt.handle().clone(), stream })
+        Ok(Libp2pConnection {
+            handle: self.rt.handle().clone(),
+            stream,
+        })
     }
 
     /// Let the background swarm run for `millis` so buffered stream data is
@@ -156,8 +168,14 @@ impl Libp2pConnection {
     pub fn split(self) -> (Libp2pReadHalf, Libp2pWriteHalf) {
         let (read, write) = self.stream.split();
         (
-            Libp2pReadHalf { handle: self.handle.clone(), read },
-            Libp2pWriteHalf { handle: self.handle, write },
+            Libp2pReadHalf {
+                handle: self.handle.clone(),
+                read,
+            },
+            Libp2pWriteHalf {
+                handle: self.handle,
+                write,
+            },
         )
     }
 }
@@ -182,7 +200,10 @@ impl crate::link::FrameReader for Libp2pReadHalf {
             read.read_exact(&mut len).await?;
             let n = u32::from_be_bytes(len) as usize;
             if n > MAX_FRAME {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
             }
             let mut buf = vec![0u8; n];
             read.read_exact(&mut buf).await?;
@@ -210,7 +231,9 @@ impl Connection for Libp2pConnection {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         let stream = &mut self.stream;
         self.handle.block_on(async move {
-            stream.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await?;
             stream.write_all(bytes).await?;
             stream.flush().await
         })
@@ -223,7 +246,10 @@ impl Connection for Libp2pConnection {
             stream.read_exact(&mut len).await?;
             let n = u32::from_be_bytes(len) as usize;
             if n > MAX_FRAME {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
             }
             let mut buf = vec![0u8; n];
             stream.read_exact(&mut buf).await?;

@@ -57,8 +57,14 @@ fn group_history_key(group_id: &str) -> Vec<u8> {
 }
 
 /// Load a group's transcript.
-pub fn group_load<S: Storage>(store: &S, group_id: &str) -> Result<Vec<GroupStoredMessage>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(&group_history_key(group_id))?, "group transcript"))
+pub fn group_load<S: Storage>(
+    store: &S,
+    group_id: &str,
+) -> Result<Vec<GroupStoredMessage>, S::Error> {
+    Ok(crate::decode_or_warn(
+        store.get(&group_history_key(group_id))?,
+        "group transcript",
+    ))
 }
 
 /// Append one message to a group's transcript.
@@ -75,7 +81,10 @@ pub fn group_append<S: Storage>(
 
 /// Load a peer's transcript (empty if none / unreadable).
 pub fn load<S: Storage>(store: &S, peer: &str) -> Result<Vec<StoredMessage>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(&history_key(peer))?, "1:1 transcript"))
+    Ok(crate::decode_or_warn(
+        store.get(&history_key(peer))?,
+        "1:1 transcript",
+    ))
 }
 
 const PEER_INDEX: &[u8] = b"history:peers";
@@ -86,7 +95,11 @@ pub fn peers<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
 }
 
 /// Append one message to a peer's transcript (and index the peer).
-pub fn append<S: Storage>(store: &mut S, peer: &str, message: StoredMessage) -> Result<(), S::Error> {
+pub fn append<S: Storage>(
+    store: &mut S,
+    peer: &str,
+    message: StoredMessage,
+) -> Result<(), S::Error> {
     let mut transcript = load(store, peer)?;
     transcript.push(message);
     store.put(&history_key(peer), &wire::encode(&transcript))?;
@@ -100,10 +113,17 @@ pub fn append<S: Storage>(store: &mut S, peer: &str, message: StoredMessage) -> 
 }
 
 /// Load a peer's transcript, pruning any messages expired as of `now`.
-pub fn load_active<S: Storage>(store: &mut S, peer: &str, now: u64) -> Result<Vec<StoredMessage>, S::Error> {
+pub fn load_active<S: Storage>(
+    store: &mut S,
+    peer: &str,
+    now: u64,
+) -> Result<Vec<StoredMessage>, S::Error> {
     let all = load(store, peer)?;
-    let active: Vec<StoredMessage> =
-        all.iter().filter(|m| !matches!(m.expires_at, Some(at) if now >= at)).cloned().collect();
+    let active: Vec<StoredMessage> = all
+        .iter()
+        .filter(|m| !matches!(m.expires_at, Some(at) if now >= at))
+        .cloned()
+        .collect();
     if active.len() != all.len() {
         store.put(&history_key(peer), &wire::encode(&active))?;
     }
@@ -120,7 +140,13 @@ pub fn clear<S: Storage>(store: &mut S, peer: &str) -> Result<(), S::Error> {
 /// Edit a stored 1:1 message by id (marks it edited). No-op if not found.
 /// Edit a stored 1:1 message by id — but only one authored by the same side as
 /// the edit (`by_me`), so a peer can't rewrite *your* messages and vice versa.
-pub fn edit<S: Storage>(store: &mut S, peer: &str, id: &str, new_text: &str, by_me: bool) -> Result<(), S::Error> {
+pub fn edit<S: Storage>(
+    store: &mut S,
+    peer: &str,
+    id: &str,
+    new_text: &str,
+    by_me: bool,
+) -> Result<(), S::Error> {
     let mut transcript = load(store, peer)?;
     let mut changed = false;
     for m in &mut transcript {
@@ -137,15 +163,28 @@ pub fn edit<S: Storage>(store: &mut S, peer: &str, id: &str, new_text: &str, by_
 
 /// Delete a stored 1:1 message by id — only if authored by the same side as the
 /// delete (`by_me`). No-op if not found or authored by the other side.
-pub fn delete<S: Storage>(store: &mut S, peer: &str, id: &str, by_me: bool) -> Result<(), S::Error> {
-    let transcript: Vec<StoredMessage> =
-        load(store, peer)?.into_iter().filter(|m| !(m.id == id && m.from_me == by_me)).collect();
+pub fn delete<S: Storage>(
+    store: &mut S,
+    peer: &str,
+    id: &str,
+    by_me: bool,
+) -> Result<(), S::Error> {
+    let transcript: Vec<StoredMessage> = load(store, peer)?
+        .into_iter()
+        .filter(|m| !(m.id == id && m.from_me == by_me))
+        .collect();
     store.put(&history_key(peer), &wire::encode(&transcript))
 }
 
 /// Edit a stored group message by id — only one whose recorded `sender` matches,
 /// so a member can't rewrite another member's message.
-pub fn group_edit<S: Storage>(store: &mut S, group_id: &str, id: &str, new_text: &str, sender: &str) -> Result<(), S::Error> {
+pub fn group_edit<S: Storage>(
+    store: &mut S,
+    group_id: &str,
+    id: &str,
+    new_text: &str,
+    sender: &str,
+) -> Result<(), S::Error> {
     let mut transcript = group_load(store, group_id)?;
     for m in &mut transcript {
         if m.id == id && m.sender == sender {
@@ -156,17 +195,31 @@ pub fn group_edit<S: Storage>(store: &mut S, group_id: &str, id: &str, new_text:
 }
 
 /// Delete a stored group message by id — only if its recorded `sender` matches.
-pub fn group_delete<S: Storage>(store: &mut S, group_id: &str, id: &str, sender: &str) -> Result<(), S::Error> {
-    let transcript: Vec<GroupStoredMessage> =
-        group_load(store, group_id)?.into_iter().filter(|m| !(m.id == id && m.sender == sender)).collect();
+pub fn group_delete<S: Storage>(
+    store: &mut S,
+    group_id: &str,
+    id: &str,
+    sender: &str,
+) -> Result<(), S::Error> {
+    let transcript: Vec<GroupStoredMessage> = group_load(store, group_id)?
+        .into_iter()
+        .filter(|m| !(m.id == id && m.sender == sender))
+        .collect();
     store.put(&group_history_key(group_id), &wire::encode(&transcript))
 }
 
 /// Load a group's transcript, pruning expired messages as of `now`.
-pub fn group_load_active<S: Storage>(store: &mut S, group_id: &str, now: u64) -> Result<Vec<GroupStoredMessage>, S::Error> {
+pub fn group_load_active<S: Storage>(
+    store: &mut S,
+    group_id: &str,
+    now: u64,
+) -> Result<Vec<GroupStoredMessage>, S::Error> {
     let all = group_load(store, group_id)?;
-    let active: Vec<GroupStoredMessage> =
-        all.iter().filter(|m| !matches!(m.expires_at, Some(at) if now >= at)).cloned().collect();
+    let active: Vec<GroupStoredMessage> = all
+        .iter()
+        .filter(|m| !matches!(m.expires_at, Some(at) if now >= at))
+        .cloned()
+        .collect();
     if active.len() != all.len() {
         store.put(&group_history_key(group_id), &wire::encode(&active))?;
     }
@@ -198,7 +251,13 @@ mod tests {
     }
 
     fn msg(from_me: bool, text: &str) -> StoredMessage {
-        StoredMessage { id: String::new(), from_me, text: text.into(), timestamp: 0, expires_at: None }
+        StoredMessage {
+            id: String::new(),
+            from_me,
+            text: text.into(),
+            timestamp: 0,
+            expires_at: None,
+        }
     }
 
     #[test]
@@ -220,8 +279,30 @@ mod tests {
     #[test]
     fn expired_messages_are_pruned_on_load() {
         let mut store = MemStore::default();
-        append(&mut store, "bob", StoredMessage { id: String::new(), from_me: true, text: "keep".into(), timestamp: 0, expires_at: None }).unwrap();
-        append(&mut store, "bob", StoredMessage { id: String::new(), from_me: true, text: "gone".into(), timestamp: 0, expires_at: Some(100) }).unwrap();
+        append(
+            &mut store,
+            "bob",
+            StoredMessage {
+                id: String::new(),
+                from_me: true,
+                text: "keep".into(),
+                timestamp: 0,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        append(
+            &mut store,
+            "bob",
+            StoredMessage {
+                id: String::new(),
+                from_me: true,
+                text: "gone".into(),
+                timestamp: 0,
+                expires_at: Some(100),
+            },
+        )
+        .unwrap();
 
         // Before expiry: both present.
         assert_eq!(load_active(&mut store, "bob", 50).unwrap().len(), 2);
@@ -259,13 +340,32 @@ mod tests {
     fn edit_delete_are_author_scoped() {
         let mut store = MemStore::default();
         // A message the peer authored (from_me: false).
-        append(&mut store, "bob", StoredMessage { id: "m1".into(), from_me: false, text: "theirs".into(), timestamp: 0, expires_at: None }).unwrap();
+        append(
+            &mut store,
+            "bob",
+            StoredMessage {
+                id: "m1".into(),
+                from_me: false,
+                text: "theirs".into(),
+                timestamp: 0,
+                expires_at: None,
+            },
+        )
+        .unwrap();
 
         // A "mine"-scoped edit/delete (by_me: true) must NOT touch the peer's message.
         edit(&mut store, "bob", "m1", "hacked", true).unwrap();
-        assert_eq!(load(&store, "bob").unwrap()[0].text, "theirs", "a peer can't edit as if it were mine");
+        assert_eq!(
+            load(&store, "bob").unwrap()[0].text,
+            "theirs",
+            "a peer can't edit as if it were mine"
+        );
         delete(&mut store, "bob", "m1", true).unwrap();
-        assert_eq!(load(&store, "bob").unwrap().len(), 1, "a peer can't delete my-scoped");
+        assert_eq!(
+            load(&store, "bob").unwrap().len(),
+            1,
+            "a peer can't delete my-scoped"
+        );
 
         // The correctly-scoped delete (by_me: false) does remove it.
         delete(&mut store, "bob", "m1", false).unwrap();
@@ -275,14 +375,28 @@ mod tests {
     #[test]
     fn group_edit_delete_are_sender_scoped() {
         let mut store = MemStore::default();
-        let gm = |id: &str, sender: &str, text: &str| GroupStoredMessage { id: id.into(), sender: sender.into(), text: text.into(), timestamp: 0, expires_at: None };
+        let gm = |id: &str, sender: &str, text: &str| GroupStoredMessage {
+            id: id.into(),
+            sender: sender.into(),
+            text: text.into(),
+            timestamp: 0,
+            expires_at: None,
+        };
         group_append(&mut store, "g1", gm("m1", "alice", "alice's")).unwrap();
 
         // Bob can't edit or delete Alice's message.
         group_edit(&mut store, "g1", "m1", "hacked", "bob").unwrap();
-        assert_eq!(group_load(&store, "g1").unwrap()[0].text, "alice's", "another member can't rewrite it");
+        assert_eq!(
+            group_load(&store, "g1").unwrap()[0].text,
+            "alice's",
+            "another member can't rewrite it"
+        );
         group_delete(&mut store, "g1", "m1", "bob").unwrap();
-        assert_eq!(group_load(&store, "g1").unwrap().len(), 1, "another member can't delete it");
+        assert_eq!(
+            group_load(&store, "g1").unwrap().len(),
+            1,
+            "another member can't delete it"
+        );
 
         // Alice (the author) can.
         group_delete(&mut store, "g1", "m1", "alice").unwrap();
@@ -292,7 +406,9 @@ mod tests {
     #[test]
     fn corrupt_transcript_loads_empty_not_error() {
         let mut store = MemStore::default();
-        store.put(&history_key("bob"), b"not valid wire bytes").unwrap();
+        store
+            .put(&history_key("bob"), b"not valid wire bytes")
+            .unwrap();
         // Corruption is surfaced (logged), not a hard error — the app keeps working
         // and the raw bytes stay put for recovery.
         let loaded = load(&store, "bob").unwrap();

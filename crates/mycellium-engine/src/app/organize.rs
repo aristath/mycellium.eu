@@ -18,8 +18,6 @@ pub fn draft_cmd(peer: &str, text: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn draft_clear(peer: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
@@ -28,8 +26,6 @@ pub fn draft_clear(peer: &str) -> Result<()> {
     println!("cleared draft for '{key}'");
     Ok(())
 }
-
-
 
 /// Resolve an expiry target (a peer nickname/handle, or a group id) to its store key.
 pub fn expire_key(fs: &FileStore, target: &str) -> Result<String> {
@@ -41,8 +37,6 @@ pub fn expire_key(fs: &FileStore, target: &str) -> Result<String> {
     }
 }
 
-
-
 pub fn expire_set(target: &str, duration: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let secs = parse_duration(duration)?;
@@ -53,8 +47,6 @@ pub fn expire_set(target: &str, duration: &str) -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn expire_clear(target: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
@@ -63,8 +55,6 @@ pub fn expire_clear(target: &str) -> Result<()> {
     println!("cleared disappearing-message timer for '{key}'");
     Ok(())
 }
-
-
 
 pub fn expire_show(target: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -76,8 +66,6 @@ pub fn expire_show(target: &str) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 pub fn set_blocked(handle: &str, blocked: bool) -> Result<()> {
     let identity = store::load_identity()?;
@@ -92,8 +80,6 @@ pub fn set_blocked(handle: &str, blocked: bool) -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn list_blocked() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
@@ -107,8 +93,6 @@ pub fn list_blocked() -> Result<()> {
     }
     Ok(())
 }
-
-
 
 pub fn contact_add(nickname: &str, handle: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -130,8 +114,6 @@ pub fn contact_add(nickname: &str, handle: &str, directory: &str) -> Result<()> 
     Ok(())
 }
 
-
-
 pub fn contact_list() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
@@ -146,8 +128,6 @@ pub fn contact_list() -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn contact_remove(nickname: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
@@ -155,8 +135,6 @@ pub fn contact_remove(nickname: &str) -> Result<()> {
     println!("removed '{nickname}'");
     Ok(())
 }
-
-
 
 pub fn clear_history(peer: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -166,8 +144,6 @@ pub fn clear_history(peer: &str) -> Result<()> {
     println!("cleared history with '{key}'");
     Ok(())
 }
-
-
 
 pub fn conversations() -> Result<()> {
     let identity = store::load_identity()?;
@@ -200,8 +176,6 @@ pub fn conversations() -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn search(query: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
@@ -222,7 +196,9 @@ pub fn search(query: &str) -> Result<()> {
 
     // Group transcripts.
     for id in groups::list(&fs)? {
-        let name = groups::load(&fs, &id)?.map(|g| g.name).unwrap_or_else(|| id.clone());
+        let name = groups::load(&fs, &id)?
+            .map(|g| g.name)
+            .unwrap_or_else(|| id.clone());
         for m in history::group_load_active(&mut fs, &id, now)? {
             if m.text.to_lowercase().contains(&needle) {
                 println!("[group {name}] {}: {}", m.sender, m.text);
@@ -238,8 +214,6 @@ pub fn search(query: &str) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 pub fn show_history(peer: &str) -> Result<()> {
     let identity = store::load_identity()?;

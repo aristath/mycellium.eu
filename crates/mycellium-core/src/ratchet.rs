@@ -134,7 +134,9 @@ impl Ratchet {
     /// Encrypt `plaintext`. `ad` is extra associated data bound into the AEAD
     /// (e.g. the two identities); it must match on decrypt.
     pub fn encrypt(&mut self, plaintext: &[u8], ad: &[u8]) -> RatchetMessage {
-        let cks = self.cks.expect("sending chain must be established before sending");
+        let cks = self
+            .cks
+            .expect("sending chain must be established before sending");
         let (cks_next, mk) = kdf_ck(&cks);
         self.cks = Some(cks_next);
 
@@ -208,7 +210,9 @@ impl Ratchet {
             return Err(Error::TooManySkipped);
         }
 
-        let dhr = self.dhr.expect("receiving chain implies a remote ratchet key");
+        let dhr = self
+            .dhr
+            .expect("receiving chain implies a remote ratchet key");
         let mut ck = ckr;
         while self.nr < until {
             let (ck_next, mk) = kdf_ck(&ck);
@@ -224,7 +228,11 @@ impl Ratchet {
         Ok(())
     }
 
-    fn dh_ratchet<P: Platform>(&mut self, platform: &mut P, header_dh: [u8; 32]) -> Result<(), Error> {
+    fn dh_ratchet<P: Platform>(
+        &mut self,
+        platform: &mut P,
+        header_dh: [u8; 32],
+    ) -> Result<(), Error> {
         // Reject a low-order remote ratchet key *before* mutating any state, so a
         // rejected header can't leave the ratchet half-stepped.
         let dh_recv = dh(&self.dhs, &header_dh)?;
@@ -341,7 +349,9 @@ mod tests {
         .unwrap();
         let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
 
-        let alice_r = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
+        let alice_r =
+            Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public())
+                .unwrap();
         let bob_r = Ratchet::new_responder(&bob_sk, &bob);
         (alice_r, bob_r)
     }

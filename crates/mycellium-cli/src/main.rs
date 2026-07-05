@@ -21,11 +21,11 @@ use mycellium_core::transport::Transport;
 use mycellium_core::wire;
 
 use mycellium_directory_client::DirectoryClient;
-use mycellium_storage::filestore::FileStore;
-use mycellium_storage::store;
 use mycellium_engine::blocklist;
 use mycellium_engine::history::{self, StoredMessage};
 use mycellium_engine::platform::OsPlatform;
+use mycellium_storage::filestore::FileStore;
+use mycellium_storage::store;
 use mycellium_transport::libp2p_net::{self, Libp2pNode};
 use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_transport::net::TcpTransport;
@@ -35,14 +35,15 @@ use mycellium_engine::app::*;
 
 const DEFAULT_DIRECTORY: &str = "http://127.0.0.1:8080";
 
-
 #[derive(Parser)]
-#[command(name = "mycellium", about = "Mycellium peer-to-peer messenger (POC client)")]
+#[command(
+    name = "mycellium",
+    about = "Mycellium peer-to-peer messenger (POC client)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
-
 
 #[derive(Subcommand)]
 enum Command {
@@ -312,7 +313,6 @@ enum Command {
     },
 }
 
-
 #[derive(Subcommand)]
 enum DraftAction {
     /// Save a draft for a peer.
@@ -333,7 +333,6 @@ enum DraftAction {
         peer: String,
     },
 }
-
 
 #[derive(Subcommand)]
 enum ExpireAction {
@@ -356,7 +355,6 @@ enum ExpireAction {
     },
 }
 
-
 #[derive(Subcommand)]
 enum ContactAction {
     /// Add a contact, pinning their current identity (trust-on-first-use).
@@ -376,7 +374,6 @@ enum ContactAction {
         nickname: String,
     },
 }
-
 
 #[derive(Subcommand)]
 enum GroupAction {
@@ -485,26 +482,107 @@ enum GroupAction {
     List,
 }
 
-
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::IdentityNew => identity_new(),
-        Command::LinkDevice { handle, addr, libp2p, directory } => {
-            link_device(&handle, &addr, libp2p, &directory)
-        }
+        Command::LinkDevice {
+            handle,
+            addr,
+            libp2p,
+            directory,
+        } => link_device(&handle, &addr, libp2p, &directory),
         Command::Devices { handle, directory } => list_devices(&handle, &directory),
-        Command::RevokeDevice { handle, device_id, directory } => {
-            revoke_device(&handle, &device_id, &directory)
-        }
+        Command::RevokeDevice {
+            handle,
+            device_id,
+            directory,
+        } => revoke_device(&handle, &device_id, &directory),
         Command::IdentityShow => identity_show(),
-        Command::Register { handle, addr, libp2p, directory } => {
-            register(&handle, &addr, libp2p, &directory)
-        }
+        Command::Register {
+            handle,
+            addr,
+            libp2p,
+            directory,
+        } => register(&handle, &addr, libp2p, &directory),
         Command::Listen { addr, libp2p, tui } => listen(&addr, libp2p, tui),
-        Command::Chat { peer, whoami, tui, directory } => chat(&peer, &whoami, tui, &directory),
-        Command::Send { peer, whoami, message, reply_to, react, to, file, edit, delete, expire, directory } => {
-            send(
-                &peer,
+        Command::Chat {
+            peer,
+            whoami,
+            tui,
+            directory,
+        } => chat(&peer, &whoami, tui, &directory),
+        Command::Send {
+            peer,
+            whoami,
+            message,
+            reply_to,
+            react,
+            to,
+            file,
+            edit,
+            delete,
+            expire,
+            directory,
+        } => send(
+            &peer,
+            &whoami,
+            message.as_deref(),
+            reply_to.as_deref(),
+            react.as_deref(),
+            to.as_deref(),
+            file.as_deref(),
+            edit.as_deref(),
+            delete.as_deref(),
+            expire.as_deref(),
+            &directory,
+        ),
+        Command::Broadcast {
+            to,
+            whoami,
+            message,
+            directory,
+        } => broadcast(&to, &whoami, &message, &directory),
+        Command::Inbox { whoami, directory } => inbox(&whoami, &directory),
+        Command::Outbox { directory } => outbox_show(&directory),
+        Command::Serve {
+            addr,
+            whoami,
+            directory,
+        } => serve(&addr, &whoami, &directory),
+        Command::GuardianSplit { shares, threshold } => guardian_split(shares, threshold),
+        Command::GuardianRecover { shares } => guardian_recover(&shares),
+        Command::History { peer } => show_history(&peer),
+        Command::ClearHistory { peer } => clear_history(&peer),
+        Command::Conversations => conversations(),
+        Command::Search { query } => search(&query),
+        Command::Forward {
+            message_id,
+            from,
+            to,
+            whoami,
+            directory,
+        } => forward(&message_id, &from, &to, &whoami, &directory),
+        Command::Group { action } => match action {
+            GroupAction::Create {
+                name,
+                members,
+                whoami,
+                directory,
+            } => group_create(&name, &members, &whoami, &directory),
+            GroupAction::Send {
+                group,
+                whoami,
+                message,
+                reply_to,
+                react,
+                to,
+                file,
+                edit,
+                delete,
+                expire,
+                directory,
+            } => group_send(
+                &group,
                 &whoami,
                 message.as_deref(),
                 reply_to.as_deref(),
@@ -515,58 +593,35 @@ fn main() -> Result<()> {
                 delete.as_deref(),
                 expire.as_deref(),
                 &directory,
-            )
-        }
-        Command::Broadcast { to, whoami, message, directory } => {
-            broadcast(&to, &whoami, &message, &directory)
-        }
-        Command::Inbox { whoami, directory } => inbox(&whoami, &directory),
-        Command::Outbox { directory } => outbox_show(&directory),
-        Command::Serve { addr, whoami, directory } => serve(&addr, &whoami, &directory),
-        Command::GuardianSplit { shares, threshold } => guardian_split(shares, threshold),
-        Command::GuardianRecover { shares } => guardian_recover(&shares),
-        Command::History { peer } => show_history(&peer),
-        Command::ClearHistory { peer } => clear_history(&peer),
-        Command::Conversations => conversations(),
-        Command::Search { query } => search(&query),
-        Command::Forward { message_id, from, to, whoami, directory } => {
-            forward(&message_id, &from, &to, &whoami, &directory)
-        }
-        Command::Group { action } => match action {
-            GroupAction::Create { name, members, whoami, directory } => {
-                group_create(&name, &members, &whoami, &directory)
-            }
-            GroupAction::Send { group, whoami, message, reply_to, react, to, file, edit, delete, expire, directory } => {
-                group_send(
-                    &group,
-                    &whoami,
-                    message.as_deref(),
-                    reply_to.as_deref(),
-                    react.as_deref(),
-                    to.as_deref(),
-                    file.as_deref(),
-                    edit.as_deref(),
-                    delete.as_deref(),
-                    expire.as_deref(),
-                    &directory,
-                )
-            }
-            GroupAction::Add { group, member, whoami, directory } => {
-                group_add(&group, &member, &whoami, &directory)
-            }
-            GroupAction::Remove { group, member, whoami, directory } => {
-                group_remove(&group, &member, &whoami, &directory)
-            }
+            ),
+            GroupAction::Add {
+                group,
+                member,
+                whoami,
+                directory,
+            } => group_add(&group, &member, &whoami, &directory),
+            GroupAction::Remove {
+                group,
+                member,
+                whoami,
+                directory,
+            } => group_remove(&group, &member, &whoami, &directory),
             GroupAction::History { group } => group_history(&group),
             GroupAction::Info { group } => group_info(&group),
-            GroupAction::Leave { group, whoami, directory } => group_leave(&group, &whoami, &directory),
+            GroupAction::Leave {
+                group,
+                whoami,
+                directory,
+            } => group_leave(&group, &whoami, &directory),
             GroupAction::Sync { whoami, directory } => group_sync(&whoami, &directory),
             GroupAction::List => group_list(),
         },
         Command::Contact { action } => match action {
-            ContactAction::Add { nickname, handle, directory } => {
-                contact_add(&nickname, &handle, &directory)
-            }
+            ContactAction::Add {
+                nickname,
+                handle,
+                directory,
+            } => contact_add(&nickname, &handle, &directory),
             ContactAction::List => contact_list(),
             ContactAction::Remove { nickname } => contact_remove(&nickname),
         },
@@ -592,7 +647,6 @@ fn main() -> Result<()> {
     }
 }
 
-
 fn listen(addr: &str, libp2p: bool, tui: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let history = Arc::new(Mutex::new(open_history(&identity)?));
@@ -613,7 +667,13 @@ fn listen(addr: &str, libp2p: bool, tui: bool) -> Result<()> {
                 }
                 Ok(session) => {
                     let (reader, writer) = conn.split();
-                    run_session(Box::new(reader), Box::new(writer), session, tui, Arc::clone(&history));
+                    run_session(
+                        Box::new(reader),
+                        Box::new(writer),
+                        session,
+                        tui,
+                        Arc::clone(&history),
+                    );
                     node.drain(300);
                     std::process::exit(0);
                 }
@@ -631,7 +691,13 @@ fn listen(addr: &str, libp2p: bool, tui: bool) -> Result<()> {
                 }
                 Ok(session) => {
                     let (reader, writer) = conn.split()?;
-                    run_session(Box::new(reader), Box::new(writer), session, tui, Arc::clone(&history));
+                    run_session(
+                        Box::new(reader),
+                        Box::new(writer),
+                        session,
+                        tui,
+                        Arc::clone(&history),
+                    );
                     std::process::exit(0);
                 }
                 Err(err) => eprintln!("(ignoring connection: {err})"),
@@ -639,7 +705,6 @@ fn listen(addr: &str, libp2p: bool, tui: bool) -> Result<()> {
         }
     }
 }
-
 
 fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -661,9 +726,22 @@ fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
         let mut conn = node
             .dial_str(&location)
             .with_context(|| format!("could not connect to {location}"))?;
-        let session = handshake_initiator(&mut conn, &identity, &me, &peer_handle, &peer_record, &location)?;
+        let session = handshake_initiator(
+            &mut conn,
+            &identity,
+            &me,
+            &peer_handle,
+            &peer_record,
+            &location,
+        )?;
         let (reader, writer) = conn.split();
-        run_session(Box::new(reader), Box::new(writer), session, tui, Arc::clone(&history));
+        run_session(
+            Box::new(reader),
+            Box::new(writer),
+            session,
+            tui,
+            Arc::clone(&history),
+        );
         node.drain(300);
         std::process::exit(0);
     } else {
@@ -671,13 +749,25 @@ fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
         let mut conn = transport
             .dial(&peer_record.record.primary().peer_id)
             .with_context(|| format!("could not connect to {location}"))?;
-        let session = handshake_initiator(&mut conn, &identity, &me, &peer_handle, &peer_record, &location)?;
+        let session = handshake_initiator(
+            &mut conn,
+            &identity,
+            &me,
+            &peer_handle,
+            &peer_record,
+            &location,
+        )?;
         let (reader, writer) = conn.split()?;
-        run_session(Box::new(reader), Box::new(writer), session, tui, Arc::clone(&history));
+        run_session(
+            Box::new(reader),
+            Box::new(writer),
+            session,
+            tui,
+            Arc::clone(&history),
+        );
         std::process::exit(0);
     }
 }
-
 
 /// Run a session in either the terminal UI or line mode.
 fn run_session(
@@ -696,7 +786,6 @@ fn run_session(
     }
 }
 
-
 /// Run a full-duplex chat: a reader thread decrypts and prints incoming
 /// messages while the main thread encrypts stdin lines and sends them. The
 /// ratchet is shared under a mutex since both directions advance it. Every
@@ -707,7 +796,11 @@ fn run_duplex(
     session: Session,
     history: Arc<Mutex<FileStore>>,
 ) {
-    let Session { ratchet, ad, peer_name } = session;
+    let Session {
+        ratchet,
+        ad,
+        peer_name,
+    } = session;
     let ratchet = Arc::new(Mutex::new(ratchet));
     let ad = Arc::new(ad);
     let peer_name = Arc::new(peer_name);
@@ -741,12 +834,22 @@ fn run_duplex(
                 Ok(msg) => msg,
                 Err(_) => continue,
             };
-            let decrypted = reader_ratchet.lock().unwrap().decrypt(&mut platform, &msg, &reader_ad);
+            let decrypted = reader_ratchet
+                .lock()
+                .unwrap()
+                .decrypt(&mut platform, &msg, &reader_ad);
             match decrypted {
                 Ok(plaintext) => {
                     let (id, expires_at, display) = render_incoming(&plaintext);
                     println!("{reader_peer}: {display}  (#{id})");
-                    record(&reader_history, &reader_peer, false, id, display, expires_at);
+                    record(
+                        &reader_history,
+                        &reader_peer,
+                        false,
+                        id,
+                        display,
+                        expires_at,
+                    );
                 }
                 Err(_) => eprintln!("(received an undecryptable message)"),
             }
@@ -767,18 +870,36 @@ fn run_duplex(
         if writer.send_frame(&wire::encode(&msg)).is_err() {
             break;
         }
-        record(&history, &peer_name, true, app.id.clone(), line, app.expires_at);
+        record(
+            &history,
+            &peer_name,
+            true,
+            app.id.clone(),
+            line,
+            app.expires_at,
+        );
     }
 }
 
-
 /// Persist one message to the encrypted history store (best-effort), keeping its
 /// real id + expiry so reply/edit/delete/expiry work the same as offline mail.
-fn record(history: &Arc<Mutex<FileStore>>, peer: &str, from_me: bool, id: String, text: String, expires_at: Option<u64>) {
-    let message = StoredMessage { id, from_me, text, timestamp: OsPlatform.now_unix_secs(), expires_at };
+fn record(
+    history: &Arc<Mutex<FileStore>>,
+    peer: &str,
+    from_me: bool,
+    id: String,
+    text: String,
+    expires_at: Option<u64>,
+) {
+    let message = StoredMessage {
+        id,
+        from_me,
+        text,
+        timestamp: OsPlatform.now_unix_secs(),
+        expires_at,
+    };
     let _ = history::append(&mut *history.lock().unwrap(), peer, message);
 }
-
 
 /// Decode a decrypted payload into `(id, expires_at, display)`, tolerating older
 /// raw text (which has no metadata → empty id, no expiry).
@@ -788,6 +909,10 @@ fn render_incoming(bytes: &[u8]) -> (String, Option<u64>, String) {
             let summary = msg.summary();
             (msg.id, msg.expires_at, summary)
         }
-        Err(_) => (String::new(), None, String::from_utf8_lossy(bytes).into_owned()),
+        Err(_) => (
+            String::new(),
+            None,
+            String::from_utf8_lossy(bytes).into_owned(),
+        ),
     }
 }

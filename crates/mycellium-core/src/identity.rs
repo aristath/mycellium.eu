@@ -155,8 +155,7 @@ impl Identity {
     /// inherit another device's message keys (that is what keeps past traffic
     /// safe). Use [`Identity::restore`] to reload *this* device from storage.
     pub fn from_phrase<P: Platform>(phrase: &str, platform: &mut P) -> Result<Self, Error> {
-        let mnemonic =
-            bip39::Mnemonic::parse_normalized(phrase).map_err(|_| Error::Malformed)?;
+        let mnemonic = bip39::Mnemonic::parse_normalized(phrase).map_err(|_| Error::Malformed)?;
         let mut device_seed = [0u8; 32];
         platform.fill_random(&mut device_seed);
         Self::build(mnemonic, device_seed)
@@ -164,8 +163,7 @@ impl Identity {
 
     /// Reload a device from its persisted phrase + device seed (same device).
     pub fn restore(phrase: &str, device_seed: [u8; 32]) -> Result<Self, Error> {
-        let mnemonic =
-            bip39::Mnemonic::parse_normalized(phrase).map_err(|_| Error::Malformed)?;
+        let mnemonic = bip39::Mnemonic::parse_normalized(phrase).map_err(|_| Error::Malformed)?;
         Self::build(mnemonic, device_seed)
     }
 
@@ -176,15 +174,19 @@ impl Identity {
         // into external wallets (MetaMask et al.) and yields the same address.
         let path: DerivationPath = "m/44'/60'/0'/0/0".parse().map_err(|_| Error::Malformed)?;
         let xprv = XPrv::derive_from_path(seed, &path).map_err(|_| Error::Malformed)?;
-        let wallet = WalletSigningKey::from_slice(&xprv.to_bytes()).map_err(|_| Error::Malformed)?;
+        let wallet =
+            WalletSigningKey::from_slice(&xprv.to_bytes()).map_err(|_| Error::Malformed)?;
         seed.zeroize();
 
         // Device and messaging keys come from the **device seed** (random, held
         // only by this device) — not the mnemonic — so a seed leak can authorize
         // a new device but never retroactively decrypt this device's traffic.
-        let device = DeviceSigningKey::from_bytes(&derive_key(&device_seed, b"mycellium:device:ed25519:v1"));
-        let messaging = StaticSecret::from(derive_key(&device_seed, b"mycellium:messaging:x25519:v1"));
-        let signed_pre_key = StaticSecret::from(derive_key(&device_seed, b"mycellium:spk:x25519:v1:0"));
+        let device =
+            DeviceSigningKey::from_bytes(&derive_key(&device_seed, b"mycellium:device:ed25519:v1"));
+        let messaging =
+            StaticSecret::from(derive_key(&device_seed, b"mycellium:messaging:x25519:v1"));
+        let signed_pre_key =
+            StaticSecret::from(derive_key(&device_seed, b"mycellium:spk:x25519:v1:0"));
         Ok(Self {
             mnemonic: mnemonic.to_string(),
             device_seed,
@@ -255,12 +257,16 @@ impl Identity {
 
     /// Diffie-Hellman between the **identity (messaging)** secret and `peer`.
     pub(crate) fn dh_identity(&self, peer: &MessagingPublicKey) -> [u8; 32] {
-        self.messaging.diffie_hellman(&XPublicKey::from(peer.0)).to_bytes()
+        self.messaging
+            .diffie_hellman(&XPublicKey::from(peer.0))
+            .to_bytes()
     }
 
     /// Diffie-Hellman between the **signed pre-key** secret and `peer`.
     pub(crate) fn dh_signed_pre_key(&self, peer: &MessagingPublicKey) -> [u8; 32] {
-        self.signed_pre_key.diffie_hellman(&XPublicKey::from(peer.0)).to_bytes()
+        self.signed_pre_key
+            .diffie_hellman(&XPublicKey::from(peer.0))
+            .to_bytes()
     }
 
     /// The signed pre-key secret, for seeding the responder's first ratchet.
@@ -347,7 +353,11 @@ mod tests {
         let b = Identity::from_phrase(a.mnemonic(), &mut SeededPlatform(200)).unwrap();
         assert_eq!(a.wallet_public(), b.wallet_public(), "same account");
         assert_ne!(a.device_public(), b.device_public(), "new device key");
-        assert_ne!(a.messaging_public(), b.messaging_public(), "new message key");
+        assert_ne!(
+            a.messaging_public(),
+            b.messaging_public(),
+            "new message key"
+        );
     }
 
     fn from_hex_32(s: &str) -> [u8; 32] {

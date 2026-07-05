@@ -13,10 +13,10 @@ use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::platform::Platform;
 use mycellium_core::userid::user_id;
 use mycellium_directory_client::DirectoryClient;
-use mycellium_queue_client::QueueClient;
 use mycellium_engine::app;
 use mycellium_engine::platform::OsPlatform;
 use mycellium_engine::{contacts, groups, history, names};
+use mycellium_queue_client::QueueClient;
 use mycellium_storage::store;
 
 use crate::State;
@@ -24,7 +24,11 @@ use crate::State;
 /// Route an `/api/...` request. Returns `(http_status, json_body)`.
 pub fn dispatch(state: &Mutex<State>, method: &Method, path: &str, body: &str) -> (u16, String) {
     // Percent-decode each segment — a browser sends emails as e.g. `a%40b.com`.
-    let owned: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(percent_decode).collect();
+    let owned: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(percent_decode)
+        .collect();
     let segs: Vec<&str> = owned.iter().map(String::as_str).collect();
     let req = parse(body);
     let directory = state.lock().unwrap().directory.clone();
@@ -92,7 +96,9 @@ fn ensure_identity() -> anyhow::Result<Identity> {
 
 fn status(directory: &str) -> anyhow::Result<Value> {
     let queue = std::env::var("MYCELLIUM_QUEUE").unwrap_or_default();
-    let wallet = store::load_identity().ok().map(|id| hex(&id.wallet_public().0));
+    let wallet = store::load_identity()
+        .ok()
+        .map(|id| hex(&id.wallet_public().0));
     Ok(json!({
         // The account exists once `handle` (= the id) is set. `name` is the
         // free-form display name; the UI shows the name, routes on the handle.
@@ -130,7 +136,7 @@ fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<
     let (pending, dev_code) = client.auth_start(&token, &uid, email)?;
     save_name(name)?;
     save_email(email)?; // your own email, so the app can show "add me by …"
-    // Remember both the id (to publish) and the name for this pending signup.
+                        // Remember both the id (to publish) and the name for this pending signup.
     state.lock().unwrap().pending.insert(pending.clone(), uid);
     Ok(json!({ "pending": pending, "dev_code": dev_code }))
 }
@@ -261,7 +267,17 @@ fn thread_send(peer: &str, req: &Value, directory: &str) -> anyhow::Result<Value
     let attachment = save_upload(req)?;
     let file = attachment.as_ref().map(|p| p.to_string_lossy().to_string());
     let result = app::send(
-        &to_uid(peer), &me, message, reply_to, react, target, file.as_deref(), None, delete, None, directory,
+        &to_uid(peer),
+        &me,
+        message,
+        reply_to,
+        react,
+        target,
+        file.as_deref(),
+        None,
+        delete,
+        None,
+        directory,
     );
     if let Some(path) = &attachment {
         let _ = std::fs::remove_file(path);
@@ -310,7 +326,19 @@ fn group_load(id: &str) -> anyhow::Result<Value> {
 fn group_send(id: &str, req: &Value, directory: &str) -> anyhow::Result<Value> {
     let message = field(req, "message").ok_or_else(|| anyhow::anyhow!("message required"))?;
     let me = read_handle().ok_or_else(|| anyhow::anyhow!("register a handle first"))?;
-    app::group_send(id, &me, Some(message), None, None, None, None, None, None, None, directory)?;
+    app::group_send(
+        id,
+        &me,
+        Some(message),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        directory,
+    )?;
     Ok(json!({ "ok": true }))
 }
 
@@ -367,7 +395,9 @@ fn parse(body: &str) -> Value {
 }
 
 fn field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(|x| x.as_str()).filter(|s| !s.is_empty())
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 fn err(msg: &str) -> String {
@@ -379,7 +409,8 @@ fn err(msg: &str) -> String {
 fn reachable(url: &str) -> bool {
     match socket_addr(url) {
         Some(addr) => {
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).is_ok()
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600))
+                .is_ok()
         }
         None => false,
     }
@@ -433,7 +464,10 @@ fn handle_path() -> std::path::PathBuf {
 }
 
 fn read_handle() -> Option<String> {
-    std::fs::read_to_string(handle_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(handle_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn name_path() -> std::path::PathBuf {
@@ -441,7 +475,10 @@ fn name_path() -> std::path::PathBuf {
 }
 
 fn read_name() -> Option<String> {
-    std::fs::read_to_string(name_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(name_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Persist our display name and make it live immediately (the engine reads it
@@ -483,7 +520,10 @@ fn email_path() -> std::path::PathBuf {
 }
 
 fn read_email() -> Option<String> {
-    std::fs::read_to_string(email_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(email_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn save_email(email: &str) -> anyhow::Result<()> {

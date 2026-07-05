@@ -28,7 +28,10 @@ struct Semaphore {
 }
 impl Semaphore {
     const fn new(n: usize) -> Self {
-        Semaphore { count: std::sync::Mutex::new(n), cv: std::sync::Condvar::new() }
+        Semaphore {
+            count: std::sync::Mutex::new(n),
+            cv: std::sync::Condvar::new(),
+        }
     }
 }
 
@@ -108,7 +111,12 @@ fn start_directory() -> String {
 fn home(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
-    path.push(format!("mycellium-e2e-{}-{}-{}", tag, std::process::id(), n));
+    path.push(format!(
+        "mycellium-e2e-{}-{}-{}",
+        tag,
+        std::process::id(),
+        n
+    ));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
@@ -194,10 +202,24 @@ fn live_push_delivery_when_online() {
     let bob_addr = format!("127.0.0.1:{bob_port}");
     let bob = home("bob-serve");
     ok(&cli(&bob, &["identity-new"]), "bob id");
-    ok(&cli(&bob, &["register", "bob", "--addr", &bob_addr, "--directory", &dir]), "bob register");
+    ok(
+        &cli(
+            &bob,
+            &["register", "bob", "--addr", &bob_addr, "--directory", &dir],
+        ),
+        "bob register",
+    );
 
     let mut bob_serve = Command::new(CLI)
-        .args(["serve", "--addr", &bob_addr, "--as", "bob", "--directory", &dir])
+        .args([
+            "serve",
+            "--addr",
+            &bob_addr,
+            "--as",
+            "bob",
+            "--directory",
+            &dir,
+        ])
         .env("MYCELLIUM_HOME", &bob)
         .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdout(Stdio::piped())
@@ -207,12 +229,31 @@ fn live_push_delivery_when_online() {
     wait_port(bob_port);
 
     // Alice sends; since Bob is online, it's pushed live to his `serve`.
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--message", "live hello", "--directory", &dir]), "send");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "live hello",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
     let got = wait_contains(&bob_out, "from alice: live hello", 20);
 
     let _ = bob_serve.kill();
     let _ = bob_serve.wait();
-    assert!(got, "bob's serve did not receive the live message:\n{}", bob_out.lock().unwrap());
+    assert!(
+        got,
+        "bob's serve did not receive the live message:\n{}",
+        bob_out.lock().unwrap()
+    );
 }
 
 #[test]
@@ -229,11 +270,31 @@ fn revoked_device_stops_receiving() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6401", "--directory", &dir]), "register");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "register",
+                "mary",
+                "--addr",
+                "127.0.0.1:6401",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
     let mary_b = home("rev-b");
     ok(
         &Command::new(CLI)
-            .args(["link-device", "mary", "--addr", "127.0.0.1:6402", "--directory", &dir])
+            .args([
+                "link-device",
+                "mary",
+                "--addr",
+                "127.0.0.1:6402",
+                "--directory",
+                &dir,
+            ])
             .env("MYCELLIUM_HOME", &mary_b)
             .env("MYCELLIUM_PASSPHRASE", PASS)
             .env("MYCELLIUM_PHRASE", &phrase)
@@ -252,14 +313,43 @@ fn revoked_device_stops_receiving() {
         .and_then(|l| l.split_whitespace().next())
         .expect("device B id")
         .to_string();
-    ok(&cli(&mary_a, &["revoke-device", "mary", &b_id, "--directory", &dir]), "revoke-device");
+    ok(
+        &cli(
+            &mary_a,
+            &["revoke-device", "mary", &b_id, "--directory", &dir],
+        ),
+        "revoke-device",
+    );
 
     // A message sent after the revoke reaches A but not the revoked B.
-    ok(&cli(&john, &["send", "mary", "--as", "john", "--message", "after revoke", "--directory", &dir]), "send");
+    ok(
+        &cli(
+            &john,
+            &[
+                "send",
+                "mary",
+                "--as",
+                "john",
+                "--message",
+                "after revoke",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
     let a = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&a.stdout).contains("after revoke"), "device A missed it: {}", String::from_utf8_lossy(&a.stdout));
+    assert!(
+        String::from_utf8_lossy(&a.stdout).contains("after revoke"),
+        "device A missed it: {}",
+        String::from_utf8_lossy(&a.stdout)
+    );
     let b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(!String::from_utf8_lossy(&b.stdout).contains("after revoke"), "revoked device B still received it: {}", String::from_utf8_lossy(&b.stdout));
+    assert!(
+        !String::from_utf8_lossy(&b.stdout).contains("after revoke"),
+        "revoked device B still received it: {}",
+        String::from_utf8_lossy(&b.stdout)
+    );
 }
 
 #[test]
@@ -277,11 +367,31 @@ fn read_receipt_reaches_sender_cluster() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6301", "--directory", &dir]), "register");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "register",
+                "mary",
+                "--addr",
+                "127.0.0.1:6301",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
     let mary_b = home("rcpt-b");
     ok(
         &Command::new(CLI)
-            .args(["link-device", "mary", "--addr", "127.0.0.1:6302", "--directory", &dir])
+            .args([
+                "link-device",
+                "mary",
+                "--addr",
+                "127.0.0.1:6302",
+                "--directory",
+                &dir,
+            ])
             .env("MYCELLIUM_HOME", &mary_b)
             .env("MYCELLIUM_PASSPHRASE", PASS)
             .env("MYCELLIUM_PHRASE", &phrase)
@@ -292,12 +402,34 @@ fn read_receipt_reaches_sender_cluster() {
     );
 
     // Mary sends from device A; John reads it, returning a receipt to the cluster.
-    ok(&cli(&mary_a, &["send", "john", "--as", "mary", "--message", "did you get this", "--directory", &dir]), "send");
-    ok(&cli(&john, &["inbox", "--as", "john", "--directory", &dir]), "john inbox");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "send",
+                "john",
+                "--as",
+                "mary",
+                "--message",
+                "did you get this",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
+    ok(
+        &cli(&john, &["inbox", "--as", "john", "--directory", &dir]),
+        "john inbox",
+    );
 
     // Device A (which sent) sees the read receipt.
     let a = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&a.stdout).contains("read your message"), "sender device missed receipt: {}", String::from_utf8_lossy(&a.stdout));
+    assert!(
+        String::from_utf8_lossy(&a.stdout).contains("read your message"),
+        "sender device missed receipt: {}",
+        String::from_utf8_lossy(&a.stdout)
+    );
 }
 
 #[test]
@@ -314,15 +446,57 @@ fn bootstrapped_device_can_send_to_group() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6601", "--directory", &dir]), "register");
-    ok(&cli(&alice, &["group", "create", "team", "--members", "mary", "--as", "alice", "--directory", &dir]), "create");
-    ok(&cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]), "mary-a invite");
-    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "alice mesh");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "register",
+                "mary",
+                "--addr",
+                "127.0.0.1:6601",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "mary",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "create",
+    );
+    ok(
+        &cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]),
+        "mary-a invite",
+    );
+    ok(
+        &cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]),
+        "alice mesh",
+    );
 
     let mary_b = home("gsend-b");
     ok(
         &Command::new(CLI)
-            .args(["link-device", "mary", "--addr", "127.0.0.1:6602", "--directory", &dir])
+            .args([
+                "link-device",
+                "mary",
+                "--addr",
+                "127.0.0.1:6602",
+                "--directory",
+                &dir,
+            ])
             .env("MYCELLIUM_HOME", &mary_b)
             .env("MYCELLIUM_PASSPHRASE", PASS)
             .env("MYCELLIUM_PHRASE", &phrase)
@@ -333,17 +507,56 @@ fn bootstrapped_device_can_send_to_group() {
     );
 
     // Sync groups to B; B bootstraps and announces its own key to the members.
-    ok(&cli(&mary_a, &["group", "sync", "--as", "mary", "--directory", &dir]), "group sync");
-    ok(&cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]), "mary-b bootstrap");
-    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "alice learns B key");
-    ok(&cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]), "mary-a learns B key");
+    ok(
+        &cli(
+            &mary_a,
+            &["group", "sync", "--as", "mary", "--directory", &dir],
+        ),
+        "group sync",
+    );
+    ok(
+        &cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]),
+        "mary-b bootstrap",
+    );
+    ok(
+        &cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]),
+        "alice learns B key",
+    );
+    ok(
+        &cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]),
+        "mary-a learns B key",
+    );
 
     // B sends to the group; both Alice and Mary's phone can read it.
-    ok(&cli(&mary_b, &["group", "send", "team", "--as", "mary", "--message", "sent from my laptop", "--directory", &dir]), "b group send");
+    ok(
+        &cli(
+            &mary_b,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "mary",
+                "--message",
+                "sent from my laptop",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "b group send",
+    );
     let a = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&a.stdout).contains("sent from my laptop"), "alice can't read B's group message: {}", String::from_utf8_lossy(&a.stdout));
+    assert!(
+        String::from_utf8_lossy(&a.stdout).contains("sent from my laptop"),
+        "alice can't read B's group message: {}",
+        String::from_utf8_lossy(&a.stdout)
+    );
     let ma = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&ma.stdout).contains("sent from my laptop"), "mary's phone can't read B's group message: {}", String::from_utf8_lossy(&ma.stdout));
+    assert!(
+        String::from_utf8_lossy(&ma.stdout).contains("sent from my laptop"),
+        "mary's phone can't read B's group message: {}",
+        String::from_utf8_lossy(&ma.stdout)
+    );
 }
 
 #[test]
@@ -361,16 +574,58 @@ fn new_device_bootstraps_into_group() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6501", "--directory", &dir]), "register");
-    ok(&cli(&alice, &["group", "create", "team", "--members", "mary", "--as", "alice", "--directory", &dir]), "create");
-    ok(&cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]), "mary-a invite");
-    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "alice mesh");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "register",
+                "mary",
+                "--addr",
+                "127.0.0.1:6501",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "mary",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "create",
+    );
+    ok(
+        &cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]),
+        "mary-a invite",
+    );
+    ok(
+        &cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]),
+        "alice mesh",
+    );
 
     // Link device B *after* the group exists — it has no group state yet.
     let mary_b = home("gsync-b");
     ok(
         &Command::new(CLI)
-            .args(["link-device", "mary", "--addr", "127.0.0.1:6502", "--directory", &dir])
+            .args([
+                "link-device",
+                "mary",
+                "--addr",
+                "127.0.0.1:6502",
+                "--directory",
+                &dir,
+            ])
             .env("MYCELLIUM_HOME", &mary_b)
             .env("MYCELLIUM_PASSPHRASE", PASS)
             .env("MYCELLIUM_PHRASE", &phrase)
@@ -381,18 +636,67 @@ fn new_device_bootstraps_into_group() {
     );
 
     // Sync groups from A to the cluster; B bootstraps into "team".
-    ok(&cli(&mary_a, &["group", "sync", "--as", "mary", "--directory", &dir]), "group sync");
-    ok(&cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]), "mary-b bootstrap");
+    ok(
+        &cli(
+            &mary_a,
+            &["group", "sync", "--as", "mary", "--directory", &dir],
+        ),
+        "group sync",
+    );
+    ok(
+        &cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]),
+        "mary-b bootstrap",
+    );
 
     // Alice's later group message is readable on the newly-linked device B.
-    ok(&cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "seen on laptop", "--directory", &dir]), "alice send");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "alice",
+                "--message",
+                "seen on laptop",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "alice send",
+    );
     let b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&b.stdout).contains("seen on laptop"), "device B can't read group after sync: {}", String::from_utf8_lossy(&b.stdout));
+    assert!(
+        String::from_utf8_lossy(&b.stdout).contains("seen on laptop"),
+        "device B can't read group after sync: {}",
+        String::from_utf8_lossy(&b.stdout)
+    );
 
     // And a message from Mary's own phone (device A) also shows on B.
-    ok(&cli(&mary_a, &["group", "send", "team", "--as", "mary", "--message", "from my phone", "--directory", &dir]), "mary-a send");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "mary",
+                "--message",
+                "from my phone",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "mary-a send",
+    );
     let b2 = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&b2.stdout).contains("from my phone"), "device B can't read own cluster's msg: {}", String::from_utf8_lossy(&b2.stdout));
+    assert!(
+        String::from_utf8_lossy(&b2.stdout).contains("from my phone"),
+        "device B can't read own cluster's msg: {}",
+        String::from_utf8_lossy(&b2.stdout)
+    );
 }
 
 #[test]
@@ -410,11 +714,31 @@ fn group_reaches_all_member_devices() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&bob_a, &["register", "bob", "--addr", "127.0.0.1:6201", "--directory", &dir]), "register");
+    ok(
+        &cli(
+            &bob_a,
+            &[
+                "register",
+                "bob",
+                "--addr",
+                "127.0.0.1:6201",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
     let bob_b = home("grp-b");
     ok(
         &Command::new(CLI)
-            .args(["link-device", "bob", "--addr", "127.0.0.1:6202", "--directory", &dir])
+            .args([
+                "link-device",
+                "bob",
+                "--addr",
+                "127.0.0.1:6202",
+                "--directory",
+                &dir,
+            ])
             .env("MYCELLIUM_HOME", &bob_b)
             .env("MYCELLIUM_PASSPHRASE", PASS)
             .env("MYCELLIUM_PHRASE", &phrase)
@@ -425,16 +749,62 @@ fn group_reaches_all_member_devices() {
     );
 
     // Alice creates the group; both Bob devices pick up the sender key.
-    ok(&cli(&alice, &["group", "create", "team", "--members", "bob", "--as", "alice", "--directory", &dir]), "group create");
-    ok(&cli(&bob_a, &["inbox", "--as", "bob", "--directory", &dir]), "bob-a invite");
-    ok(&cli(&bob_b, &["inbox", "--as", "bob", "--directory", &dir]), "bob-b invite");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "bob",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "group create",
+    );
+    ok(
+        &cli(&bob_a, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob-a invite",
+    );
+    ok(
+        &cli(&bob_b, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob-b invite",
+    );
 
     // Alice sends to the group; both of Bob's devices receive it.
-    ok(&cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "hello team", "--directory", &dir]), "group send");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "alice",
+                "--message",
+                "hello team",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "group send",
+    );
     let a = cli(&bob_a, &["inbox", "--as", "bob", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&a.stdout).contains("hello team"), "device A missed group msg: {}", String::from_utf8_lossy(&a.stdout));
+    assert!(
+        String::from_utf8_lossy(&a.stdout).contains("hello team"),
+        "device A missed group msg: {}",
+        String::from_utf8_lossy(&a.stdout)
+    );
     let b = cli(&bob_b, &["inbox", "--as", "bob", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&b.stdout).contains("hello team"), "device B missed group msg: {}", String::from_utf8_lossy(&b.stdout));
+    assert!(
+        String::from_utf8_lossy(&b.stdout).contains("hello team"),
+        "device B missed group msg: {}",
+        String::from_utf8_lossy(&b.stdout)
+    );
 }
 
 #[test]
@@ -452,11 +822,31 @@ fn sent_messages_sync_to_own_devices() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6101", "--directory", &dir]), "register");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "register",
+                "mary",
+                "--addr",
+                "127.0.0.1:6101",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
 
     let mary_b = home("sync-b");
     let linked = Command::new(CLI)
-        .args(["link-device", "mary", "--addr", "127.0.0.1:6102", "--directory", &dir])
+        .args([
+            "link-device",
+            "mary",
+            "--addr",
+            "127.0.0.1:6102",
+            "--directory",
+            &dir,
+        ])
         .env("MYCELLIUM_HOME", &mary_b)
         .env("MYCELLIUM_PASSPHRASE", PASS)
         .env("MYCELLIUM_PHRASE", &phrase)
@@ -466,13 +856,36 @@ fn sent_messages_sync_to_own_devices() {
     ok(&linked, "link-device");
 
     // Mary sends to John from device A.
-    ok(&cli(&mary_a, &["send", "john", "--as", "mary", "--message", "from my phone", "--directory", &dir]), "send");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "send",
+                "john",
+                "--as",
+                "mary",
+                "--message",
+                "from my phone",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
 
     // Device B mirrors the sent message, and it lands in Mary's transcript with John.
     let inbox_b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&inbox_b.stdout).contains("from my phone"), "device B did not sync: {}", String::from_utf8_lossy(&inbox_b.stdout));
+    assert!(
+        String::from_utf8_lossy(&inbox_b.stdout).contains("from my phone"),
+        "device B did not sync: {}",
+        String::from_utf8_lossy(&inbox_b.stdout)
+    );
     let hist = cli(&mary_b, &["history", "john"]);
-    assert!(String::from_utf8_lossy(&hist.stdout).contains("from my phone"), "not in device B history: {}", String::from_utf8_lossy(&hist.stdout));
+    assert!(
+        String::from_utf8_lossy(&hist.stdout).contains("from my phone"),
+        "not in device B history: {}",
+        String::from_utf8_lossy(&hist.stdout)
+    );
 }
 
 #[test]
@@ -490,11 +903,31 @@ fn message_reaches_all_recipient_devices() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("mnemonic");
-    ok(&cli(&mary_a, &["register", "mary", "--addr", "127.0.0.1:6001", "--directory", &dir]), "register");
+    ok(
+        &cli(
+            &mary_a,
+            &[
+                "register",
+                "mary",
+                "--addr",
+                "127.0.0.1:6001",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
 
     let mary_b = home("mary-b");
     let linked = Command::new(CLI)
-        .args(["link-device", "mary", "--addr", "127.0.0.1:6002", "--directory", &dir])
+        .args([
+            "link-device",
+            "mary",
+            "--addr",
+            "127.0.0.1:6002",
+            "--directory",
+            &dir,
+        ])
         .env("MYCELLIUM_HOME", &mary_b)
         .env("MYCELLIUM_PASSPHRASE", PASS)
         .env("MYCELLIUM_PHRASE", &phrase)
@@ -504,13 +937,36 @@ fn message_reaches_all_recipient_devices() {
     ok(&linked, "link-device");
 
     // John sends once to "mary" — his client fans out to her whole cluster.
-    ok(&cli(&john, &["send", "mary", "--as", "john", "--message", "hi cluster", "--directory", &dir]), "send");
+    ok(
+        &cli(
+            &john,
+            &[
+                "send",
+                "mary",
+                "--as",
+                "john",
+                "--message",
+                "hi cluster",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
 
     // Both of Mary's devices receive it.
     let a = cli(&mary_a, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&a.stdout).contains("hi cluster"), "device A missed it: {}", String::from_utf8_lossy(&a.stdout));
+    assert!(
+        String::from_utf8_lossy(&a.stdout).contains("hi cluster"),
+        "device A missed it: {}",
+        String::from_utf8_lossy(&a.stdout)
+    );
     let b = cli(&mary_b, &["inbox", "--as", "mary", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&b.stdout).contains("hi cluster"), "device B missed it: {}", String::from_utf8_lossy(&b.stdout));
+    assert!(
+        String::from_utf8_lossy(&b.stdout).contains("hi cluster"),
+        "device B missed it: {}",
+        String::from_utf8_lossy(&b.stdout)
+    );
 }
 
 #[test]
@@ -527,12 +983,32 @@ fn link_device_joins_and_revoke_removes() {
         .map(|l| l.trim().to_string())
         .find(|l| l.split_whitespace().count() == 24)
         .expect("24-word mnemonic in output");
-    ok(&cli(&dev_a, &["register", "ari", "--addr", "127.0.0.1:5551", "--directory", &dir]), "register");
+    ok(
+        &cli(
+            &dev_a,
+            &[
+                "register",
+                "ari",
+                "--addr",
+                "127.0.0.1:5551",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "register",
+    );
 
     // Device B (fresh home): link to the same account via the seed phrase.
     let dev_b = home("dev-b");
     let linked = Command::new(CLI)
-        .args(["link-device", "ari", "--addr", "127.0.0.1:5552", "--directory", &dir])
+        .args([
+            "link-device",
+            "ari",
+            "--addr",
+            "127.0.0.1:5552",
+            "--directory",
+            &dir,
+        ])
         .env("MYCELLIUM_HOME", &dev_b)
         .env("MYCELLIUM_PASSPHRASE", PASS)
         .env("MYCELLIUM_PHRASE", &mnemonic)
@@ -544,7 +1020,10 @@ fn link_device_joins_and_revoke_removes() {
     // The cluster now has both devices.
     let devs = cli(&dev_a, &["devices", "ari", "--directory", &dir]);
     let text = String::from_utf8_lossy(&devs.stdout);
-    assert!(text.contains("5551") && text.contains("5552"), "both devices should be listed: {text}");
+    assert!(
+        text.contains("5551") && text.contains("5552"),
+        "both devices should be listed: {text}"
+    );
 
     // `identity-show` on device B reports a device-id that appears in the list.
     let b_show = cli(&dev_b, &["identity-show"]);
@@ -554,7 +1033,10 @@ fn link_device_joins_and_revoke_removes() {
         .find(|l| l.trim_start().starts_with("device-id:"))
         .and_then(|l| l.split_whitespace().nth(1))
         .expect("device-id line");
-    assert!(text.contains(b_self_id), "device B's own id not in the listing: {b_self_id}");
+    assert!(
+        text.contains(b_self_id),
+        "device B's own id not in the listing: {b_self_id}"
+    );
 
     // Revoke device B (by its short id) and confirm it's gone.
     let b_id = text
@@ -563,10 +1045,19 @@ fn link_device_joins_and_revoke_removes() {
         .and_then(|l| l.split_whitespace().next())
         .expect("device B id")
         .to_string();
-    ok(&cli(&dev_a, &["revoke-device", "ari", &b_id, "--directory", &dir]), "revoke-device");
+    ok(
+        &cli(
+            &dev_a,
+            &["revoke-device", "ari", &b_id, "--directory", &dir],
+        ),
+        "revoke-device",
+    );
     let after = cli(&dev_a, &["devices", "ari", "--directory", &dir]);
     let after = String::from_utf8_lossy(&after.stdout);
-    assert!(after.contains("5551") && !after.contains("5552"), "B should be revoked: {after}");
+    assert!(
+        after.contains("5551") && !after.contains("5552"),
+        "B should be revoked: {after}"
+    );
 }
 
 #[test]
@@ -576,14 +1067,29 @@ fn offline_send_and_receive() {
     let (alice, bob) = two_accounts(&dir, "127.0.0.1:1", false); // addr unused offline
 
     ok(
-        &cli(&alice, &["send", "bob", "--as", "alice", "--message", "hello e2e", "--directory", &dir]),
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "hello e2e",
+                "--directory",
+                &dir,
+            ],
+        ),
         "alice send",
     );
 
     let inbox = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     ok(&inbox, "bob inbox");
     let out = String::from_utf8_lossy(&inbox.stdout);
-    assert!(out.contains("from alice: hello e2e"), "inbox output was: {out}");
+    assert!(
+        out.contains("from alice: hello e2e"),
+        "inbox output was: {out}"
+    );
 
     // A second drain must be empty (the mailbox drained).
     let again = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
@@ -595,7 +1101,17 @@ fn account(dir: &str, name: &str) -> PathBuf {
     let h = home(name);
     ok(&cli(&h, &["identity-new"]), "identity-new");
     ok(
-        &cli(&h, &["register", name, "--addr", "127.0.0.1:1", "--directory", dir]),
+        &cli(
+            &h,
+            &[
+                "register",
+                name,
+                "--addr",
+                "127.0.0.1:1",
+                "--directory",
+                dir,
+            ],
+        ),
         "register",
     );
     h
@@ -609,12 +1125,34 @@ fn broadcast_reaches_each_recipient() {
     let bob = account(&dir, "bob");
     let carol = account(&dir, "carol");
 
-    ok(&cli(&alice, &["broadcast", "--to", "bob,carol", "--as", "alice", "--message", "town hall at 5", "--directory", &dir]), "broadcast");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "broadcast",
+                "--to",
+                "bob,carol",
+                "--as",
+                "alice",
+                "--message",
+                "town hall at 5",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "broadcast",
+    );
 
     let b = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&b.stdout).contains("town hall at 5"), "bob missed broadcast");
+    assert!(
+        String::from_utf8_lossy(&b.stdout).contains("town hall at 5"),
+        "bob missed broadcast"
+    );
     let c = cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]);
-    assert!(String::from_utf8_lossy(&c.stdout).contains("town hall at 5"), "carol missed broadcast");
+    assert!(
+        String::from_utf8_lossy(&c.stdout).contains("town hall at 5"),
+        "carol missed broadcast"
+    );
 }
 
 #[test]
@@ -627,32 +1165,73 @@ fn group_message_reaches_all_members() {
 
     // Alice creates the group and invites Bob and Carol (sends them her key).
     ok(
-        &cli(&alice, &["group", "create", "team", "--members", "bob,carol", "--as", "alice", "--directory", &dir]),
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "bob,carol",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
         "group create",
     );
 
     // Bob and Carol process the invite (learning Alice's sender key).
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox");
-    ok(&cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]), "carol inbox");
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox",
+    );
+    ok(
+        &cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]),
+        "carol inbox",
+    );
 
     // Alice sends to the group; it fans out to every member.
     ok(
-        &cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "hello team", "--directory", &dir]),
+        &cli(
+            &alice,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "alice",
+                "--message",
+                "hello team",
+                "--directory",
+                &dir,
+            ],
+        ),
         "group send",
     );
 
     // Both members receive and decrypt it.
     let bob_in = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     let b = String::from_utf8_lossy(&bob_in.stdout);
-    assert!(b.contains("[team] alice: hello team"), "bob did not get the group message: {b}");
+    assert!(
+        b.contains("[team] alice: hello team"),
+        "bob did not get the group message: {b}"
+    );
 
     let carol_in = cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]);
     let c = String::from_utf8_lossy(&carol_in.stdout);
-    assert!(c.contains("[team] alice: hello team"), "carol did not get the group message: {c}");
+    assert!(
+        c.contains("[team] alice: hello team"),
+        "carol did not get the group message: {c}"
+    );
 
     // Groups are listed locally.
     let list = cli(&bob, &["group", "list"]);
-    assert!(String::from_utf8_lossy(&list.stdout).contains("team"), "bob's group list missing 'team'");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("team"),
+        "bob's group list missing 'team'"
+    );
 
     // The transcript is recorded for both the sender and the receivers.
     let alice_hist = cli(&alice, &["group", "history", "team"]);
@@ -674,17 +1253,48 @@ fn group_leave_and_info() {
     let alice = account(&dir, "alice");
     let bob = account(&dir, "bob");
 
-    ok(&cli(&alice, &["group", "create", "team", "--members", "bob", "--as", "alice", "--directory", &dir]), "create");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "bob",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "create",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox",
+    );
 
     // Info lists members.
     let info = cli(&bob, &["group", "info", "team"]);
-    assert!(String::from_utf8_lossy(&info.stdout).contains("members:"), "info missing members");
+    assert!(
+        String::from_utf8_lossy(&info.stdout).contains("members:"),
+        "info missing members"
+    );
 
     // Bob leaves; the group is gone from his list.
-    ok(&cli(&bob, &["group", "leave", "team", "--as", "bob", "--directory", &dir]), "leave");
+    ok(
+        &cli(
+            &bob,
+            &["group", "leave", "team", "--as", "bob", "--directory", &dir],
+        ),
+        "leave",
+    );
     let list = cli(&bob, &["group", "list"]);
-    assert!(!String::from_utf8_lossy(&list.stdout).contains("team"), "group still listed after leaving");
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("team"),
+        "group still listed after leaving"
+    );
 }
 
 #[test]
@@ -693,18 +1303,30 @@ fn draft_and_wipe() {
     // Drafts round-trip; wipe erases everything.
     let home = home("wipe");
     ok(&cli(&home, &["identity-new"]), "identity-new");
-    ok(&cli(&home, &["draft", "set", "bob", "half-written thought"]), "draft set");
+    ok(
+        &cli(&home, &["draft", "set", "bob", "half-written thought"]),
+        "draft set",
+    );
     let show = cli(&home, &["draft", "show", "bob"]);
-    assert!(String::from_utf8_lossy(&show.stdout).contains("half-written thought"), "draft not saved");
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("half-written thought"),
+        "draft not saved"
+    );
 
     // Wipe requires --yes.
     let refused = cli(&home, &["wipe"]);
-    assert!(!refused.status.success(), "wipe without --yes should refuse");
+    assert!(
+        !refused.status.success(),
+        "wipe without --yes should refuse"
+    );
     ok(&cli(&home, &["wipe", "--yes"]), "wipe --yes");
 
     // Identity is gone.
     let after = cli(&home, &["identity-show"]);
-    assert!(!after.status.success(), "identity should be gone after wipe");
+    assert!(
+        !after.status.success(),
+        "identity should be gone after wipe"
+    );
 }
 
 #[test]
@@ -715,18 +1337,75 @@ fn group_add_reaches_new_member() {
     let bob = account(&dir, "bob");
     let dave = account(&dir, "dave");
 
-    ok(&cli(&alice, &["group", "create", "team", "--members", "bob", "--as", "alice", "--directory", &dir]), "create");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "bob",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "create",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox",
+    );
 
     // Add Dave later, then Dave joins from his inbox.
-    ok(&cli(&alice, &["group", "add", "team", "--member", "dave", "--as", "alice", "--directory", &dir]), "group add");
-    ok(&cli(&dave, &["inbox", "--as", "dave", "--directory", &dir]), "dave inbox");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "add",
+                "team",
+                "--member",
+                "dave",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "group add",
+    );
+    ok(
+        &cli(&dave, &["inbox", "--as", "dave", "--directory", &dir]),
+        "dave inbox",
+    );
 
     // A message sent after Dave joined reaches him.
-    ok(&cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "welcome dave", "--directory", &dir]), "group send");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "alice",
+                "--message",
+                "welcome dave",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "group send",
+    );
     let dave_in = cli(&dave, &["inbox", "--as", "dave", "--directory", &dir]);
     let d = String::from_utf8_lossy(&dave_in.stdout);
-    assert!(d.contains("[team] alice: welcome dave"), "dave did not receive after being added: {d}");
+    assert!(
+        d.contains("[team] alice: welcome dave"),
+        "dave did not receive after being added: {d}"
+    );
 }
 
 #[test]
@@ -737,24 +1416,87 @@ fn group_remove_excludes_member() {
     let bob = account(&dir, "bob");
     let carol = account(&dir, "carol");
 
-    ok(&cli(&alice, &["group", "create", "team", "--members", "bob,carol", "--as", "alice", "--directory", &dir]), "create");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox");
-    ok(&cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]), "carol inbox");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "create",
+                "team",
+                "--members",
+                "bob,carol",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "create",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox",
+    );
+    ok(
+        &cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]),
+        "carol inbox",
+    );
 
     // Alice removes Carol (re-keys), Bob processes the removal.
-    ok(&cli(&alice, &["group", "remove", "team", "--member", "carol", "--as", "alice", "--directory", &dir]), "group remove");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox after remove");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "remove",
+                "team",
+                "--member",
+                "carol",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "group remove",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox after remove",
+    );
 
     // A message after removal reaches Bob but never Carol.
-    ok(&cli(&alice, &["group", "send", "team", "--as", "alice", "--message", "after removal", "--directory", &dir]), "group send");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "group",
+                "send",
+                "team",
+                "--as",
+                "alice",
+                "--message",
+                "after removal",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "group send",
+    );
 
     let bob_in = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     let b = String::from_utf8_lossy(&bob_in.stdout);
-    assert!(b.contains("[team] alice: after removal"), "bob (still a member) should receive: {b}");
+    assert!(
+        b.contains("[team] alice: after removal"),
+        "bob (still a member) should receive: {b}"
+    );
 
     let carol_in = cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]);
     let c = String::from_utf8_lossy(&carol_in.stdout);
-    assert!(!c.contains("after removal"), "removed carol must NOT receive the message: {c}");
+    assert!(
+        !c.contains("after removal"),
+        "removed carol must NOT receive the message: {c}"
+    );
 }
 
 #[test]
@@ -764,13 +1506,34 @@ fn clear_history_removes_a_conversation() {
     let alice = account(&dir, "alice");
     let bob = account(&dir, "bob");
 
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--message", "hi there", "--directory", &dir]), "send");
-    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "inbox");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--message",
+                "hi there",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
+    ok(
+        &cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]),
+        "inbox",
+    );
     assert!(String::from_utf8_lossy(&cli(&alice, &["history", "bob"]).stdout).contains("hi there"));
 
     ok(&cli(&alice, &["clear-history", "bob"]), "clear");
     let after = cli(&alice, &["history", "bob"]);
-    assert!(!String::from_utf8_lossy(&after.stdout).contains("hi there"), "history not cleared");
+    assert!(
+        !String::from_utf8_lossy(&after.stdout).contains("hi there"),
+        "history not cleared"
+    );
 }
 
 #[test]
@@ -782,13 +1545,50 @@ fn forward_relays_a_message() {
     let carol = account(&dir, "carol");
 
     // Bob sends Alice a message; Alice reads it and learns its id.
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--message", "the plan", "--directory", &dir]), "bob send");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--message",
+                "the plan",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "bob send",
+    );
     let alice_in = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
     let a = String::from_utf8_lossy(&alice_in.stdout);
-    let id = a.split("(#").nth(1).and_then(|s| s.split(')').next()).map(|s| s.trim().to_string()).expect("id");
+    let id = a
+        .split("(#")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .map(|s| s.trim().to_string())
+        .expect("id");
 
     // Alice forwards it to Carol.
-    ok(&cli(&alice, &["forward", &id, "--from", "bob", "--to", "carol", "--as", "alice", "--directory", &dir]), "forward");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "forward",
+                &id,
+                "--from",
+                "bob",
+                "--to",
+                "carol",
+                "--as",
+                "alice",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "forward",
+    );
     let carol_in = cli(&carol, &["inbox", "--as", "carol", "--directory", &dir]);
     assert!(
         String::from_utf8_lossy(&carol_in.stdout).contains("Fwd from bob: the plan"),
@@ -805,7 +1605,19 @@ fn edit_and_delete_apply_to_transcript() {
     let bob = account(&dir, "bob");
 
     // Send and note the id.
-    let out = cli(&alice, &["send", "bob", "--as", "alice", "--message", "helo", "--directory", &dir]);
+    let out = cli(
+        &alice,
+        &[
+            "send",
+            "bob",
+            "--as",
+            "alice",
+            "--message",
+            "helo",
+            "--directory",
+            &dir,
+        ],
+    );
     let so = String::from_utf8_lossy(&out.stdout);
     let id = so
         .split("(#")
@@ -813,19 +1625,68 @@ fn edit_and_delete_apply_to_transcript() {
         .and_then(|s| s.split(')').next())
         .map(|s| s.trim().to_string())
         .expect("id");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "inbox1");
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "inbox1",
+    );
 
     // Edit it.
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--edit", &id, "--message", "hello", "--directory", &dir]), "edit");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "inbox2");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--edit",
+                &id,
+                "--message",
+                "hello",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "edit",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "inbox2",
+    );
     let h1 = cli(&bob, &["history", "alice"]);
-    assert!(String::from_utf8_lossy(&h1.stdout).contains("hello (edited)"), "edit not applied: {}", String::from_utf8_lossy(&h1.stdout));
+    assert!(
+        String::from_utf8_lossy(&h1.stdout).contains("hello (edited)"),
+        "edit not applied: {}",
+        String::from_utf8_lossy(&h1.stdout)
+    );
 
     // Delete (unsend) it.
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--delete", &id, "--directory", &dir]), "delete");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "inbox3");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--delete",
+                &id,
+                "--directory",
+                &dir,
+            ],
+        ),
+        "delete",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "inbox3",
+    );
     let h2 = cli(&bob, &["history", "alice"]);
-    assert!(!String::from_utf8_lossy(&h2.stdout).contains("hello"), "message not deleted: {}", String::from_utf8_lossy(&h2.stdout));
+    assert!(
+        !String::from_utf8_lossy(&h2.stdout).contains("hello"),
+        "message not deleted: {}",
+        String::from_utf8_lossy(&h2.stdout)
+    );
 }
 
 #[test]
@@ -840,16 +1701,25 @@ fn export_and_import_round_trip() {
 
     // Export, then import into a fresh home.
     let backup = std::env::temp_dir().join(format!("mycellium-backup-{}.bin", std::process::id()));
-    ok(&cli(&alice, &["export", backup.to_str().unwrap()]), "export");
+    ok(
+        &cli(&alice, &["export", backup.to_str().unwrap()]),
+        "export",
+    );
 
     let restored = home("backup-restored");
-    ok(&cli(&restored, &["import", backup.to_str().unwrap()]), "import");
+    ok(
+        &cli(&restored, &["import", backup.to_str().unwrap()]),
+        "import",
+    );
 
     // Same identity and the same local state come back.
     let restored_wallet = field(&cli(&restored, &["identity-show"]).stdout, "wallet:");
     assert_eq!(wallet, restored_wallet, "restored identity must match");
     let blocked = cli(&restored, &["blocked"]);
-    assert!(String::from_utf8_lossy(&blocked.stdout).contains("spammer"), "block list not restored");
+    assert!(
+        String::from_utf8_lossy(&blocked.stdout).contains("spammer"),
+        "block list not restored"
+    );
 
     let _ = std::fs::remove_file(&backup);
 }
@@ -861,13 +1731,34 @@ fn conversations_lists_peers() {
     let alice = account(&dir, "alice");
     let bob = account(&dir, "bob");
 
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--message", "dinner tonight?", "--directory", &dir]), "send");
-    ok(&cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]), "inbox");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--message",
+                "dinner tonight?",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
+    ok(
+        &cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]),
+        "inbox",
+    );
 
     let convos = cli(&alice, &["conversations"]);
     let out = String::from_utf8_lossy(&convos.stdout);
     assert!(out.contains("bob"), "conversations missing bob: {out}");
-    assert!(out.contains("dinner tonight?"), "conversations missing preview: {out}");
+    assert!(
+        out.contains("dinner tonight?"),
+        "conversations missing preview: {out}"
+    );
 }
 
 #[test]
@@ -877,15 +1768,54 @@ fn search_finds_across_transcripts() {
     let alice = account(&dir, "alice");
     let bob = account(&dir, "bob");
 
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--message", "meet me at the harbor", "--directory", &dir]), "send");
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--message", "unrelated chatter", "--directory", &dir]), "send2");
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "meet me at the harbor",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "unrelated chatter",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send2",
+    );
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox",
+    );
 
     // Case-insensitive search finds the matching line and not the other.
     let found = cli(&bob, &["search", "HARBOR"]);
     let out = String::from_utf8_lossy(&found.stdout);
-    assert!(out.contains("meet me at the harbor"), "search missed the match: {out}");
-    assert!(!out.contains("unrelated chatter"), "search returned a non-match: {out}");
+    assert!(
+        out.contains("meet me at the harbor"),
+        "search missed the match: {out}"
+    );
+    assert!(
+        !out.contains("unrelated chatter"),
+        "search returned a non-match: {out}"
+    );
 
     let none = cli(&bob, &["search", "zzz-nothing"]);
     assert!(String::from_utf8_lossy(&none.stdout).contains("no matches"));
@@ -899,8 +1829,42 @@ fn disappearing_message_expires() {
     let bob = account(&dir, "bob");
 
     // One long-lived message and one that expires almost immediately.
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--message", "stays", "--expire", "1h", "--directory", &dir]), "send stays");
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--message", "poof", "--expire", "1s", "--directory", &dir]), "send poof");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "stays",
+                "--expire",
+                "1h",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send stays",
+    );
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "poof",
+                "--expire",
+                "1s",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send poof",
+    );
 
     std::thread::sleep(Duration::from_secs(2));
 
@@ -912,7 +1876,10 @@ fn disappearing_message_expires() {
     // Per-conversation default is stored and shown.
     ok(&cli(&alice, &["expire", "set", "bob", "1h"]), "expire set");
     let show = cli(&alice, &["expire", "show", "bob"]);
-    assert!(String::from_utf8_lossy(&show.stdout).contains("3600s"), "default TTL not shown");
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("3600s"),
+        "default TTL not shown"
+    );
 }
 
 #[test]
@@ -930,14 +1897,29 @@ fn file_attachment_transfers() {
     std::fs::write(&file_path, contents).unwrap();
 
     ok(
-        &cli(&alice, &["send", "bob", "--as", "alice", "--file", file_path.to_str().unwrap(), "--directory", &dir]),
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--file",
+                file_path.to_str().unwrap(),
+                "--directory",
+                &dir,
+            ],
+        ),
         "send file",
     );
 
     // Bob receives it; it lands in his downloads and matches the original.
     let bob_in = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     let out = String::from_utf8_lossy(&bob_in.stdout);
-    assert!(out.contains("📎 note.txt"), "bob inbox missing attachment: {out}");
+    assert!(
+        out.contains("📎 note.txt"),
+        "bob inbox missing attachment: {out}"
+    );
 
     let saved = bob.join("downloads").join("note.txt");
     let got = std::fs::read_to_string(&saved).expect("attachment saved");
@@ -962,7 +1944,11 @@ fn verify_shows_matching_safety_numbers() {
             .map(|s| s.trim().to_string())
             .expect("safety number line")
     };
-    assert_eq!(extract(&a.stdout), extract(&b.stdout), "safety numbers must match");
+    assert_eq!(
+        extract(&a.stdout),
+        extract(&b.stdout),
+        "safety numbers must match"
+    );
 }
 
 #[test]
@@ -977,7 +1963,10 @@ fn presence_reflects_announcements() {
     assert!(String::from_utf8_lossy(&before.stdout).contains("bob is offline"));
 
     // Bob announces, then Alice sees him online.
-    ok(&cli(&bob, &["announce", "--as", "bob", "--directory", &dir]), "announce");
+    ok(
+        &cli(&bob, &["announce", "--as", "bob", "--directory", &dir]),
+        "announce",
+    );
     let after = cli(&alice, &["presence", "bob", "--directory", &dir]);
     assert!(
         String::from_utf8_lossy(&after.stdout).contains("bob is online"),
@@ -998,14 +1987,47 @@ fn blocked_sender_is_dropped() {
     assert!(String::from_utf8_lossy(&cli(&alice, &["blocked"]).stdout).contains("bob"));
 
     // Bob sends anyway; Alice's inbox drops it (nothing shown).
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--message", "let me in", "--directory", &dir]), "send");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--message",
+                "let me in",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
     let alice_in = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
     let a = String::from_utf8_lossy(&alice_in.stdout);
-    assert!(!a.contains("let me in"), "blocked message should not appear: {a}");
+    assert!(
+        !a.contains("let me in"),
+        "blocked message should not appear: {a}"
+    );
 
     // After unblocking, a new message gets through.
     ok(&cli(&alice, &["unblock", "bob"]), "unblock");
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--message", "now allowed", "--directory", &dir]), "send2");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--message",
+                "now allowed",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send2",
+    );
     let alice_in2 = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
     assert!(
         String::from_utf8_lossy(&alice_in2.stdout).contains("now allowed"),
@@ -1021,7 +2043,19 @@ fn read_receipts_return_to_sender() {
     let bob = account(&dir, "bob");
 
     // Alice sends and notes the message id from the output.
-    let send_out = cli(&alice, &["send", "bob", "--as", "alice", "--message", "ping", "--directory", &dir]);
+    let send_out = cli(
+        &alice,
+        &[
+            "send",
+            "bob",
+            "--as",
+            "alice",
+            "--message",
+            "ping",
+            "--directory",
+            &dir,
+        ],
+    );
     let so = String::from_utf8_lossy(&send_out.stdout);
     let id = so
         .split("(#")
@@ -1031,12 +2065,18 @@ fn read_receipts_return_to_sender() {
         .expect("message id");
 
     // Bob reads it (which sends a read receipt back).
-    ok(&cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]), "bob inbox");
+    ok(
+        &cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]),
+        "bob inbox",
+    );
 
     // Alice sees the receipt on her next inbox.
     let alice_in = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
     let a = String::from_utf8_lossy(&alice_in.stdout);
-    assert!(a.contains(&format!("bob read your message #{id}")), "alice missing receipt: {a}");
+    assert!(
+        a.contains(&format!("bob read your message #{id}")),
+        "alice missing receipt: {a}"
+    );
 }
 
 #[test]
@@ -1047,15 +2087,39 @@ fn contacts_resolve_nicknames() {
     let bob = account(&dir, "bob");
 
     // Alice adds Bob under the nickname "b" (pinning his identity).
-    ok(&cli(&alice, &["contact", "add", "b", "bob", "--directory", &dir]), "contact add");
+    ok(
+        &cli(&alice, &["contact", "add", "b", "bob", "--directory", &dir]),
+        "contact add",
+    );
     let list = cli(&alice, &["contact", "list"]);
-    assert!(String::from_utf8_lossy(&list.stdout).contains("b → bob"), "contact not listed");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("b → bob"),
+        "contact not listed"
+    );
 
     // Sending to the nickname reaches Bob.
-    ok(&cli(&alice, &["send", "b", "--as", "alice", "--message", "via nickname", "--directory", &dir]), "send by nickname");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "b",
+                "--as",
+                "alice",
+                "--message",
+                "via nickname",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send by nickname",
+    );
     let bob_in = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     let b = String::from_utf8_lossy(&bob_in.stdout);
-    assert!(b.contains("from alice: via nickname"), "bob did not receive nickname-addressed message: {b}");
+    assert!(
+        b.contains("from alice: via nickname"),
+        "bob did not receive nickname-addressed message: {b}"
+    );
 }
 
 #[test]
@@ -1066,7 +2130,22 @@ fn typed_messages_reply_and_react() {
     let bob = account(&dir, "bob");
 
     // Alice sends a plain message; Bob reads it and learns its id.
-    ok(&cli(&alice, &["send", "bob", "--as", "alice", "--message", "original", "--directory", &dir]), "send");
+    ok(
+        &cli(
+            &alice,
+            &[
+                "send",
+                "bob",
+                "--as",
+                "alice",
+                "--message",
+                "original",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "send",
+    );
     let bob_in = cli(&bob, &["inbox", "--as", "bob", "--directory", &dir]);
     let b = String::from_utf8_lossy(&bob_in.stdout);
     assert!(b.contains("from alice: original"), "bob inbox: {b}");
@@ -1079,13 +2158,53 @@ fn typed_messages_reply_and_react() {
     assert!(!id.is_empty());
 
     // Bob reacts to and replies to that message.
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--react", "👍", "--to", &id, "--directory", &dir]), "react");
-    ok(&cli(&bob, &["send", "alice", "--as", "bob", "--message", "sure", "--reply-to", &id, "--directory", &dir]), "reply");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--react",
+                "👍",
+                "--to",
+                &id,
+                "--directory",
+                &dir,
+            ],
+        ),
+        "react",
+    );
+    ok(
+        &cli(
+            &bob,
+            &[
+                "send",
+                "alice",
+                "--as",
+                "bob",
+                "--message",
+                "sure",
+                "--reply-to",
+                &id,
+                "--directory",
+                &dir,
+            ],
+        ),
+        "reply",
+    );
 
     let alice_in = cli(&alice, &["inbox", "--as", "alice", "--directory", &dir]);
     let a = String::from_utf8_lossy(&alice_in.stdout);
-    assert!(a.contains(&format!("reacted 👍 to {id}")), "alice missing reaction: {a}");
-    assert!(a.contains(&format!("↪ (re {id}) sure")), "alice missing reply: {a}");
+    assert!(
+        a.contains(&format!("reacted 👍 to {id}")),
+        "alice missing reaction: {a}"
+    );
+    assert!(
+        a.contains(&format!("↪ (re {id}) sure")),
+        "alice missing reply: {a}"
+    );
 }
 
 #[test]
@@ -1136,14 +2255,26 @@ fn history_is_persisted_after_a_chat() {
     let alice_hist = cli(&alice, &["history", "bob"]);
     ok(&alice_hist, "alice history");
     let a = String::from_utf8_lossy(&alice_hist.stdout);
-    assert!(a.contains("you: history ping"), "alice history missing sent: {a}");
-    assert!(a.contains("bob: history pong"), "alice history missing received: {a}");
+    assert!(
+        a.contains("you: history ping"),
+        "alice history missing sent: {a}"
+    );
+    assert!(
+        a.contains("bob: history pong"),
+        "alice history missing received: {a}"
+    );
 
     let bob_hist = cli(&bob, &["history", "alice"]);
     ok(&bob_hist, "bob history");
     let b = String::from_utf8_lossy(&bob_hist.stdout);
-    assert!(b.contains("you: history pong"), "bob history missing sent: {b}");
-    assert!(b.contains("alice: history ping"), "bob history missing received: {b}");
+    assert!(
+        b.contains("you: history pong"),
+        "bob history missing sent: {b}"
+    );
+    assert!(
+        b.contains("alice: history ping"),
+        "bob history missing received: {b}"
+    );
 }
 
 #[test]
@@ -1239,9 +2370,19 @@ fn full_duplex(libp2p: bool) {
     let _ = bob_listener.kill();
     let _ = bob_listener.wait();
 
-    assert!(bob_got, "bob never received alice's message.\nbob stdout:\n{b}");
-    assert!(alice_got, "alice never received bob's reply.\nalice stdout:\n{a}");
-    assert_eq!(safety_number(&a), safety_number(&b), "safety numbers disagree");
+    assert!(
+        bob_got,
+        "bob never received alice's message.\nbob stdout:\n{b}"
+    );
+    assert!(
+        alice_got,
+        "alice never received bob's reply.\nalice stdout:\n{a}"
+    );
+    assert_eq!(
+        safety_number(&a),
+        safety_number(&b),
+        "safety numbers disagree"
+    );
 }
 
 #[test]
@@ -1260,7 +2401,10 @@ fn wrong_passphrase_is_rejected() {
     );
 
     // The correct passphrase still works.
-    ok(&cli(&h, &["identity-show"]), "identity-show with correct passphrase");
+    ok(
+        &cli(&h, &["identity-show"]),
+        "identity-show with correct passphrase",
+    );
 }
 
 #[test]
@@ -1273,13 +2417,36 @@ fn handle_squatting_is_rejected() {
     ok(&cli(&mallory, &["identity-new"]), "mallory identity-new");
 
     ok(
-        &cli(&bob, &["register", "bob", "--addr", "127.0.0.1:1", "--directory", &dir]),
+        &cli(
+            &bob,
+            &[
+                "register",
+                "bob",
+                "--addr",
+                "127.0.0.1:1",
+                "--directory",
+                &dir,
+            ],
+        ),
         "bob registers 'bob'",
     );
 
     // Mallory holds a different key, so she cannot claim the same handle.
-    let out = cli(&mallory, &["register", "bob", "--addr", "127.0.0.1:2", "--directory", &dir]);
-    assert!(!out.status.success(), "squatting a taken handle must be rejected");
+    let out = cli(
+        &mallory,
+        &[
+            "register",
+            "bob",
+            "--addr",
+            "127.0.0.1:2",
+            "--directory",
+            &dir,
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "squatting a taken handle must be rejected"
+    );
 }
 
 #[test]
@@ -1291,19 +2458,38 @@ fn social_recovery_round_trip() {
     let original_wallet = field(&cli(&orig, &["identity-show"]).stdout, "wallet:");
 
     // Split 2-of-3 and recover on a fresh device from two shares under a NEW passphrase.
-    let split = cli(&orig, &["guardian-split", "--shares", "3", "--threshold", "2"]);
+    let split = cli(
+        &orig,
+        &["guardian-split", "--shares", "3", "--threshold", "2"],
+    );
     ok(&split, "guardian-split");
     let parts = shares(&split.stdout);
     assert_eq!(parts.len(), 3, "expected 3 shares");
 
     let recovered = home("recovered");
     ok(
-        &cli_pass(&recovered, "new-passphrase", &["guardian-recover", "--share", &parts[0], "--share", &parts[2]]),
+        &cli_pass(
+            &recovered,
+            "new-passphrase",
+            &[
+                "guardian-recover",
+                "--share",
+                &parts[0],
+                "--share",
+                &parts[2],
+            ],
+        ),
         "guardian-recover",
     );
 
-    let recovered_wallet = field(&cli_pass(&recovered, "new-passphrase", &["identity-show"]).stdout, "wallet:");
-    assert_eq!(original_wallet, recovered_wallet, "recovered identity must match the original");
+    let recovered_wallet = field(
+        &cli_pass(&recovered, "new-passphrase", &["identity-show"]).stdout,
+        "wallet:",
+    );
+    assert_eq!(
+        original_wallet, recovered_wallet,
+        "recovered identity must match the original"
+    );
 }
 
 #[test]
@@ -1320,7 +2506,14 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
     ok(&cli(&carol, &["identity-new"]), "carol id");
     ok(
         &Command::new(CLI)
-            .args(["register", "carol", "--addr", &carol_addr, "--directory", &dir])
+            .args([
+                "register",
+                "carol",
+                "--addr",
+                &carol_addr,
+                "--directory",
+                &dir,
+            ])
             .env("MYCELLIUM_HOME", &carol)
             .env("MYCELLIUM_PASSPHRASE", PASS)
             .env("MYCELLIUM_QUEUE", "") // no queue in her record
@@ -1331,7 +2524,19 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
     );
 
     // Undeliverable → parked in Alice's outbox.
-    let sent = cli(&alice, &["send", "carol", "--as", "alice", "--message", "ping later", "--directory", &dir]);
+    let sent = cli(
+        &alice,
+        &[
+            "send",
+            "carol",
+            "--as",
+            "alice",
+            "--message",
+            "ping later",
+            "--directory",
+            &dir,
+        ],
+    );
     ok(&sent, "send");
     assert!(
         String::from_utf8_lossy(&sent.stdout).contains("queued for retry"),
@@ -1349,7 +2554,15 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
 
     // Carol comes online with `serve` (announces presence before it binds).
     let mut carol_serve = Command::new(CLI)
-        .args(["serve", "--addr", &carol_addr, "--as", "carol", "--directory", &dir])
+        .args([
+            "serve",
+            "--addr",
+            &carol_addr,
+            "--as",
+            "carol",
+            "--directory",
+            &dir,
+        ])
         .env("MYCELLIUM_HOME", &carol)
         .env("MYCELLIUM_PASSPHRASE", PASS)
         .env("MYCELLIUM_QUEUE", "")
@@ -1365,7 +2578,11 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
 
     let _ = carol_serve.kill();
     let _ = carol_serve.wait();
-    assert!(got, "carol's serve did not receive the retried message:\n{}", carol_out.lock().unwrap());
+    assert!(
+        got,
+        "carol's serve did not receive the retried message:\n{}",
+        carol_out.lock().unwrap()
+    );
     assert!(
         String::from_utf8_lossy(&flushed.stdout).contains("delivered 1"),
         "outbox should report a delivery: {}",

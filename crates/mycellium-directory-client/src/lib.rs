@@ -61,20 +61,31 @@ impl DirectoryClient {
     /// Point the client at a base URL with an explicit HTTP transport (used by
     /// the browser/WASM build).
     pub fn with_transport(base: impl Into<String>, transport: Box<dyn HttpTransport>) -> Self {
-        DirectoryClient { base: base.into().trim_end_matches('/').to_string(), transport }
+        DirectoryClient {
+            base: base.into().trim_end_matches('/').to_string(),
+            transport,
+        }
     }
 
     /// Full SIWE-style login: fetch a challenge, sign it, exchange for a token.
     pub fn login(&self, identity: &Identity) -> Result<String> {
         let wallet = identity.wallet_public();
-        let challenge: ChallengeResp =
-            self.json("POST", "/login/challenge", None, Some(&ChallengeReq { wallet }))?;
+        let challenge: ChallengeResp = self.json(
+            "POST",
+            "/login/challenge",
+            None,
+            Some(&ChallengeReq { wallet }),
+        )?;
         let signature = identity.sign(&mycellium_core::login::challenge_message(&challenge.nonce));
         let verified: VerifyResp = self.json(
             "POST",
             "/login/verify",
             None,
-            Some(&VerifyReq { wallet, nonce: challenge.nonce, signature }),
+            Some(&VerifyReq {
+                wallet,
+                nonce: challenge.nonce,
+                signature,
+            }),
         )?;
         Ok(verified.token)
     }
@@ -82,7 +93,13 @@ impl DirectoryClient {
     /// Publish a signed record under `handle` using a session `token`.
     pub fn publish(&self, token: &str, handle: &Handle, record: &SignedRecord) -> Result<()> {
         let payload = serde_json::to_vec(record)?;
-        self.call("PUT", &format!("/records/{}", id(handle)), Some(token), Some("application/json"), Some(&payload))?;
+        self.call(
+            "PUT",
+            &format!("/records/{}", id(handle)),
+            Some(token),
+            Some("application/json"),
+            Some(&payload),
+        )?;
         Ok(())
     }
 
@@ -94,7 +111,12 @@ impl DirectoryClient {
     /// Begin an email-verified username claim. Returns `(pending_token,
     /// dev_code)` — `dev_code` is set only when the directory runs in dev mode
     /// (no SMTP), so the local flow works without a real inbox.
-    pub fn auth_start(&self, token: &str, username: &str, email: &str) -> Result<(String, Option<String>)> {
+    pub fn auth_start(
+        &self,
+        token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<(String, Option<String>)> {
         #[derive(Serialize)]
         struct Req<'a> {
             username: &'a str,
@@ -107,7 +129,15 @@ impl DirectoryClient {
         }
         // The directory binds the *id*, never the plaintext username.
         let uid = user_id(username);
-        let resp: Resp = self.json("POST", "/auth/start", Some(token), Some(&Req { username: uid.as_str(), email }))?;
+        let resp: Resp = self.json(
+            "POST",
+            "/auth/start",
+            Some(token),
+            Some(&Req {
+                username: uid.as_str(),
+                email,
+            }),
+        )?;
         Ok((resp.pending, resp.dev_code))
     }
 
@@ -144,7 +174,13 @@ impl DirectoryClient {
 
     /// Announce that we're online (heartbeat).
     pub fn announce(&self, token: &str, handle: &Handle) -> Result<()> {
-        self.call("POST", &format!("/presence/{}", id(handle)), Some(token), None, None)?;
+        self.call(
+            "POST",
+            &format!("/presence/{}", id(handle)),
+            Some(token),
+            None,
+            None,
+        )?;
         Ok(())
     }
 
@@ -154,7 +190,8 @@ impl DirectoryClient {
         struct Presence {
             online: bool,
         }
-        let resp: Presence = self.json::<(), _>("GET", &format!("/presence/{}", id(handle)), None, None)?;
+        let resp: Presence =
+            self.json::<(), _>("GET", &format!("/presence/{}", id(handle)), None, None)?;
         Ok(resp.online)
     }
 
@@ -190,7 +227,10 @@ impl DirectoryClient {
         if let Some(a) = &auth {
             headers.push(("Authorization", a));
         }
-        let resp = self.transport.request(method, &url, &headers, body).map_err(|e| anyhow!("{path}: {e}"))?;
+        let resp = self
+            .transport
+            .request(method, &url, &headers, body)
+            .map_err(|e| anyhow!("{path}: {e}"))?;
         if resp.status >= 400 {
             return Err(anyhow!("{path}: HTTP {}", resp.status));
         }

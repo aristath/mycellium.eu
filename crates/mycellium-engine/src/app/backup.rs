@@ -13,8 +13,6 @@ pub fn wipe(yes: bool) -> Result<()> {
     Ok(())
 }
 
-
-
 /// A portable backup: the encrypted identity plus every store entry. Each part
 /// is already encrypted at rest — the seed is Argon2id-sealed under the identity
 /// passphrase, and the history keys derive from the seed — so the bundle's
@@ -25,8 +23,6 @@ pub struct Backup {
     identity: Vec<u8>,
     store: Vec<(String, Vec<u8>)>,
 }
-
-
 
 pub fn export_backup(path: &str) -> Result<()> {
     // Require unlocking the identity to authorize the export.
@@ -45,7 +41,10 @@ pub fn export_backup(path: &str) -> Result<()> {
         }
     }
 
-    let backup = Backup { identity, store: entries };
+    let backup = Backup {
+        identity,
+        store: entries,
+    };
     std::fs::write(path, wire::encode(&backup)).context("could not write backup")?;
     // Restrict the file where the platform supports it (the bundle is a
     // high-value collection, even though every entry is already encrypted).
@@ -54,7 +53,10 @@ pub fn export_backup(path: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    println!("exported identity + {} store entries to {path}", backup.store.len());
+    println!(
+        "exported identity + {} store entries to {path}",
+        backup.store.len()
+    );
     println!(
         "  \u{26a0} this backup's security rests entirely on your identity passphrase: the seed is\n  \
          Argon2id-sealed under it, and the history keys derive from the seed. Anyone who obtains\n  \
@@ -62,8 +64,6 @@ pub fn export_backup(path: &str) -> Result<()> {
     );
     Ok(())
 }
-
-
 
 pub fn import_backup(path: &str) -> Result<()> {
     if store::exists() {
@@ -82,7 +82,10 @@ pub fn import_backup(path: &str) -> Result<()> {
     std::fs::create_dir_all(&store_dir)?;
     for (name, data) in &backup.store {
         // Only ever write a basename inside the store dir.
-        if let Some(safe) = std::path::Path::new(name).file_name().and_then(|n| n.to_str()) {
+        if let Some(safe) = std::path::Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+        {
             std::fs::write(store_dir.join(safe), data)?;
         }
     }

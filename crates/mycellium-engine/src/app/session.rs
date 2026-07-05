@@ -9,8 +9,6 @@ pub struct Session {
     pub peer_name: String,
 }
 
-
-
 /// Initiator handshake: send our record + X3DH init, build the session.
 pub fn handshake_initiator(
     conn: &mut dyn Wire,
@@ -29,21 +27,32 @@ pub fn handshake_initiator(
     let mut platform = OsPlatform;
     let responder_ik = peer_record.record.primary().id_key;
     let responder_spk = peer_record.record.primary().signed_pre_key.public;
-    let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk).map_err(|e| anyhow!("{e}"))?;
+    let initiated = x3dh::initiate(&mut platform, identity, &responder_ik, &responder_spk)
+        .map_err(|e| anyhow!("{e}"))?;
     conn.send(&wire::encode(&initiated.init))?;
 
-    let ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk).map_err(|e| anyhow!("{e}"))?;
+    let ratchet = Ratchet::new_initiator(&mut platform, &initiated.shared_secret, &responder_spk)
+        .map_err(|e| anyhow!("{e}"))?;
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
 
     let sn = safety::safety_number(&identity.wallet_public(), &peer_record.record.wallet);
-    println!("connected to '{}' at {} — end-to-end encrypted.", peer_handle.as_str(), location);
-    println!("safety number (verify with '{}' out of band): {sn}", peer_handle.as_str());
+    println!(
+        "connected to '{}' at {} — end-to-end encrypted.",
+        peer_handle.as_str(),
+        location
+    );
+    println!(
+        "safety number (verify with '{}' out of band): {sn}",
+        peer_handle.as_str()
+    );
     println!("Type messages (Ctrl-D to quit):");
 
-    Ok(Session { ratchet, ad, peer_name: peer_handle.as_str().to_string() })
+    Ok(Session {
+        ratchet,
+        ad,
+        peer_name: peer_handle.as_str().to_string(),
+    })
 }
-
-
 
 /// Responder handshake: read the peer's record + X3DH init, build the session.
 pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<Session> {
@@ -67,5 +76,9 @@ pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<S
     println!("safety number (verify with '{who}' out of band): {sn}");
     println!("Type messages (Ctrl-D to quit):");
 
-    Ok(Session { ratchet, ad, peer_name: who })
+    Ok(Session {
+        ratchet,
+        ad,
+        peer_name: who,
+    })
 }

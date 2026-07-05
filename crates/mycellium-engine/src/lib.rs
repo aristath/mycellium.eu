@@ -23,8 +23,8 @@ pub mod draft;
 pub mod expiry;
 pub mod groups;
 pub mod history;
-pub mod names;
 pub mod inbound;
+pub mod names;
 pub mod outbox;
 
 /// Decode stored bytes, distinguishing *absent* (→ default, silently) from

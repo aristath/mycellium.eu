@@ -11,8 +11,6 @@ pub fn announce(whoami: &str, directory: &str) -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn verify(peer: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
@@ -20,11 +18,11 @@ pub fn verify(peer: &str, directory: &str) -> Result<()> {
     let (peer_handle, peer_record) = lookup_verified(&client, &fs, peer)?;
     let sn = safety::safety_number(&identity.wallet_public(), &peer_record.record.wallet);
     println!("safety number with '{}': {sn}", peer_handle.as_str());
-    println!("compare it with them out of band — if it matches, no one is impersonating either of you.");
+    println!(
+        "compare it with them out of band — if it matches, no one is impersonating either of you."
+    );
     Ok(())
 }
-
-
 
 pub fn presence(peer: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -33,11 +31,13 @@ pub fn presence(peer: &str, directory: &str) -> Result<()> {
     let handle = Handle::new(handle_str).map_err(|_| anyhow!("invalid handle or nickname"))?;
     let client = DirectoryClient::new(directory);
     let online = client.presence(&handle)?;
-    println!("{} is {}", handle.as_str(), if online { "online" } else { "offline" });
+    println!(
+        "{} is {}",
+        handle.as_str(),
+        if online { "online" } else { "offline" }
+    );
     Ok(())
 }
-
-
 
 /// Resolve a nickname to a handle (or pass a raw handle through), then verify
 /// the record matches any pinned wallet for that contact (TOFU).

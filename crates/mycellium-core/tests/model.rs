@@ -47,9 +47,16 @@ const AD: &[u8] = b"a|b";
 fn established(p: &mut RngPlatform) -> (Ratchet, Ratchet) {
     let alice = Identity::generate(p).unwrap();
     let bob = Identity::generate(p).unwrap();
-    let initiated = x3dh::initiate(p, &alice, &bob.messaging_public(), &bob.signed_pre_key_public()).unwrap();
+    let initiated = x3dh::initiate(
+        p,
+        &alice,
+        &bob.messaging_public(),
+        &bob.signed_pre_key_public(),
+    )
+    .unwrap();
     let bob_sk = x3dh::respond(&bob, &initiated.init).unwrap();
-    let a = Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
+    let a =
+        Ratchet::new_initiator(p, &initiated.shared_secret, &bob.signed_pre_key_public()).unwrap();
     let b = Ratchet::new_responder(&bob_sk, &bob);
     (a, b)
 }
@@ -97,10 +104,18 @@ fn ratchet_correct_under_random_interleavings() {
 
         // Drain whatever is left, still in order.
         while let Some((pt, ct)) = to_bob.pop_front() {
-            assert_eq!(bob.decrypt(&mut p, &ct, AD).unwrap(), pt, "drain bob, seed {seed}");
+            assert_eq!(
+                bob.decrypt(&mut p, &ct, AD).unwrap(),
+                pt,
+                "drain bob, seed {seed}"
+            );
         }
         while let Some((pt, ct)) = to_alice.pop_front() {
-            assert_eq!(alice.decrypt(&mut p, &ct, AD).unwrap(), pt, "drain alice, seed {seed}");
+            assert_eq!(
+                alice.decrypt(&mut p, &ct, AD).unwrap(),
+                pt,
+                "drain alice, seed {seed}"
+            );
         }
     }
 }
@@ -124,7 +139,10 @@ fn shamir_random_thresholds_round_trip() {
             let j = (meta.next() as usize) % (i + 1);
             order.swap(i, j);
         }
-        let subset: Vec<Share> = order[..t as usize].iter().map(|&i| shares[i].clone()).collect();
+        let subset: Vec<Share> = order[..t as usize]
+            .iter()
+            .map(|&i| shares[i].clone())
+            .collect();
         assert_eq!(shamir::combine(&subset).unwrap(), secret, "t={t} n={n}");
     }
 }

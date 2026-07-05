@@ -23,11 +23,11 @@ use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::RatchetMessage;
 use mycellium_core::wire;
 
-use mycellium_storage::filestore::FileStore;
-use mycellium_engine::history::{self, StoredMessage};
-use mycellium_transport::link::{FrameReader, FrameWriter};
-use mycellium_engine::platform::OsPlatform;
 use mycellium_engine::app::Session;
+use mycellium_engine::history::{self, StoredMessage};
+use mycellium_engine::platform::OsPlatform;
+use mycellium_storage::filestore::FileStore;
+use mycellium_transport::link::{FrameReader, FrameWriter};
 
 /// Who authored a line in the transcript.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,19 +53,31 @@ pub struct ChatModel {
 
 impl ChatModel {
     pub fn new(peer_name: impl Into<String>) -> Self {
-        ChatModel { peer_name: peer_name.into(), lines: Vec::new() }
+        ChatModel {
+            peer_name: peer_name.into(),
+            lines: Vec::new(),
+        }
     }
 
     pub fn sent(&mut self, text: impl Into<String>) {
-        self.lines.push(ChatLine { author: Author::Me, text: text.into() });
+        self.lines.push(ChatLine {
+            author: Author::Me,
+            text: text.into(),
+        });
     }
 
     pub fn received(&mut self, text: impl Into<String>) {
-        self.lines.push(ChatLine { author: Author::Peer, text: text.into() });
+        self.lines.push(ChatLine {
+            author: Author::Peer,
+            text: text.into(),
+        });
     }
 
     pub fn system(&mut self, text: impl Into<String>) {
-        self.lines.push(ChatLine { author: Author::System, text: text.into() });
+        self.lines.push(ChatLine {
+            author: Author::System,
+            text: text.into(),
+        });
     }
 
     /// Render one line as styled spans, with a sender prefix.
@@ -95,7 +107,11 @@ pub fn run(
     session: Session,
     history: Arc<Mutex<FileStore>>,
 ) -> Result<()> {
-    let Session { ratchet, ad, peer_name } = session;
+    let Session {
+        ratchet,
+        ad,
+        peer_name,
+    } = session;
     let ratchet = Arc::new(Mutex::new(ratchet));
     let ad = Arc::new(ad);
     let peer_name = Arc::new(peer_name);
@@ -123,7 +139,11 @@ pub fn run(
                     if let Ok(plaintext) = decrypted {
                         let (id, expires_at, text) = match AppMessage::decode(&plaintext) {
                             Ok(m) => (m.id.clone(), m.expires_at, m.summary()),
-                            Err(_) => (String::new(), None, String::from_utf8_lossy(&plaintext).into_owned()),
+                            Err(_) => (
+                                String::new(),
+                                None,
+                                String::from_utf8_lossy(&plaintext).into_owned(),
+                            ),
                         };
                         record(&history, &peer, false, id, text.clone(), expires_at);
                         let _ = tx.send(Incoming::Message(text));
@@ -168,10 +188,20 @@ pub fn run(
                     }
                     match key.code {
                         KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
                         KeyCode::Enter => {
                             if !input.is_empty() {
-                                submit(&ratchet, &ad, &mut *writer, &history, &peer_name, &mut model, &input);
+                                submit(
+                                    &ratchet,
+                                    &ad,
+                                    &mut *writer,
+                                    &history,
+                                    &peer_name,
+                                    &mut model,
+                                    &input,
+                                );
                                 input.clear();
                             }
                         }
@@ -213,7 +243,14 @@ fn submit(
     match writer.send_frame(&wire::encode(&msg)) {
         Ok(()) => {
             model.sent(input);
-            record(history, peer, true, app.id.clone(), input.to_string(), app.expires_at);
+            record(
+                history,
+                peer,
+                true,
+                app.id.clone(),
+                input.to_string(),
+                app.expires_at,
+            );
         }
         Err(_) => model.system("failed to send"),
     }
@@ -221,8 +258,21 @@ fn submit(
 
 /// Persist one message to the encrypted history store (best-effort), preserving
 /// its real id + expiry.
-fn record(history: &Arc<Mutex<FileStore>>, peer: &str, from_me: bool, id: String, text: String, expires_at: Option<u64>) {
-    let message = StoredMessage { id, from_me, text, timestamp: OsPlatform.now_unix_secs(), expires_at };
+fn record(
+    history: &Arc<Mutex<FileStore>>,
+    peer: &str,
+    from_me: bool,
+    id: String,
+    text: String,
+    expires_at: Option<u64>,
+) {
+    let message = StoredMessage {
+        id,
+        from_me,
+        text,
+        timestamp: OsPlatform.now_unix_secs(),
+        expires_at,
+    };
     let _ = history::append(&mut *history.lock().unwrap(), peer, message);
 }
 
@@ -232,7 +282,10 @@ fn render(frame: &mut Frame, model: &ChatModel, input: &str) {
     // Show the last messages that fit inside the transcript pane.
     let visible = chunks[0].height.saturating_sub(2) as usize;
     let start = model.lines.len().saturating_sub(visible);
-    let transcript: Vec<Line> = model.lines[start..].iter().map(|l| model.line_spans(l)).collect();
+    let transcript: Vec<Line> = model.lines[start..]
+        .iter()
+        .map(|l| model.line_spans(l))
+        .collect();
 
     frame.render_widget(
         Paragraph::new(transcript).block(

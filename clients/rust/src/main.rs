@@ -37,12 +37,30 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--port" => { i += 1; port = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(port); }
-            "--directory" => { i += 1; directory = args.get(i).cloned().unwrap_or(directory); }
-            "--queue" => { i += 1; queue = args.get(i).cloned().unwrap_or(queue); }
-            "--data-dir" => { i += 1; data_dir = args.get(i).cloned().unwrap_or(data_dir); }
-            "--help" | "-h" => { print_help(); return; }
-            other => { eprintln!("unknown argument: {other}"); std::process::exit(2); }
+            "--port" => {
+                i += 1;
+                port = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(port);
+            }
+            "--directory" => {
+                i += 1;
+                directory = args.get(i).cloned().unwrap_or(directory);
+            }
+            "--queue" => {
+                i += 1;
+                queue = args.get(i).cloned().unwrap_or(queue);
+            }
+            "--data-dir" => {
+                i += 1;
+                data_dir = args.get(i).cloned().unwrap_or(data_dir);
+            }
+            "--help" | "-h" => {
+                print_help();
+                return;
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                std::process::exit(2);
+            }
         }
         i += 1;
     }
@@ -61,17 +79,26 @@ fn main() {
         }
     }
 
-    let state = Mutex::new(State { directory, pending: std::collections::HashMap::new() });
+    let state = Mutex::new(State {
+        directory,
+        pending: std::collections::HashMap::new(),
+    });
     let addr = format!("127.0.0.1:{port}");
     let server = match Server::http(&addr) {
         Ok(s) => s,
-        Err(e) => { eprintln!("could not bind {addr}: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("could not bind {addr}: {e}");
+            std::process::exit(1);
+        }
     };
 
     println!("Mycellium client on  http://{addr}");
     println!("  data:      {data_dir}");
     println!("  directory: {}", state.lock().unwrap().directory);
-    println!("  queue:     {}", std::env::var("MYCELLIUM_QUEUE").unwrap_or_default());
+    println!(
+        "  queue:     {}",
+        std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
+    );
     println!("Open the URL above in your browser.");
 
     for request in server.incoming_requests() {
@@ -90,7 +117,11 @@ fn handle(state: &Mutex<State>, mut request: Request) {
         let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
         let (status, json) = api::dispatch(state, &method, rest, &body);
         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-        let _ = request.respond(Response::from_string(json).with_status_code(status).with_header(header));
+        let _ = request.respond(
+            Response::from_string(json)
+                .with_status_code(status)
+                .with_header(header),
+        );
         return;
     }
 
@@ -99,7 +130,11 @@ fn handle(state: &Mutex<State>, mut request: Request) {
         let _ = request.respond(Response::from_string("method not allowed").with_status_code(405));
         return;
     }
-    let asset_path = if path == "/" { "/index.html" } else { path.as_str() };
+    let asset_path = if path == "/" {
+        "/index.html"
+    } else {
+        path.as_str()
+    };
     match web::asset(asset_path) {
         Some((bytes, mime)) => {
             let header = Header::from_bytes(&b"Content-Type"[..], mime.as_bytes()).unwrap();
@@ -144,5 +179,7 @@ fn default_data_dir() -> String {
 fn print_help() {
     println!("mycellium-client — local web/PWA client for Mycellium\n");
     println!("USAGE:\n    mycellium-client [--port N] [--directory URL] [--queue URL] [--data-dir PATH]\n");
-    println!("Defaults: port {DEFAULT_PORT}, directory {DEFAULT_DIRECTORY}, queue {DEFAULT_QUEUE}.");
+    println!(
+        "Defaults: port {DEFAULT_PORT}, directory {DEFAULT_DIRECTORY}, queue {DEFAULT_QUEUE}."
+    );
 }

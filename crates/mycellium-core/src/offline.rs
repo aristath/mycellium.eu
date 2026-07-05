@@ -96,8 +96,12 @@ mod tests {
             &bob_record.record.primary().signed_pre_key.public,
         )
         .unwrap();
-        let mut ratchet =
-            Ratchet::new_initiator(&mut p, &initiated.shared_secret, &bob_record.record.primary().signed_pre_key.public).unwrap();
+        let mut ratchet = Ratchet::new_initiator(
+            &mut p,
+            &initiated.shared_secret,
+            &bob_record.record.primary().signed_pre_key.public,
+        )
+        .unwrap();
         let ad_bytes = ad(&alice, &bob);
         let message = ratchet.encrypt(b"see you tomorrow", &ad_bytes);
 
@@ -111,7 +115,10 @@ mod tests {
 
         // ... time passes, Bob comes online and opens the envelope.
         assert!(envelope.sender_record.verify().is_ok());
-        assert_eq!(envelope.init.initiator_ik, envelope.sender_record.record.primary().id_key);
+        assert_eq!(
+            envelope.init.initiator_ik,
+            envelope.sender_record.record.primary().id_key
+        );
 
         let shared = x3dh::respond(&bob, &envelope.init).unwrap();
         let mut bob_ratchet = Ratchet::new_responder(&shared, &bob);

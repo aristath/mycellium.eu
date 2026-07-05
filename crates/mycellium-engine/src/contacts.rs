@@ -47,22 +47,27 @@ pub fn save<S: Storage>(store: &mut S, contact: &Contact) -> Result<(), S::Error
 pub fn load<S: Storage>(store: &S, nickname: &str) -> Result<Option<Contact>, S::Error> {
     match store.get(&contact_key(nickname))? {
         None => Ok(None),
-        Some(b) => match wire::decode(&b) {
-            Ok(c) => Ok(Some(c)),
-            Err(_) => {
-                // A corrupt contact must not silently vanish — contacts are TOFU
-                // pins, part of the safety model.
-                #[cfg(not(target_arch = "wasm32"))]
-                eprintln!("(warning: corrupt contact '{nickname}' in local storage — treated as missing)");
-                Ok(None)
+        Some(b) => {
+            match wire::decode(&b) {
+                Ok(c) => Ok(Some(c)),
+                Err(_) => {
+                    // A corrupt contact must not silently vanish — contacts are TOFU
+                    // pins, part of the safety model.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    eprintln!("(warning: corrupt contact '{nickname}' in local storage — treated as missing)");
+                    Ok(None)
+                }
             }
-        },
+        }
     }
 }
 
 /// All known nicknames.
 pub fn list_names<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(INDEX_KEY)?, "contact index"))
+    Ok(crate::decode_or_warn(
+        store.get(INDEX_KEY)?,
+        "contact index",
+    ))
 }
 
 /// All contacts.
@@ -79,7 +84,10 @@ pub fn list<S: Storage>(store: &S) -> Result<Vec<Contact>, S::Error> {
 /// Remove a contact by nickname.
 pub fn remove<S: Storage>(store: &mut S, nickname: &str) -> Result<(), S::Error> {
     store.delete(&contact_key(nickname))?;
-    let names: Vec<String> = list_names(store)?.into_iter().filter(|n| n != nickname).collect();
+    let names: Vec<String> = list_names(store)?
+        .into_iter()
+        .filter(|n| n != nickname)
+        .collect();
     store.put(INDEX_KEY, &wire::encode(&names))
 }
 

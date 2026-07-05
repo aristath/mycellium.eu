@@ -101,7 +101,10 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
 
     // A worker pool so many clients are served concurrently, not one-at-a-time
     // (Tier 0.2). tiny_http's `recv` is safe to call from multiple threads.
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 32);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 32);
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let server = Arc::clone(&server);
@@ -126,7 +129,10 @@ fn bind_server(addr: &str) -> std::io::Result<Server> {
     let to_io = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
     match (env_str("MYCELLIUM_TLS_CERT"), env_str("MYCELLIUM_TLS_KEY")) {
         (Some(cert), Some(key)) => {
-            let config = tiny_http::SslConfig { certificate: std::fs::read(&cert)?, private_key: std::fs::read(&key)? };
+            let config = tiny_http::SslConfig {
+                certificate: std::fs::read(&cert)?,
+                private_key: std::fs::read(&key)?,
+            };
             println!("  tls: enabled ({cert})");
             Server::https(addr, config).map_err(to_io)
         }
@@ -190,8 +196,9 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
     // Operational metrics (Prometheus text). Open, no auth.
     if method == Method::Get && path == "/metrics" {
         metrics.record(200);
-        let resp = Response::from_string(metrics.render("directory"))
-            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap());
+        let resp = Response::from_string(metrics.render("directory")).with_header(
+            Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap(),
+        );
         let _ = request.respond(resp);
         return;
     }
@@ -209,8 +216,16 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
     }
     if over_cap || buf.len() > MAX_BODY {
         metrics.record(413);
-        mycellium_observe::access_log("directory", method.as_str(), &log_path, 413, start.elapsed().as_millis());
-        let mut resp = Response::from_string(error_json("payload too large")).with_status_code(413).with_header(json_header());
+        mycellium_observe::access_log(
+            "directory",
+            method.as_str(),
+            &log_path,
+            413,
+            start.elapsed().as_millis(),
+        );
+        let mut resp = Response::from_string(error_json("payload too large"))
+            .with_status_code(413)
+            .with_header(json_header());
         for h in cors_headers() {
             resp.add_header(h);
         }
@@ -224,8 +239,16 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
         Err(err) => (err.status(), error_json(err.reason())),
     };
     metrics.record(code);
-    mycellium_observe::access_log("directory", method.as_str(), &log_path, code, start.elapsed().as_millis());
-    let mut response = Response::from_string(json).with_status_code(code).with_header(json_header());
+    mycellium_observe::access_log(
+        "directory",
+        method.as_str(),
+        &log_path,
+        code,
+        start.elapsed().as_millis(),
+    );
+    let mut response = Response::from_string(json)
+        .with_status_code(code)
+        .with_header(json_header());
     for h in cors_headers() {
         response.add_header(h);
     }
@@ -236,8 +259,14 @@ fn handle_request(directory: &Mutex<Directory>, metrics: &Metrics, mut request: 
 fn cors_headers() -> Vec<Header> {
     [
         (&b"Access-Control-Allow-Origin"[..], &b"*"[..]),
-        (&b"Access-Control-Allow-Methods"[..], &b"GET, POST, PUT, DELETE, OPTIONS"[..]),
-        (&b"Access-Control-Allow-Headers"[..], &b"Authorization, Content-Type"[..]),
+        (
+            &b"Access-Control-Allow-Methods"[..],
+            &b"GET, POST, PUT, DELETE, OPTIONS"[..],
+        ),
+        (
+            &b"Access-Control-Allow-Headers"[..],
+            &b"Authorization, Content-Type"[..],
+        ),
     ]
     .iter()
     .filter_map(|(k, v)| Header::from_bytes(*k, *v).ok())
@@ -265,10 +294,12 @@ fn route(
 
         (Method::Post, ["login", "verify"]) => {
             let req: VerifyReq = parse(body)?;
-            let token = directory
-                .lock()
-                .unwrap()
-                .verify(&req.wallet, &req.nonce, &req.signature, now_secs())?;
+            let token = directory.lock().unwrap().verify(
+                &req.wallet,
+                &req.nonce,
+                &req.signature,
+                now_secs(),
+            )?;
             Ok((200, to_json(&VerifyResp { token })))
         }
 
@@ -276,7 +307,10 @@ fn route(
             let token = token.ok_or(ApiError::Unauthorized)?;
             let handle = Handle::new(*handle).map_err(|_| ApiError::HandleMismatch)?;
             let record: SignedRecord = parse(body)?;
-            directory.lock().unwrap().publish(token, &handle, record, now_secs())?;
+            directory
+                .lock()
+                .unwrap()
+                .publish(token, &handle, record, now_secs())?;
             Ok((200, "\"ok\"".into()))
         }
 
@@ -294,7 +328,10 @@ fn route(
             let req: AuthStartReq = parse(body)?;
             let username = Handle::new(&req.username).map_err(|_| ApiError::BadRequest)?;
             let (pending, code) =
-                directory.lock().unwrap().auth_start(token, &username, &req.email, now_secs())?;
+                directory
+                    .lock()
+                    .unwrap()
+                    .auth_start(token, &username, &req.email, now_secs())?;
             // Send the code off the lock — a slow SMTP server must never stall
             // the directory. Dev mode logs it; production emails it.
             // Send to the *canonical* address, matching what auth_start stored/hashed.
@@ -311,16 +348,24 @@ fn route(
 
         (Method::Post, ["auth", "confirm"]) => {
             let req: AuthConfirmReq = parse(body)?;
-            let username = directory.lock().unwrap().auth_confirm(&req.pending, &req.code, now_secs())?;
-            Ok((200, serde_json::json!({ "ok": true, "username": username.as_str() }).to_string()))
+            let username =
+                directory
+                    .lock()
+                    .unwrap()
+                    .auth_confirm(&req.pending, &req.code, now_secs())?;
+            Ok((
+                200,
+                serde_json::json!({ "ok": true, "username": username.as_str() }).to_string(),
+            ))
         }
 
         (Method::Post, ["auth", "status"]) => {
             let req: AuthStatusReq = parse(body)?;
             match directory.lock().unwrap().auth_status(&req.pending) {
-                Some((verified, username)) => {
-                    Ok((200, serde_json::json!({ "verified": verified, "username": username }).to_string()))
-                }
+                Some((verified, username)) => Ok((
+                    200,
+                    serde_json::json!({ "verified": verified, "username": username }).to_string(),
+                )),
                 None => Err(ApiError::NotFound),
             }
         }
@@ -329,7 +374,10 @@ fn route(
         (Method::Post, ["presence", handle]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let handle = Handle::new(*handle).map_err(|_| ApiError::NotFound)?;
-            directory.lock().unwrap().heartbeat(token, &handle, now_secs())?;
+            directory
+                .lock()
+                .unwrap()
+                .heartbeat(token, &handle, now_secs())?;
             Ok((200, "\"ok\"".into()))
         }
 

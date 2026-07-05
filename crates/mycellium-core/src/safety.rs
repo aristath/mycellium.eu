@@ -85,6 +85,8 @@ mod tests {
         let sn = safety_number(&wallet(1), &wallet(2));
         let groups: Vec<&str> = sn.split(' ').collect();
         assert_eq!(groups.len(), GROUPS);
-        assert!(groups.iter().all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit())));
+        assert!(groups
+            .iter()
+            .all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit())));
     }
 }

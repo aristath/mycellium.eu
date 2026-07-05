@@ -17,7 +17,9 @@ use lettre::{Message, SmtpTransport, Transport};
 /// Dev mode = no SMTP configured. In dev the code is logged and returned to the
 /// caller instead of emailed.
 pub fn is_dev() -> bool {
-    std::env::var("MYCELLIUM_SMTP_HOST").map(|h| h.trim().is_empty()).unwrap_or(true)
+    std::env::var("MYCELLIUM_SMTP_HOST")
+        .map(|h| h.trim().is_empty())
+        .unwrap_or(true)
 }
 
 /// Deliver a verification code to `to`. Best-effort — logs on failure so a
@@ -35,7 +37,9 @@ pub fn send_verification(to: &str, code: &str) {
 fn smtp_send(to: &str, code: &str) -> Result<(), String> {
     let host = env("MYCELLIUM_SMTP_HOST").ok_or("no MYCELLIUM_SMTP_HOST")?;
     let from = env("MYCELLIUM_SMTP_FROM").ok_or("no MYCELLIUM_SMTP_FROM")?;
-    let port: u16 = env("MYCELLIUM_SMTP_PORT").and_then(|p| p.parse().ok()).unwrap_or(587);
+    let port: u16 = env("MYCELLIUM_SMTP_PORT")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(587);
 
     let email = Message::builder()
         .from(from.parse().map_err(|_| "bad MYCELLIUM_SMTP_FROM")?)

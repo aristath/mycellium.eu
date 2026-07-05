@@ -6,8 +6,6 @@ use super::*;
 /// Associated data binding a group message to its group.
 pub use crate::wireops::group_ad;
 
-
-
 pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
@@ -36,13 +34,22 @@ pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &st
     };
     stored.note_sender(my_group_id(&identity), me.as_str());
     groups::save(&mut fs, &stored)?;
-    distribute_key(&identity, &me, &client, &stored, &group, &mut fs, OsPlatform.now_unix_secs());
+    distribute_key(
+        &identity,
+        &me,
+        &client,
+        &stored,
+        &group,
+        &mut fs,
+        OsPlatform.now_unix_secs(),
+    );
 
-    println!("created group '{name}' ({group_id}) with {} members", all.len());
+    println!(
+        "created group '{name}' ({group_id}) with {} members",
+        all.len()
+    );
     Ok(())
 }
-
-
 
 /// Send our sender-key distribution to every other member (over pairwise E2E).
 pub fn distribute_key(
@@ -56,10 +63,17 @@ pub fn distribute_key(
 ) {
     // Every member, including our own handle — `distribute_key_to` skips only
     // this exact device, so our sibling devices still get our key (Layer 11).
-    distribute_key_to(identity, me, client, stored, group, &stored.members, fs, now);
+    distribute_key_to(
+        identity,
+        me,
+        client,
+        stored,
+        group,
+        &stored.members,
+        fs,
+        now,
+    );
 }
-
-
 
 /// Send our sender-key distribution to a specific set of members. Any device we
 /// can't reach live or via its queue is parked in the outbox for retry — so key
@@ -105,7 +119,9 @@ pub fn distribute_key_to(
             if device.device_key == identity.device_public() {
                 continue;
             }
-            let Ok(env) = seal_to(identity, me, device, &plaintext) else { continue };
+            let Ok(env) = seal_to(identity, me, device, &plaintext) else {
+                continue;
+            };
             let item = MailItem::GroupInvite(env);
             if !deliver(client, &handle, queue.as_ref(), device, &item) {
                 let slot = device_slot(&device.device_key);
@@ -114,8 +130,6 @@ pub fn distribute_key_to(
         }
     }
 }
-
-
 
 pub fn handle_group_invite(
     identity: &Identity,
@@ -135,8 +149,11 @@ pub fn handle_group_invite(
     match groups::load(fs, &payload.group_id)? {
         Some(mut stored) => {
             // Already in the group — learn this member's sender key.
-            let mut group = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-            group.add_member(sender_id.clone(), &payload.distribution).map_err(|_| anyhow!("bad sender key"))?;
+            let mut group =
+                Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
+            group
+                .add_member(sender_id.clone(), &payload.distribution)
+                .map_err(|_| anyhow!("bad sender key"))?;
             stored.note_sender(sender_id, from.as_str());
 
             // Learn any members we didn't know about, and send them our key.
@@ -152,14 +169,25 @@ pub fn handle_group_invite(
             stored.state = group.export();
             groups::save(fs, &stored)?;
             if !newcomers.is_empty() {
-                distribute_key_to(identity, me, client, &stored, &group, &newcomers, fs, OsPlatform.now_unix_secs());
+                distribute_key_to(
+                    identity,
+                    me,
+                    client,
+                    &stored,
+                    &group,
+                    &newcomers,
+                    fs,
+                    OsPlatform.now_unix_secs(),
+                );
             }
         }
         None => {
             // First time we hear of this group: join, and reply with our key.
             let mut own_platform = OsPlatform;
             let mut group = Group::new(&mut own_platform, my_group_id(identity));
-            group.add_member(sender_id.clone(), &payload.distribution).map_err(|_| anyhow!("bad sender key"))?;
+            group
+                .add_member(sender_id.clone(), &payload.distribution)
+                .map_err(|_| anyhow!("bad sender key"))?;
             let mut stored = StoredGroup {
                 id: payload.group_id.clone(),
                 name: payload.name.clone(),
@@ -171,14 +199,24 @@ pub fn handle_group_invite(
             stored.note_sender(sender_id, from.as_str());
             stored.note_sender(my_group_id(identity), me.as_str());
             groups::save(fs, &stored)?;
-            println!("joined group '{}' (invited by {})", stored.name, from.as_str());
-            distribute_key(identity, me, client, &stored, &group, fs, OsPlatform.now_unix_secs());
+            println!(
+                "joined group '{}' (invited by {})",
+                stored.name,
+                from.as_str()
+            );
+            distribute_key(
+                identity,
+                me,
+                client,
+                &stored,
+                &group,
+                fs,
+                OsPlatform.now_unix_secs(),
+            );
         }
     }
     Ok(())
 }
-
-
 
 pub fn handle_group_text(
     blocked: &[String],
@@ -231,7 +269,11 @@ pub fn handle_group_text(
                     }
                     (app.id.clone(), app.summary(), app.expires_at)
                 }
-                Err(_) => (String::new(), String::from_utf8_lossy(&plaintext).into_owned(), None),
+                Err(_) => (
+                    String::new(),
+                    String::from_utf8_lossy(&plaintext).into_owned(),
+                    None,
+                ),
             };
             println!("[{}] {sender}: {display}  (#{id})", stored.name);
             let entry = GroupStoredMessage {
@@ -243,12 +285,12 @@ pub fn handle_group_text(
             };
             let _ = history::group_append(fs, group_id, entry);
         }
-        Err(_) => eprintln!("(a group message could not be decrypted yet — missing that sender's key)"),
+        Err(_) => {
+            eprintln!("(a group message could not be decrypted yet — missing that sender's key)")
+        }
     }
     Ok(())
 }
-
-
 
 pub fn group_add(group: &str, member: &str, whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -266,12 +308,18 @@ pub fn group_add(group: &str, member: &str, whoami: &str, directory: &str) -> Re
     // Distribute our key with the updated roster: the newcomer joins, and
     // existing members learn the newcomer and send it their keys.
     let session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    distribute_key(&identity, &me, &client, &stored, &session, &mut fs, OsPlatform.now_unix_secs());
+    distribute_key(
+        &identity,
+        &me,
+        &client,
+        &stored,
+        &session,
+        &mut fs,
+        OsPlatform.now_unix_secs(),
+    );
     println!("invited '{member}' to '{}'", stored.name);
     Ok(())
 }
-
-
 
 pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -286,7 +334,8 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
     stored.members.retain(|m| m != member);
 
     // Drop every device-sender of the removed handle, and re-key ourselves.
-    let mut session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
+    let mut session =
+        Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
     for (id, handle) in &stored.sender_handles {
         if handle == member {
             session.remove_member(id);
@@ -298,7 +347,15 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
     groups::save(&mut fs, &stored)?;
 
     // Give the remaining members our fresh key, and tell them to re-key too.
-    distribute_key(&identity, &me, &client, &stored, &session, &mut fs, OsPlatform.now_unix_secs());
+    distribute_key(
+        &identity,
+        &me,
+        &client,
+        &stored,
+        &session,
+        &mut fs,
+        OsPlatform.now_unix_secs(),
+    );
     let control = MailItem::GroupRemove {
         group_id: stored.id.clone(),
         member: member.to_string(),
@@ -308,14 +365,19 @@ pub fn group_remove(group: &str, member: &str, whoami: &str, directory: &str) ->
             continue;
         }
         if let Ok(handle) = Handle::new(m.clone()) {
-            deliver_to_cluster_or_queue(&client, &identity, &handle, &control, &mut fs, OsPlatform.now_unix_secs());
+            deliver_to_cluster_or_queue(
+                &client,
+                &identity,
+                &handle,
+                &control,
+                &mut fs,
+                OsPlatform.now_unix_secs(),
+            );
         }
     }
     println!("removed '{member}' from '{}' (re-keyed)", stored.name);
     Ok(())
 }
-
-
 
 /// React to a removal: drop the member, re-key, and redistribute our new key.
 pub fn handle_group_remove(
@@ -334,7 +396,8 @@ pub fn handle_group_remove(
         return Ok(()); // we were removed; nothing to re-key
     }
     stored.members.retain(|m| m != member);
-    let mut session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
+    let mut session =
+        Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
     for (id, handle) in &stored.sender_handles {
         if handle == member {
             session.remove_member(id);
@@ -344,12 +407,18 @@ pub fn handle_group_remove(
     session.rotate(&mut OsPlatform);
     stored.state = session.export();
     groups::save(fs, &stored)?;
-    distribute_key(identity, me, client, &stored, &session, fs, OsPlatform.now_unix_secs());
+    distribute_key(
+        identity,
+        me,
+        client,
+        &stored,
+        &session,
+        fs,
+        OsPlatform.now_unix_secs(),
+    );
     println!("'{member}' was removed from '{}' — re-keyed", stored.name);
     Ok(())
 }
-
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn group_send(
@@ -374,7 +443,8 @@ pub fn group_send(
     let _ = flush_outbox(&identity, &client, &mut fs);
 
     let mut stored = resolve_group(&fs, group)?;
-    let mut session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
+    let mut session =
+        Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
 
@@ -388,7 +458,10 @@ pub fn group_send(
     stored.state = session.export();
     groups::save(&mut fs, &stored)?;
 
-    let item = MailItem::GroupText { group_id: stored.id.clone(), message: gm };
+    let item = MailItem::GroupText {
+        group_id: stored.id.clone(),
+        message: gm,
+    };
     for member in &stored.members {
         let handle = match Handle::new(member.clone()) {
             Ok(h) => h,
@@ -404,7 +477,14 @@ pub fn group_send(
                         && !deliver(&client, &me, my_queue.as_ref(), device, &item)
                     {
                         let slot = device_slot(&device.device_key);
-                        let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, item.clone(), now);
+                        let _ = outbox::enqueue(
+                            &mut fs,
+                            random_id(),
+                            me.as_str(),
+                            &slot,
+                            item.clone(),
+                            now,
+                        );
                     }
                 }
             }
@@ -431,8 +511,6 @@ pub fn group_send(
     Ok(())
 }
 
-
-
 pub fn group_history(group: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
@@ -449,8 +527,6 @@ pub fn group_history(group: &str) -> Result<()> {
     Ok(())
 }
 
-
-
 pub fn group_info(group: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
@@ -459,8 +535,6 @@ pub fn group_info(group: &str) -> Result<()> {
     println!("members: {}", stored.members.join(", "));
     Ok(())
 }
-
-
 
 pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -511,16 +585,25 @@ pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
             Err(_) => continue,
         };
         for device in &siblings {
-            let Ok(env) = seal_to(&identity, &me, device, &plaintext) else { continue };
-            deliver(&client, &me, my_queue.as_ref(), device, &MailItem::GroupSync(env));
+            let Ok(env) = seal_to(&identity, &me, device, &plaintext) else {
+                continue;
+            };
+            deliver(
+                &client,
+                &me,
+                my_queue.as_ref(),
+                device,
+                &MailItem::GroupSync(env),
+            );
         }
         synced += 1;
     }
-    println!("synced {synced} group(s) to {} other device(s)", siblings.len());
+    println!(
+        "synced {synced} group(s) to {} other device(s)",
+        siblings.len()
+    );
     Ok(())
 }
-
-
 
 /// Bootstrap this device into a group from a sibling's [`GroupSyncPayload`].
 pub fn handle_group_sync(
@@ -555,12 +638,18 @@ pub fn handle_group_sync(
     stored.note_sender(my_group_id(identity), me.as_str());
     groups::save(fs, &stored)?;
     // Announce our own key to the members so this device can also *send*.
-    distribute_key(identity, me, client, &stored, &group, fs, OsPlatform.now_unix_secs());
+    distribute_key(
+        identity,
+        me,
+        client,
+        &stored,
+        &group,
+        fs,
+        OsPlatform.now_unix_secs(),
+    );
     println!("bootstrapped into group '{}'", stored.name);
     Ok(())
 }
-
-
 
 pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -579,15 +668,20 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
             continue;
         }
         if let Ok(handle) = Handle::new(member.clone()) {
-            deliver_to_cluster_or_queue(&client, &identity, &handle, &control, &mut fs, OsPlatform.now_unix_secs());
+            deliver_to_cluster_or_queue(
+                &client,
+                &identity,
+                &handle,
+                &control,
+                &mut fs,
+                OsPlatform.now_unix_secs(),
+            );
         }
     }
     groups::remove(&mut fs, &stored.id)?;
     println!("left group '{}'", stored.name);
     Ok(())
 }
-
-
 
 pub fn group_list() -> Result<()> {
     let identity = store::load_identity()?;
@@ -604,8 +698,6 @@ pub fn group_list() -> Result<()> {
     }
     Ok(())
 }
-
-
 
 /// Resolve a group by id, or by name if no id matches.
 pub fn resolve_group(fs: &FileStore, key: &str) -> Result<StoredGroup> {

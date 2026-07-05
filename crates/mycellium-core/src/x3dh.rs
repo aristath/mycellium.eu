@@ -190,11 +190,32 @@ mod tests {
         let low = MessagingPublicKey([0u8; 32]); // the order-1 point → all-zero DH
 
         // Initiator: a low-order responder pre-key or identity key is refused.
-        assert_eq!(initiate(&mut SeededPlatform(60), &alice, &bob.messaging_public(), &low).err(), Some(Error::WeakKey));
-        assert_eq!(initiate(&mut SeededPlatform(60), &alice, &low, &bob.signed_pre_key_public()).err(), Some(Error::WeakKey));
+        assert_eq!(
+            initiate(
+                &mut SeededPlatform(60),
+                &alice,
+                &bob.messaging_public(),
+                &low
+            )
+            .err(),
+            Some(Error::WeakKey)
+        );
+        assert_eq!(
+            initiate(
+                &mut SeededPlatform(60),
+                &alice,
+                &low,
+                &bob.signed_pre_key_public()
+            )
+            .err(),
+            Some(Error::WeakKey)
+        );
 
         // Responder: a low-order initiator identity/ephemeral is refused.
-        let bad = HandshakeInit { initiator_ik: low, initiator_ek: low };
+        let bad = HandshakeInit {
+            initiator_ik: low,
+            initiator_ek: low,
+        };
         assert_eq!(respond(&bob, &bad).err(), Some(Error::WeakKey));
     }
 
@@ -213,6 +234,9 @@ mod tests {
         .unwrap();
         // Mallory tries to respond with her own keys — she can't reach Bob's SK.
         let mallory_secret = respond(&mallory, &initiated.init).unwrap();
-        assert_ne!(initiated.shared_secret.as_bytes(), mallory_secret.as_bytes());
+        assert_ne!(
+            initiated.shared_secret.as_bytes(),
+            mallory_secret.as_bytes()
+        );
     }
 }

@@ -108,7 +108,11 @@ impl AppMessage {
                 s
             }
             Body::Receipt { message_id, read } => {
-                let mut s = String::from(if *read { "✓✓ read " } else { "✓ delivered " });
+                let mut s = String::from(if *read {
+                    "✓✓ read "
+                } else {
+                    "✓ delivered "
+                });
                 s.push_str(message_id);
                 s
             }
@@ -174,13 +178,19 @@ mod tests {
             id: "a2".to_string(),
             timestamp: 2,
             expires_at: None,
-            body: Body::Reply { to: "a1".to_string(), text: "hi back".to_string() },
+            body: Body::Reply {
+                to: "a1".to_string(),
+                text: "hi back".to_string(),
+            },
         });
         round_trip(&AppMessage {
             id: "a3".to_string(),
             timestamp: 3,
             expires_at: None,
-            body: Body::Reaction { to: "a1".to_string(), emoji: "👍".to_string() },
+            body: Body::Reaction {
+                to: "a1".to_string(),
+                emoji: "👍".to_string(),
+            },
         });
         let file = AppMessage {
             id: "a4".to_string(),
@@ -198,27 +208,43 @@ mod tests {
 
     #[test]
     fn summaries_read_well() {
-        let text = AppMessage { id: "x".into(), timestamp: 0, expires_at: None, body: Body::Text("yo".into()) };
+        let text = AppMessage {
+            id: "x".into(),
+            timestamp: 0,
+            expires_at: None,
+            body: Body::Text("yo".into()),
+        };
         assert_eq!(text.summary(), "yo");
         let reply = AppMessage {
             id: "y".into(),
             timestamp: 0,
             expires_at: None,
-            body: Body::Reply { to: "x".into(), text: "sup".into() },
+            body: Body::Reply {
+                to: "x".into(),
+                text: "sup".into(),
+            },
         };
         assert_eq!(reply.summary(), "↪ (re x) sup");
         let react = AppMessage {
             id: "z".into(),
             timestamp: 0,
             expires_at: None,
-            body: Body::Reaction { to: "x".into(), emoji: "🔥".into() },
+            body: Body::Reaction {
+                to: "x".into(),
+                emoji: "🔥".into(),
+            },
         };
         assert_eq!(react.summary(), "reacted 🔥 to x");
     }
 
     #[test]
     fn expiry_is_respected() {
-        let mut m = AppMessage { id: "e".into(), timestamp: 0, expires_at: None, body: Body::Text("x".into()) };
+        let mut m = AppMessage {
+            id: "e".into(),
+            timestamp: 0,
+            expires_at: None,
+            body: Body::Text("x".into()),
+        };
         assert!(!m.is_expired(1_000)); // no expiry set
         m.expires_at = Some(100);
         assert!(!m.is_expired(99));

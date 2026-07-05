@@ -12,7 +12,10 @@ const KEY: &[u8] = b"names";
 
 /// All learned `(id, name)` pairs.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<(String, String)>, S::Error> {
-    Ok(store.get(KEY)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(store
+        .get(KEY)?
+        .and_then(|b| wire::decode(&b).ok())
+        .unwrap_or_default())
 }
 
 /// Remember (or refresh) the display name a peer publishes for their id.
@@ -31,7 +34,10 @@ pub fn note<S: Storage>(store: &mut S, id: &str, name: &str) -> Result<(), S::Er
 
 /// The learned name for `id`, if any.
 pub fn get<S: Storage>(store: &S, id: &str) -> Result<Option<String>, S::Error> {
-    Ok(load(store)?.into_iter().find(|(i, _)| i == id).map(|(_, n)| n))
+    Ok(load(store)?
+        .into_iter()
+        .find(|(i, _)| i == id)
+        .map(|(_, n)| n))
 }
 
 #[cfg(test)]

@@ -147,7 +147,8 @@ impl Queue {
     pub fn challenge(&mut self, wallet: WalletPublicKey, now: u64) -> String {
         // Housekeeping: drop challenges never signed within the TTL so the map
         // stays bounded rather than growing with every unfinished login.
-        self.challenges.retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
+        self.challenges
+            .retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
         let nonce = random_hex::<16>();
         self.challenges.insert(nonce.clone(), (wallet, now));
         nonce
@@ -213,7 +214,9 @@ impl Queue {
                 list.remove(0);
             }
             if let Some(store) = &self.store {
-                store.put_subs(&wallet_hex, list).map_err(|_| ApiError::Storage)?;
+                store
+                    .put_subs(&wallet_hex, list)
+                    .map_err(|_| ApiError::Storage)?;
             }
         }
         Ok(())
@@ -228,7 +231,9 @@ impl Queue {
             list.retain(|e| e != endpoint);
             if list.len() != before {
                 if let Some(store) = &self.store {
-                    store.put_subs(&wallet_hex, list).map_err(|_| ApiError::Storage)?;
+                    store
+                        .put_subs(&wallet_hex, list)
+                        .map_err(|_| ApiError::Storage)?;
                 }
             }
         }
@@ -281,7 +286,9 @@ impl Queue {
         }
         mailbox.push(blob);
         if let Some(store) = &self.store {
-            store.put_mailbox(recipient_wallet_hex, slot, mailbox).map_err(|_| ApiError::Storage)?;
+            store
+                .put_mailbox(recipient_wallet_hex, slot, mailbox)
+                .map_err(|_| ApiError::Storage)?;
         }
         Ok(())
     }
@@ -302,9 +309,14 @@ impl Queue {
         if hex33(&caller.0) != wallet_hex {
             return Err(ApiError::Forbidden);
         }
-        let drained = self.mailboxes.remove(&(wallet_hex.to_string(), slot.to_string())).unwrap_or_default();
+        let drained = self
+            .mailboxes
+            .remove(&(wallet_hex.to_string(), slot.to_string()))
+            .unwrap_or_default();
         if let Some(store) = &self.store {
-            store.del_mailbox(wallet_hex, slot).map_err(|_| ApiError::Storage)?;
+            store
+                .del_mailbox(wallet_hex, slot)
+                .map_err(|_| ApiError::Storage)?;
         }
         Ok(drained)
     }
@@ -313,7 +325,8 @@ impl Queue {
     fn allow(&mut self, wallet: [u8; 33], action: &'static str, now: u64) -> bool {
         // Bound memory: prune fully-elapsed buckets once the map grows large.
         if self.rate.len() > RATE_PRUNE_AT {
-            self.rate.retain(|_, (start, _)| now.saturating_sub(*start) < RATE_WINDOW);
+            self.rate
+                .retain(|_, (start, _)| now.saturating_sub(*start) < RATE_WINDOW);
         }
         let entry = self.rate.entry((wallet, action)).or_insert((now, 0));
         if now.saturating_sub(entry.0) >= RATE_WINDOW {
@@ -336,11 +349,18 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     println!("  push: VAPID enabled");
 
     // A worker pool so many clients are served concurrently (Tier 0.2).
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 32);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 32);
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let (server, queue, vapid, metrics) =
-            (Arc::clone(&server), Arc::clone(&queue), Arc::clone(&vapid), Arc::clone(&metrics));
+        let (server, queue, vapid, metrics) = (
+            Arc::clone(&server),
+            Arc::clone(&queue),
+            Arc::clone(&vapid),
+            Arc::clone(&metrics),
+        );
         handles.push(std::thread::spawn(move || {
             while let Ok(request) = server.recv() {
                 handle_request(&queue, &vapid, &metrics, request);
@@ -361,7 +381,10 @@ fn bind_server(addr: &str) -> std::io::Result<Server> {
     let env_str = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     match (env_str("MYCELLIUM_TLS_CERT"), env_str("MYCELLIUM_TLS_KEY")) {
         (Some(cert), Some(key)) => {
-            let config = tiny_http::SslConfig { certificate: std::fs::read(&cert)?, private_key: std::fs::read(&key)? };
+            let config = tiny_http::SslConfig {
+                certificate: std::fs::read(&cert)?,
+                private_key: std::fs::read(&key)?,
+            };
             println!("  tls: enabled ({cert})");
             Server::https(addr, config).map_err(to_io)
         }
@@ -435,7 +458,12 @@ fn restrict_perms(path: &str) {
 #[cfg(not(unix))]
 fn restrict_perms(_path: &str) {}
 
-fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: &mycellium_observe::Metrics, mut request: Request) {
+fn handle_request(
+    queue: &Arc<Mutex<Queue>>,
+    vapid: &Arc<push::Vapid>,
+    metrics: &mycellium_observe::Metrics,
+    mut request: Request,
+) {
     let start = std::time::Instant::now();
     let method = request.method().clone();
 
@@ -455,8 +483,9 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
     let log_path = redact_path(&path);
     if method == Method::Get && path == "/metrics" {
         metrics.record(200);
-        let resp = Response::from_string(metrics.render("queue"))
-            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap());
+        let resp = Response::from_string(metrics.render("queue")).with_header(
+            Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap(),
+        );
         let _ = request.respond(resp);
         return;
     }
@@ -473,9 +502,17 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
     }
     if over_cap || buf.len() > MAX_BODY {
         metrics.record(413);
-        mycellium_observe::access_log("queue", method.as_str(), &log_path, 413, start.elapsed().as_millis());
+        mycellium_observe::access_log(
+            "queue",
+            method.as_str(),
+            &log_path,
+            413,
+            start.elapsed().as_millis(),
+        );
         let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-        let mut resp = Response::from_string("{\"error\":\"payload too large\"}").with_status_code(413).with_header(header);
+        let mut resp = Response::from_string("{\"error\":\"payload too large\"}")
+            .with_status_code(413)
+            .with_header(header);
         for h in cors_headers() {
             resp.add_header(h);
         }
@@ -489,9 +526,17 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
         Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
     };
     metrics.record(status);
-    mycellium_observe::access_log("queue", method.as_str(), &log_path, status, start.elapsed().as_millis());
+    mycellium_observe::access_log(
+        "queue",
+        method.as_str(),
+        &log_path,
+        status,
+        start.elapsed().as_millis(),
+    );
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let mut response = Response::from_string(payload).with_status_code(status).with_header(header);
+    let mut response = Response::from_string(payload)
+        .with_status_code(status)
+        .with_header(header);
     for h in cors_headers() {
         response.add_header(h);
     }
@@ -502,8 +547,14 @@ fn handle_request(queue: &Arc<Mutex<Queue>>, vapid: &Arc<push::Vapid>, metrics: 
 fn cors_headers() -> Vec<Header> {
     [
         (&b"Access-Control-Allow-Origin"[..], &b"*"[..]),
-        (&b"Access-Control-Allow-Methods"[..], &b"GET, POST, PUT, DELETE, OPTIONS"[..]),
-        (&b"Access-Control-Allow-Headers"[..], &b"Authorization, Content-Type"[..]),
+        (
+            &b"Access-Control-Allow-Methods"[..],
+            &b"GET, POST, PUT, DELETE, OPTIONS"[..],
+        ),
+        (
+            &b"Access-Control-Allow-Headers"[..],
+            &b"Authorization, Content-Type"[..],
+        ),
     ]
     .iter()
     .filter_map(|(k, v)| Header::from_bytes(*k, *v).ok())
@@ -563,13 +614,20 @@ fn route(
         }
         (Method::Post, ["login", "verify"]) => {
             let req: VerifyReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            let token = queue.lock().unwrap().verify(&req.wallet, &req.nonce, &req.signature, now)?;
+            let token =
+                queue
+                    .lock()
+                    .unwrap()
+                    .verify(&req.wallet, &req.nonce, &req.signature, now)?;
             Ok((200, to_json(&VerifyResp { token })))
         }
 
-        (Method::Get, ["push", "key"]) => {
-            Ok((200, to_json(&PushKey { key: vapid.public_key().to_string() })))
-        }
+        (Method::Get, ["push", "key"]) => Ok((
+            200,
+            to_json(&PushKey {
+                key: vapid.public_key().to_string(),
+            }),
+        )),
         (Method::Post, ["push", "subscribe"]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
@@ -579,13 +637,19 @@ fn route(
         (Method::Post, ["push", "unsubscribe"]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
             let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            queue.lock().unwrap().unsubscribe(token, &req.endpoint, now)?;
+            queue
+                .lock()
+                .unwrap()
+                .unsubscribe(token, &req.endpoint, now)?;
             Ok((200, "\"ok\"".into()))
         }
 
         (Method::Post, ["mailbox", wallet_hex, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
-            queue.lock().unwrap().deposit(token, wallet_hex, slot, body.to_string(), now)?;
+            queue
+                .lock()
+                .unwrap()
+                .deposit(token, wallet_hex, slot, body.to_string(), now)?;
             // Wake the recipient's devices — contentless, and off the lock/thread
             // so a slow push endpoint never stalls the queue.
             let endpoints = queue.lock().unwrap().subscriptions(wallet_hex);
@@ -611,7 +675,10 @@ fn route(
         }
         (Method::Get, ["mailbox", wallet_hex, slot]) => {
             let token = token.ok_or(ApiError::Unauthorized)?;
-            let messages = queue.lock().unwrap().collect(token, wallet_hex, slot, now)?;
+            let messages = queue
+                .lock()
+                .unwrap()
+                .collect(token, wallet_hex, slot, now)?;
             Ok((200, to_json(&Messages { messages })))
         }
 
@@ -680,7 +747,10 @@ fn is_slot(s: &str) -> bool {
 /// A plausible Web Push endpoint: a bounded HTTPS URL with a host. (Requiring
 /// HTTPS also keeps the queue from being pointed at plain-HTTP internal URLs.)
 fn is_push_endpoint(e: &str) -> bool {
-    e.len() <= MAX_ENDPOINT_LEN && push::origin_of(e).map(|o| o.starts_with("https://")).unwrap_or(false)
+    e.len() <= MAX_ENDPOINT_LEN
+        && push::origin_of(e)
+            .map(|o| o.starts_with("https://"))
+            .unwrap_or(false)
 }
 
 fn random_hex<const N: usize>() -> String {
@@ -730,21 +800,32 @@ mod tests {
         {
             let mut q = Queue::open(path_str).unwrap();
             let atoken = login(&mut q, &alice);
-            q.deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0).unwrap();
+            q.deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0)
+                .unwrap();
             let btoken = login(&mut q, &bob);
-            q.subscribe(&btoken, "https://push.example/abc".into(), 0).unwrap();
+            q.subscribe(&btoken, "https://push.example/abc".into(), 0)
+                .unwrap();
         } // drop → flushed
 
         // Reopen: the queued blob and the push subscription are both still there.
         let mut q2 = Queue::open(path_str).unwrap();
-        assert_eq!(q2.subscriptions(&bob_hex), vec!["https://push.example/abc".to_string()]);
+        assert_eq!(
+            q2.subscriptions(&bob_hex),
+            vec!["https://push.example/abc".to_string()]
+        );
         let btoken = login(&mut q2, &bob);
-        assert_eq!(q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT, 0).unwrap(), vec!["sealed".to_string()]);
+        assert_eq!(
+            q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT, 0).unwrap(),
+            vec!["sealed".to_string()]
+        );
         // ...and after collecting, the drain is persisted (empty on next reopen).
         drop(q2);
         let mut q3 = Queue::open(path_str).unwrap();
         let btoken2 = login(&mut q3, &bob);
-        assert!(q3.collect(&btoken2, &bob_hex, ACCOUNT_SLOT, 0).unwrap().is_empty());
+        assert!(q3
+            .collect(&btoken2, &bob_hex, ACCOUNT_SLOT, 0)
+            .unwrap()
+            .is_empty());
 
         let _ = std::fs::remove_file(path);
     }
@@ -756,7 +837,9 @@ mod tests {
         let bob = Identity::generate(&mut P(4)).unwrap();
         let bob_hex = hex33(&bob.wallet_public().0);
         let token = login(&mut q, &alice); // issued at now = 0
-        assert!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 10).is_ok());
+        assert!(q
+            .deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 10)
+            .is_ok());
         assert_eq!(
             q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), TOKEN_TTL + 1),
             Err(ApiError::Unauthorized),
@@ -772,7 +855,9 @@ mod tests {
         let token = login(&mut q, &bob); // issued at now = 0
 
         // Fresh token works for both collect and subscribe.
-        assert!(q.subscribe(&token, "https://push.example/ok".into(), 10).is_ok());
+        assert!(q
+            .subscribe(&token, "https://push.example/ok".into(), 10)
+            .is_ok());
         assert!(q.collect(&token, &bob_hex, ACCOUNT_SLOT, 10).is_ok());
 
         // Past TOKEN_TTL the same token is rejected for every authenticated op.
@@ -798,17 +883,26 @@ mod tests {
         let hex = hex33(&a.wallet_public().0);
 
         // Non-HTTPS / malformed endpoints are refused.
-        assert_eq!(q.subscribe(&token, "http://insecure/x".into(), 0), Err(ApiError::BadRequest));
-        assert_eq!(q.subscribe(&token, "not a url".into(), 0), Err(ApiError::BadRequest));
+        assert_eq!(
+            q.subscribe(&token, "http://insecure/x".into(), 0),
+            Err(ApiError::BadRequest)
+        );
+        assert_eq!(
+            q.subscribe(&token, "not a url".into(), 0),
+            Err(ApiError::BadRequest)
+        );
 
         // Duplicate subscribes are idempotent.
-        q.subscribe(&token, "https://push.example/a".into(), 0).unwrap();
-        q.subscribe(&token, "https://push.example/a".into(), 0).unwrap();
+        q.subscribe(&token, "https://push.example/a".into(), 0)
+            .unwrap();
+        q.subscribe(&token, "https://push.example/a".into(), 0)
+            .unwrap();
         assert_eq!(q.subscriptions(&hex).len(), 1);
 
         // The list is capped, evicting the oldest.
         for i in 0..MAX_SUBS_PER_WALLET + 5 {
-            q.subscribe(&token, format!("https://push.example/{i}"), 0).unwrap();
+            q.subscribe(&token, format!("https://push.example/{i}"), 0)
+                .unwrap();
         }
         assert_eq!(q.subscriptions(&hex).len(), MAX_SUBS_PER_WALLET);
 
@@ -837,12 +931,17 @@ mod tests {
         // Within the TTL the same handshake still works.
         let nonce2 = q.challenge(a.wallet_public(), 0);
         let sig2 = a.sign(&mycellium_core::login::challenge_message(&nonce2));
-        assert!(q.verify(&a.wallet_public(), &nonce2, &sig2, CHALLENGE_TTL).is_ok());
+        assert!(q
+            .verify(&a.wallet_public(), &nonce2, &sig2, CHALLENGE_TTL)
+            .is_ok());
     }
 
     #[test]
     fn access_log_paths_are_redacted() {
-        assert_eq!(redact_path("/mailbox/deadbeef/account"), "/mailbox/:wallet/:slot");
+        assert_eq!(
+            redact_path("/mailbox/deadbeef/account"),
+            "/mailbox/:wallet/:slot"
+        );
         assert_eq!(redact_path("/login/challenge"), "/login/challenge");
         assert_eq!(redact_path("/push/key"), "/push/key");
     }
@@ -855,13 +954,24 @@ mod tests {
         let token = login(&mut q, &a);
         let bob_hex = hex33(&b.wallet_public().0);
         // A too-short wallet hex names no real mailbox.
-        assert_eq!(q.deposit(&token, "abc", ACCOUNT_SLOT, "x".into(), 0), Err(ApiError::BadRequest));
+        assert_eq!(
+            q.deposit(&token, "abc", ACCOUNT_SLOT, "x".into(), 0),
+            Err(ApiError::BadRequest)
+        );
         // An oversized / non-hex slot can't mint a sparse mailbox.
         let huge = "z".repeat(10_000);
-        assert_eq!(q.deposit(&token, &bob_hex, &huge, "x".into(), 0), Err(ApiError::BadRequest));
-        assert!(q.mailboxes.is_empty(), "no mailbox created for malformed targets");
+        assert_eq!(
+            q.deposit(&token, &bob_hex, &huge, "x".into(), 0),
+            Err(ApiError::BadRequest)
+        );
+        assert!(
+            q.mailboxes.is_empty(),
+            "no mailbox created for malformed targets"
+        );
         // A well-formed target still works.
-        assert!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0).is_ok());
+        assert!(q
+            .deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0)
+            .is_ok());
     }
 
     #[test]
@@ -883,16 +993,27 @@ mod tests {
         let bob_hex = hex33(&bob.wallet_public().0);
 
         let alice_token = login(&mut q, &alice);
-        q.deposit(&alice_token, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0).unwrap();
+        q.deposit(&alice_token, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0)
+            .unwrap();
 
         // A non-owner can't collect Bob's mailbox.
         let alice_hex = hex33(&alice.wallet_public().0);
-        assert_eq!(q.collect(&alice_token, &alice_hex, ACCOUNT_SLOT, 0).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            q.collect(&alice_token, &alice_hex, ACCOUNT_SLOT, 0)
+                .unwrap(),
+            Vec::<String>::new()
+        );
 
         // Bob collects his own, then it's drained.
         let bob_token = login(&mut q, &bob);
-        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(), vec!["sealed".to_string()]);
-        assert_eq!(q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(),
+            vec!["sealed".to_string()]
+        );
+        assert_eq!(
+            q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -902,9 +1023,15 @@ mod tests {
         let bob_hex = hex33(&Identity::generate(&mut P(90)).unwrap().wallet_public().0);
         let token = login(&mut q, &alice);
         for _ in 0..DEPOSIT_RATE_LIMIT {
-            q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0).unwrap();
+            q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0)
+                .unwrap();
         }
-        assert_eq!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0), Err(ApiError::RateLimited));
-        assert!(q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), RATE_WINDOW).is_ok());
+        assert_eq!(
+            q.deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), 0),
+            Err(ApiError::RateLimited)
+        );
+        assert!(q
+            .deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), RATE_WINDOW)
+            .is_ok());
     }
 }

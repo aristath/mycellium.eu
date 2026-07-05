@@ -42,7 +42,10 @@ impl PendingItem {
 
 /// Load the whole inbound-retry store.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<PendingItem>, S::Error> {
-    Ok(store.get(KEY)?.and_then(|b| wire::decode(&b).ok()).unwrap_or_default())
+    Ok(store
+        .get(KEY)?
+        .and_then(|b| wire::decode(&b).ok())
+        .unwrap_or_default())
 }
 
 /// Persist the whole inbound-retry store.
@@ -56,7 +59,11 @@ mod tests {
 
     #[test]
     fn expiry_is_by_attempts_or_ttl() {
-        let mk = |attempts, created| PendingItem { blob: "x".into(), created_at: created, attempts };
+        let mk = |attempts, created| PendingItem {
+            blob: "x".into(),
+            created_at: created,
+            attempts,
+        };
         assert!(!mk(0, 0).is_expired(10));
         assert!(mk(MAX_ATTEMPTS, 0).is_expired(0)); // too many tries
         assert!(mk(0, 0).is_expired(TTL_SECS + 1)); // too old

@@ -57,7 +57,11 @@ impl Vapid {
     fn from_signing(signing: SigningKey) -> Self {
         let point = signing.verifying_key().to_encoded_point(false);
         let public_b64 = b64url(point.as_bytes());
-        Vapid { signing, public_b64, subject: "mailto:push@mycellium.invalid".to_string() }
+        Vapid {
+            signing,
+            public_b64,
+            subject: "mailto:push@mycellium.invalid".to_string(),
+        }
     }
 
     /// The base64url public key clients pass as `applicationServerKey`.
@@ -72,7 +76,11 @@ impl Vapid {
             None => return SendResult::Failed,
         };
         let header = b64url(br#"{"typ":"JWT","alg":"ES256"}"#);
-        let claims = format!(r#"{{"aud":"{aud}","exp":{},"sub":"{}"}}"#, now + 12 * 3600, self.subject);
+        let claims = format!(
+            r#"{{"aud":"{aud}","exp":{},"sub":"{}"}}"#,
+            now + 12 * 3600,
+            self.subject
+        );
         let signing_input = format!("{header}.{}", b64url(claims.as_bytes()));
         let sig: Signature = self.signing.sign(signing_input.as_bytes());
         let jwt = format!("{signing_input}.{}", b64url(&sig.to_bytes()));
@@ -124,15 +132,23 @@ mod tests {
     #[test]
     fn vapid_public_key_is_base64url_65_bytes() {
         let v = Vapid::generate();
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v.public_key()).unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(v.public_key())
+            .unwrap();
         assert_eq!(raw.len(), 65); // uncompressed P-256 point
         assert_eq!(raw[0], 0x04);
     }
 
     #[test]
     fn origin_extraction() {
-        assert_eq!(origin_of("https://fcm.googleapis.com/fcm/send/abc").as_deref(), Some("https://fcm.googleapis.com"));
-        assert_eq!(origin_of("https://updates.push.services.mozilla.com/wpush/v2/xyz").as_deref(), Some("https://updates.push.services.mozilla.com"));
+        assert_eq!(
+            origin_of("https://fcm.googleapis.com/fcm/send/abc").as_deref(),
+            Some("https://fcm.googleapis.com")
+        );
+        assert_eq!(
+            origin_of("https://updates.push.services.mozilla.com/wpush/v2/xyz").as_deref(),
+            Some("https://updates.push.services.mozilla.com")
+        );
         assert_eq!(origin_of("not-a-url"), None);
     }
 }

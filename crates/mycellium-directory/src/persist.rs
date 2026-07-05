@@ -66,7 +66,10 @@ impl Store {
         let records = txn.open_table(RECORDS).map_err(|e| e.to_string())?;
         for entry in records.iter().map_err(|e| e.to_string())? {
             let (k, v) = entry.map_err(|e| e.to_string())?;
-            if let (Ok(handle), Ok(record)) = (Handle::new(k.value()), wire::decode::<SignedRecord>(v.value())) {
+            if let (Ok(handle), Ok(record)) = (
+                Handle::new(k.value()),
+                wire::decode::<SignedRecord>(v.value()),
+            ) {
                 out.records.insert(handle, record);
             }
         }
@@ -91,33 +94,61 @@ impl Store {
 
     /// Atomically write a handle's binding **and** record in one transaction, so
     /// a crash can never leave a binding without its record (or vice versa).
-    pub fn put_binding_and_record(&self, handle: &Handle, wallet: &WalletPublicKey, record: &SignedRecord) -> Result<(), String> {
+    pub fn put_binding_and_record(
+        &self,
+        handle: &Handle,
+        wallet: &WalletPublicKey,
+        record: &SignedRecord,
+    ) -> Result<(), String> {
         let encoded = wire::encode(record);
         self.write(|txn| {
-            txn.open_table(BINDINGS).map_err(err)?.insert(handle.as_str(), &wallet.0[..]).map_err(err)?;
-            txn.open_table(RECORDS).map_err(err)?.insert(handle.as_str(), &encoded[..]).map_err(err)?;
+            txn.open_table(BINDINGS)
+                .map_err(err)?
+                .insert(handle.as_str(), &wallet.0[..])
+                .map_err(err)?;
+            txn.open_table(RECORDS)
+                .map_err(err)?
+                .insert(handle.as_str(), &encoded[..])
+                .map_err(err)?;
             Ok(())
         })
     }
 
     /// Atomically write a handle's binding **and** recovery-email hash in one
     /// transaction (for email-verified claim + recovery).
-    pub fn put_binding_and_email(&self, handle: &Handle, wallet: &WalletPublicKey, hash: &str) -> Result<(), String> {
+    pub fn put_binding_and_email(
+        &self,
+        handle: &Handle,
+        wallet: &WalletPublicKey,
+        hash: &str,
+    ) -> Result<(), String> {
         self.write(|txn| {
-            txn.open_table(BINDINGS).map_err(err)?.insert(handle.as_str(), &wallet.0[..]).map_err(err)?;
-            txn.open_table(EMAILS).map_err(err)?.insert(handle.as_str(), hash).map_err(err)?;
+            txn.open_table(BINDINGS)
+                .map_err(err)?
+                .insert(handle.as_str(), &wallet.0[..])
+                .map_err(err)?;
+            txn.open_table(EMAILS)
+                .map_err(err)?
+                .insert(handle.as_str(), hash)
+                .map_err(err)?;
             Ok(())
         })
     }
 
     pub fn set_pepper(&self, pepper: &[u8; 32]) -> Result<(), String> {
         self.write(|txn| {
-            txn.open_table(META).map_err(err)?.insert("pepper", &pepper[..]).map_err(err)?;
+            txn.open_table(META)
+                .map_err(err)?
+                .insert("pepper", &pepper[..])
+                .map_err(err)?;
             Ok(())
         })
     }
 
-    fn write(&self, f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>) -> Result<(), String> {
+    fn write(
+        &self,
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>,
+    ) -> Result<(), String> {
         let txn = self.db.begin_write().map_err(err)?;
         f(&txn)?;
         txn.commit().map_err(err)

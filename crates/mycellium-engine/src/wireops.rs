@@ -18,7 +18,10 @@ use mycellium_core::userid::user_id;
 use mycellium_core::x3dh;
 
 /// The AEAD associated data binding a message to both parties' identity keys.
-pub fn associated_data(initiator_ik: &MessagingPublicKey, responder_ik: &MessagingPublicKey) -> Vec<u8> {
+pub fn associated_data(
+    initiator_ik: &MessagingPublicKey,
+    responder_ik: &MessagingPublicKey,
+) -> Vec<u8> {
     let mut ad = Vec::with_capacity(64);
     ad.extend_from_slice(&initiator_ik.0);
     ad.extend_from_slice(&responder_ik.0);
@@ -44,7 +47,12 @@ pub fn random_id<P: Platform>(platform: &mut P) -> String {
 
 /// Wrap a message `body` into an [`AppMessage`] with a fresh id + timestamp.
 pub fn app_message<P: Platform>(platform: &mut P, body: Body) -> AppMessage {
-    AppMessage { id: random_id(platform), timestamp: platform.now_unix_secs(), expires_at: None, body }
+    AppMessage {
+        id: random_id(platform),
+        timestamp: platform.now_unix_secs(),
+        expires_at: None,
+        body,
+    }
 }
 
 /// A plain-text application message (no expiry).
@@ -119,8 +127,10 @@ pub fn seal_to<P: Platform>(
     let responder_ik = device.id_key;
     let responder_spk = device.signed_pre_key.public;
     // Fails closed if the recipient device published a low-order key.
-    let initiated = x3dh::initiate(platform, identity, &responder_ik, &responder_spk).map_err(|e| anyhow!("{e}"))?;
-    let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk).map_err(|e| anyhow!("{e}"))?;
+    let initiated = x3dh::initiate(platform, identity, &responder_ik, &responder_spk)
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk)
+        .map_err(|e| anyhow!("{e}"))?;
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
     let sealed = ratchet.encrypt(plaintext, &ad);
     Ok(Envelope {
@@ -134,8 +144,14 @@ pub fn seal_to<P: Platform>(
 
 /// Decrypt an incoming envelope, verifying the sender's self-record binds their
 /// name, identity key, and handshake.
-pub fn open_envelope<P: Platform>(platform: &mut P, identity: &Identity, env: &Envelope) -> Result<(Handle, Vec<u8>)> {
-    env.sender_record.verify().map_err(|_| anyhow!("sender record failed verification"))?;
+pub fn open_envelope<P: Platform>(
+    platform: &mut P,
+    identity: &Identity,
+    env: &Envelope,
+) -> Result<(Handle, Vec<u8>)> {
+    env.sender_record
+        .verify()
+        .map_err(|_| anyhow!("sender record failed verification"))?;
     // The envelope carries the sender's plaintext name for display; it's
     // self-verifying — its id must equal the id in the wallet-signed record.
     if user_id(env.from.as_str()) != env.sender_record.record.handle {
@@ -147,7 +163,8 @@ pub fn open_envelope<P: Platform>(platform: &mut P, identity: &Identity, env: &E
     let shared = x3dh::respond(identity, &env.init).map_err(|e| anyhow!("{e}"))?;
     let mut ratchet = Ratchet::new_responder(&shared, identity);
     let ad = associated_data(&env.init.initiator_ik, &identity.messaging_public());
-    let plaintext =
-        ratchet.decrypt(platform, &env.message, &ad).map_err(|_| anyhow!("could not decrypt message"))?;
+    let plaintext = ratchet
+        .decrypt(platform, &env.message, &ad)
+        .map_err(|_| anyhow!("could not decrypt message"))?;
     Ok((env.from.clone(), plaintext))
 }
