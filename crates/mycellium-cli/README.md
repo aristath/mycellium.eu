@@ -40,6 +40,8 @@ rendering. No protocol logic lives here; every command dispatches straight into
 | `forward <message_id> --from <p> --to <p> --as <me>` | Forward a stored message to another peer. |
 | `announce --as <me>` / `presence <peer>` | Heartbeat the directory / check if a handle is online. |
 | `verify <peer> [--confirm]` | Show the safety number + trust state (unverified / pinned / verified / **changed**); `--confirm` marks the peer verified after you compare it out of band. |
+| `card <handle>` | Print your own contact card (a QR + code) for a peer to scan and verify you. |
+| `verify-card <card>` | Verify a peer from their contact card — compares it against the directory record; a mismatch fails closed. |
 
 **Groups**
 

@@ -276,6 +276,18 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
+    /// Show your own contact card (QR + code) for a peer to scan and verify you.
+    Card {
+        /// Your handle.
+        handle: String,
+    },
+    /// Verify a peer from their contact card (compares it to the directory record).
+    VerifyCard {
+        /// The card string a peer showed you (from their `card`).
+        card: String,
+        #[arg(long, default_value = DEFAULT_DIRECTORY)]
+        directory: String,
+    },
     /// Block a handle (its messages are dropped).
     Block {
         /// The handle to block.
@@ -623,6 +635,15 @@ fn main() -> Result<()> {
             confirm,
             directory,
         } => verify(&peer, &directory, confirm),
+        Command::Card { handle } => {
+            let card = contact_card(&handle)?;
+            println!("Contact card for '{handle}' — show this to a peer to verify you:\n");
+            print_qr(&card);
+            println!("\n{card}\n");
+            println!("They run:  mycellium verify-card {card}");
+            Ok(())
+        }
+        Command::VerifyCard { card, directory } => verify_card(&card, &directory),
         Command::Expire { action } => match action {
             ExpireAction::Set { target, duration } => expire_set(&target, &duration),
             ExpireAction::Clear { target } => expire_clear(&target),
@@ -906,5 +927,17 @@ fn render_incoming(bytes: &[u8]) -> (String, Option<u64>, String) {
             None,
             String::from_utf8_lossy(bytes).into_owned(),
         ),
+    }
+}
+
+/// Render `text` as a scannable QR in the terminal (dense half-block unicode).
+/// Best-effort — if the payload is too large for a QR, the printed code still works.
+fn print_qr(text: &str) {
+    if let Ok(code) = qrcode::QrCode::new(text) {
+        let img = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        println!("{img}");
     }
 }

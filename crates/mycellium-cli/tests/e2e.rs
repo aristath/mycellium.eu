@@ -1843,6 +1843,38 @@ fn verify_shows_matching_safety_numbers() {
 }
 
 #[test]
+fn contact_card_verifies_a_peer() {
+    let _throttle = throttle();
+    let dir = start_directory();
+    let alice = account(&dir, "alice");
+    let bob = account(&dir, "bob");
+
+    // Bob prints his contact card.
+    let card_out = cli(&bob, &["card", "bob"]);
+    let out = String::from_utf8_lossy(&card_out.stdout);
+    let card = out
+        .lines()
+        .find(|l| l.contains("verify-card "))
+        .and_then(|l| l.split("verify-card ").nth(1))
+        .map(|s| s.trim().to_string())
+        .expect("card line in output");
+
+    // Alice verifies it — it matches the directory record → verified.
+    let v = cli(&alice, &["verify-card", &card, "--directory", &dir]);
+    assert!(
+        String::from_utf8_lossy(&v.stdout).contains("verified 'bob'"),
+        "card should verify: {}",
+        String::from_utf8_lossy(&v.stdout)
+    );
+    // And bob now reads as verified for alice.
+    let vb = cli(&alice, &["verify", "bob", "--directory", &dir]);
+    assert!(
+        String::from_utf8_lossy(&vb.stdout).contains("✓ verified"),
+        "bob should now be verified"
+    );
+}
+
+#[test]
 fn verify_confirm_marks_a_peer_verified() {
     let _throttle = throttle();
     let dir = start_directory();

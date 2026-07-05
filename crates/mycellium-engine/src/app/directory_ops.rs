@@ -43,6 +43,56 @@ pub fn verify(peer: &str, directory: &str, confirm: bool) -> Result<()> {
     Ok(())
 }
 
+/// Emit **your own** contact card — a compact `{handle, wallet}` you show out of
+/// band (in person / a trusted channel) so a peer can verify you without reading
+/// a long safety number aloud. The wallet is public, so a card carries no secret.
+pub fn contact_card(handle: &str) -> Result<String> {
+    let identity = store::load_identity()?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let card = serde_json::json!({
+        "v": 1,
+        "h": handle.as_str(),
+        "w": hex(&identity.wallet_public().0),
+    })
+    .to_string();
+    Ok(hex(card.as_bytes()))
+}
+
+/// Verify a peer's contact card: parse it, look up its handle in the directory,
+/// and compare the card's wallet (which reached you *out of band*) against the
+/// record the directory serves. A **match** means the directory is honest for that
+/// handle, so we mark it verified. A **mismatch** means the directory handed you a
+/// different identity — a MITM — so we refuse.
+pub fn verify_card(card: &str, directory: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let bytes = from_hex(card.trim()).map_err(|_| anyhow!("invalid contact card"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid contact card"))?;
+    let handle = v["h"].as_str().ok_or_else(|| anyhow!("malformed card"))?;
+    let card_wallet = v["w"].as_str().ok_or_else(|| anyhow!("malformed card"))?;
+    let handle_h = Handle::new(handle).map_err(|_| anyhow!("invalid handle in card"))?;
+
+    let client = DirectoryClient::new(directory);
+    let record = client
+        .lookup(&handle_h)
+        .map_err(|_| anyhow!("no record for '{handle}' — is the handle registered?"))?;
+    record
+        .verify()
+        .map_err(|_| anyhow!("that handle's record failed verification"))?;
+
+    if hex(&record.record.wallet.0) != card_wallet {
+        bail!(
+            "⚠ MISMATCH: the card for '{handle}' does NOT match the directory's record.\n   \
+             Either the directory is serving a different identity (a possible MITM), or the\n   \
+             card is stale/forged. Do NOT trust this identity."
+        );
+    }
+    verified::mark(&mut fs, handle, &record.record.wallet)?;
+    println!("✓ verified '{handle}' from its contact card — the directory's record matches.");
+    Ok(())
+}
+
 pub fn presence(peer: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;

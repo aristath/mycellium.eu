@@ -20,6 +20,8 @@ anyhow = "1"
 getrandom = "0.2"
 # Terminal UI for interactive chat (bundles crossterm).
 ratatui = "0.29"
+# Render contact cards / pairing offers as scannable terminal QR codes.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # Tests spin up an in-process directory + queue; the client depends on neither.
