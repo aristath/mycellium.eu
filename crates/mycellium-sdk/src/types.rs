@@ -88,6 +88,17 @@ pub struct Contact {
     pub trust: TrustLevel,
 }
 
+/// A group conversation this account belongs to.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Group {
+    /// The stable group id.
+    pub id: String,
+    /// The human-readable group name.
+    pub name: String,
+    /// The member handles (including this account).
+    pub members: Vec<String>,
+}
+
 /// This device's own account, for the profile/settings screen.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Account {

@@ -22,9 +22,13 @@
 //!   Keychain) *underneath this same API*, replacing the sidecar identity file
 //!   without changing the foreign contract.
 //!
-//! Scope of this increment (issue #64): a correct, building, testable
-//! identity → register → send → sync → read core over native storage. Groups,
-//! pairing, contacts, verification, backup, and the C-ABI are follow-ups.
+//! Scope (issue #64): the full messaging surface over native storage —
+//! identity → register → send/reply/react/delete/file → sync → read, plus
+//! contacts, out-of-band verification, seedless device pairing, groups, and a
+//! store backup/restore. Inbound blobs are written to a durable retry store
+//! before processing, so a not-yet-decryptable item is retried, not dropped.
+//! The C-ABI desktop surface and generated Kotlin/Swift binding smoke tests are
+//! the remaining follow-ups.
 
 uniffi::setup_scaffolding!();
 
@@ -33,5 +37,6 @@ pub mod types;
 
 pub use client::MyceliumClient;
 pub use types::{
-    Account, Contact, Conversation, DeliveryState, EventListener, Message, SdkError, TrustLevel,
+    Account, Contact, Conversation, DeliveryState, EventListener, Group, Message, SdkError,
+    TrustLevel,
 };

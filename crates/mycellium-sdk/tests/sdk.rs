@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mycellium_sdk::{DeliveryState, EventListener, Message, MyceliumClient};
+use mycellium_sdk::{DeliveryState, EventListener, Message, MyceliumClient, TrustLevel};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -207,6 +207,149 @@ fn config_persists_across_reopen() {
     let acct = reopened.account();
     assert_eq!(acct.handle, "carol");
     assert_eq!(acct.name, "Carol");
+}
+
+/// Register two fresh clients (alice, bob) against `dir`/`queue`.
+fn two_clients(dir: &str, queue: &str) -> (Arc<MyceliumClient>, Arc<MyceliumClient>) {
+    let alice =
+        MyceliumClient::new(data_dir("alice").to_string_lossy().into_owned()).expect("open alice");
+    let bob =
+        MyceliumClient::new(data_dir("bob").to_string_lossy().into_owned()).expect("open bob");
+    alice
+        .register(dir.into(), queue.into(), "alice".into(), "Alice".into())
+        .expect("alice register");
+    bob.register(dir.into(), queue.into(), "bob".into(), "Bob".into())
+        .expect("bob register");
+    (alice, bob)
+}
+
+#[test]
+fn contacts_and_verification() {
+    let dir = start_directory();
+    let queue = ensure_queue();
+    let (alice, bob) = two_clients(&dir, &queue);
+
+    // Safety numbers are symmetric across both devices.
+    assert_eq!(
+        alice.safety_number("bob".into()).expect("alice sn"),
+        bob.safety_number("alice".into()).expect("bob sn"),
+    );
+
+    // Add + TOFU-pin a contact.
+    alice
+        .add_contact("bobby".into(), "bob".into())
+        .expect("add contact");
+    let contacts = alice.contacts();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0].nickname, "bobby");
+    assert_eq!(contacts[0].handle, "bob");
+    assert_eq!(contacts[0].trust, TrustLevel::Pinned);
+    assert_eq!(
+        alice.trust_level("bob".into()).expect("trust level"),
+        TrustLevel::Pinned
+    );
+
+    // Mark verified out of band — trust rises to Verified.
+    alice.mark_verified("bob".into()).expect("mark verified");
+    assert_eq!(
+        alice.trust_level("bob".into()).expect("trust level 2"),
+        TrustLevel::Verified
+    );
+    assert_eq!(alice.contacts()[0].trust, TrustLevel::Verified);
+
+    // A contact card round-trips: bob's card verifies against the directory.
+    let card = bob.contact_card().expect("bob card");
+    assert_eq!(alice.verify_card(card).expect("verify card"), "bob");
+
+    // Remove the contact.
+    alice.remove_contact("bobby".into()).expect("remove");
+    assert!(alice.contacts().is_empty());
+}
+
+#[test]
+fn group_create_send_thread() {
+    let dir = start_directory();
+    let queue = ensure_queue();
+    let (alice, bob) = two_clients(&dir, &queue);
+
+    // Alice creates the group; the invite is deposited to bob.
+    let gid = alice
+        .group_create("team".into(), vec!["bob".into()])
+        .expect("group create");
+
+    // Bob syncs to join (and reciprocate his sender key); alice learns bob's key.
+    let _ = bob.sync().expect("bob sync invite");
+    let _ = alice.sync().expect("alice sync invite");
+
+    // Alice sends to the group.
+    let sent = alice
+        .group_send(gid.clone(), "hello team".into())
+        .expect("group send");
+    assert!(sent.from_me);
+    assert_eq!(sent.sender, "alice");
+
+    // Bob syncs and decrypts the group message.
+    let inbound = bob.sync().expect("bob sync text");
+    assert!(
+        inbound.iter().any(|m| m.text == "hello team"),
+        "bob should receive the group message"
+    );
+
+    // Bob's group thread shows it, attributed to alice.
+    let thread = bob.group_thread(gid.clone()).expect("bob group thread");
+    assert!(thread
+        .iter()
+        .any(|m| m.text == "hello team" && m.sender == "alice" && !m.from_me));
+
+    // The group appears in bob's group list with its name + members.
+    let groups = bob.groups();
+    let g = groups.iter().find(|g| g.id == gid).expect("group in list");
+    assert_eq!(g.name, "team");
+    assert!(g.members.iter().any(|m| m == "bob"));
+    assert!(g.members.iter().any(|m| m == "alice"));
+
+    // Alice's own transcript records the sent copy.
+    let alice_thread = alice.group_thread(gid).expect("alice group thread");
+    assert!(alice_thread
+        .iter()
+        .any(|m| m.text == "hello team" && m.from_me));
+}
+
+#[test]
+fn reply_and_react_round_trip() {
+    let dir = start_directory();
+    let queue = ensure_queue();
+    let (alice, bob) = two_clients(&dir, &queue);
+
+    // Alice sends; bob receives and learns the message id.
+    alice
+        .send_text("bob".into(), "original".into())
+        .expect("send");
+    let inbound = bob.sync().expect("bob sync");
+    assert_eq!(inbound.len(), 1);
+    let orig_id = inbound[0].id.clone();
+
+    // Bob replies to it.
+    let reply = bob
+        .reply("alice".into(), orig_id.clone(), "a reply".into())
+        .expect("reply");
+    assert!(reply.from_me);
+    assert!(reply.text.contains("a reply"));
+
+    // Alice receives the reply.
+    let got = alice.sync().expect("alice sync reply");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].text.contains("a reply"));
+    assert!(!got[0].from_me);
+
+    // Bob reacts to the original; alice receives the reaction.
+    let react = bob
+        .react("alice".into(), orig_id, "👍".into())
+        .expect("react");
+    assert!(react.text.contains("👍"));
+    let got2 = alice.sync().expect("alice sync react");
+    assert_eq!(got2.len(), 1);
+    assert!(got2[0].text.contains("👍"));
 }
 
 /// A newtype so the callback-interface `Box<dyn EventListener>` can wrap our
