@@ -2572,6 +2572,9 @@ dependencies = [
 name = "mycellium-sdk"
 version = "0.0.0"
 dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
  "mycellium-core",
  "mycellium-directory",
  "mycellium-directory-client",

@@ -31,6 +31,7 @@ use mycellium_queue_client::{wallet_hex, QueueClient};
 use mycellium_core::platform::Platform;
 use mycellium_storage::filestore::FileStore;
 
+use crate::secrets::{PlaintextFileSecretStore, SecretStore};
 use crate::types::{
     Account, Contact, Conversation, DeliveryState, EventListener, Group, Message, SdkError,
     TrustLevel,
@@ -44,6 +45,11 @@ const MAX_ATTACHMENT: usize = 256 * 1024;
 // for desktop clients) and smoke tests that load the *generated* Kotlin/Swift
 // bindings. The Rust messaging/contacts/verification/pairing/groups/backup
 // surface below is complete and covered by `tests/sdk.rs`.
+//
+// #65 is addressed: the identity secret is now held behind a `SecretStore`
+// (see `secrets.rs`), which platform apps back with the OS keystore. The
+// remaining follow-up is shipping the per-OS `SecretStore` adapters described in
+// `docs/research/SECURE-STORAGE.md`.
 
 /// The mailbox slot for account-wide items (matches the engine's `ACCOUNT_SLOT`).
 const ACCOUNT_SLOT: &str = "account";
@@ -55,15 +61,21 @@ const K_QUEUE: &[u8] = b"myc:queue";
 const K_HANDLE: &[u8] = b"myc:handle";
 const K_NAME: &[u8] = b"myc:name";
 
-/// The device identity's persistable secret. Lives in a sidecar file under
-/// `data_dir` (NOT inside the [`FileStore`], which is itself keyed by the
-/// identity, so it can't hold its own key). #65 replaces this with an
-/// OS-secure-storage adapter behind the same API.
+/// The device identity's persistable secret. Held behind a [`SecretStore`] (NOT
+/// inside the [`FileStore`], which is itself keyed by the identity, so it can't
+/// hold its own key). The platform app chooses where it physically lives —
+/// OS keystore in production, a passphrase/plaintext file for dev (#65).
+///
+/// The wire form (JSON of this struct) is unchanged from the legacy
+/// `identity.json` sidecar, so a sidecar migrates into the store byte-for-byte.
 #[derive(Serialize, Deserialize)]
 struct StoredIdentity {
     wallet_secret: [u8; 32],
     device_seed: [u8; 32],
 }
+
+/// The [`SecretStore`] key under which the identity secret is held.
+const IDENTITY_KEY: &str = "identity";
 
 /// Client configuration, persisted in the store and cached in memory.
 #[derive(Default, Clone)]
@@ -76,10 +88,13 @@ struct Config {
 
 /// The locked interior: everything one client instance owns.
 struct Inner {
-    /// The data-dir root (holds the identity sidecar + the `store/` directory).
-    /// Kept so pairing can re-key the store and backup can snapshot it.
+    /// The data-dir root (holds the `store/` directory). Kept so pairing can
+    /// re-key the store and backup can snapshot it.
     root: PathBuf,
     store: FileStore,
+    /// Where the identity secret is held. Pairing re-stores the adopted account
+    /// key here.
+    secrets: Box<dyn SecretStore>,
     identity: Identity,
     config: Config,
     listener: Option<Arc<dyn EventListener>>,
@@ -98,14 +113,28 @@ pub struct MyceliumClient {
 
 #[uniffi::export]
 impl MyceliumClient {
-    /// Open (or create) a client rooted at `data_dir`: load-or-create the device
-    /// identity, open its encrypted store, and load any persisted config.
+    /// Open (or create) a client rooted at `data_dir`, holding the identity secret
+    /// through the app-supplied [`SecretStore`].
+    ///
+    /// This is the constructor **production apps use**: pass a [`SecretStore`]
+    /// backed by the OS keystore (Keychain / Keystore / DPAPI / libsecret — see
+    /// `docs/research/SECURE-STORAGE.md`), so the account's root key never sits in
+    /// plaintext on disk.
+    ///
+    /// Loads the identity from `store.load("identity")` if present; otherwise, if a
+    /// legacy plaintext `data_dir/identity.json` sidecar exists it is imported into
+    /// the store and removed (clean upgrade); otherwise a fresh identity is
+    /// generated and stored. The encrypted `data_dir/store` (history, config) is
+    /// then opened under that identity.
     #[uniffi::constructor]
-    pub fn new(data_dir: String) -> Result<Arc<Self>, SdkError> {
+    pub fn new_with_secret_store(
+        data_dir: String,
+        secrets: Box<dyn SecretStore>,
+    ) -> Result<Arc<Self>, SdkError> {
         let root = PathBuf::from(&data_dir);
         std::fs::create_dir_all(&root).map_err(SdkError::storage)?;
 
-        let identity = load_or_create_identity(&root)?;
+        let identity = load_or_create_identity(&root, secrets.as_ref())?;
         let store = FileStore::open(root.join("store"), identity.storage_key())
             .map_err(SdkError::storage)?;
         let config = Config {
@@ -119,12 +148,32 @@ impl MyceliumClient {
             inner: Mutex::new(Inner {
                 root,
                 store,
+                secrets,
                 identity,
                 config,
                 listener: None,
                 pairing: None,
             }),
         }))
+    }
+
+    /// Open (or create) a client rooted at `data_dir` using the **dev-only**
+    /// plaintext-file secret store (`data_dir/secrets/`, best-effort `0600`).
+    ///
+    /// **Production apps MUST NOT use this.** It provides no at-rest
+    /// confidentiality for the account's root key — anyone who can read the file
+    /// reads the key. Real apps call
+    /// [`new_with_secret_store`](Self::new_with_secret_store) with a [`SecretStore`]
+    /// backed by the OS keystore; headless/server deployments can use
+    /// [`PassphraseFileSecretStore`](crate::PassphraseFileSecretStore) instead.
+    /// This convenience exists only for tests, local development, and the migration
+    /// path off the historical `identity.json` sidecar (#65).
+    #[uniffi::constructor]
+    pub fn new(data_dir: String) -> Result<Arc<Self>, SdkError> {
+        let secrets = Box::new(PlaintextFileSecretStore::new(
+            PathBuf::from(&data_dir).join("secrets"),
+        ));
+        Self::new_with_secret_store(data_dir, secrets)
     }
 
     /// This device's account (handle/name empty until `register`).
@@ -1033,7 +1082,7 @@ impl MyceliumClient {
 
         let new_identity =
             Identity::adopt(&mut OsPlatform, ws).map_err(|e| SdkError::crypto(format!("{e:?}")))?;
-        persist_identity(&inner.root, &new_identity)?;
+        store_identity(inner.secrets.as_ref(), &new_identity)?;
         // The store is keyed by the identity, so re-open it under the adopted
         // account's storage key (this device was fresh, so nothing is lost).
         let store = FileStore::open(inner.root.join("store"), new_identity.storage_key())
@@ -1074,49 +1123,58 @@ impl MyceliumClient {
     }
 }
 
-/// Load the persisted identity from `data_dir/identity.json`, or generate and
-/// persist a fresh one.
-fn load_or_create_identity(root: &std::path::Path) -> Result<Identity, SdkError> {
-    let path = root.join("identity.json");
-    if let Ok(bytes) = std::fs::read(&path) {
-        let stored: StoredIdentity = serde_json::from_slice(&bytes).map_err(SdkError::storage)?;
-        return Identity::from_wallet_secret(stored.wallet_secret, stored.device_seed)
-            .map_err(|e| SdkError::crypto(format!("{e:?}")));
+/// Load the identity from the [`SecretStore`], migrating a legacy plaintext
+/// `data_dir/identity.json` sidecar into the store if present, or generating and
+/// storing a fresh one.
+///
+/// Order: (1) the store already holds `"identity"` → decode it; (2) else a legacy
+/// sidecar exists → import it into the store, delete the sidecar, use it (clean
+/// upgrade for pre-#65 SDK data); (3) else generate a fresh identity and store it.
+fn load_or_create_identity(
+    root: &std::path::Path,
+    secrets: &dyn SecretStore,
+) -> Result<Identity, SdkError> {
+    if let Some(bytes) = secrets.load(IDENTITY_KEY.to_string())? {
+        return decode_identity(&bytes);
     }
+
+    // Migration: a legacy plaintext sidecar upgrades into the store, then the
+    // plaintext copy is removed. Its bytes are the same JSON form we store, so it
+    // imports verbatim (and is validated by `decode_identity`).
+    let legacy = root.join("identity.json");
+    if let Ok(bytes) = std::fs::read(&legacy) {
+        let identity = decode_identity(&bytes)?;
+        secrets.store(IDENTITY_KEY.to_string(), bytes)?;
+        let _ = std::fs::remove_file(&legacy);
+        return Ok(identity);
+    }
+
     let identity =
         Identity::generate(&mut OsPlatform).map_err(|e| SdkError::crypto(format!("{e:?}")))?;
-    persist_identity(root, &identity)?;
+    store_identity(secrets, &identity)?;
     Ok(identity)
 }
 
-/// Write `identity`'s persistable secret to `root/identity.json` (owner-only where
-/// supported). Used at first-run and when device pairing adopts a new account.
-fn persist_identity(root: &std::path::Path, identity: &Identity) -> Result<(), SdkError> {
-    let path = root.join("identity.json");
+/// Persist `identity`'s secret through the [`SecretStore`]. Used at first-run and
+/// when device pairing adopts a new account.
+fn store_identity(secrets: &dyn SecretStore, identity: &Identity) -> Result<(), SdkError> {
+    secrets.store(IDENTITY_KEY.to_string(), encode_identity(identity)?)
+}
+
+/// Serialize `identity`'s persistable secret to the stored JSON form.
+fn encode_identity(identity: &Identity) -> Result<Vec<u8>, SdkError> {
     let stored = StoredIdentity {
         wallet_secret: identity.wallet_secret(),
         device_seed: identity.device_seed(),
     };
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&stored).map_err(SdkError::storage)?,
-    )
-    .map_err(SdkError::storage)?;
-    restrict_secret_file(&path);
-    Ok(())
+    serde_json::to_vec(&stored).map_err(SdkError::storage)
 }
 
-/// Best-effort tighten the sidecar identity file to owner-only (0600) on Unix,
-/// so the device secret isn't world-readable. (#65 replaces this sidecar with
-/// OS-secure storage.)
-fn restrict_secret_file(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+/// Reconstruct an [`Identity`] from its stored JSON secret form.
+fn decode_identity(bytes: &[u8]) -> Result<Identity, SdkError> {
+    let stored: StoredIdentity = serde_json::from_slice(bytes).map_err(SdkError::storage)?;
+    Identity::from_wallet_secret(stored.wallet_secret, stored.device_seed)
+        .map_err(|e| SdkError::crypto(format!("{e:?}")))
 }
 
 /// Publish our record, merging this device into any record that already exists

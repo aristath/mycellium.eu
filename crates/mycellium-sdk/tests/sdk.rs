@@ -9,7 +9,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mycellium_sdk::{DeliveryState, EventListener, Message, MyceliumClient, TrustLevel};
+use std::collections::HashMap;
+
+use mycellium_sdk::{
+    DeliveryState, EventListener, Message, MyceliumClient, PassphraseFileSecretStore, SdkError,
+    SecretStore, TrustLevel,
+};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -368,4 +373,181 @@ impl EventListener for RecorderHandle {
     fn on_pairing(&self, event: String) {
         self.0.on_pairing(event);
     }
+}
+
+// ---- secret-store integration (#65) -------------------------------------------
+
+/// An in-memory `SecretStore` standing in for a platform's OS keystore. Its map is
+/// shared behind an `Arc`, so a "reopen" (a fresh handle over the same map) sees
+/// what the previous instance stored — the way a real keystore persists.
+#[derive(Clone, Default)]
+struct MockSecretStore {
+    map: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+impl SecretStore for MockSecretStore {
+    fn store(&self, key: String, secret: Vec<u8>) -> Result<(), SdkError> {
+        self.map.lock().unwrap().insert(key, secret);
+        Ok(())
+    }
+    fn load(&self, key: String) -> Result<Option<Vec<u8>>, SdkError> {
+        Ok(self.map.lock().unwrap().get(&key).cloned())
+    }
+    fn delete(&self, key: String) -> Result<(), SdkError> {
+        self.map.lock().unwrap().remove(&key);
+        Ok(())
+    }
+}
+
+#[test]
+fn mock_secret_store_drives_sdk_end_to_end() {
+    let dir = start_directory();
+    let queue = ensure_queue();
+
+    // Two accounts whose identity secrets live only in the (in-memory) store.
+    let alice_secrets = MockSecretStore::default();
+    let bob_secrets = MockSecretStore::default();
+    let bob_dir = data_dir("bob-mock");
+
+    let alice = MyceliumClient::new_with_secret_store(
+        data_dir("alice-mock").to_string_lossy().into_owned(),
+        Box::new(alice_secrets),
+    )
+    .expect("open alice");
+    let bob = MyceliumClient::new_with_secret_store(
+        bob_dir.to_string_lossy().into_owned(),
+        Box::new(bob_secrets.clone()),
+    )
+    .expect("open bob");
+
+    // The identity secret was persisted through the store, not to a sidecar file.
+    assert!(
+        bob_secrets.map.lock().unwrap().contains_key("identity"),
+        "identity must be held in the SecretStore"
+    );
+    assert!(
+        !bob_dir.join("identity.json").exists(),
+        "no plaintext identity.json sidecar should be written"
+    );
+
+    alice
+        .register(dir.clone(), queue.clone(), "alice".into(), "Alice".into())
+        .expect("alice register");
+    bob.register(dir.clone(), queue.clone(), "bob".into(), "Bob".into())
+        .expect("bob register");
+
+    let bob_wallet = bob.wallet_address();
+
+    // A real send/sync round-trips through the store-backed identities.
+    alice
+        .send_text("bob".into(), "hi via keystore".into())
+        .expect("alice send");
+    let inbound = bob.sync().expect("bob sync");
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].text, "hi via keystore");
+
+    // Reopen bob with a fresh handle over the *same* store map: identity and
+    // config persist because the identity was loaded back out of the store.
+    drop(bob);
+    let bob2 = MyceliumClient::new_with_secret_store(
+        bob_dir.to_string_lossy().into_owned(),
+        Box::new(bob_secrets),
+    )
+    .expect("reopen bob");
+    assert_eq!(
+        bob2.wallet_address(),
+        bob_wallet,
+        "identity must persist across reopen through the store"
+    );
+    assert_eq!(bob2.account().handle, "bob");
+    let thread = bob2.thread("alice".into()).expect("thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(thread[0].text, "hi via keystore");
+}
+
+#[test]
+fn passphrase_store_round_trips_and_fails_closed() {
+    let dir = data_dir("passphrase-store");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let store = PassphraseFileSecretStore::new(dir.clone(), "correct horse battery staple");
+    let secret = b"a very secret 32-byte-ish blob!!".to_vec();
+
+    // A missing key is `None`, not an error.
+    assert!(store.load("identity".into()).unwrap().is_none());
+
+    // Round-trip: store then load returns the exact bytes.
+    store.store("identity".into(), secret.clone()).unwrap();
+    assert_eq!(store.load("identity".into()).unwrap(), Some(secret.clone()));
+
+    // The on-disk file must not contain the plaintext (it's AEAD-sealed).
+    let on_disk = std::fs::read(dir.join("identity")).unwrap();
+    assert!(
+        on_disk
+            .windows(secret.len())
+            .all(|w| w != secret.as_slice()),
+        "plaintext secret must not appear on disk"
+    );
+
+    // Wrong passphrase fails closed (an error, never a wrong/empty plaintext).
+    let wrong = PassphraseFileSecretStore::new(dir.clone(), "wrong passphrase");
+    assert!(
+        wrong.load("identity".into()).is_err(),
+        "a wrong passphrase must fail closed"
+    );
+
+    // Delete removes it; a second delete is a no-op.
+    store.delete("identity".into()).unwrap();
+    assert!(store.load("identity".into()).unwrap().is_none());
+    store.delete("identity".into()).unwrap();
+}
+
+#[test]
+fn legacy_sidecar_migrates_into_store_then_is_removed() {
+    // Produce a *real* identity secret by opening a client over a mock store, then
+    // read the stored bytes back out — that is exactly the legacy sidecar's JSON.
+    let seed_secrets = MockSecretStore::default();
+    let seed = MyceliumClient::new_with_secret_store(
+        data_dir("migrate-seed").to_string_lossy().into_owned(),
+        Box::new(seed_secrets.clone()),
+    )
+    .expect("seed client");
+    let wallet = seed.wallet_address();
+    let identity_bytes = seed_secrets
+        .map
+        .lock()
+        .unwrap()
+        .get("identity")
+        .cloned()
+        .expect("seed identity stored");
+
+    // Plant it as a legacy plaintext sidecar in a fresh data dir with an *empty*
+    // store, then open a client there.
+    let dd = data_dir("migrate-target");
+    std::fs::create_dir_all(&dd).unwrap();
+    std::fs::write(dd.join("identity.json"), &identity_bytes).unwrap();
+
+    let target_secrets = MockSecretStore::default();
+    let client = MyceliumClient::new_with_secret_store(
+        dd.to_string_lossy().into_owned(),
+        Box::new(target_secrets.clone()),
+    )
+    .expect("open migrating client");
+
+    // The migrated identity is the same account...
+    assert_eq!(
+        client.wallet_address(),
+        wallet,
+        "migrated identity must match the sidecar"
+    );
+    // ...it was imported into the store...
+    assert_eq!(
+        target_secrets.map.lock().unwrap().get("identity"),
+        Some(&identity_bytes),
+        "sidecar must be imported into the store byte-for-byte"
+    );
+    // ...and the plaintext sidecar is gone.
+    assert!(
+        !dd.join("identity.json").exists(),
+        "the legacy sidecar must be removed after migration"
+    );
 }

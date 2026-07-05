@@ -9,18 +9,23 @@
 //!
 //! ## Ownership of secrets and storage
 //!
-//! All persistent state lives under the `data_dir` passed to
-//! [`client::MyceliumClient::new`]:
+//! The bulk of persistent state lives under the `data_dir` passed to the
+//! constructor; the **identity secret** is held separately behind a
+//! [`secrets::SecretStore`]:
 //!
-//! - The device **identity secret** (wallet secret + device seed) is written to
-//!   `data_dir/identity.json`. The message history, learned names, and config
-//!   snapshot live in `data_dir/store`, an encrypted [`mycellium_storage`]
-//!   `FileStore` keyed by the identity itself.
+//! - The device **identity secret** (wallet secret + device seed) is persisted
+//!   through a [`secrets::SecretStore`] the platform app supplies — backed by the
+//!   OS keystore (Keychain / Keystore / DPAPI / libsecret). Only that small,
+//!   high-value key material goes through the store. See
+//!   `docs/research/SECURE-STORAGE.md` and issue #65.
+//! - The message history, learned names, and config snapshot live in
+//!   `data_dir/store`, an encrypted [`mycellium_storage`] `FileStore` keyed by the
+//!   identity itself (so it cannot hold its own key — hence the separate store).
 //! - The SDK **never logs secrets** and never returns key material across the
 //!   boundary except the public wallet address (a stable, shareable account id).
-//! - Issue #65 will slot OS-secure-storage adapters (Android Keystore / iOS
-//!   Keychain) *underneath this same API*, replacing the sidecar identity file
-//!   without changing the foreign contract.
+//! - [`client::MyceliumClient::new`] is a **dev-only** convenience that defaults to
+//!   a plaintext-file store; production apps MUST call
+//!   [`client::MyceliumClient::new_with_secret_store`] with an OS-backed store.
 //!
 //! Scope (issue #64): the full messaging surface over native storage —
 //! identity → register → send/reply/react/delete/file → sync → read, plus
@@ -33,9 +38,11 @@
 uniffi::setup_scaffolding!();
 
 pub mod client;
+pub mod secrets;
 pub mod types;
 
 pub use client::MyceliumClient;
+pub use secrets::{PassphraseFileSecretStore, PlaintextFileSecretStore, SecretStore};
 pub use types::{
     Account, Contact, Conversation, DeliveryState, EventListener, Group, Message, SdkError,
     TrustLevel,
