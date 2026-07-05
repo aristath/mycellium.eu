@@ -1,0 +1,4 @@
+module mycellium_sdkFFI {
+    header "mycellium_sdkFFI.h"
+    export *
+}

@@ -25,6 +25,8 @@ jobs:
         run: cargo test --workspace
       - name: no_std core builds without std
         run: cargo build -p mycellium-core --no-default-features
+      - name: SDK bindings smoke test (Kotlin + Swift generate)
+        run: ./crates/mycellium-sdk/bindings/generate.sh
 
   wasm:
     name: wasm build
