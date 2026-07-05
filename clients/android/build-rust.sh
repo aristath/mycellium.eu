@@ -29,7 +29,9 @@ binding_dir="$app_dir/build/generated/uniffi"
 # arm64-v8a  -> aarch64-linux-android      (modern phones)
 # armeabi-v7a-> armv7-linux-androideabi    (older 32-bit phones)
 # x86_64     -> x86_64-linux-android       (emulator on x86 hosts)
-abis=(arm64-v8a armeabi-v7a x86_64)
+# Override with ANDROID_ABIS (space-separated) — CI builds just x86_64 for speed,
+# which is enough for the emulator + a build/compile check.
+read -r -a abis <<< "${ANDROID_ABIS:-arm64-v8a armeabi-v7a x86_64}"
 
 command -v cargo >/dev/null || { echo "error: cargo not found (install Rust)" >&2; exit 1; }
 command -v cargo-ndk >/dev/null || {
