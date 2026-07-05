@@ -15,6 +15,7 @@ path = "src/main.rs"
 # The reusable directory logic; this crate is just the deployable shell (args,
 # and — later — config, TLS, persistence wiring).
 mycellium-directory = { path = "../mycellium-directory" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints.rust]
 unsafe_code = "forbid"

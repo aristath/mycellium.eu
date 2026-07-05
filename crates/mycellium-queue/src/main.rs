@@ -9,7 +9,8 @@ use std::process::exit;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8090";
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let addr = resolve_addr();
     println!(
         "mycellium-queue {} — store-and-forward on http://{addr}",
@@ -17,7 +18,7 @@ fn main() {
     );
     println!("  routes: /health · /login/{{challenge,verify}} · /mailbox/{{wallet}}/{{slot}}");
     println!("  holds opaque E2E blobs keyed by wallet; reads nothing");
-    if let Err(err) = mycellium_queue::serve(&addr) {
+    if let Err(err) = mycellium_queue::serve(&addr).await {
         eprintln!("mycellium-queue failed: {err}");
         exit(1);
     }

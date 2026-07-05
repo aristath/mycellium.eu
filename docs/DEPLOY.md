@@ -65,7 +65,9 @@ manage in the app.
 
 ### Alternative: native TLS
 
-For a single-box deploy without a proxy, point the services at PEM files:
+For a single-box deploy without a proxy, point the services at PEM files — TLS is
+terminated in-process by **rustls** (a pure-Rust, memory-safe stack; no system
+OpenSSL needed):
 
 ```sh
 export MYCELLIUM_TLS_CERT=/etc/mycellium/cert.pem
@@ -73,7 +75,10 @@ export MYCELLIUM_TLS_KEY=/etc/mycellium/key.pem
 mycellium-server --addr 0.0.0.0:443
 ```
 
-You are then responsible for certificate renewal (e.g. a certbot cron).
+You are then responsible for certificate renewal (e.g. a certbot cron). On
+`SIGTERM`/`SIGINT` the service shuts down gracefully — in-flight requests drain
+(up to 10s) and the durable store closes cleanly — so a rolling restart drops no
+work.
 
 ## Observability
 
@@ -167,8 +172,9 @@ services with separate trust.
   balancer; the durable store moves to Postgres for multi-node (roadmap T0.1).
 - The **queue** is per-recipient store-and-forward; shard by recipient wallet
   when one node isn't enough.
-- Both serve on a worker-thread pool today (roadmap T0.2); validate under load
-  before a large launch (T2.4).
+- Both serve on an async runtime (**axum + hyper + tokio**, via the shared
+  `mycellium-serve` crate), so a single node handles many concurrent connections
+  on a small thread pool; validate under load before a large launch (T2.4).
 
 See [PRODUCTION-READINESS.md](PRODUCTION-READINESS.md) for what's done and what's
 left.

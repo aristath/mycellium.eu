@@ -12,7 +12,8 @@ use std::process::exit;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let addr = resolve_addr();
     println!(
         "mycellium-server {} — hosting the directory on http://{addr}",
@@ -20,7 +21,7 @@ fn main() {
     );
     println!("  routes: /health · /login/{{challenge,verify}} · /auth/{{start,confirm,status}} · /records/{{handle}} · /presence/{{handle}} · /metrics");
     println!("  untrusted: stores signed records + presence; holds no keys, reads no content");
-    if let Err(err) = mycellium_directory::serve(&addr) {
+    if let Err(err) = mycellium_directory::serve(&addr).await {
         eprintln!("mycellium-server failed: {err}");
         exit(1);
     }

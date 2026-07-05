@@ -191,9 +191,10 @@ blocking XHR never touches the UI thread) and talks to it by RPC. Full walk-thro
 
 Both services are durable when `MYCELLIUM_DATA` is set: the directory keeps
 bindings, records, and email claims in embedded **redb**; the queue keeps mailboxes,
-Web Push subscriptions, and its VAPID keypair. Both run a small worker-thread pool,
+Web Push subscriptions, and its VAPID keypair. Both run on a shared async runtime
+(**axum + hyper + tokio**, the `mycellium-serve` crate) with graceful shutdown,
 cap request bodies, emit permissive CORS (browser clients call them directly), can
-terminate TLS natively (`MYCELLIUM_TLS_*`) or sit behind a proxy, and expose
+terminate TLS natively with **rustls** (`MYCELLIUM_TLS_*`) or sit behind a proxy, and expose
 `/metrics` + JSON access logs via `mycellium-observe`. Because records are
 self-certifying, persistence and replication are safe — a store can withhold or
 serve stale, never forge.

@@ -2,7 +2,7 @@
 
 > A per-recipient, wallet-keyed store-and-forward mailbox, decoupled from the directory.
 
-**Layer:** service (library + binary) · **Depends on:** mycellium-core, tiny_http, serde
+**Layer:** service (library + binary) · **Depends on:** mycellium-core, axum, mycellium-serve, serde
 
 ## What it does
 

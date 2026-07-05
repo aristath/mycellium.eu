@@ -35,7 +35,10 @@ fn start() -> String {
     let addr = format!("127.0.0.1:{port}");
     let serve = addr.clone();
     std::thread::spawn(move || {
-        let _ = mycellium_directory::serve(&serve);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let _ = mycellium_directory::serve(&serve).await;
+        });
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {

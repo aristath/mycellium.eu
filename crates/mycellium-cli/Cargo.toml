@@ -27,6 +27,8 @@ qrcode = { version = "0.14", default-features = false }
 # Tests spin up an in-process directory + queue; the client depends on neither.
 mycellium-directory = { path = "../mycellium-directory" }
 mycellium-queue = { path = "../mycellium-queue" }
+# Both services are async now; the e2e harness runs each in a tokio runtime.
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -32,6 +32,9 @@ crates/
   mycellium-directory-client/   HTTP client of the directory (transport-injectable)
   mycellium-queue-client/       HTTP client of the queue (transport-injectable)
   mycellium-observe/            server metrics (/metrics) + structured access logs
+  mycellium-serve/              shared async HTTP runtime (axum + hyper + tokio +
+                                rustls): TLS, CORS, body caps, redacted logs,
+                                graceful shutdown — used by directory + queue
   ── engine + shells ──
   mycellium-engine/             the headless peer: conversations, groups,
                                 multi-device delivery, outbox retry, contacts
@@ -58,6 +61,7 @@ Every crate links its own README: [core](crates/mycellium-core/README.md) ·
 [queue-client](crates/mycellium-queue-client/README.md) ·
 [http](crates/mycellium-http/README.md) ·
 [observe](crates/mycellium-observe/README.md) ·
+[serve](crates/mycellium-serve/README.md) ·
 [engine](crates/mycellium-engine/README.md) ·
 [cli](crates/mycellium-cli/README.md) ·
 [wasm](crates/mycellium-wasm/README.md).

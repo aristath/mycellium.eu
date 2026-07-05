@@ -30,15 +30,15 @@ for smaller refinements found in the doc audit.
   inside); unset = in-memory. Reopen tests prove survival. *Next: Postgres for
   multi-node.*
 
-- [x] **T0.2 — Concurrency.** *(directory + queue done)* Both servers now use a
-  worker-thread pool sharing `Arc<Server>` (each thread calls `recv()`), state
-  behind a `Mutex`, push sends off the lock. *Next: validate under load (T2.4),
-  connection limits (T2.5).*
+- [x] **T0.2 — Concurrency.** *(directory + queue done)* Both servers run on a
+  shared async runtime (**axum + hyper + tokio**, the `mycellium-serve` crate)
+  with graceful shutdown on `SIGTERM`/`SIGINT`; state is behind a `Mutex` and push
+  sends go off the lock. *Next: validate under load (T2.4), connection limits (T2.5).*
 
-- [x] **T0.3 — TLS / HTTPS.** *(done)* Both servers serve HTTPS natively when
-  `MYCELLIUM_TLS_CERT` + `MYCELLIUM_TLS_KEY` point at PEM files (tiny_http
-  rustls), else plain HTTP behind a proxy. [docs/DEPLOY.md](DEPLOY.md) documents
-  the recommended Caddy reverse-proxy (automatic Let's Encrypt) and the native
+- [x] **T0.3 — TLS / HTTPS.** *(done)* Both servers serve HTTPS natively with
+  **rustls** when `MYCELLIUM_TLS_CERT` + `MYCELLIUM_TLS_KEY` point at PEM files,
+  else plain HTTP behind a proxy. [docs/DEPLOY.md](DEPLOY.md) documents the
+  recommended Caddy reverse-proxy (automatic Let's Encrypt) and the native
   option. Verified with a self-signed cert.
 
 - [x] **T0.4 — Real email sending.** *(done)* A `mailer` module sends the
@@ -142,7 +142,7 @@ for smaller refinements found in the doc audit.
 - [~] **T2.4 — Load & scale testing.** *(directory read-load validated)* A load
   harness (`clients/rust/e2e/load.test.mjs`) fires thousands of concurrent
   lookups and asserts **zero drops** while reporting throughput + latency
-  percentiles; the worker pool sustains it comfortably (>15k req/s, p99 ~25 ms on
+  percentiles; the async runtime sustains it comfortably (>15k req/s, p99 ~25 ms on
   loopback — the client is the bottleneck, not the server). *Left: write-path +
   queue load, and the multi-node horizontal-scale story (clone the directory,
   shard the queue).*

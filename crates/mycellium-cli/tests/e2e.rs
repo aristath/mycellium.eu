@@ -84,7 +84,10 @@ fn ensure_queue() {
         let addr = format!("127.0.0.1:{port}");
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
-            let _ = mycellium_queue::serve(&serve_addr);
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                let _ = mycellium_queue::serve(&serve_addr).await;
+            });
         });
         wait_port(port);
         let url = format!("http://{addr}");
@@ -103,7 +106,10 @@ fn start_directory() -> String {
     let addr = format!("127.0.0.1:{port}");
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
-        let _ = mycellium_directory::serve(&serve_addr);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let _ = mycellium_directory::serve(&serve_addr).await;
+        });
     });
     wait_port(port);
     format!("http://{addr}")

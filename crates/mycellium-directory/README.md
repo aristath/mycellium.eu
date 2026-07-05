@@ -2,7 +2,7 @@
 
 > The untrusted name registry: SIWE-style wallet login, a store of self-signed records, and presence.
 
-**Layer:** service (library) · **Depends on:** mycellium-core, tiny_http, serde
+**Layer:** service (library) · **Depends on:** mycellium-core, axum, mycellium-serve, serde
 
 ## What it does
 
@@ -46,7 +46,7 @@ request bodies are capped (413 above 256 KiB).
 - `Directory::heartbeat(token, handle, now)` / `presence(handle, now)` — mark online / query within `PRESENCE_TTL`.
 - `Directory::challenge_message(nonce)` — the exact bytes a client signs.
 - `ApiError` — a rejected request plus its HTTP `status()` and `reason()` (includes `RateLimited`, `Storage`).
-- `serve(addr)` — bind `addr` and run the HTTP shell over a `Directory` (a worker pool sized to the host; honours `MYCELLIUM_DATA`, `MYCELLIUM_TLS_*`, `MYCELLIUM_SMTP_*`).
+- `serve(addr)` — bind `addr` and run the HTTP shell over a `Directory` (async, via the shared `mycellium-serve` runtime; honours `MYCELLIUM_DATA`, `MYCELLIUM_TLS_*`, `MYCELLIUM_SMTP_*`).
 
 ## How it fits
 

@@ -20,9 +20,13 @@ use std::sync::{Arc, Mutex};
 mod persist;
 mod push;
 
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use mycellium_core::identity::{Signature, WalletPublicKey};
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Method, Request, Response, Server};
 
 /// A request the queue rejected, with the HTTP status it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,59 +395,40 @@ impl Queue {
     }
 }
 
-/// Run the queue as an HTTP service on `addr` (blocks).
-pub fn serve(addr: &str) -> std::io::Result<()> {
-    let server = Arc::new(bind_server(addr)?);
-    let queue = Arc::new(Mutex::new(open_queue()?));
-    let vapid = Arc::new(load_or_generate_vapid());
-    let metrics = Arc::new(mycellium_observe::Metrics::default());
-    println!("  push: VAPID enabled");
-
-    // A worker pool so many clients are served concurrently (Tier 0.2).
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(2, 32);
-    let mut handles = Vec::with_capacity(workers);
-    for _ in 0..workers {
-        let (server, queue, vapid, metrics) = (
-            Arc::clone(&server),
-            Arc::clone(&queue),
-            Arc::clone(&vapid),
-            Arc::clone(&metrics),
-        );
-        handles.push(std::thread::spawn(move || {
-            while let Ok(request) = server.recv() {
-                handle_request(&queue, &vapid, &metrics, request);
-            }
-        }));
-    }
-    for h in handles {
-        let _ = h.join();
-    }
-    Ok(())
+/// Both pieces of shared state the queue handlers need. axum threads a single
+/// `State` type, so the queue and its VAPID keypair travel together.
+#[derive(Clone)]
+pub struct QueueState {
+    queue: Arc<Mutex<Queue>>,
+    vapid: Arc<push::Vapid>,
 }
 
-/// Bind an HTTP or HTTPS server. TLS is enabled when both `MYCELLIUM_TLS_CERT`
-/// and `MYCELLIUM_TLS_KEY` point at PEM files; otherwise plain HTTP (typically
-/// behind a TLS-terminating reverse proxy — see docs/DEPLOY.md).
-fn bind_server(addr: &str) -> std::io::Result<Server> {
-    let to_io = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::other(e.to_string());
-    let env_str = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    match (env_str("MYCELLIUM_TLS_CERT"), env_str("MYCELLIUM_TLS_KEY")) {
-        (Some(cert), Some(key)) => {
-            let config = tiny_http::SslConfig {
-                certificate: std::fs::read(&cert)?,
-                private_key: std::fs::read(&key)?,
-            };
-            println!("  tls: enabled ({cert})");
-            Server::https(addr, config).map_err(to_io)
-        }
-        _ => {
-            println!("  tls: disabled (set MYCELLIUM_TLS_CERT + MYCELLIUM_TLS_KEY, or terminate at a proxy)");
-            Server::http(addr).map_err(to_io)
-        }
-    }
+/// Bind `addr` and serve the queue until a shutdown signal arrives.
+pub async fn serve(addr: &str) -> std::io::Result<()> {
+    let queue = Arc::new(Mutex::new(open_queue()?));
+    let vapid = Arc::new(load_or_generate_vapid());
+    println!("  push: VAPID enabled");
+    let state = QueueState { queue, vapid };
+    mycellium_serve::Server::new("queue", MAX_BODY)
+        .run(addr, router(state))
+        .await
+}
+
+/// The queue's routes, over already-constructed state. Split out so tests can
+/// mount it without the process-level startup.
+pub fn router(state: QueueState) -> Router {
+    Router::new()
+        .route("/login/challenge", post(login_challenge))
+        .route("/login/verify", post(login_verify))
+        .route("/push/key", get(push_key))
+        .route("/push/subscribe", post(push_subscribe))
+        .route("/push/unsubscribe", post(push_unsubscribe))
+        .route(
+            "/mailbox/{wallet}/{slot}",
+            post(mailbox_post).get(mailbox_get),
+        )
+        .route("/pair/{rid}", post(pair_post).get(pair_get))
+        .with_state(state)
 }
 
 /// Open the queue durably from `MYCELLIUM_DATA` (a data *directory*; we use
@@ -517,107 +502,130 @@ fn restrict_perms(path: &str) {
 #[cfg(not(unix))]
 fn restrict_perms(_path: &str) {}
 
-fn handle_request(
-    queue: &Arc<Mutex<Queue>>,
-    vapid: &Arc<push::Vapid>,
-    metrics: &mycellium_observe::Metrics,
-    mut request: Request,
-) {
-    let start = std::time::Instant::now();
-    let method = request.method().clone();
+// --- handlers ---------------------------------------------------------------
 
-    // CORS preflight (the browser PWA calls this API cross-origin).
-    if method == Method::Options {
-        let mut resp = Response::empty(204);
-        for h in cors_headers() {
-            resp.add_header(h);
-        }
-        let _ = request.respond(resp);
-        return;
-    }
-
-    let path = request.url().split('?').next().unwrap_or("").to_string();
-    // Routing uses the real `path`; logging uses a redacted template so access
-    // logs never carry the wallet/mailbox identifier (only the route hit).
-    let log_path = redact_path(&path);
-    if method == Method::Get && path == "/metrics" {
-        metrics.record(200);
-        let resp = Response::from_string(metrics.render("queue")).with_header(
-            Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap(),
-        );
-        let _ = request.respond(resp);
-        return;
-    }
-
-    // Reject oversized bodies before buffering them (memory-DoS defense). The
-    // Content-Length check is a fast path; we then read one byte *past* the cap so
-    // a missing or lying Content-Length can't slip an over-cap body through by
-    // truncation — if that extra byte materializes, it's 413.
-    let over_cap = request.body_length().map(|n| n > MAX_BODY).unwrap_or(false);
-    let mut buf = Vec::new();
-    {
-        let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY as u64 + 1);
-        let _ = std::io::Read::read_to_end(&mut limited, &mut buf);
-    }
-    if over_cap || buf.len() > MAX_BODY {
-        metrics.record(413);
-        mycellium_observe::access_log(
-            "queue",
-            method.as_str(),
-            &log_path,
-            413,
-            start.elapsed().as_millis(),
-        );
-        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-        let mut resp = Response::from_string("{\"error\":\"payload too large\"}")
-            .with_status_code(413)
-            .with_header(header);
-        for h in cors_headers() {
-            resp.add_header(h);
-        }
-        let _ = request.respond(resp);
-        return;
-    }
-    let body = String::from_utf8_lossy(&buf).into_owned();
-    let token = bearer(&request);
-    let (status, payload) = match route(queue, vapid, &request, &body, token.as_deref()) {
-        Ok(ok) => ok,
-        Err(err) => (err.status(), format!("{{\"error\":\"{}\"}}", err.reason())),
-    };
-    metrics.record(status);
-    mycellium_observe::access_log(
-        "queue",
-        method.as_str(),
-        &log_path,
-        status,
-        start.elapsed().as_millis(),
-    );
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let mut response = Response::from_string(payload)
-        .with_status_code(status)
-        .with_header(header);
-    for h in cors_headers() {
-        response.add_header(h);
-    }
-    let _ = request.respond(response);
+async fn login_challenge(State(st): State<QueueState>, body: String) -> Result<Response, ApiError> {
+    let req: ChallengeReq = parse(&body)?;
+    let nonce = st.queue.lock().unwrap().challenge(req.wallet, now_secs());
+    Ok(Json(ChallengeResp { nonce }).into_response())
 }
 
-/// Permissive CORS headers so the browser-served PWA can call this API.
-fn cors_headers() -> Vec<Header> {
-    [
-        (&b"Access-Control-Allow-Origin"[..], &b"*"[..]),
-        (
-            &b"Access-Control-Allow-Methods"[..],
-            &b"GET, POST, PUT, DELETE, OPTIONS"[..],
-        ),
-        (
-            &b"Access-Control-Allow-Headers"[..],
-            &b"Authorization, Content-Type"[..],
-        ),
-    ]
-    .iter()
-    .filter_map(|(k, v)| Header::from_bytes(*k, *v).ok())
-    .collect()
+async fn login_verify(State(st): State<QueueState>, body: String) -> Result<Response, ApiError> {
+    let req: VerifyReq = parse(&body)?;
+    let token =
+        st.queue
+            .lock()
+            .unwrap()
+            .verify(&req.wallet, &req.nonce, &req.signature, now_secs())?;
+    Ok(Json(VerifyResp { token }).into_response())
+}
+
+// The VAPID public key clients need to subscribe to Web Push (open, no auth).
+async fn push_key(State(st): State<QueueState>) -> Response {
+    Json(PushKey {
+        key: st.vapid.public_key().to_string(),
+    })
+    .into_response()
+}
+
+async fn push_subscribe(
+    State(st): State<QueueState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ApiError> {
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+    let req: SubscribeReq = parse(&body)?;
+    st.queue
+        .lock()
+        .unwrap()
+        .subscribe(token, req.endpoint, now_secs())?;
+    Ok(ok())
+}
+
+async fn push_unsubscribe(
+    State(st): State<QueueState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ApiError> {
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+    let req: SubscribeReq = parse(&body)?;
+    st.queue
+        .lock()
+        .unwrap()
+        .unsubscribe(token, &req.endpoint, now_secs())?;
+    Ok(ok())
+}
+
+async fn mailbox_post(
+    State(st): State<QueueState>,
+    Path((wallet, slot)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ApiError> {
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+    let now = now_secs();
+    st.queue
+        .lock()
+        .unwrap()
+        .deposit(token, &wallet, &slot, body, now)?;
+    // Wake the recipient's devices — contentless, and off the lock/thread so a
+    // slow push endpoint never stalls the queue.
+    let endpoints = st.queue.lock().unwrap().subscriptions(&wallet);
+    if !endpoints.is_empty() {
+        let vapid = Arc::clone(&st.vapid);
+        let queue = Arc::clone(&st.queue);
+        std::thread::spawn(move || {
+            let mut gone = Vec::new();
+            for endpoint in endpoints {
+                if vapid.send(&endpoint, now) == push::SendResult::Gone {
+                    gone.push(endpoint);
+                }
+            }
+            // Prune subscriptions the push service says are gone, so we don't
+            // POST to them on every future deposit.
+            if !gone.is_empty() {
+                queue.lock().unwrap().remove_endpoints(&wallet, &gone);
+            }
+        });
+    }
+    Ok(ok())
+}
+
+async fn mailbox_get(
+    State(st): State<QueueState>,
+    Path((wallet, slot)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+    let messages = st
+        .queue
+        .lock()
+        .unwrap()
+        .collect(token, &wallet, &slot, now_secs())?;
+    Ok(Json(Messages { messages }).into_response())
+}
+
+// Device-pairing rendezvous — unauthenticated by design (the id is the
+// capability; the payloads are end-to-end sealed).
+async fn pair_post(
+    State(st): State<QueueState>,
+    Path(rid): Path<String>,
+    body: String,
+) -> Result<Response, ApiError> {
+    let req: PairPost = parse(&body)?;
+    st.queue
+        .lock()
+        .unwrap()
+        .pair_post(&rid, req.msg, now_secs())?;
+    Ok(ok())
+}
+
+async fn pair_get(
+    State(st): State<QueueState>,
+    Path(rid): Path<String>,
+) -> Result<Response, ApiError> {
+    let msgs = st.queue.lock().unwrap().pair_fetch(&rid, now_secs())?;
+    Ok(Json(PairFetch { msgs }).into_response())
 }
 
 #[derive(Deserialize)]
@@ -659,122 +667,34 @@ struct PairFetch {
     msgs: Vec<String>,
 }
 
-fn route(
-    queue: &Arc<Mutex<Queue>>,
-    vapid: &Arc<push::Vapid>,
-    request: &Request,
-    body: &str,
-    token: Option<&str>,
-) -> Result<(u16, String), ApiError> {
-    let url = request.url().to_string();
-    let path = url.split('?').next().unwrap_or("");
-    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let now = now_secs();
+// --- helpers ----------------------------------------------------------------
 
-    match (request.method(), segments.as_slice()) {
-        (Method::Get, ["health"]) => Ok((200, "\"ok\"".into())),
-
-        (Method::Post, ["login", "challenge"]) => {
-            let req: ChallengeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            let nonce = queue.lock().unwrap().challenge(req.wallet, now);
-            Ok((200, to_json(&ChallengeResp { nonce })))
-        }
-        (Method::Post, ["login", "verify"]) => {
-            let req: VerifyReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            let token =
-                queue
-                    .lock()
-                    .unwrap()
-                    .verify(&req.wallet, &req.nonce, &req.signature, now)?;
-            Ok((200, to_json(&VerifyResp { token })))
-        }
-
-        (Method::Get, ["push", "key"]) => Ok((
-            200,
-            to_json(&PushKey {
-                key: vapid.public_key().to_string(),
-            }),
-        )),
-        (Method::Post, ["push", "subscribe"]) => {
-            let token = token.ok_or(ApiError::Unauthorized)?;
-            let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            queue.lock().unwrap().subscribe(token, req.endpoint, now)?;
-            Ok((200, "\"ok\"".into()))
-        }
-        (Method::Post, ["push", "unsubscribe"]) => {
-            let token = token.ok_or(ApiError::Unauthorized)?;
-            let req: SubscribeReq = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            queue
-                .lock()
-                .unwrap()
-                .unsubscribe(token, &req.endpoint, now)?;
-            Ok((200, "\"ok\"".into()))
-        }
-
-        (Method::Post, ["mailbox", wallet_hex, slot]) => {
-            let token = token.ok_or(ApiError::Unauthorized)?;
-            queue
-                .lock()
-                .unwrap()
-                .deposit(token, wallet_hex, slot, body.to_string(), now)?;
-            // Wake the recipient's devices — contentless, and off the lock/thread
-            // so a slow push endpoint never stalls the queue.
-            let endpoints = queue.lock().unwrap().subscriptions(wallet_hex);
-            if !endpoints.is_empty() {
-                let vapid = Arc::clone(vapid);
-                let queue = Arc::clone(queue);
-                let wallet_hex = wallet_hex.to_string();
-                std::thread::spawn(move || {
-                    let mut gone = Vec::new();
-                    for endpoint in endpoints {
-                        if vapid.send(&endpoint, now) == push::SendResult::Gone {
-                            gone.push(endpoint);
-                        }
-                    }
-                    // Prune subscriptions the push service says are gone, so we
-                    // don't POST to them on every future deposit.
-                    if !gone.is_empty() {
-                        queue.lock().unwrap().remove_endpoints(&wallet_hex, &gone);
-                    }
-                });
-            }
-            Ok((200, "\"ok\"".into()))
-        }
-        (Method::Get, ["mailbox", wallet_hex, slot]) => {
-            let token = token.ok_or(ApiError::Unauthorized)?;
-            let messages = queue
-                .lock()
-                .unwrap()
-                .collect(token, wallet_hex, slot, now)?;
-            Ok((200, to_json(&Messages { messages })))
-        }
-
-        // Device-pairing rendezvous — unauthenticated (the id is the capability;
-        // the payloads are end-to-end sealed).
-        (Method::Post, ["pair", rid]) => {
-            let req: PairPost = serde_json::from_str(body).map_err(|_| ApiError::BadRequest)?;
-            queue.lock().unwrap().pair_post(rid, req.msg, now)?;
-            Ok((200, "\"ok\"".into()))
-        }
-        (Method::Get, ["pair", rid]) => {
-            let msgs = queue.lock().unwrap().pair_fetch(rid, now)?;
-            Ok((200, to_json(&PairFetch { msgs })))
-        }
-
-        _ => Err(ApiError::BadRequest),
+/// Map a domain [`ApiError`] to an HTTP status + `{"error": reason}` body.
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status()).unwrap_or(StatusCode::BAD_REQUEST);
+        (status, Json(serde_json::json!({ "error": self.reason() }))).into_response()
     }
 }
 
-fn bearer(request: &Request) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .and_then(|h| h.value.as_str().strip_prefix("Bearer ").map(str::to_string))
+/// The canonical `"ok"` success body (a JSON string), as the clients expect.
+fn ok() -> Response {
+    Json("ok").into_response()
 }
 
-fn to_json<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".into())
+/// Parse a JSON request body, content-type-agnostically (the clients don't always
+/// set `Content-Type`), mapping any failure to a domain error.
+fn parse<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T, ApiError> {
+    serde_json::from_str(body).map_err(|_| ApiError::BadRequest)
+}
+
+/// Extract a `Bearer` token from the `Authorization` header.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 fn now_secs() -> u64 {
@@ -785,18 +705,6 @@ fn now_secs() -> u64 {
 }
 
 /// Lowercase hex of a 33-byte compressed wallet key.
-/// Collapse the mailbox path's wallet + slot to a template, so access logs
-/// record which route was hit but never the wallet identifier (activity
-/// metadata). Fixed routes (login, push, metrics) log verbatim.
-fn redact_path(path: &str) -> String {
-    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
-    match segs.as_slice() {
-        ["mailbox", _, _] => "/mailbox/:wallet/:slot".to_string(),
-        ["pair", _] => "/pair/:rid".to_string(),
-        _ => path.to_string(),
-    }
-}
-
 pub fn hex33(bytes: &[u8; 33]) -> String {
     let mut out = String::with_capacity(66);
     for b in bytes {
@@ -1059,16 +967,6 @@ mod tests {
         assert!(q
             .verify(&a.wallet_public(), &nonce2, &sig2, CHALLENGE_TTL)
             .is_ok());
-    }
-
-    #[test]
-    fn access_log_paths_are_redacted() {
-        assert_eq!(
-            redact_path("/mailbox/deadbeef/account"),
-            "/mailbox/:wallet/:slot"
-        );
-        assert_eq!(redact_path("/login/challenge"), "/login/challenge");
-        assert_eq!(redact_path("/push/key"), "/push/key");
     }
 
     #[test]
