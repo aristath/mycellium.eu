@@ -54,13 +54,34 @@ import uniffi.mycellium_sdk.SecretStore
  * exporting the raw secret: the account is re-bound from a fresh device by email
  * verification (issue #6).
  */
-class AndroidKeystoreSecretStore(context: Context) : SecretStore {
+class AndroidKeystoreSecretStore(
+    context: Context,
+    /**
+     * Isolates this store's blobs under `secretstore/<namespace>/`. Leave empty
+     * for a single-account app; give distinct namespaces if one app process holds
+     * more than one account (e.g. account switching, or an in-process test with
+     * two clients) so their `"identity"` secrets don't collide.
+     */
+    private val namespace: String = "",
+) : SecretStore {
 
     private val appContext = context.applicationContext
 
     /** Per-key sealed blobs live here, one file per SDK key. */
     private val blobDir: File by lazy {
-        File(appContext.filesDir, BLOB_DIR).apply { mkdirs() }
+        val base = File(appContext.filesDir, BLOB_DIR)
+        val dir = if (namespace.isEmpty()) {
+            base
+        } else {
+            // Base64-url-encode the namespace to a safe directory name (same
+            // scheme as blob filenames), so any string is a valid, collision-free dir.
+            val safe = Base64.encodeToString(
+                namespace.toByteArray(Charsets.UTF_8),
+                Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP,
+            )
+            File(base, safe)
+        }
+        dir.apply { mkdirs() }
     }
 
     override fun store(key: String, secret: ByteArray) {

@@ -17,6 +17,8 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         // Only bundle the ABIs cargo-ndk builds in build-rust.sh. Add/remove
         // here and in build-rust.sh together.
         ndk {
@@ -107,4 +109,10 @@ dependencies {
     // JNA's own native libraries per ABI; a plain `:jna:` (jar) will crash at
     // runtime on device with UnsatisfiedLinkError. This is required.
     implementation("net.java.dev.jna:jna:5.14.0@aar")
+
+    // Instrumented (on-device/emulator) e2e tests — they exercise the real native
+    // stack: JNA -> the Rust .so -> HTTP -> a live directory+queue -> decrypt.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }
