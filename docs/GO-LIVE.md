@@ -6,9 +6,14 @@ A pre-flight list for putting Mycellium in front of real users. Pair it with
 
 ## Before launch
 
-- [ ] **⛔ Independent security/crypto audit** (T3.1). The protocol uses vetted
-      primitives, but the composition has not been externally reviewed. See
-      [`SECURITY.md`](SECURITY.md).
+- [ ] **⛔ Independent security/crypto audit** (T3.1, #66). The protocol uses vetted
+      primitives, but the composition has **not** been externally reviewed —
+      **status: unaudited.** The auditor-facing brief (system overview, crypto
+      composition with exact file/version references, trust boundaries, prioritized
+      targets, known limitations) is ready in [`AUDIT-BRIEF.md`](AUDIT-BRIEF.md).
+      Remaining before launch: **freeze an audit-target commit/tag**, engage an
+      independent crypto/protocol auditor, fix all critical/high findings, and
+      publish a disclosure summary. See also [`SECURITY.md`](SECURITY.md).
 - [ ] **⛔ Durable storage on.** `MYCELLIUM_DATA` set for *both* services (else state
       is in-memory and lost on restart, including all Web Push subscriptions).
 - [ ] **⛔ HTTPS everywhere.** Directory, queue, and the PWA all over TLS (proxy or
@@ -50,12 +55,13 @@ A pre-flight list for putting Mycellium in front of real users. Pair it with
       off single-node redb (→ Postgres) before you need multi-node (T0.1).
 - [ ] **Queue:** per-recipient store-and-forward; shard by recipient wallet when one
       node isn't enough. Tune `DEPOSIT_RATE_LIMIT` / `MAX_MAILBOX` for your traffic.
-- [ ] Size the worker pools and connection limits for the box; re-run the load test
-      after any change.
+- [ ] Tune the async runtime + connection limits for the box (the services run on
+      axum/hyper/tokio via `mycellium-serve`); re-run the load test after any change.
 
 ## Known gaps to disclose to early users
 
-- No independent audit yet.
+- **Unaudited.** No independent security/crypto audit yet (#66); the audit brief is
+  ready ([`AUDIT-BRIEF.md`](AUDIT-BRIEF.md)) but the review hasn't run.
 - Browser: one account per profile; new mail arrives by ~3 s polling. See
   [`BROWSER.md`](BROWSER.md).
 - No NAT traversal for direct P2P; delivery falls back to the queue.
