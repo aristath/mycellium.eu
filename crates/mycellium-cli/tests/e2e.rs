@@ -257,6 +257,7 @@ fn live_push_delivery_when_online() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn revoked_device_stops_receiving() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -353,6 +354,7 @@ fn revoked_device_stops_receiving() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn read_receipt_reaches_sender_cluster() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -433,6 +435,7 @@ fn read_receipt_reaches_sender_cluster() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn bootstrapped_device_can_send_to_group() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -560,6 +563,7 @@ fn bootstrapped_device_can_send_to_group() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn new_device_bootstraps_into_group() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -700,6 +704,7 @@ fn new_device_bootstraps_into_group() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn group_reaches_all_member_devices() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -808,6 +813,7 @@ fn group_reaches_all_member_devices() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn sent_messages_sync_to_own_devices() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -889,6 +895,7 @@ fn sent_messages_sync_to_own_devices() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn message_reaches_all_recipient_devices() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -970,6 +977,7 @@ fn message_reaches_all_recipient_devices() {
 }
 
 #[test]
+#[ignore = "multi-device e2e pending the pairing flow (#6)"]
 fn link_device_joins_and_revoke_removes() {
     let _throttle = throttle();
     let dir = start_directory();
@@ -2453,6 +2461,7 @@ fn handle_squatting_is_rejected() {
 }
 
 #[test]
+#[ignore = "guardian/seed recovery removed; email recovery is the model (#6)"]
 fn social_recovery_round_trip() {
     let _throttle = throttle();
     // Create an identity and note its wallet.

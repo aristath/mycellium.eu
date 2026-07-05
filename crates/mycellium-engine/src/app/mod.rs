@@ -13,7 +13,6 @@ use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::Ratchet;
 use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::safety;
-use mycellium_core::shamir::{self, Share};
 use mycellium_core::transport::Transport;
 use mycellium_core::userid::user_id;
 use mycellium_core::wire;

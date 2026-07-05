@@ -28,11 +28,11 @@ struct Sealed {
     ciphertext: Vec<u8>,
 }
 
-/// The secret material sealed inside [`Sealed`]: the account phrase plus this
-/// device's own seed (Layer 11), so reloading reproduces the *same* device.
+/// The secret material sealed inside [`Sealed`]: the account wallet secret plus
+/// this device's own seed (Layer 11), so reloading reproduces the *same* device.
 #[derive(Serialize, Deserialize)]
 struct Secret {
-    mnemonic: String,
+    wallet_secret: Vec<u8>,
     device_seed: Vec<u8>,
 }
 
@@ -78,7 +78,7 @@ pub fn save_identity(identity: &Identity) -> Result<()> {
     let key_ga: Key = key.into();
     let nonce_ga: Nonce = nonce.into();
     let secret = Secret {
-        mnemonic: identity.mnemonic().to_string(),
+        wallet_secret: identity.wallet_secret().to_vec(),
         device_seed: identity.device_seed().to_vec(),
     };
     let plaintext = serde_json::to_vec(&secret)?;
@@ -127,9 +127,14 @@ pub fn load_identity() -> Result<Identity> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("identity file has a malformed device seed"))?;
+    let wallet_secret: [u8; 32] = secret
+        .wallet_secret
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("identity file has a malformed wallet secret"))?;
 
-    Identity::restore(secret.mnemonic.trim(), device_seed)
-        .map_err(|_| anyhow!("stored seed phrase is invalid"))
+    Identity::from_wallet_secret(wallet_secret, device_seed)
+        .map_err(|_| anyhow!("stored account key is invalid"))
 }
 
 /// Derive a 32-byte key from a passphrase and salt with Argon2id.

@@ -64,8 +64,8 @@ const save = async (bytes) => {
 // (no persist afterwards); WRITES do. `export`/`import` are intentionally absent:
 // nothing calls them over RPC (save() uses session.export() directly), and they
 // dump/replace the whole store (seed included), so they stay off the wire.
-const READS = new Set(['peers', 'groups', 'thread', 'group_thread', 'wallet', 'file', 'name_of', 'get', 'push_key', 'link_payload', 'qr_svg', 'version']);
-const WRITES = new Set(['register', 'send', 'reply', 'react', 'delete_message', 'send_file', 'sync', 'group_create', 'group_send', 'group_add', 'group_leave', 'link_device', 'push_subscribe', 'put', 'del', 'add_message']);
+const READS = new Set(['peers', 'groups', 'thread', 'group_thread', 'wallet', 'file', 'name_of', 'get', 'push_key', 'qr_svg', 'version']);
+const WRITES = new Set(['register', 'send', 'reply', 'react', 'delete_message', 'send_file', 'sync', 'group_create', 'group_send', 'group_add', 'group_leave', 'push_subscribe', 'put', 'del', 'add_message']);
 
 let session = null;
 const ready = (async () => {

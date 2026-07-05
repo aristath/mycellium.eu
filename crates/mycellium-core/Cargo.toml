@@ -12,7 +12,6 @@ rust-version.workspace = true
 # build the core for a `no_std` target (ESP32 / Cortex-M). See Layer 10.
 default = ["std"]
 std = [
-    "bip39/std",
     "k256/std",
     "ed25519-dalek/std",
     "sha2/std",
@@ -22,17 +21,14 @@ std = [
     "zeroize/std",
     "serde/std",
     "postcard/use-std",
-    "bip32/std",
 ]
 
 [dependencies]
-# Seed phrases (Layer 9). Entropy is supplied by the host `Platform`, so no RNG
-# dependency is pulled in here.
-bip39 = { version = "2", default-features = false, features = ["alloc"] }
-# secp256k1 wallet key — root identity, SIWE, record signatures.
+# secp256k1 wallet key — the account root, SIWE login, record signatures. The
+# account is a raw random secret (no BIP-39 seed phrase / BIP-32 derivation);
+# recovery is via the directory's email verification, and new devices adopt the
+# account over the `pairing` protocol.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
-# BIP-32/44 HD derivation of the wallet key (external-wallet interop).
-bip32 = { version = "0.5", default-features = false, features = ["alloc", "secp256k1"] }
 # Ed25519 device key — basis of the libp2p PeerId / transport.
 ed25519-dalek = { version = "2", default-features = false }
 # X25519 messaging key — X3DH.

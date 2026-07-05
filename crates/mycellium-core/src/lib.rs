@@ -32,7 +32,6 @@ pub mod platform;
 pub mod ratchet;
 pub mod record;
 pub mod safety;
-pub mod shamir;
 pub mod storage;
 pub mod transport;
 pub mod userid;

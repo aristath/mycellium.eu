@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 use mycellium_core::identity::Identity;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::{Ratchet, RatchetMessage};
-use mycellium_core::shamir::{self, Share};
 use mycellium_core::x3dh;
 
 /// Deterministic xorshift PRNG.
@@ -23,9 +22,6 @@ impl Rng {
         x ^= x << 17;
         self.0 = x;
         x
-    }
-    fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| (self.next() & 0xff) as u8).collect()
     }
 }
 
@@ -117,32 +113,5 @@ fn ratchet_correct_under_random_interleavings() {
                 "drain alice, seed {seed}"
             );
         }
-    }
-}
-
-#[test]
-fn shamir_random_thresholds_round_trip() {
-    let mut meta = Rng(0xabcd_ef01_2345_6789);
-    for _ in 0..400 {
-        let n = (meta.next() % 8 + 2) as u8; // 2..=9 shares
-        let t = (meta.next() % n as u64 + 1) as u8; // 1..=n threshold
-        let secret_len = (meta.next() % 40 + 1) as usize;
-        let secret = meta.bytes(secret_len);
-
-        let mut plat = RngPlatform(Rng(meta.next() | 1));
-        let shares = shamir::split(&secret, t, n, &mut plat).unwrap();
-        assert_eq!(shares.len(), n as usize);
-
-        // A random t-subset must reconstruct the secret.
-        let mut order: Vec<usize> = (0..shares.len()).collect();
-        for i in (1..order.len()).rev() {
-            let j = (meta.next() as usize) % (i + 1);
-            order.swap(i, j);
-        }
-        let subset: Vec<Share> = order[..t as usize]
-            .iter()
-            .map(|&i| shares[i].clone())
-            .collect();
-        assert_eq!(shamir::combine(&subset).unwrap(), secret, "t={t} n={n}");
     }
 }

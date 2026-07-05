@@ -245,15 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_preserves_the_account_wallet() {
+    fn adopting_the_account_preserves_the_wallet() {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
-        // Recovering from the phrase preserves the account (wallet); the device
-        // keys are fresh per device (Layer 11), so only the wallet must match.
-        let recovered = Identity::from_phrase(id.mnemonic(), &mut p).unwrap();
-        assert_eq!(id.wallet_public(), recovered.wallet_public());
-        // Reloading *this* device from its seed reproduces its device keys.
-        let same = Identity::restore(id.mnemonic(), id.device_seed()).unwrap();
+        // Adopting the account on a new device (as pairing delivers the wallet
+        // secret) preserves the account (wallet); device keys are fresh per
+        // device (Layer 11), so only the wallet must match.
+        let adopted = Identity::adopt(&mut p, id.wallet_secret()).unwrap();
+        assert_eq!(id.wallet_public(), adopted.wallet_public());
+        // Reloading *this* device from its persisted secrets reproduces its keys.
+        let same = Identity::from_wallet_secret(id.wallet_secret(), id.device_seed()).unwrap();
         assert_eq!(id.device_public(), same.device_public());
     }
 

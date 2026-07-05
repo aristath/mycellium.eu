@@ -1,9 +1,12 @@
-// Multi-device: a second in-browser device adopts an account from a link payload
-// (same seed phrase, fresh device key) and merges itself into the directory
-// record. A message to the account then fans out to BOTH devices.
-//
-// Run:  node clients/rust/e2e/wasm-multidevice.test.mjs  (build: clients/web/build.sh + cargo build)
+// Multi-device: a second in-browser device adopts an account and both receive a
+// message. SKIPPED pending the seedless pairing flow (#6) — seed-phrase device
+// linking (link_payload/link_device) has been removed, so this must be rewritten
+// to drive the pairing protocol once the browser pairing UI lands.
 
+console.log('SKIP wasm-multidevice: pending seedless pairing flow (#6)');
+process.exit(0);
+
+// eslint-disable-next-line no-unreachable
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';

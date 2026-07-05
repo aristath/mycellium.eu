@@ -9,10 +9,6 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-
-/// How long a device-link payload stays valid (10 minutes).
-const LINK_TTL: u64 = 600;
 
 /// Maximum attachment size, matching the native engine (attachments ride inline
 /// inside the sealed envelope, so this stays well under the queue's body cap).
@@ -102,14 +98,17 @@ pub struct Session {
 /// round-trips through IndexedDB — the browser account survives reloads.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredIdentity {
-    mnemonic: String,
+    wallet_secret: [u8; 32],
     device_seed: [u8; 32],
 }
 
 const IDENTITY_KEY: &[u8] = b"myc:identity";
 
 fn store_identity(store: &mut MemStore, identity: &Identity) {
-    let secret = StoredIdentity { mnemonic: identity.mnemonic().to_string(), device_seed: identity.device_seed() };
+    let secret = StoredIdentity {
+        wallet_secret: identity.wallet_secret(),
+        device_seed: identity.device_seed(),
+    };
     if let Ok(bytes) = serde_json::to_vec(&secret) {
         let _ = store.put(IDENTITY_KEY, &bytes);
     }
@@ -138,7 +137,7 @@ impl Session {
             .ok_or_else(|| JsValue::from_str("snapshot has no identity"))?;
         let secret: StoredIdentity =
             serde_json::from_slice(&raw).map_err(|e| JsValue::from_str(&format!("corrupt identity: {e}")))?;
-        let identity = Identity::restore(secret.mnemonic.trim(), secret.device_seed)
+        let identity = Identity::from_wallet_secret(secret.wallet_secret, secret.device_seed)
             .map_err(|_| JsValue::from_str("stored identity is invalid"))?;
         Ok(Session { store, identity })
     }
@@ -247,21 +246,7 @@ impl Session {
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
-    /// A base64 link payload to add a **second device** to this account. It
-    /// carries the account seed phrase — treat it as the account secret; it's
-    /// shown to the user only to transfer to their own other device (QR / link).
-    pub fn link_payload(&self, dir: &str, queue: &str, handle: &str, name: &str) -> String {
-        // The payload expires so a stale link/QR (left in history, a screenshot,
-        // an old tab) can't be used to add a device later. NOTE: this bounds the
-        // link_device *flow* only — it does not protect the seed the payload
-        // carries; the complete fix is a pairing protocol that never ships the
-        // seed at all (see the crate README / issue #6).
-        let exp = BrowserPlatform.now_unix_secs() + LINK_TTL;
-        let json = serde_json::json!({ "v": 1, "m": self.identity.mnemonic(), "d": dir, "q": queue, "h": handle, "n": name, "exp": exp });
-        B64URL.encode(json.to_string())
-    }
-
-    /// A scannable QR (SVG string) encoding `text` — e.g. a device-link URL.
+    /// A scannable QR (SVG string) encoding `text` — e.g. a pairing offer.
     pub fn qr_svg(&self, text: &str) -> Result<String, JsValue> {
         let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| JsValue::from_str(&format!("qr: {e}")))?;
         Ok(code
@@ -270,39 +255,6 @@ impl Session {
             .dark_color(qrcode::render::svg::Color("#0b0f0c"))
             .light_color(qrcode::render::svg::Color("#ffffff"))
             .build())
-    }
-
-    /// Adopt an account from a [`link_payload`](Self::link_payload): same seed
-    /// phrase (→ same wallet) but a fresh device key, then merge this device into
-    /// the account's directory record. Returns `{dir,queue,handle,name}` JSON.
-    pub fn link_device(&mut self, payload_b64: &str) -> Result<String, JsValue> {
-        let bytes = B64URL.decode(payload_b64.trim()).map_err(|_| JsValue::from_str("invalid link"))?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| JsValue::from_str("invalid link"))?;
-        // Reject an expired link before doing anything else (a missing `exp` is
-        // treated as expired — every payload this build produces carries one).
-        let exp = v["exp"].as_u64().unwrap_or(0);
-        if BrowserPlatform.now_unix_secs() > exp {
-            return Err(JsValue::from_str("this device link has expired — generate a new one"));
-        }
-        let mnemonic = v["m"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
-        let handle = v["h"].as_str().ok_or_else(|| JsValue::from_str("bad link"))?;
-        let (dir, queue, name) = (v["d"].as_str().unwrap_or(""), v["q"].as_str().unwrap_or(""), v["n"].as_str().unwrap_or(handle));
-
-        // New identity: the account's seed, a brand-new device seed.
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).map_err(|e| JsValue::from_str(&format!("{e}")))?;
-        self.identity = Identity::restore(mnemonic.trim(), seed).map_err(|_| JsValue::from_str("invalid seed phrase"))?;
-        store_identity(&mut self.store, &self.identity);
-
-        // Merge our (new) device into the account's record and publish.
-        self.publish_merged(dir, handle, name, queue)?;
-
-        let _ = self.store.put(b"myc:handle", handle.as_bytes());
-        let _ = self.store.put(b"myc:name", name.as_bytes());
-        let _ = self.store.put(b"myc:dir", dir.as_bytes());
-        let _ = self.store.put(b"myc:queue", queue.as_bytes());
-        let _ = self.store.put(b"myc:me", serde_json::json!({ "handle": handle, "name": name }).to_string().as_bytes());
-        Ok(serde_json::json!({ "dir": dir, "queue": queue, "handle": handle, "name": name }).to_string())
     }
 
     /// The learned display name for a peer handle, if we've seen their record.

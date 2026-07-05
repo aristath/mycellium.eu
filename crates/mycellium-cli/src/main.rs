@@ -64,22 +64,6 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
-    /// Link this (fresh) device to an existing account (Layer 11).
-    ///
-    /// Reads your 24-word phrase from `MYCELLIUM_PHRASE` or stdin, adopts the
-    /// account with fresh device keys, and adds this device to your record.
-    LinkDevice {
-        /// Your handle.
-        handle: String,
-        /// Address other peers dial to reach this device.
-        #[arg(long)]
-        addr: String,
-        /// Advertise a libp2p multiaddr instead of a raw TCP address.
-        #[arg(long)]
-        libp2p: bool,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
     /// List the devices in an account's cluster.
     Devices {
         /// The handle to inspect.
@@ -192,21 +176,6 @@ enum Command {
         whoami: String,
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
-    },
-    /// Split your identity into guardian shares (t-of-n social recovery).
-    GuardianSplit {
-        /// Total number of shares to hand out.
-        #[arg(long)]
-        shares: u8,
-        /// How many shares are needed to recover.
-        #[arg(long)]
-        threshold: u8,
-    },
-    /// Recover an identity on a new device from guardian shares.
-    GuardianRecover {
-        /// A guardian share (repeat `--share` for each).
-        #[arg(long = "share", required = true)]
-        shares: Vec<String>,
     },
     /// Show the stored message history with a peer.
     History {
@@ -472,12 +441,6 @@ enum GroupAction {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::IdentityNew => identity_new(),
-        Command::LinkDevice {
-            handle,
-            addr,
-            libp2p,
-            directory,
-        } => link_device(&handle, &addr, libp2p, &directory),
         Command::Devices { handle, directory } => list_devices(&handle, &directory),
         Command::RevokeDevice {
             handle,
@@ -536,8 +499,6 @@ fn main() -> Result<()> {
             whoami,
             directory,
         } => serve(&addr, &whoami, &directory),
-        Command::GuardianSplit { shares, threshold } => guardian_split(shares, threshold),
-        Command::GuardianRecover { shares } => guardian_recover(&shares),
         Command::History { peer } => show_history(&peer),
         Command::ClearHistory { peer } => clear_history(&peer),
         Command::Conversations => conversations(),
