@@ -205,6 +205,10 @@ enum Command {
         /// Your own handle.
         #[arg(long = "as")]
         whoami: String,
+        /// Receive over the libp2p transport instead of raw TCP (match how you
+        /// registered — a `--libp2p` account must serve with `--libp2p`).
+        #[arg(long)]
+        libp2p: bool,
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
@@ -555,8 +559,9 @@ fn main() -> Result<()> {
         Command::Serve {
             addr,
             whoami,
+            libp2p,
             directory,
-        } => serve(&addr, &whoami, &directory),
+        } => serve(&addr, &whoami, libp2p, &directory),
         Command::History { peer } => show_history(&peer),
         Command::ClearHistory { peer } => clear_history(&peer),
         Command::Conversations => conversations(),

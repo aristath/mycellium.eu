@@ -255,6 +255,94 @@ fn live_push_delivery_when_online() {
     );
 }
 
+#[test]
+fn full_duplex_mail_over_libp2p() {
+    let _throttle = throttle();
+    let dir = start_directory();
+
+    // Bob registers a libp2p multiaddr and stays online with `serve --libp2p`,
+    // so a NATed/libp2p recipient is reachable for a *live* mail push (#59) — not
+    // forced down to the queue as before.
+    let bob_port = free_port();
+    let bob_addr = format!("127.0.0.1:{bob_port}");
+    let bob = home("bob-serve-libp2p");
+    ok(&cli(&bob, &["identity-new"]), "bob id");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "register",
+                "bob",
+                "--addr",
+                &bob_addr,
+                "--libp2p",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "bob register libp2p",
+    );
+
+    let alice = account(&dir, "alice");
+
+    let mut bob_serve = Command::new(CLI)
+        .args([
+            "serve",
+            "--addr",
+            &bob_addr,
+            "--as",
+            "bob",
+            "--libp2p",
+            "--directory",
+            &dir,
+        ])
+        .env("MYCELLIUM_HOME", &bob)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bob serve libp2p");
+    let bob_out = tail(bob_serve.stdout.take().unwrap());
+    wait_port(bob_port);
+
+    // Alice sends; Bob is online and advertises a multiaddr, so the message is
+    // dialed live over libp2p into his `serve` and decrypted there.
+    let sent = cli(
+        &alice,
+        &[
+            "send",
+            "bob",
+            "--as",
+            "alice",
+            "--message",
+            "live over libp2p",
+            "--directory",
+            &dir,
+        ],
+    );
+    ok(&sent, "send");
+    // The send reports a live *direct* path (delivered, none queued) — proving it
+    // went over libp2p, not parked in the outbox/queue.
+    let so = String::from_utf8_lossy(&sent.stdout);
+    assert!(
+        so.contains("[1 direct, 0 queued]"),
+        "send should report a live direct libp2p delivery: {so}"
+    );
+    assert!(
+        !so.contains("queued for retry"),
+        "libp2p live delivery must not be parked in the outbox: {so}"
+    );
+
+    let got = wait_contains(&bob_out, "from alice: live over libp2p", 20);
+
+    let _ = bob_serve.kill();
+    let _ = bob_serve.wait();
+    assert!(
+        got,
+        "bob's libp2p serve did not receive the live message:\n{}",
+        bob_out.lock().unwrap()
+    );
+}
+
 /// Read the offer token the new device's `pair` prints, from its live stdout,
 /// then keep draining stdout so the still-running child never hits a broken pipe.
 fn read_pair_offer(child: &mut std::process::Child) -> String {

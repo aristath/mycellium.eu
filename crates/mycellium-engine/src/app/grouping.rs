@@ -123,8 +123,17 @@ pub fn distribute_key_to(
                 continue;
             };
             let item = MailItem::GroupInvite(env);
-            if !deliver_scored(fs, client, &handle, queue.as_ref(), device, &item, now)
-                .is_delivered()
+            if !deliver_scored(
+                fs,
+                identity.device_secret(),
+                client,
+                &handle,
+                queue.as_ref(),
+                device,
+                &item,
+                now,
+            )
+            .is_delivered()
             {
                 let slot = device_slot(&device.device_key);
                 let _ = outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item, now);
@@ -440,6 +449,7 @@ pub fn group_send(
                     if device.device_key != identity.device_public()
                         && !deliver_scored(
                             &mut fs,
+                            identity.device_secret(),
                             &client,
                             &me,
                             my_queue.as_ref(),
@@ -562,6 +572,7 @@ pub fn group_sync(whoami: &str, directory: &str) -> Result<()> {
                 continue;
             };
             let _ = deliver(
+                identity.device_secret(),
                 &client,
                 &me,
                 my_queue.as_ref(),
@@ -661,6 +672,7 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
             let item = MailItem::GroupLeave(env);
             if !deliver_scored(
                 &mut fs,
+                identity.device_secret(),
                 &client,
                 &handle,
                 queue.as_ref(),

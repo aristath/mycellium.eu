@@ -28,6 +28,7 @@ pub fn forward(
     let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode())?;
     let queue = QueueTarget::open(&identity, &to_record.record);
     let _ = deliver(
+        identity.device_secret(),
         &client,
         &to_handle,
         queue.as_ref(),
@@ -82,6 +83,7 @@ pub fn send(
         let item = MailItem::Direct(envelope);
         let path = deliver_scored(
             &mut fs,
+            identity.device_secret(),
             &client,
             &peer_handle,
             queue.as_ref(),
@@ -158,8 +160,17 @@ pub fn send(
                 peer: peer_handle.as_str().to_string(),
                 envelope,
             };
-            if !deliver_scored(&mut fs, &client, &me, my_queue.as_ref(), device, &sync, now)
-                .is_delivered()
+            if !deliver_scored(
+                &mut fs,
+                identity.device_secret(),
+                &client,
+                &me,
+                my_queue.as_ref(),
+                device,
+                &sync,
+                now,
+            )
+            .is_delivered()
             {
                 let slot = device_slot(&device.device_key);
                 let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, sync, now);
@@ -188,6 +199,7 @@ pub fn broadcast(
                 let envelope = seal_to(&identity, &me, record.record.primary(), &app.encode())?;
                 let queue = QueueTarget::open(&identity, &record.record);
                 if deliver(
+                    identity.device_secret(),
                     &client,
                     &handle,
                     queue.as_ref(),
@@ -287,36 +299,83 @@ impl QueueTarget {
     }
 }
 
+/// Which direct-line transport a device's advertised `peer_id` selects.
+///
+/// A record advertises either a raw `host:port` (TCP) or a libp2p multiaddr
+/// (`/ip4/.../tcp/.../p2p/<peer-id>`, marked by its leading `/`); an empty or
+/// non-UTF-8 `peer_id` is unusable for a live push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectTransport {
+    /// Raw `host:port` — dial over plain framed TCP.
+    Tcp,
+    /// A libp2p multiaddr — dial over `libp2p_net` (Noise + Yamux).
+    Libp2p,
+    /// No usable direct address (empty or non-UTF-8).
+    None,
+}
+
+/// Classify a device's advertised address into the transport a live push uses.
+/// Pure and total, so the send-side transport selection is unit-testable.
+fn direct_transport(peer_id: &[u8]) -> DirectTransport {
+    match core::str::from_utf8(peer_id) {
+        Ok("") => DirectTransport::None,
+        // A leading '/' marks a libp2p multiaddr (same rule `chat`/`register` use).
+        Ok(addr) if addr.starts_with('/') => DirectTransport::Libp2p,
+        Ok(_) => DirectTransport::Tcp,
+        Err(_) => DirectTransport::None,
+    }
+}
+
 /// The live direct-push seam: push `item` over a direct connection to `device`,
 /// returning whether it was accepted. Factored out of the ladder so the ordering
 /// logic is unit-testable without a real network.
 ///
-/// This preserves today's exact behavior: raw-TCP dial of a `host:port`
-/// `peer_id`; a multiaddr or empty `peer_id` is skipped.
-fn direct_push(device: &Device, item: &MailItem) -> bool {
-    let Ok(addr) = String::from_utf8(device.peer_id.0.clone()) else {
-        return false;
-    };
-    if addr.is_empty() {
-        return false;
-    }
-    if addr.starts_with('/') {
-        // TODO(#59): route multiaddr peers through libp2p_net (Noise) instead of
-        // skipping them. Deferred for now: the live-push receiver (`serve`) has
-        // no libp2p listener for `/mycellium/1.0` MailItem frames, and no CLI
-        // e2e exercises this path — dialing libp2p here would deliver into a
-        // void. Wire a libp2p receive path into `serve` first, then dial here
-        // (verifying the Noise peer against the pinned/record identity) and
-        // report `DeliveryPath::Direct`.
-        return false;
-    }
+/// A raw `host:port` `peer_id` is dialed over framed TCP; a libp2p multiaddr is
+/// dialed over `libp2p_net` (Noise authenticates the peer's device key against
+/// the `/p2p/<peer-id>` embedded in the record). Either way the receiver is a
+/// `serve` loop reading `MailItem` frames. `device_secret` is *our* device key,
+/// used only to build the dialing libp2p node.
+fn direct_push(device_secret: [u8; 32], device: &Device, item: &MailItem) -> bool {
     let Ok(frame) = serde_json::to_vec(item) else {
         return false;
     };
-    match net::TcpConnection::connect(&addr) {
-        Ok(mut conn) => conn.send_frame(&frame).is_ok(),
-        Err(_) => false,
+    match direct_transport(&device.peer_id.0) {
+        DirectTransport::None => false,
+        DirectTransport::Tcp => {
+            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            match net::TcpConnection::connect(&addr) {
+                Ok(mut conn) => conn.send_frame(&frame).is_ok(),
+                Err(_) => false,
+            }
+        }
+        DirectTransport::Libp2p => {
+            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            push_libp2p(device_secret, &addr, &frame)
+        }
     }
+}
+
+/// Dial `multiaddr` over libp2p (a fresh dial-only node keyed by our device
+/// secret) and push one framed `MailItem`. Returns whether the frame was written.
+///
+/// The Noise handshake authenticates the responder against the `/p2p/<peer-id>`
+/// in the multiaddr — which is derived from the recipient device's key in the
+/// signed record — so a successful push reached the pinned identity, not an
+/// impostor (the same end-to-end guarantee the TCP path relies on the sealed
+/// envelope for, plus transport-level peer authentication).
+fn push_libp2p(device_secret: [u8; 32], multiaddr: &str, frame: &[u8]) -> bool {
+    let mut node = match libp2p_net::Libp2pNode::new(device_secret, None) {
+        Ok(node) => node,
+        Err(_) => return false,
+    };
+    let ok = match node.dial_str(multiaddr) {
+        Ok(mut conn) => conn.send_frame(frame).is_ok(),
+        Err(_) => false,
+    };
+    // Let the background swarm flush the buffered frame before the node (and its
+    // runtime) drop — mirrors `chat`/`listen`'s drain before exit.
+    node.drain(300);
+    ok
 }
 
 /// The pure delivery ladder: consult `score` (if any) for the order of the
@@ -366,6 +425,7 @@ where
 /// the ladder with the real network seams (direct push, queue deposit).
 fn deliver_recording<S: Storage>(
     score: Option<&mut S>,
+    device_secret: [u8; 32],
     dir: &DirectoryClient,
     handle: &Handle,
     queue: Option<&QueueTarget>,
@@ -376,7 +436,7 @@ fn deliver_recording<S: Storage>(
     let online = dir.presence(handle).unwrap_or(false);
     let key = device_slot(&device.device_key);
     deliver_ladder(score, online, &key, now, |path| match path {
-        DeliveryPath::Direct => direct_push(device, item),
+        DeliveryPath::Direct => direct_push(device_secret, device, item),
         DeliveryPath::Queue => queue.map(|q| q.deposit(&key, item)).unwrap_or(false),
         // The direct band never emits Relay yet, and Queue/Outbox/Failed aren't
         // attempted as live rungs — nothing else to try.
@@ -391,13 +451,14 @@ fn deliver_recording<S: Storage>(
 /// reachability memory consulted or recorded); the primary send/retry paths use
 /// [`deliver_scored`].
 pub fn deliver(
+    device_secret: [u8; 32],
     dir: &DirectoryClient,
     handle: &Handle,
     queue: Option<&QueueTarget>,
     device: &Device,
     item: &MailItem,
 ) -> DeliveryPath {
-    deliver_recording::<FileStore>(None, dir, handle, queue, device, item, 0)
+    deliver_recording::<FileStore>(None, device_secret, dir, handle, queue, device, item, 0)
 }
 
 /// Like [`deliver`], but consults and updates the local, per-device
@@ -406,6 +467,7 @@ pub fn deliver(
 /// outbox remain the guaranteed fallback.
 pub fn deliver_scored(
     store: &mut FileStore,
+    device_secret: [u8; 32],
     dir: &DirectoryClient,
     handle: &Handle,
     queue: Option<&QueueTarget>,
@@ -413,7 +475,16 @@ pub fn deliver_scored(
     item: &MailItem,
     now: u64,
 ) -> DeliveryPath {
-    deliver_recording(Some(store), dir, handle, queue, device, item, now)
+    deliver_recording(
+        Some(store),
+        device_secret,
+        dir,
+        handle,
+        queue,
+        device,
+        item,
+        now,
+    )
 }
 
 /// Deliver the *same* item to every device in a handle's cluster (Layer 11),
@@ -428,7 +499,14 @@ pub fn deliver_to_cluster(
         if rec.verify().is_ok() {
             let queue = QueueTarget::open(identity, &rec.record);
             for device in &rec.record.devices {
-                let _ = deliver(dir, handle, queue.as_ref(), device, item);
+                let _ = deliver(
+                    identity.device_secret(),
+                    dir,
+                    handle,
+                    queue.as_ref(),
+                    device,
+                    item,
+                );
             }
         }
     }
@@ -449,8 +527,17 @@ pub fn deliver_to_cluster_or_queue(
         if rec.verify().is_ok() {
             let queue = QueueTarget::open(identity, &rec.record);
             for device in &rec.record.devices {
-                if !deliver_scored(fs, dir, handle, queue.as_ref(), device, item, now)
-                    .is_delivered()
+                if !deliver_scored(
+                    fs,
+                    identity.device_secret(),
+                    dir,
+                    handle,
+                    queue.as_ref(),
+                    device,
+                    item,
+                    now,
+                )
+                .is_delivered()
                 {
                     let slot = device_slot(&device.device_key);
                     let _ =
@@ -506,6 +593,7 @@ pub fn flush_outbox(
         let queue = QueueTarget::open(identity, &record.record);
         if deliver_scored(
             fs,
+            identity.device_secret(),
             client,
             &handle,
             queue.as_ref(),
@@ -555,7 +643,14 @@ pub fn outbox_show(directory: &str) -> Result<()> {
 }
 
 /// Accept live-pushed items from peers and process them (the `serve` receiver).
-pub fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
+///
+/// `libp2p` selects the receive transport, matching how the account registered:
+/// a libp2p multiaddr recipient listens on a `libp2p_net` node for the
+/// `/mycellium/1.0` stream protocol; a raw `host:port` recipient listens on
+/// framed TCP. Both feed received `MailItem` frames into the same `process_item`
+/// path, so senders reach an online recipient live over whichever transport its
+/// record advertises (#59).
+pub fn serve(addr: &str, whoami: &str, libp2p: bool, directory: &str) -> Result<()> {
     let identity = std::sync::Arc::new(store::load_identity()?);
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
@@ -581,28 +676,61 @@ pub fn serve(addr: &str, whoami: &str, directory: &str) -> Result<()> {
     let mut fs = open_history(&identity)?;
     let blocked = blocklist::load(&fs)?;
 
-    let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
-    println!(
-        "serving on {addr} as {} — receiving live messages",
-        me.as_str()
-    );
     let mut platform = OsPlatform;
-    loop {
-        let mut conn = match transport.accept() {
-            Ok(conn) => conn,
-            Err(_) => continue,
-        };
-        while let Ok(frame) = conn.recv_frame() {
-            if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
-                let _ = process_item(
-                    &identity,
-                    &me,
-                    &client,
-                    &blocked,
-                    &mut platform,
-                    &mut fs,
-                    item,
-                );
+    if libp2p {
+        // libp2p receive path: bind a node and accept `/mycellium/1.0` streams.
+        // Each inbound stream carries `MailItem` frames pushed by a sender's
+        // `direct_push`; feed them into the SAME `process_item` path as TCP.
+        let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
+        let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
+            .context("could not start libp2p node")?;
+        println!(
+            "serving (libp2p) on {addr} as {} ({}) — receiving live messages",
+            me.as_str(),
+            node.peer_id()
+        );
+        loop {
+            let mut conn = match node.accept() {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            while let Ok(frame) = conn.recv_frame() {
+                if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
+                    let _ = process_item(
+                        &identity,
+                        &me,
+                        &client,
+                        &blocked,
+                        &mut platform,
+                        &mut fs,
+                        item,
+                    );
+                }
+            }
+        }
+    } else {
+        let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
+        println!(
+            "serving on {addr} as {} — receiving live messages",
+            me.as_str()
+        );
+        loop {
+            let mut conn = match transport.accept() {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            while let Ok(frame) = conn.recv_frame() {
+                if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
+                    let _ = process_item(
+                        &identity,
+                        &me,
+                        &client,
+                        &blocked,
+                        &mut platform,
+                        &mut fs,
+                        item,
+                    );
+                }
             }
         }
     }
@@ -846,7 +974,14 @@ pub fn send_receipt(
         let Ok(env) = seal_to(identity, me, device, &encoded) else {
             continue;
         };
-        let _ = deliver(client, to, queue.as_ref(), device, &MailItem::Direct(env));
+        let _ = deliver(
+            identity.device_secret(),
+            client,
+            to,
+            queue.as_ref(),
+            device,
+            &MailItem::Direct(env),
+        );
     }
 }
 
@@ -1014,6 +1149,49 @@ mod ladder_tests {
             reachability::best_paths(&store, "dev", 1_050),
             reachability::default_order(),
             "a recorded direct success keeps direct ahead of the queue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    //! The send-side transport selection: which live-push transport a device's
+    //! advertised `peer_id` maps to. Pure classification — no network.
+
+    use super::{direct_transport, DirectTransport};
+
+    #[test]
+    fn raw_host_port_selects_tcp() {
+        assert_eq!(direct_transport(b"127.0.0.1:9001"), DirectTransport::Tcp);
+        assert_eq!(
+            direct_transport(b"example.com:443"),
+            DirectTransport::Tcp,
+            "a hostname:port is still a TCP address"
+        );
+    }
+
+    #[test]
+    fn leading_slash_selects_libp2p() {
+        // A full dialable multiaddr (with the /p2p/<peer-id> component).
+        assert_eq!(
+            direct_transport(b"/ip4/127.0.0.1/tcp/9001/p2p/12D3KooWabc"),
+            DirectTransport::Libp2p,
+        );
+        // Even a bare multiaddr prefix classifies as libp2p (the dial fails later,
+        // falling through to the queue — the classifier only picks the transport).
+        assert_eq!(
+            direct_transport(b"/ip4/10.0.0.2/tcp/1"),
+            DirectTransport::Libp2p,
+        );
+    }
+
+    #[test]
+    fn empty_or_non_utf8_is_unusable() {
+        assert_eq!(direct_transport(b""), DirectTransport::None);
+        assert_eq!(
+            direct_transport(&[0xff, 0xfe, 0x00]),
+            DirectTransport::None,
+            "a non-UTF-8 peer_id has no usable direct address"
         );
     }
 }
