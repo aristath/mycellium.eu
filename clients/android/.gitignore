@@ -1,0 +1,25 @@
+# Gradle / Android build outputs
+build/
+.gradle/
+app/build/
+
+# Local machine config (SDK/NDK paths, signing) — never commit.
+local.properties
+
+# The Gradle wrapper JAR is a binary; regenerate it with `gradle wrapper`.
+gradle/wrapper/gradle-wrapper.jar
+gradlew
+gradlew.bat
+
+# Rust/binding build artifacts produced by build-rust.sh — regenerated, never committed:
+#   - the cargo-ndk native libraries
+app/src/main/jniLibs/
+#   - the UniFFI-generated Kotlin binding (also lands in app/build via the source set)
+app/src/main/generated/
+**/generated/uniffi/
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+captures/
