@@ -72,8 +72,10 @@ pub fn send(
     let queue = QueueTarget::open(&identity, &peer_record.record);
     let now = OsPlatform.now_unix_secs();
     let mut delivered = 0;
-    // Per-path tally for observability (#59): how many went out live vs queued.
+    // Per-path tally for observability (#59): how many went out live (direct or
+    // relayed) vs into the recipient's queue.
     let mut direct = 0;
+    let mut relay = 0;
     let mut queued_live = 0;
     for device in &peer_record.record.devices {
         let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else {
@@ -92,8 +94,12 @@ pub fn send(
             now,
         );
         match path {
-            DeliveryPath::Direct | DeliveryPath::Relay => {
+            DeliveryPath::Direct => {
                 direct += 1;
+                delivered += 1;
+            }
+            DeliveryPath::Relay => {
+                relay += 1;
                 delivered += 1;
             }
             DeliveryPath::Queue => {
@@ -120,8 +126,16 @@ pub fn send(
     } else {
         String::new()
     };
+    // A relayed live delivery (through a Circuit Relay v2 node, #59) is reported
+    // as its own path so it's observable as neither a plain direct push nor a
+    // queue deposit.
+    let relay_note = if relay > 0 {
+        format!(" [{relay} relay]")
+    } else {
+        String::new()
+    };
     println!(
-        "sent to '{}' — {delivered}/{total} device(s) (#{}){note}{breakdown}",
+        "sent to '{}' — {delivered}/{total} device(s) (#{}){note}{breakdown}{relay_note}",
         peer_handle.as_str(),
         app.id
     );
@@ -326,6 +340,17 @@ fn direct_transport(peer_id: &[u8]) -> DirectTransport {
     }
 }
 
+/// Whether a device's advertised address is a **Circuit Relay v2** address
+/// (contains a `/p2p-circuit` hop) — the device is reachable only *through* a
+/// relay. Such an address is still a libp2p multiaddr ([`DirectTransport::Libp2p`])
+/// and dialed the same way; this only selects the [`DeliveryPath::Relay`] label
+/// (vs `Direct`) for observability + scoring (#59).
+fn is_relay_addr(peer_id: &[u8]) -> bool {
+    core::str::from_utf8(peer_id)
+        .map(|addr| addr.contains("/p2p-circuit"))
+        .unwrap_or(false)
+}
+
 /// The live direct-push seam: push `item` over a direct connection to `device`,
 /// returning whether it was accepted. Factored out of the ladder so the ordering
 /// logic is unit-testable without a real network.
@@ -385,14 +410,17 @@ fn push_libp2p(device_secret: [u8; 32], multiaddr: &str, frame: &[u8]) -> bool {
 /// parks the item in the outbox — exactly as today.
 ///
 /// `online` gates the live/direct rungs: a peer whose presence is false is only
-/// offered the queue, preserving today's "offline → queue" behavior. With
-/// `score == None` no memory is consulted or recorded and the order is
-/// [`reachability::default_order`], so an unscored caller behaves exactly as
-/// before this module existed.
+/// offered the queue, preserving today's "offline → queue" behavior. `live_path`
+/// is the live-direct rung to try first — [`DeliveryPath::Direct`] for a
+/// directly-dialable peer, or [`DeliveryPath::Relay`] for one reachable only via
+/// a Circuit Relay v2 address (#59); the queue is always the floor. With
+/// `score == None` no memory is consulted or recorded and the order is simply
+/// `[live_path, Queue]`, so an unscored caller behaves exactly as before.
 fn deliver_ladder<S, F>(
     mut score: Option<&mut S>,
     online: bool,
     key: &str,
+    live_path: DeliveryPath,
     now: u64,
     mut attempt: F,
 ) -> DeliveryPath
@@ -401,8 +429,8 @@ where
     F: FnMut(DeliveryPath) -> bool,
 {
     let order = match score.as_deref() {
-        Some(s) => reachability::best_paths(s, key, now),
-        None => reachability::default_order(),
+        Some(s) => reachability::best_paths_for(s, key, live_path, now),
+        None => vec![live_path, DeliveryPath::Queue],
     };
     for path in order {
         // Live rungs are only worth attempting when the peer is online; the
@@ -435,11 +463,21 @@ fn deliver_recording<S: Storage>(
 ) -> DeliveryPath {
     let online = dir.presence(handle).unwrap_or(false);
     let key = device_slot(&device.device_key);
-    deliver_ladder(score, online, &key, now, |path| match path {
-        DeliveryPath::Direct => direct_push(device_secret, device, item),
+    // A `/p2p-circuit/` address is dialed over libp2p exactly like a direct
+    // multiaddr (the relay-client transport routes it), but reported as
+    // [`DeliveryPath::Relay`] for observability + scoring; a non-circuit address
+    // stays [`DeliveryPath::Direct`] (#59).
+    let live_path = if is_relay_addr(&device.peer_id.0) {
+        DeliveryPath::Relay
+    } else {
+        DeliveryPath::Direct
+    };
+    deliver_ladder(score, online, &key, live_path, now, |path| match path {
+        // Both live rungs dial the same libp2p/TCP seam; the label is chosen
+        // above purely for observability + scoring.
+        DeliveryPath::Direct | DeliveryPath::Relay => direct_push(device_secret, device, item),
         DeliveryPath::Queue => queue.map(|q| q.deposit(&key, item)).unwrap_or(false),
-        // The direct band never emits Relay yet, and Queue/Outbox/Failed aren't
-        // attempted as live rungs — nothing else to try.
+        // Queue/Outbox/Failed aren't attempted as live rungs — nothing else to try.
         _ => false,
     })
 }
@@ -650,7 +688,23 @@ pub fn outbox_show(directory: &str) -> Result<()> {
 /// framed TCP. Both feed received `MailItem` frames into the same `process_item`
 /// path, so senders reach an online recipient live over whichever transport its
 /// record advertises (#59).
-pub fn serve(addr: &str, whoami: &str, libp2p: bool, directory: &str) -> Result<()> {
+///
+/// `relay` (requires `libp2p`) makes this a **relay-only** device: instead of
+/// binding a directly-dialable address, it obtains a Circuit Relay v2 reservation
+/// on the given relay multiaddr and re-publishes its record with the resulting
+/// `…/p2p-circuit/…` address, so senders reach it *through* the relay. Inbound
+/// relayed streams surface on the same `accept()` path and feed `process_item`
+/// exactly like direct ones (#59).
+pub fn serve(
+    addr: &str,
+    whoami: &str,
+    libp2p: bool,
+    relay: Option<&str>,
+    directory: &str,
+) -> Result<()> {
+    if relay.is_some() && !libp2p {
+        bail!("--relay requires --libp2p (a circuit address is a libp2p multiaddr)");
+    }
     let identity = std::sync::Arc::new(store::load_identity()?);
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
@@ -681,14 +735,35 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool, directory: &str) -> Result<
         // libp2p receive path: bind a node and accept `/mycellium/1.0` streams.
         // Each inbound stream carries `MailItem` frames pushed by a sender's
         // `direct_push`; feed them into the SAME `process_item` path as TCP.
-        let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
-        let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
-            .context("could not start libp2p node")?;
-        println!(
-            "serving (libp2p) on {addr} as {} ({}) — receiving live messages",
-            me.as_str(),
-            node.peer_id()
-        );
+        let mut node = if let Some(relay_addr) = relay {
+            // Relay-only: no directly-dialable listen address. Reserve a slot on
+            // the relay and advertise the resulting circuit address, so senders
+            // reach us purely through the relay (the receive path is otherwise
+            // identical — relayed inbound streams surface on `accept()` too).
+            let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), None)
+                .context("could not start libp2p node")?;
+            let circuit = node
+                .reserve_str(relay_addr)
+                .context("could not reserve a slot on the relay")?;
+            republish_this_device(&client, &token, &identity, &me, &circuit)
+                .context("could not publish our relay (circuit) address")?;
+            println!(
+                "serving (libp2p via relay) as {} ({}) at {circuit} — receiving live messages",
+                me.as_str(),
+                node.peer_id()
+            );
+            node
+        } else {
+            let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
+            let node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
+                .context("could not start libp2p node")?;
+            println!(
+                "serving (libp2p) on {addr} as {} ({}) — receiving live messages",
+                me.as_str(),
+                node.peer_id()
+            );
+            node
+        };
         loop {
             let mut conn = match node.accept() {
                 Ok(conn) => conn,
@@ -1031,10 +1106,17 @@ mod ladder_tests {
         let mut store = MemStore::default();
         let tried = RefCell::new(Vec::new());
         // Direct fails, queue succeeds → the ladder escalates to the queue.
-        let path = deliver_ladder(Some(&mut store), true, "dev", 1_000, |p| {
-            tried.borrow_mut().push(p);
-            matches!(p, DeliveryPath::Queue)
-        });
+        let path = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Direct,
+            1_000,
+            |p| {
+                tried.borrow_mut().push(p);
+                matches!(p, DeliveryPath::Queue)
+            },
+        );
         assert_eq!(path, DeliveryPath::Queue);
         assert_eq!(
             *tried.borrow(),
@@ -1047,10 +1129,17 @@ mod ladder_tests {
     fn direct_success_stops_before_the_queue() {
         let mut store = MemStore::default();
         let tried = RefCell::new(Vec::new());
-        let path = deliver_ladder(Some(&mut store), true, "dev", 1_000, |p| {
-            tried.borrow_mut().push(p);
-            true
-        });
+        let path = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Direct,
+            1_000,
+            |p| {
+                tried.borrow_mut().push(p);
+                true
+            },
+        );
         assert_eq!(path, DeliveryPath::Direct);
         assert_eq!(*tried.borrow(), vec![DeliveryPath::Direct]);
     }
@@ -1059,10 +1148,17 @@ mod ladder_tests {
     fn offline_skips_direct_and_uses_the_queue() {
         let mut store = MemStore::default();
         let tried = RefCell::new(Vec::new());
-        let path = deliver_ladder(Some(&mut store), false, "dev", 1_000, |p| {
-            tried.borrow_mut().push(p);
-            true
-        });
+        let path = deliver_ladder(
+            Some(&mut store),
+            false,
+            "dev",
+            DeliveryPath::Direct,
+            1_000,
+            |p| {
+                tried.borrow_mut().push(p);
+                true
+            },
+        );
         assert_eq!(path, DeliveryPath::Queue);
         assert_eq!(
             *tried.borrow(),
@@ -1079,10 +1175,17 @@ mod ladder_tests {
             reachability::record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
         }
         let tried = RefCell::new(Vec::new());
-        let path = deliver_ladder(Some(&mut store), true, "dev", 260, |p| {
-            tried.borrow_mut().push(p);
-            matches!(p, DeliveryPath::Queue)
-        });
+        let path = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Direct,
+            260,
+            |p| {
+                tried.borrow_mut().push(p);
+                matches!(p, DeliveryPath::Queue)
+            },
+        );
         assert_eq!(path, DeliveryPath::Queue);
         assert_eq!(
             tried.borrow()[0],
@@ -1103,6 +1206,7 @@ mod ladder_tests {
             Some(&mut store),
             true,
             "dev",
+            DeliveryPath::Direct,
             220 + reachability::REPROBE_SECS + 1,
             |p| {
                 tried.borrow_mut().push(p);
@@ -1120,7 +1224,7 @@ mod ladder_tests {
     fn unscored_ladder_matches_the_default_order() {
         // No score store: behaves exactly as before this module existed.
         let tried = RefCell::new(Vec::new());
-        let path = deliver_ladder::<MemStore, _>(None, true, "dev", 0, |p| {
+        let path = deliver_ladder::<MemStore, _>(None, true, "dev", DeliveryPath::Direct, 0, |p| {
             tried.borrow_mut().push(p);
             matches!(p, DeliveryPath::Queue)
         });
@@ -1134,7 +1238,14 @@ mod ladder_tests {
     #[test]
     fn nothing_works_reports_failed() {
         let mut store = MemStore::default();
-        let path = deliver_ladder(Some(&mut store), true, "dev", 0, |_p| false);
+        let path = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Direct,
+            0,
+            |_p| false,
+        );
         assert_eq!(path, DeliveryPath::Failed);
     }
 
@@ -1142,13 +1253,65 @@ mod ladder_tests {
     fn outcomes_are_recorded_into_the_score() {
         let mut store = MemStore::default();
         // A direct success is remembered, keeping direct first next time.
-        let _ = deliver_ladder(Some(&mut store), true, "dev", 1_000, |p| {
-            matches!(p, DeliveryPath::Direct)
-        });
+        let _ = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Direct,
+            1_000,
+            |p| matches!(p, DeliveryPath::Direct),
+        );
         assert_eq!(
             reachability::best_paths(&store, "dev", 1_050),
             reachability::default_order(),
             "a recorded direct success keeps direct ahead of the queue"
+        );
+    }
+
+    #[test]
+    fn relay_live_path_is_tried_first_and_reported() {
+        // A relay-only device: the ladder tries the Relay rung first (before the
+        // queue floor) and, on success, reports `Relay` — not `Direct` — so the
+        // circuit delivery is observable and scored as such (#59).
+        let mut store = MemStore::default();
+        let tried = RefCell::new(Vec::new());
+        let path = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Relay,
+            1_000,
+            |p| {
+                tried.borrow_mut().push(p);
+                matches!(p, DeliveryPath::Relay)
+            },
+        );
+        assert_eq!(path, DeliveryPath::Relay);
+        assert_eq!(*tried.borrow(), vec![DeliveryPath::Relay]);
+    }
+
+    #[test]
+    fn relay_falls_through_to_the_queue_floor() {
+        // If the relayed dial fails, the queue floor still catches it — the
+        // store-and-forward guarantee is preserved for relay peers too.
+        let mut store = MemStore::default();
+        let tried = RefCell::new(Vec::new());
+        let path = deliver_ladder(
+            Some(&mut store),
+            true,
+            "dev",
+            DeliveryPath::Relay,
+            1_000,
+            |p| {
+                tried.borrow_mut().push(p);
+                matches!(p, DeliveryPath::Queue)
+            },
+        );
+        assert_eq!(path, DeliveryPath::Queue);
+        assert_eq!(
+            *tried.borrow(),
+            vec![DeliveryPath::Relay, DeliveryPath::Queue],
+            "a failed relay dial must fall through to the queue"
         );
     }
 }
@@ -1158,7 +1321,20 @@ mod transport_tests {
     //! The send-side transport selection: which live-push transport a device's
     //! advertised `peer_id` maps to. Pure classification — no network.
 
-    use super::{direct_transport, DirectTransport};
+    use super::{direct_transport, is_relay_addr, DirectTransport};
+
+    #[test]
+    fn circuit_addr_is_libp2p_and_relay_labelled() {
+        // A `/p2p-circuit/` multiaddr still dials over libp2p...
+        let circuit = b"/ip4/127.0.0.1/tcp/9/p2p/12D3KooWrelay/p2p-circuit/p2p/12D3KooWbob";
+        assert_eq!(direct_transport(circuit), DirectTransport::Libp2p);
+        // ...but is labelled a relay path for observability + scoring.
+        assert!(is_relay_addr(circuit));
+        // A plain (non-circuit) multiaddr is a direct path.
+        assert!(!is_relay_addr(b"/ip4/127.0.0.1/tcp/9001/p2p/12D3KooWbob"));
+        // A raw host:port TCP address is never a relay path.
+        assert!(!is_relay_addr(b"127.0.0.1:9001"));
+    }
 
     #[test]
     fn raw_host_port_selects_tcp() {

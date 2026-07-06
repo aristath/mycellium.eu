@@ -865,6 +865,10 @@ internal open class UniffiVTableCallbackInterfaceSecretStore(
 
 
 
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -938,6 +942,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_mycellium_sdk_fn_method_myceliumclient_register(`ptr`: Pointer,`dirUrl`: RustBuffer.ByValue,`queueUrl`: RustBuffer.ByValue,`handle`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_mycellium_sdk_fn_method_myceliumclient_register_push(`ptr`: Pointer,`platform`: RustBuffer.ByValue,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_mycellium_sdk_fn_method_myceliumclient_remove_contact(`ptr`: Pointer,`nickname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_mycellium_sdk_fn_method_myceliumclient_reply(`ptr`: Pointer,`peerHandle`: RustBuffer.ByValue,`replyTo`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -960,6 +966,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_mycellium_sdk_fn_method_myceliumclient_trust_level(`ptr`: Pointer,`peerHandle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_mycellium_sdk_fn_method_myceliumclient_unregister_push(`ptr`: Pointer,`platform`: RustBuffer.ByValue,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_mycellium_sdk_fn_method_myceliumclient_verify_card(`ptr`: Pointer,`card`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_mycellium_sdk_fn_method_myceliumclient_wallet_address(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1124,6 +1132,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_mycellium_sdk_checksum_method_myceliumclient_register(
     ): Short
+    fun uniffi_mycellium_sdk_checksum_method_myceliumclient_register_push(
+    ): Short
     fun uniffi_mycellium_sdk_checksum_method_myceliumclient_remove_contact(
     ): Short
     fun uniffi_mycellium_sdk_checksum_method_myceliumclient_reply(
@@ -1145,6 +1155,8 @@ internal interface UniffiLib : Library {
     fun uniffi_mycellium_sdk_checksum_method_myceliumclient_thread(
     ): Short
     fun uniffi_mycellium_sdk_checksum_method_myceliumclient_trust_level(
+    ): Short
+    fun uniffi_mycellium_sdk_checksum_method_myceliumclient_unregister_push(
     ): Short
     fun uniffi_mycellium_sdk_checksum_method_myceliumclient_verify_card(
     ): Short
@@ -1251,6 +1263,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_mycellium_sdk_checksum_method_myceliumclient_register() != 9495.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_mycellium_sdk_checksum_method_myceliumclient_register_push() != 48460.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_mycellium_sdk_checksum_method_myceliumclient_remove_contact() != 33725.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1282,6 +1297,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mycellium_sdk_checksum_method_myceliumclient_trust_level() != 20480.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_mycellium_sdk_checksum_method_myceliumclient_unregister_push() != 6986.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mycellium_sdk_checksum_method_myceliumclient_verify_card() != 28037.toShort()) {
@@ -1792,6 +1810,21 @@ public interface MyceliumClientInterface {
     fun `register`(`dirUrl`: kotlin.String, `queueUrl`: kotlin.String, `handle`: kotlin.String, `name`: kotlin.String)
     
     /**
+     * Register this device's native/web push token with the account's queue, so
+     * the queue can wake this device **contentlessly** on deposit. `platform`
+     * selects the transport (Web Push / APNs / FCM / UnifiedPush) and `token` is
+     * the OS-issued token (or, for Web Push / UnifiedPush, the endpoint URL).
+     * Idempotent server-side: re-registering the same token is a no-op. Logs the
+     * queue in with this device identity, like `sync`. Returns
+     * [`SdkError::NotRegistered`] if no queue is configured yet.
+     *
+     * The wake carries no sender or content; messages are decrypted on this
+     * device by `sync()` (decrypt-then-display). The push provider only learns
+     * that a device was woken and when.
+     */
+    fun `registerPush`(`platform`: PushPlatform, `token`: kotlin.String)
+    
+    /**
      * Remove a contact by nickname.
      */
     fun `removeContact`(`nickname`: kotlin.String)
@@ -1865,6 +1898,14 @@ public interface MyceliumClientInterface {
      * trusted, given any TOFU pin / out-of-band verification.
      */
     fun `trustLevel`(`peerHandle`: kotlin.String): TrustLevel
+    
+    /**
+     * Remove this device's push registration from the queue (user disabled
+     * notifications, or the device is being removed). Safe to call when none
+     * exists. Mail still queues and arrives on the next `sync()` — disabling
+     * notifications never drops messages.
+     */
+    fun `unregisterPush`(`platform`: PushPlatform, `token`: kotlin.String)
     
     /**
      * Verify a peer's contact `card`: parse it, look its handle up in the
@@ -2355,6 +2396,31 @@ open class MyceliumClient: Disposable, AutoCloseable, MyceliumClientInterface {
 
     
     /**
+     * Register this device's native/web push token with the account's queue, so
+     * the queue can wake this device **contentlessly** on deposit. `platform`
+     * selects the transport (Web Push / APNs / FCM / UnifiedPush) and `token` is
+     * the OS-issued token (or, for Web Push / UnifiedPush, the endpoint URL).
+     * Idempotent server-side: re-registering the same token is a no-op. Logs the
+     * queue in with this device identity, like `sync`. Returns
+     * [`SdkError::NotRegistered`] if no queue is configured yet.
+     *
+     * The wake carries no sender or content; messages are decrypted on this
+     * device by `sync()` (decrypt-then-display). The push provider only learns
+     * that a device was woken and when.
+     */
+    @Throws(SdkException::class)override fun `registerPush`(`platform`: PushPlatform, `token`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_mycellium_sdk_fn_method_myceliumclient_register_push(
+        it, FfiConverterTypePushPlatform.lower(`platform`),FfiConverterString.lower(`token`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Remove a contact by nickname.
      */
     @Throws(SdkException::class)override fun `removeContact`(`nickname`: kotlin.String)
@@ -2542,6 +2608,24 @@ open class MyceliumClient: Disposable, AutoCloseable, MyceliumClientInterface {
     }
     )
     }
+    
+
+    
+    /**
+     * Remove this device's push registration from the queue (user disabled
+     * notifications, or the device is being removed). Safe to call when none
+     * exists. Mail still queues and arrives on the next `sync()` — disabling
+     * notifications never drops messages.
+     */
+    @Throws(SdkException::class)override fun `unregisterPush`(`platform`: PushPlatform, `token`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_mycellium_sdk_fn_method_myceliumclient_unregister_push(
+        it, FfiConverterTypePushPlatform.lower(`platform`),FfiConverterString.lower(`token`),_status)
+}
+    }
+    
     
 
     
@@ -3006,6 +3090,120 @@ public object FfiConverterTypeDeliveryState: FfiConverterRustBuffer<DeliveryStat
 
     override fun write(value: DeliveryState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Which native/web push transport a device token belongs to, for
+ * [`register_push`](crate::MyceliumClient::register_push). The SDK tags the
+ * subscription it registers with the account's queue accordingly; the queue
+ * then wakes this device **contentlessly** on deposit.
+ */
+sealed class PushPlatform {
+    
+    /**
+     * Browser Web Push (VAPID). The token is the browser push endpoint URL.
+     */
+    object WebPush : PushPlatform()
+    
+    
+    /**
+     * Apple Push Notification service. The token is the APNs device token;
+     * `topic` is the app bundle id the wake is addressed to.
+     */
+    data class Apns(
+        /**
+         * The app bundle id (APNs `apns-topic`).
+         */
+        val `topic`: kotlin.String) : PushPlatform() {
+        companion object
+    }
+    
+    /**
+     * Firebase Cloud Messaging. The token is the FCM registration token.
+     */
+    object Fcm : PushPlatform()
+    
+    
+    /**
+     * UnifiedPush / ntfy (de-Googled). The token is the distributor endpoint URL.
+     */
+    object UnifiedPush : PushPlatform()
+    
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePushPlatform : FfiConverterRustBuffer<PushPlatform>{
+    override fun read(buf: ByteBuffer): PushPlatform {
+        return when(buf.getInt()) {
+            1 -> PushPlatform.WebPush
+            2 -> PushPlatform.Apns(
+                FfiConverterString.read(buf),
+                )
+            3 -> PushPlatform.Fcm
+            4 -> PushPlatform.UnifiedPush
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: PushPlatform) = when(value) {
+        is PushPlatform.WebPush -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is PushPlatform.Apns -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`topic`)
+            )
+        }
+        is PushPlatform.Fcm -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is PushPlatform.UnifiedPush -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: PushPlatform, buf: ByteBuffer) {
+        when(value) {
+            is PushPlatform.WebPush -> {
+                buf.putInt(1)
+                Unit
+            }
+            is PushPlatform.Apns -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`topic`, buf)
+                Unit
+            }
+            is PushPlatform.Fcm -> {
+                buf.putInt(3)
+                Unit
+            }
+            is PushPlatform.UnifiedPush -> {
+                buf.putInt(4)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 

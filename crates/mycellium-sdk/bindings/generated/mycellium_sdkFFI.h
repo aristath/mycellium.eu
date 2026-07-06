@@ -451,6 +451,11 @@ RustBuffer uniffi_mycellium_sdk_fn_method_myceliumclient_react(void*_Nonnull ptr
 void uniffi_mycellium_sdk_fn_method_myceliumclient_register(void*_Nonnull ptr, RustBuffer dir_url, RustBuffer queue_url, RustBuffer handle, RustBuffer name, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_REGISTER_PUSH
+#define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_REGISTER_PUSH
+void uniffi_mycellium_sdk_fn_method_myceliumclient_register_push(void*_Nonnull ptr, RustBuffer platform, RustBuffer token, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_REMOVE_CONTACT
 #define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_REMOVE_CONTACT
 void uniffi_mycellium_sdk_fn_method_myceliumclient_remove_contact(void*_Nonnull ptr, RustBuffer nickname, RustCallStatus *_Nonnull out_status
@@ -504,6 +509,11 @@ RustBuffer uniffi_mycellium_sdk_fn_method_myceliumclient_thread(void*_Nonnull pt
 #ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_TRUST_LEVEL
 #define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_TRUST_LEVEL
 RustBuffer uniffi_mycellium_sdk_fn_method_myceliumclient_trust_level(void*_Nonnull ptr, RustBuffer peer_handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_UNREGISTER_PUSH
+#define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_UNREGISTER_PUSH
+void uniffi_mycellium_sdk_fn_method_myceliumclient_unregister_push(void*_Nonnull ptr, RustBuffer platform, RustBuffer token, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_FN_METHOD_MYCELIUMCLIENT_VERIFY_CARD
@@ -938,6 +948,12 @@ uint16_t uniffi_mycellium_sdk_checksum_method_myceliumclient_register(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_REGISTER_PUSH
+#define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_REGISTER_PUSH
+uint16_t uniffi_mycellium_sdk_checksum_method_myceliumclient_register_push(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_REMOVE_CONTACT
 #define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_REMOVE_CONTACT
 uint16_t uniffi_mycellium_sdk_checksum_method_myceliumclient_remove_contact(void
@@ -1001,6 +1017,12 @@ uint16_t uniffi_mycellium_sdk_checksum_method_myceliumclient_thread(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_TRUST_LEVEL
 #define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_TRUST_LEVEL
 uint16_t uniffi_mycellium_sdk_checksum_method_myceliumclient_trust_level(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_UNREGISTER_PUSH
+#define UNIFFI_FFIDEF_UNIFFI_MYCELLIUM_SDK_CHECKSUM_METHOD_MYCELIUMCLIENT_UNREGISTER_PUSH
+uint16_t uniffi_mycellium_sdk_checksum_method_myceliumclient_unregister_push(void
     
 );
 #endif

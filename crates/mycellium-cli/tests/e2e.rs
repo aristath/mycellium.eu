@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mycellium_transport::libp2p_net::{self, Libp2pNode};
+
 /// Path to the built CLI binary (Cargo sets this for integration tests).
 const CLI: &str = env!("CARGO_BIN_EXE_mycellium-cli");
 const PASS: &str = "test-passphrase";
@@ -339,6 +341,152 @@ fn full_duplex_mail_over_libp2p() {
     assert!(
         got,
         "bob's libp2p serve did not receive the live message:\n{}",
+        bob_out.lock().unwrap()
+    );
+}
+
+/// Poll the directory (via `devices <handle>`) until the handle's advertised
+/// address contains `needle` (e.g. `/p2p-circuit`), or time out. A bounded wait
+/// for an async re-publish, run with `home` (any home works — `devices` reads the
+/// directory, not local identity).
+fn wait_directory_addr(home: &PathBuf, handle: &str, needle: &str, dir: &str, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let out = cli(home, &["devices", handle, "--directory", dir]);
+        if String::from_utf8_lossy(&out.stdout).contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// Circuit Relay v2 into the delivery ladder (#59): a recipient reachable ONLY
+/// through a relay gets a **live relayed** push through `deliver()`, reported as
+/// `DeliveryPath::Relay` — not parked in the queue/outbox, and not a direct dial.
+///
+/// Mirrors `full_duplex_mail_over_libp2p`, but through a relay:
+/// - An in-process relay node (its relay-server behaviour forwards for others)
+///   is bound to loopback and reachable by both CLI subprocesses.
+/// - Bob `serve`s relay-only: NO direct listen address, and an empty queue, so
+///   his ONLY reachable path is the circuit (non-vacuous — if the relayed dial
+///   didn't work the message would land in Alice's outbox and both asserts fail).
+/// - Alice `send`s and must report a live `[… relay]` delivery, and Bob's serve
+///   must print the decrypted message.
+#[test]
+fn relayed_live_delivery_through_a_relay() {
+    let _throttle = throttle();
+    let dir = start_directory();
+
+    // In-process relay R: a public node forwarding for others. Its background
+    // swarm task (spawned in `new`) forwards circuit traffic on its own — we just
+    // keep it alive for the duration. `listen_addr()` blocks until it is bound,
+    // so once we have `relay_addr` the relay is listening.
+    let relay_listen = libp2p_net::listen_multiaddr("127.0.0.1:0").unwrap();
+    let mut relay = Libp2pNode::new([42u8; 32], Some(relay_listen)).expect("relay node");
+    let relay_base = relay.listen_addr().expect("relay listen addr");
+    let relay_addr = format!("{relay_base}/p2p/{}", relay.peer_id());
+
+    // Bob registers a libp2p account (his initial direct addr is never listened
+    // on — it is overwritten by the circuit address once he reserves).
+    let bob_port = free_port();
+    let bob_addr = format!("127.0.0.1:{bob_port}");
+    let bob = home("bob-relay");
+    ok(&cli(&bob, &["identity-new"]), "bob id");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "register",
+                "bob",
+                "--addr",
+                &bob_addr,
+                "--libp2p",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "bob register libp2p",
+    );
+
+    let alice = account(&dir, "alice");
+
+    // Bob serves relay-only: reserve on R, re-publish his circuit address, accept
+    // relayed streams. Empty MYCELLIUM_QUEUE ⇒ no queue fallback in his record ⇒
+    // the relay circuit is his only reachable path.
+    let mut bob_serve = Command::new(CLI)
+        .args([
+            "serve",
+            "--addr",
+            &bob_addr,
+            "--as",
+            "bob",
+            "--libp2p",
+            "--relay",
+            &relay_addr,
+            "--directory",
+            &dir,
+        ])
+        .env("MYCELLIUM_HOME", &bob)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_QUEUE", "")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bob serve relay");
+    let bob_out = tail(bob_serve.stdout.take().unwrap());
+
+    // Bounded wait until Bob has reserved + re-published his circuit address —
+    // only then does Alice know a (relay) route to Bob.
+    let published = wait_directory_addr(&alice, "bob", "/p2p-circuit", &dir, 30);
+    if !published {
+        let _ = bob_serve.kill();
+        let _ = bob_serve.wait();
+        panic!(
+            "bob never published a circuit address:\n{}",
+            bob_out.lock().unwrap()
+        );
+    }
+
+    // Alice sends; Bob is online and advertises only a circuit address, so the
+    // message is dialed live THROUGH the relay into his serve and decrypted there.
+    let sent = cli(
+        &alice,
+        &[
+            "send",
+            "bob",
+            "--as",
+            "alice",
+            "--message",
+            "live over relay",
+            "--directory",
+            &dir,
+        ],
+    );
+    ok(&sent, "send");
+    let so = String::from_utf8_lossy(&sent.stdout);
+    // The send reports a live *relay* path — proving it went over the circuit,
+    // not a direct dial and not parked in the outbox/queue.
+    assert!(
+        so.contains("[1 relay]"),
+        "send should report a live relayed delivery: {so}"
+    );
+    assert!(
+        !so.contains("queued for retry"),
+        "relayed live delivery must not be parked in the outbox: {so}"
+    );
+    assert!(
+        !so.contains("direct"),
+        "delivery was through a relay, not a direct dial: {so}"
+    );
+
+    let got = wait_contains(&bob_out, "from alice: live over relay", 20);
+
+    let _ = bob_serve.kill();
+    let _ = bob_serve.wait();
+    relay.drain(50);
+    assert!(
+        got,
+        "bob's relay serve did not receive the live message:\n{}",
         bob_out.lock().unwrap()
     );
 }

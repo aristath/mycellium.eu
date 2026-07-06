@@ -261,16 +261,32 @@ pub fn record<S: Storage>(
 /// pay a doomed direct-dial timeout, while direct is *still listed last* so it
 /// is re-probed (never permanently abandoned).
 pub fn best_paths<S: Storage>(store: &S, device_key: &str, now: u64) -> Vec<DeliveryPath> {
+    best_paths_for(store, device_key, DeliveryPath::Direct, now)
+}
+
+/// Like [`best_paths`], but for a caller whose live-direct rung is `live` —
+/// [`DeliveryPath::Direct`] for a directly-dialable peer, or
+/// [`DeliveryPath::Relay`] for one reachable only over a Circuit Relay v2
+/// address (#59). Scoring is keyed on the *specific* live path, so a relay-only
+/// device's reachability is tracked independently of a direct one. The queue
+/// remains the guaranteed floor in every case.
+pub fn best_paths_for<S: Storage>(
+    store: &S,
+    device_key: &str,
+    live: DeliveryPath,
+    now: u64,
+) -> Vec<DeliveryPath> {
+    let live_first = vec![live, DeliveryPath::Queue];
     let Ok(st) = load(store) else {
-        return default_order();
+        return live_first;
     };
     let Some(entry) = st.find(device_key) else {
-        return default_order();
+        return live_first;
     };
-    if direct_deprioritized(&entry.stat(DeliveryPath::Direct), now) {
-        vec![DeliveryPath::Queue, DeliveryPath::Direct]
+    if direct_deprioritized(&entry.stat(live), now) {
+        vec![DeliveryPath::Queue, live]
     } else {
-        default_order()
+        live_first
     }
 }
 
@@ -462,6 +478,31 @@ mod tests {
         assert!(load(&store).unwrap().find("dev").is_some());
         clear(&mut store).unwrap();
         assert!(load(&store).unwrap().find("dev").is_none());
+    }
+
+    #[test]
+    fn relay_live_path_is_offered_first_and_scored_independently() {
+        let mut store = MemStore::default();
+        // A relay-only device: cold start offers Relay first, queue as the floor.
+        assert_eq!(
+            best_paths_for(&store, "dev", DeliveryPath::Relay, 1_000),
+            vec![DeliveryPath::Relay, DeliveryPath::Queue],
+        );
+        // A demonstrably-dead relay path is deprioritized below the queue, keyed
+        // on Relay — while a same-device Direct score would be untouched.
+        for t in [100u64, 160, 220] {
+            record(&mut store, "dev", DeliveryPath::Relay, false, t).unwrap();
+        }
+        assert_eq!(
+            best_paths_for(&store, "dev", DeliveryPath::Relay, 260),
+            vec![DeliveryPath::Queue, DeliveryPath::Relay],
+            "a persistently-dead relay path falls behind the queue"
+        );
+        // The Direct view of the same device is unaffected (independent scoring).
+        assert_eq!(
+            best_paths_for(&store, "dev", DeliveryPath::Direct, 260),
+            vec![DeliveryPath::Direct, DeliveryPath::Queue],
+        );
     }
 
     #[test]

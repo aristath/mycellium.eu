@@ -217,6 +217,16 @@ impl Libp2pNode {
             .with(Protocol::P2p(self.peer_id)))
     }
 
+    /// Like [`Self::reserve`], but takes the relay address as a string and returns
+    /// this node's dialable circuit address as a string — so callers (the engine)
+    /// need no `Multiaddr` type in scope, mirroring [`Self::dial_str`].
+    pub fn reserve_str(&mut self, relay_addr: &str) -> Result<String> {
+        let addr: Multiaddr = relay_addr
+            .parse()
+            .map_err(|_| anyhow!("'{relay_addr}' is not a valid multiaddr"))?;
+        Ok(self.reserve(&addr)?.to_string())
+    }
+
     /// This node's PeerId (derived from the device key).
     pub fn peer_id(&self) -> PeerId {
         self.peer_id

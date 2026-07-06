@@ -209,6 +209,12 @@ enum Command {
         /// registered — a `--libp2p` account must serve with `--libp2p`).
         #[arg(long)]
         libp2p: bool,
+        /// Be reachable only through a Circuit Relay v2 relay: reserve a slot on
+        /// this relay multiaddr and advertise the resulting circuit address, so
+        /// senders reach this (NATed/relay-only) device through it. Requires
+        /// `--libp2p`.
+        #[arg(long)]
+        relay: Option<String>,
         #[arg(long, default_value = DEFAULT_DIRECTORY)]
         directory: String,
     },
@@ -560,8 +566,9 @@ fn main() -> Result<()> {
             addr,
             whoami,
             libp2p,
+            relay,
             directory,
-        } => serve(&addr, &whoami, libp2p, &directory),
+        } => serve(&addr, &whoami, libp2p, relay.as_deref(), &directory),
         Command::History { peer } => show_history(&peer),
         Command::ClearHistory { peer } => clear_history(&peer),
         Command::Conversations => conversations(),

@@ -84,6 +84,32 @@ pub fn update_devices(
     client.publish(token, handle, &signed)
 }
 
+/// Re-publish this account's record with THIS device's advertised address set to
+/// `addr`, leaving the rest of the cluster untouched. Used by `serve --relay` to
+/// swap in a Circuit Relay v2 circuit address once a reservation is granted (#59),
+/// so senders dial the relay to reach this device. The record `seq` is bumped, so
+/// directories accept the update; the account wallet re-signs it.
+pub fn republish_this_device(
+    client: &DirectoryClient,
+    token: &str,
+    identity: &Identity,
+    handle: &Handle,
+    addr: &str,
+) -> Result<()> {
+    let current = client.lookup(handle)?;
+    current
+        .verify()
+        .map_err(|_| anyhow!("record failed verification"))?;
+    let my_key = identity.device_public();
+    let mut devices = current.record.devices.clone();
+    let updated = this_device(identity, addr);
+    match devices.iter_mut().find(|d| d.device_key == my_key) {
+        Some(slot) => *slot = updated,
+        None => devices.push(updated),
+    }
+    update_devices(client, token, identity, handle, devices, current.record.seq)
+}
+
 pub fn list_devices(handle: &str, directory: &str) -> Result<()> {
     let me = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
     let client = DirectoryClient::new(directory);

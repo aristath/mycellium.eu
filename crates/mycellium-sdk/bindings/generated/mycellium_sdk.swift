@@ -642,6 +642,21 @@ public protocol MyceliumClientProtocol : AnyObject {
     func register(dirUrl: String, queueUrl: String, handle: String, name: String) throws 
     
     /**
+     * Register this device's native/web push token with the account's queue, so
+     * the queue can wake this device **contentlessly** on deposit. `platform`
+     * selects the transport (Web Push / APNs / FCM / UnifiedPush) and `token` is
+     * the OS-issued token (or, for Web Push / UnifiedPush, the endpoint URL).
+     * Idempotent server-side: re-registering the same token is a no-op. Logs the
+     * queue in with this device identity, like `sync`. Returns
+     * [`SdkError::NotRegistered`] if no queue is configured yet.
+     *
+     * The wake carries no sender or content; messages are decrypted on this
+     * device by `sync()` (decrypt-then-display). The push provider only learns
+     * that a device was woken and when.
+     */
+    func registerPush(platform: PushPlatform, token: String) throws 
+    
+    /**
      * Remove a contact by nickname.
      */
     func removeContact(nickname: String) throws 
@@ -715,6 +730,14 @@ public protocol MyceliumClientProtocol : AnyObject {
      * trusted, given any TOFU pin / out-of-band verification.
      */
     func trustLevel(peerHandle: String) throws  -> TrustLevel
+    
+    /**
+     * Remove this device's push registration from the queue (user disabled
+     * notifications, or the device is being removed). Safe to call when none
+     * exists. Mail still queues and arrives on the next `sync()` — disabling
+     * notifications never drops messages.
+     */
+    func unregisterPush(platform: PushPlatform, token: String) throws 
     
     /**
      * Verify a peer's contact `card`: parse it, look its handle up in the
@@ -1099,6 +1122,27 @@ open func register(dirUrl: String, queueUrl: String, handle: String, name: Strin
 }
     
     /**
+     * Register this device's native/web push token with the account's queue, so
+     * the queue can wake this device **contentlessly** on deposit. `platform`
+     * selects the transport (Web Push / APNs / FCM / UnifiedPush) and `token` is
+     * the OS-issued token (or, for Web Push / UnifiedPush, the endpoint URL).
+     * Idempotent server-side: re-registering the same token is a no-op. Logs the
+     * queue in with this device identity, like `sync`. Returns
+     * [`SdkError::NotRegistered`] if no queue is configured yet.
+     *
+     * The wake carries no sender or content; messages are decrypted on this
+     * device by `sync()` (decrypt-then-display). The push provider only learns
+     * that a device was woken and when.
+     */
+open func registerPush(platform: PushPlatform, token: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_mycellium_sdk_fn_method_myceliumclient_register_push(self.uniffiClonePointer(),
+        FfiConverterTypePushPlatform.lower(platform),
+        FfiConverterString.lower(token),$0
+    )
+}
+}
+    
+    /**
      * Remove a contact by nickname.
      */
 open func removeContact(nickname: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
@@ -1242,6 +1286,20 @@ open func trustLevel(peerHandle: String)throws  -> TrustLevel {
         FfiConverterString.lower(peerHandle),$0
     )
 })
+}
+    
+    /**
+     * Remove this device's push registration from the queue (user disabled
+     * notifications, or the device is being removed). Safe to call when none
+     * exists. Mail still queues and arrives on the next `sync()` — disabling
+     * notifications never drops messages.
+     */
+open func unregisterPush(platform: PushPlatform, token: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_mycellium_sdk_fn_method_myceliumclient_unregister_push(self.uniffiClonePointer(),
+        FfiConverterTypePushPlatform.lower(platform),
+        FfiConverterString.lower(token),$0
+    )
+}
 }
     
     /**
@@ -2046,6 +2104,109 @@ public func FfiConverterTypeDeliveryState_lower(_ value: DeliveryState) -> RustB
 
 
 extension DeliveryState: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which native/web push transport a device token belongs to, for
+ * [`register_push`](crate::MyceliumClient::register_push). The SDK tags the
+ * subscription it registers with the account's queue accordingly; the queue
+ * then wakes this device **contentlessly** on deposit.
+ */
+
+public enum PushPlatform {
+    
+    /**
+     * Browser Web Push (VAPID). The token is the browser push endpoint URL.
+     */
+    case webPush
+    /**
+     * Apple Push Notification service. The token is the APNs device token;
+     * `topic` is the app bundle id the wake is addressed to.
+     */
+    case apns(
+        /**
+         * The app bundle id (APNs `apns-topic`).
+         */topic: String
+    )
+    /**
+     * Firebase Cloud Messaging. The token is the FCM registration token.
+     */
+    case fcm
+    /**
+     * UnifiedPush / ntfy (de-Googled). The token is the distributor endpoint URL.
+     */
+    case unifiedPush
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushPlatform: FfiConverterRustBuffer {
+    typealias SwiftType = PushPlatform
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushPlatform {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .webPush
+        
+        case 2: return .apns(topic: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .fcm
+        
+        case 4: return .unifiedPush
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PushPlatform, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .webPush:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .apns(topic):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(topic, into: &buf)
+            
+        
+        case .fcm:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unifiedPush:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushPlatform_lift(_ buf: RustBuffer) throws -> PushPlatform {
+    return try FfiConverterTypePushPlatform.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushPlatform_lower(_ value: PushPlatform) -> RustBuffer {
+    return FfiConverterTypePushPlatform.lower(value)
+}
+
+
+
+extension PushPlatform: Equatable, Hashable {}
 
 
 
@@ -2939,6 +3100,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_mycellium_sdk_checksum_method_myceliumclient_register() != 9495) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mycellium_sdk_checksum_method_myceliumclient_register_push() != 48460) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mycellium_sdk_checksum_method_myceliumclient_remove_contact() != 33725) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2970,6 +3134,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mycellium_sdk_checksum_method_myceliumclient_trust_level() != 20480) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mycellium_sdk_checksum_method_myceliumclient_unregister_push() != 6986) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mycellium_sdk_checksum_method_myceliumclient_verify_card() != 28037) {
