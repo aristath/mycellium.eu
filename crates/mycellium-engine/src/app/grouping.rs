@@ -106,9 +106,19 @@ pub fn distribute_key_to(
             Err(_) => continue,
         };
         let record = match client.lookup(&handle) {
-            Ok(r) if r.verify().is_ok() => r,
+            // Fail closed if the member's wallet no longer matches the pinned or
+            // verified one — a compelled directory that swaps a member's wallet
+            // must not trick us into sealing our group sender key to the impostor
+            // (the same fail-closed check 1:1 sends make; core review).
+            Ok(r)
+                if r.verify().is_ok()
+                    && crate::verified::level(fs, handle.as_str(), &r.record.wallet)
+                        != crate::verified::TrustLevel::Changed =>
+            {
+                r
+            }
             _ => {
-                eprintln!("(could not reach '{member}')");
+                eprintln!("(skipping '{member}': unreachable or identity changed)");
                 continue;
             }
         };
@@ -159,6 +169,14 @@ pub fn handle_group_invite(
 
     match groups::load(fs, &payload.group_id)? {
         Some(mut stored) => {
+            // An invite for a group we're already in is only trustworthy from an
+            // existing member — the group id travels in cleartext inside every
+            // group MailItem, so anyone who learns it could otherwise inject their
+            // sender key (their messages would then be accepted) or add members we
+            // then leak our key to (core review, MEDIUM). Ignore non-members.
+            if !stored.members.iter().any(|m| m == from.as_str()) {
+                return Ok(());
+            }
             // Already in the group — learn this member's sender key.
             let mut group =
                 Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
@@ -599,6 +617,13 @@ pub fn handle_group_sync(
     env: &Envelope,
 ) -> Result<()> {
     let (_from, bytes) = open_envelope(identity, platform, env)?;
+    // A group-sync bootstrap must come from our OWN cluster — otherwise any peer
+    // who can seal an envelope to us could hand us an attacker-chosen group
+    // (roster, keys, sender→handle map) and make us distribute our sender key to
+    // members of their choosing. Fail closed on a foreign sender (core review).
+    if env.sender_record.record.wallet != identity.wallet_public() {
+        return Ok(());
+    }
     let payload: GroupSyncPayload =
         serde_json::from_slice(&bytes).map_err(|_| anyhow!("malformed group sync"))?;
 

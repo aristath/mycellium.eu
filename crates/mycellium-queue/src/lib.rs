@@ -652,7 +652,7 @@ fn load_or_generate_vapid(
         Some(d) => d,
         None => return push::Vapid::generate_with_allowlist(push_allow_hosts),
     };
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir);
     let path = format!("{}/vapid.key", dir.trim_end_matches('/'));
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {

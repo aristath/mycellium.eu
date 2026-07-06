@@ -10,7 +10,7 @@ pub fn forward(
 ) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
-    let fs = open_history(&identity)?;
+    let mut fs = open_history(&identity)?;
 
     // Find the source message's text in the transcript with `from`.
     let from_key = contacts::resolve(&fs, from)?;
@@ -23,7 +23,7 @@ pub fn forward(
 
     // Send it to the recipient.
     let client = DirectoryClient::new(directory);
-    let (to_handle, to_record) = lookup_verified(&client, &fs, to)?;
+    let (to_handle, to_record) = lookup_verified(&client, &mut fs, to)?;
     let app = text_message(&forwarded);
     let envelope = seal_to(&identity, &me, to_record.record.primary(), &app.encode())?;
     let queue = QueueTarget::open(&identity, &to_record.record);
@@ -60,7 +60,7 @@ pub fn send(
     let mut fs = open_history(&identity)?;
     // First, retry anything that got stuck on an earlier attempt.
     let _ = flush_outbox(&identity, &client, &mut fs);
-    let (peer_handle, peer_record) = lookup_verified(&client, &fs, peer)?;
+    let (peer_handle, peer_record) = lookup_verified(&client, &mut fs, peer)?;
 
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
@@ -203,11 +203,11 @@ pub fn broadcast(
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let client = DirectoryClient::new(directory);
-    let fs = open_history(&identity)?;
+    let mut fs = open_history(&identity)?;
 
     let mut sent = 0;
     for recipient in recipients {
-        match lookup_verified(&client, &fs, recipient) {
+        match lookup_verified(&client, &mut fs, recipient) {
             Ok((handle, record)) => {
                 let app = text_message(message);
                 let envelope = seal_to(&identity, &me, record.record.primary(), &app.encode())?;
@@ -925,6 +925,14 @@ pub fn handle_self_sync(
     env: &Envelope,
 ) -> Result<()> {
     let (_from, bytes) = open_envelope(identity, platform, env)?;
+    // A self-sync mirror must come from our OWN cluster: the envelope's sender
+    // record has to be signed by our own wallet. Otherwise any peer who can seal
+    // a valid envelope to us could forge a `SelfSync` and inject (`from_me:true`)
+    // or edit/delete (`by_me:true`) our real outgoing transcript. Fail closed on
+    // a foreign sender (core review, HIGH).
+    if env.sender_record.record.wallet != identity.wallet_public() {
+        return Ok(());
+    }
     let app = match AppMessage::decode(&bytes) {
         Ok(app) => app,
         Err(_) => return Ok(()),
@@ -1369,5 +1377,40 @@ mod transport_tests {
             DirectTransport::None,
             "a non-UTF-8 peer_id has no usable direct address"
         );
+    }
+}
+
+#[cfg(test)]
+mod self_sync_binding_tests {
+    use super::*;
+
+    // A forged `SelfSync` from a FOREIGN identity must not touch our transcript.
+    // Pre-fix, `handle_self_sync` discarded the authenticated sender and wrote
+    // `from_me:true`, so any peer who could seal an envelope to us could inject
+    // (or edit/delete) our own outgoing history (core review, HIGH).
+    #[test]
+    fn self_sync_rejects_a_forged_mirror_from_a_foreign_identity() {
+        let mut p = OsPlatform;
+        let victim = mycellium_core::identity::Identity::generate(&mut p).unwrap();
+        let attacker = mycellium_core::identity::Identity::generate(&mut p).unwrap();
+        let vh = Handle::new("victimhandle").unwrap();
+        let ah = Handle::new("attackerhandle").unwrap();
+        // The victim's public device record — what any sender seals to.
+        let vrec = crate::wireops::build_record(&mut p, &victim, &vh, "", "", "");
+        let vdev = vrec.record.primary();
+
+        let dir = std::env::temp_dir().join(format!("myc-ss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut fs = FileStore::open(dir.join("h"), [7u8; 32]).unwrap();
+
+        // ATTACK: a foreign identity seals a mirror to the victim, wrapped as SelfSync.
+        let forged = text_message("forged outgoing").encode();
+        let env = seal_to(&attacker, &ah, vdev, &forged).unwrap();
+        handle_self_sync(&victim, &mut p, &mut fs, "someone", &env).unwrap();
+        assert!(
+            history::load(&fs, "someone").unwrap().is_empty(),
+            "a forged self-sync from a foreign identity must NOT touch our history",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

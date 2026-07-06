@@ -775,8 +775,8 @@ fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
 
     let client = DirectoryClient::new(directory);
     let (peer_handle, peer_record) = {
-        let fs = history.lock().unwrap();
-        lookup_verified(&client, &fs, peer)?
+        let mut fs = history.lock().unwrap();
+        lookup_verified(&client, &mut fs, peer)?
     };
 
     let location = String::from_utf8(peer_record.record.primary().peer_id.0.clone())

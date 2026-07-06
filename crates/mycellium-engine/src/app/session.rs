@@ -66,6 +66,16 @@ pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<S
         bail!("peer name does not match its record");
     }
     let init: HandshakeInit = wire::decode(&conn.recv()?)?;
+    // Bind the handshake to the peer's published identity — the init's identity
+    // key MUST be the one in their wallet-signed record (the same check
+    // `open_envelope` makes on the offline path). Without it an attacker can
+    // replay a victim's public record with their OWN init and complete a session
+    // we'd label as the victim — and the safety number below, computed from the
+    // record's wallet, would still match, defeating the out-of-band defense
+    // (core review, HIGH).
+    if init.initiator_ik != peer_record.record.primary().id_key {
+        bail!("handshake is not bound to the peer's identity");
+    }
 
     let shared = x3dh::respond(identity, &init).map_err(|e| anyhow!("{e}"))?;
     let ratchet = Ratchet::new_responder(&shared, identity);

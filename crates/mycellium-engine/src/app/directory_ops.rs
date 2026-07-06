@@ -15,7 +15,7 @@ pub fn verify(peer: &str, directory: &str, confirm: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let client = DirectoryClient::new(directory);
-    let (peer_handle, peer_record) = lookup_verified(&client, &fs, peer)?;
+    let (peer_handle, peer_record) = lookup_verified(&client, &mut fs, peer)?;
     let wallet = peer_record.record.wallet;
     let sn = safety::safety_number(&identity.wallet_public(), &wallet);
     let level = verified::level(&fs, peer_handle.as_str(), &wallet);
@@ -112,7 +112,7 @@ pub fn presence(peer: &str, directory: &str) -> Result<()> {
 /// the record matches any pinned wallet for that contact (TOFU).
 pub fn lookup_verified(
     client: &DirectoryClient,
-    fs: &FileStore,
+    fs: &mut FileStore,
     input: &str,
 ) -> Result<(Handle, SignedRecord)> {
     let resolved = contacts::resolve(fs, input)?;
@@ -134,6 +134,20 @@ pub fn lookup_verified(
              verify {h} --confirm   (to accept the new identity), or `contact add` to re-pin.",
             h = handle.as_str(),
             verb = if verified::get(fs, handle.as_str())?.is_some() { "verified" } else { "pinned" },
+        );
+    }
+
+    // Anti-rollback: refuse a record older than one we've already pinned for this
+    // handle. A malicious/compelled directory can serve a stale (still validly
+    // signed, same-wallet) record to re-introduce a removed device or redirect
+    // our mail — a downgrade the wallet-change guard above cannot see (HIGH).
+    if !crate::antirollback::check_and_pin(fs, handle.as_str(), record.record.seq)? {
+        bail!(
+            "⚠ STALE RECORD for '{h}': the directory returned an older record (seq {seq}) than one \
+             you've already seen. Refusing — a rollback could re-introduce a device you removed or \
+             redirect your messages. If '{h}' legitimately rolled back, clear the pin and re-verify.",
+            h = handle.as_str(),
+            seq = record.record.seq,
         );
     }
     Ok((handle, record))

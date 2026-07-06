@@ -15,6 +15,7 @@
 // exist on wasm32. They're gated behind the default `native` feature; the other
 // modules are pure domain state, generic over `mycellium_core::storage`, and
 // compile to wasm so the browser build can drive them.
+pub mod antirollback;
 #[cfg(feature = "native")]
 pub mod app;
 pub mod blocklist;
