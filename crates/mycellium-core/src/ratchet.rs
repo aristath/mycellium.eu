@@ -52,6 +52,7 @@ pub struct RatchetMessage {
 }
 
 /// One side of a Double Ratchet session.
+#[derive(Clone)]
 pub struct Ratchet {
     root: [u8; 32],
     dhs: StaticSecret,
@@ -65,6 +66,7 @@ pub struct Ratchet {
     skipped: Vec<SkippedKey>,
 }
 
+#[derive(Clone)]
 struct SkippedKey {
     dh: [u8; 32],
     n: u32,
@@ -164,21 +166,39 @@ impl Ratchet {
             return Ok(plaintext);
         }
 
-        let header_dh = msg.header.dh.0;
-        if self.dhr != Some(header_dh) {
-            // New ratchet key: bank the rest of the current chain, then step.
-            self.skip_message_keys(msg.header.pn)?;
-            self.dh_ratchet(platform, header_dh)?;
-        }
-        self.skip_message_keys(msg.header.n)?;
+        // Fail closed: perform every mutating step (DH ratchet, key skipping,
+        // chain advance) on a private clone and commit it only after the AEAD
+        // verifies. A forged header or garbage ciphertext therefore cannot
+        // desync the live session, and an at-least-once re-delivery cannot
+        // consume the current chain key out from under the next real message.
+        let mut next = self.clone();
 
-        let ckr = self.ckr.expect("receiving chain established by DH ratchet");
+        let header_dh = msg.header.dh.0;
+        if next.dhr != Some(header_dh) {
+            // New ratchet key: bank the rest of the current chain, then step.
+            next.skip_message_keys(msg.header.pn)?;
+            next.dh_ratchet(platform, header_dh)?;
+        }
+        next.skip_message_keys(msg.header.n)?;
+
+        // A message at or below the current chain position that no skipped key
+        // covered is a replay of an already-consumed key. Reject it rather than
+        // burn the live chain key on it.
+        if msg.header.n < next.nr {
+            return Err(Error::DecryptFailed);
+        }
+
+        // Fail closed when no receiving chain exists (e.g. a fresh initiator
+        // fed a header equal to its own remote key, which skips the DH ratchet).
+        let ckr = next.ckr.ok_or(Error::DecryptFailed)?;
         let (ckr_next, mk) = kdf_ck(&ckr);
-        self.ckr = Some(ckr_next);
-        self.nr += 1;
+        next.ckr = Some(ckr_next);
+        next.nr += 1;
 
         let aad = associated_data(ad, &msg.header);
-        aead_decrypt(&mk, &msg.ciphertext, &aad)
+        let plaintext = aead_decrypt(&mk, &msg.ciphertext, &aad)?;
+        *self = next;
+        Ok(plaintext)
     }
 
     fn try_skipped(&mut self, msg: &RatchetMessage, ad: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -429,5 +449,73 @@ mod tests {
         let bytes = crate::wire::encode(&msg);
         let decoded: RatchetMessage = crate::wire::decode(&bytes).unwrap();
         assert_eq!(bob.decrypt(&mut p, &decoded, AD).unwrap(), b"over the wire");
+    }
+
+    // --- Fail-closed decrypt regression tests (red-green) ---
+
+    /// A fresh initiator has `ckr: None` and `dhr: Some(responder_spk)`. A forged
+    /// message whose `header.dh` equals that public `dhr` skips the DH ratchet,
+    /// leaving `ckr` at `None`. This must fail closed, not panic on `.expect(...)`.
+    #[test]
+    fn forged_header_on_fresh_initiator_fails_closed() {
+        let mut p = SeededPlatform(0);
+        let (mut alice, _bob) = established(&mut p);
+        let dhr = alice.dhr.expect("initiator has a remote ratchet key");
+        let forged = RatchetMessage {
+            header: Header {
+                dh: MessagingPublicKey(dhr),
+                pn: 0,
+                n: 0,
+            },
+            ciphertext: alloc::vec![0u8; 32],
+        };
+        assert_eq!(
+            alice.decrypt(&mut p, &forged, AD).err(),
+            Some(Error::DecryptFailed),
+        );
+    }
+
+    /// A message with a *fresh* ratchet key but garbage ciphertext must not
+    /// corrupt the session: the DH ratchet (root/dhr/ckr) must only commit after
+    /// the AEAD verifies. A legitimate message from the real peer must still work.
+    #[test]
+    fn aead_failure_does_not_corrupt_session() {
+        let mut p = SeededPlatform(0);
+        let (mut alice, mut bob) = established(&mut p);
+
+        // Attacker-generated ratchet key the real peer never used.
+        let (_secret, attacker_dh) = generate_dh(&mut p);
+        let forged = RatchetMessage {
+            header: Header {
+                dh: MessagingPublicKey(attacker_dh),
+                pn: 0,
+                n: 0,
+            },
+            ciphertext: alloc::vec![9u8; 40],
+        };
+        assert!(bob.decrypt(&mut p, &forged, AD).is_err());
+
+        // The real peer's next message must still decrypt (state was rolled back).
+        let real = alice.encrypt(b"legit", AD);
+        assert_eq!(bob.decrypt(&mut p, &real, AD).unwrap(), b"legit");
+    }
+
+    /// Re-delivering an already-consumed in-order message (ordinary at-least-once
+    /// queue behaviour) must be rejected without consuming the live chain key, so
+    /// the next legitimate message still decrypts.
+    #[test]
+    fn replayed_in_order_message_is_harmless() {
+        let mut p = SeededPlatform(0);
+        let (mut alice, mut bob) = established(&mut p);
+        let m0 = alice.encrypt(b"zero", AD);
+        let m1 = alice.encrypt(b"one", AD);
+        let m2 = alice.encrypt(b"two", AD);
+
+        assert_eq!(bob.decrypt(&mut p, &m0, AD).unwrap(), b"zero");
+        assert_eq!(bob.decrypt(&mut p, &m1, AD).unwrap(), b"one");
+        // Queue re-delivers m1 (already consumed, not covered by a skipped key).
+        assert!(bob.decrypt(&mut p, &m1, AD).is_err());
+        // The next legitimate message must still decrypt.
+        assert_eq!(bob.decrypt(&mut p, &m2, AD).unwrap(), b"two");
     }
 }

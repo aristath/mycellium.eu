@@ -3,8 +3,38 @@
 //! directory and queue clients are written against the trait, not this type.
 
 use std::io::Read;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use mycellium_core::http::{HttpResponse, HttpTransport};
+
+/// How long the TCP connect may take before giving up. Mirrors the TCP
+/// transport's `CONNECT_TIMEOUT` (see `mycellium-transport/src/net.rs`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a single read/write may block before erroring. Bounds a
+/// slow/stalled/slow-loris directory or queue that connects then dribbles bytes
+/// (or nothing) so it can no longer pin the caller's thread forever. The byte
+/// cap in `read_response` bounds total SIZE; this bounds TIME.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The shared, timeout-and-redirect-hardened `ureq` agent. Built once and
+/// reused so connection pooling works across requests.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(IO_TIMEOUT)
+            .timeout_write(IO_TIMEOUT)
+            // Do NOT auto-follow redirects. The directory/queue are untrusted;
+            // a hostile endpoint could 302 us to `http://…` (downgrading the
+            // metadata channel) or to an internal address (SSRF). With this at
+            // zero a 3xx surfaces to the caller as a normal response instead of
+            // being silently chased.
+            .redirects(0)
+            .build()
+    })
+}
 
 /// Cap for small responses (records, auth, push keys, deposit acks) — a hostile
 /// endpoint can't make us allocate more than this.
@@ -35,7 +65,7 @@ impl HttpTransport for UreqTransport {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<HttpResponse, String> {
-        let mut req = ureq::request(method, url);
+        let mut req = agent().request(method, url);
         for (k, v) in headers {
             req = req.set(k, v);
         }
@@ -112,6 +142,36 @@ mod tests {
                 "oversized response should be rejected, got {} bytes",
                 r.body.len()
             ),
+        }
+    }
+
+    #[test]
+    fn redirects_are_not_followed() {
+        // A hostile endpoint that 302s to another location. With redirects
+        // disabled the 3xx must surface to the caller (folded into a normal
+        // response by ureq's error handling) rather than being chased — a
+        // followed redirect could downgrade https→http or reach an internal
+        // address (SSRF). The Location here points somewhere the test never
+        // serves, so if the client *did* follow it the request would fail to
+        // connect instead of returning 302.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = s.read(&mut req);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/internal\r\nContent-Length: 0\r\n\r\n"
+                );
+            }
+        });
+        match UreqTransport.request("GET", &format!("http://{addr}/records/x"), &[], None) {
+            Ok(r) => assert_eq!(
+                r.status, 302,
+                "redirect must surface as a 302, not be followed"
+            ),
+            Err(e) => panic!("redirect should surface as a 302 response, got error: {e}"),
         }
     }
 }

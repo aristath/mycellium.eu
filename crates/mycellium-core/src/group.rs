@@ -155,7 +155,7 @@ impl ReceiverKey {
         }
         while self.iteration < target {
             let (next, mk) = kdf_ck(&self.chain_key);
-            self.skipped.push((self.iteration, mk));
+            self.bank_skipped(self.iteration, mk);
             self.chain_key = next;
             self.iteration += 1;
         }
@@ -163,6 +163,18 @@ impl ReceiverKey {
         self.chain_key = next;
         self.iteration += 1;
         Ok(mk)
+    }
+
+    /// Bank a skipped message key, capping the *total* retained set. `MAX_SKIP`
+    /// bounds only the per-call gap; across many widely-spaced messages the set
+    /// would otherwise grow (and persist) without bound. Evict the oldest key
+    /// (zeroizing it) so the retained set can never exceed `MAX_SKIP`.
+    fn bank_skipped(&mut self, iteration: u32, mk: [u8; 32]) {
+        while self.skipped.len() >= MAX_SKIP as usize {
+            let (_, mut oldest) = self.skipped.remove(0);
+            oldest.zeroize();
+        }
+        self.skipped.push((iteration, mk));
     }
 }
 
@@ -483,6 +495,37 @@ mod tests {
             a.decrypt(&from_b, AD).is_err(),
             "a removed member must be rejected"
         );
+    }
+
+    /// A sender that transmits at widely spaced iterations makes the receiver
+    /// bank a full window of skipped keys on each delivery. Without a total cap on
+    /// `skipped`, this grows without bound (and is persisted). The set must stay
+    /// bounded, while normal small-gap out-of-order delivery still decrypts.
+    #[test]
+    fn skipped_set_is_bounded() {
+        let sender = SenderKey::generate(&mut SeededPlatform(1));
+        let dist = sender.distribution();
+        let mut receiver = ReceiverKey::from_distribution(&dist).unwrap();
+
+        // Each call jumps the largest single-call gap (MAX_SKIP), banking a full
+        // window. Across many calls the total must never exceed the bound.
+        let mut target = 0u32;
+        for _ in 0..8 {
+            target += MAX_SKIP;
+            let _ = receiver.message_key(target).unwrap();
+            assert!(
+                receiver.skipped.len() <= MAX_SKIP as usize,
+                "skipped set grew past the bound: {}",
+                receiver.skipped.len()
+            );
+        }
+
+        // Normal small-gap out-of-order delivery must still decrypt.
+        let (mut a, mut b, _c) = three_members();
+        let m0 = a.encrypt(b"first", AD);
+        let m1 = a.encrypt(b"second", AD);
+        assert_eq!(b.decrypt(&m1, AD).unwrap(), b"second");
+        assert_eq!(b.decrypt(&m0, AD).unwrap(), b"first");
     }
 
     #[test]

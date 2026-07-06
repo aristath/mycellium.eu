@@ -70,6 +70,8 @@ pub enum ApiError {
     RateLimited,
     /// The recipient's mailbox is full.
     MailboxFull,
+    /// The queue is at its global mailbox ceiling and can't mint a new one.
+    Capacity,
     /// Malformed request.
     BadRequest,
     /// A durable-storage write failed.
@@ -84,6 +86,7 @@ impl ApiError {
             ApiError::Unauthorized => 401,
             ApiError::Forbidden => 403,
             ApiError::RateLimited | ApiError::MailboxFull => 429,
+            ApiError::Capacity => 507,
             ApiError::Storage => 500,
         }
     }
@@ -97,6 +100,7 @@ impl ApiError {
             ApiError::Forbidden => "you may only collect your own mailbox",
             ApiError::RateLimited => "rate limit exceeded",
             ApiError::MailboxFull => "recipient mailbox is full",
+            ApiError::Capacity => "queue is at capacity",
             ApiError::BadRequest => "malformed request",
             ApiError::Storage => "storage write failed",
         }
@@ -105,6 +109,20 @@ impl ApiError {
 
 /// Maximum number of queued messages per (wallet, slot) mailbox.
 pub const MAX_MAILBOX: usize = 256;
+
+/// Global ceiling on the number of *distinct* mailboxes the queue will hold.
+/// The per-sender rate limit bounds how fast one sender deposits, but nothing
+/// bounded how many distinct (wallet, slot) mailboxes could be minted overall,
+/// so a spread-out flood could exhaust memory/disk. Once this many mailboxes
+/// exist, a deposit that would create a *new* one is refused (`Capacity`); a
+/// deposit into an already-existing mailbox still succeeds (up to `MAX_MAILBOX`).
+pub const MAX_MAILBOXES: usize = 100_000;
+
+/// Hard ceiling on outstanding login challenges. `challenge()` is unauthenticated,
+/// so TTL pruning alone let the map grow without bound within a window; at this
+/// ceiling the oldest challenge is evicted to make room, keeping memory bounded
+/// no matter the request rate.
+pub const MAX_CHALLENGES: usize = 10_000;
 
 /// Largest request body the queue will buffer. Deposits carry sealed envelopes
 /// (which may embed an attachment up to ~256 KiB), so this leaves headroom.
@@ -200,6 +218,19 @@ impl Queue {
         // stays bounded rather than growing with every unfinished login.
         self.challenges
             .retain(|_, (_, issued)| now.saturating_sub(*issued) <= CHALLENGE_TTL);
+        // Hard ceiling: if TTL pruning didn't free a slot (a burst of fresh,
+        // still-valid challenges), evict the oldest so an unauthenticated flood
+        // can't grow the map without bound.
+        if self.challenges.len() >= MAX_CHALLENGES {
+            if let Some(oldest) = self
+                .challenges
+                .iter()
+                .min_by_key(|(_, (_, issued))| *issued)
+                .map(|(nonce, _)| nonce.clone())
+            {
+                self.challenges.remove(&oldest);
+            }
+        }
         let nonce = random_hex::<16>();
         self.challenges.insert(nonce.clone(), (wallet, now));
         nonce
@@ -339,6 +370,13 @@ impl Queue {
             return Err(ApiError::RateLimited);
         }
         let key = (recipient_wallet_hex.to_string(), slot.to_string());
+        // Global mailbox ceiling: refuse a deposit that would mint a *new*
+        // mailbox once we're at capacity (O(1): `HashMap::len` + `contains_key`),
+        // so a spread-out flood of distinct (wallet, slot) targets can't exhaust
+        // storage. A deposit into an already-existing mailbox is unaffected.
+        if self.mailboxes.len() >= MAX_MAILBOXES && !self.mailboxes.contains_key(&key) {
+            return Err(ApiError::Capacity);
+        }
         let mailbox = self.mailboxes.entry(key).or_default();
         if mailbox.len() >= MAX_MAILBOX {
             return Err(ApiError::MailboxFull);
@@ -871,13 +909,18 @@ fn is_rendezvous_id(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// A plausible Web Push endpoint: a bounded HTTPS URL with a host. (Requiring
-/// HTTPS also keeps the queue from being pointed at plain-HTTP internal URLs.)
+/// A plausible Web Push endpoint: a bounded HTTPS URL with a host, whose host is
+/// not statically an internal target. (Requiring HTTPS keeps the queue off
+/// plain-HTTP internal URLs; the internal-host guard blocks loopback/link-local/
+/// private/metadata literals at subscribe time — a DNS name that only *resolves*
+/// internally is caught again, with a fresh resolution, right before the POST in
+/// `push::endpoint_is_safe_to_connect`.)
 fn is_push_endpoint(e: &str) -> bool {
     e.len() <= MAX_ENDPOINT_LEN
         && push::origin_of(e)
             .map(|o| o.starts_with("https://"))
             .unwrap_or(false)
+        && !push::is_blocked_endpoint_static(e)
 }
 
 /// Validate a [`Subscription`] per variant before it can enter storage, so a
@@ -1406,6 +1449,109 @@ mod tests {
             .is_ok());
     }
 
+    #[test]
+    fn push_endpoints_to_internal_hosts_are_rejected_at_subscribe() {
+        // Fix 1 (SSRF): before the fix these all passed the HTTPS-prefix check and
+        // were stored, so a later deposit's fan-out would POST to them. Now the
+        // internal-host guard rejects literal-IP / metadata / loopback endpoints
+        // at subscribe time, while a normal public host is still accepted.
+        for bad in [
+            "https://169.254.169.254/x", // cloud metadata (link-local)
+            "https://127.0.0.1/x",       // loopback
+            "https://[::1]/x",           // IPv6 loopback
+            "https://10.0.0.5/x",        // private 10/8
+            "https://metadata.google.internal/x",
+        ] {
+            assert!(
+                !is_push_endpoint(bad),
+                "expected internal endpoint {bad} to be rejected"
+            );
+        }
+        // A non-internal public-looking HTTPS host is still a valid endpoint.
+        assert!(is_push_endpoint("https://push.example.com/abc"));
+
+        // End-to-end through subscribe(): an internal endpoint is a BadRequest and
+        // never enters the subs map.
+        let mut q = Queue::new();
+        let a = Identity::generate(&mut P(31)).unwrap();
+        let token = login(&mut q, &a);
+        let hex = hex33(&a.wallet_public().0);
+        assert_eq!(
+            q.subscribe(&token, web("https://127.0.0.1:2379/x"), 0),
+            Err(ApiError::BadRequest)
+        );
+        assert_eq!(
+            q.subscribe(&token, web("https://169.254.169.254/latest/meta-data/"), 0),
+            Err(ApiError::BadRequest)
+        );
+        assert!(q.subscriptions(&hex).is_empty());
+        // A legit endpoint still subscribes.
+        assert!(q
+            .subscribe(&token, web("https://push.example.com/ok"), 0)
+            .is_ok());
+    }
+
+    #[test]
+    fn deposit_is_capped_at_the_global_mailbox_ceiling() {
+        // Fix 2: before the fix, deposits to unbounded distinct recipients each
+        // minted a durable mailbox with no global cap. Now, at the ceiling, a
+        // deposit that would create a NEW mailbox is refused, while a deposit into
+        // an already-existing mailbox still succeeds.
+        let mut q = Queue::new();
+        let alice = Identity::generate(&mut P(41)).unwrap();
+        let token = login(&mut q, &alice);
+
+        // Seed the map to exactly the ceiling with distinct mailboxes (directly,
+        // to stay off the per-sender rate limit and keep the test fast). One of
+        // these, `existing_hex`, we'll deposit into again below.
+        let existing = Identity::generate(&mut P(200)).unwrap();
+        let existing_hex = hex33(&existing.wallet_public().0);
+        q.mailboxes.insert(
+            (existing_hex.clone(), ACCOUNT_SLOT.to_string()),
+            vec!["seed".into()],
+        );
+        for i in 1..MAX_MAILBOXES {
+            // 66-char lowercase-hex wallet keys, all distinct.
+            let w = format!("{i:066x}");
+            q.mailboxes
+                .insert((w, ACCOUNT_SLOT.to_string()), Vec::new());
+        }
+        assert_eq!(q.mailboxes.len(), MAX_MAILBOXES);
+
+        // A deposit that would mint a brand-new mailbox is refused at capacity.
+        let newcomer = Identity::generate(&mut P(201)).unwrap();
+        let newcomer_hex = hex33(&newcomer.wallet_public().0);
+        assert_eq!(
+            q.deposit(&token, &newcomer_hex, ACCOUNT_SLOT, "x".into(), 0),
+            Err(ApiError::Capacity),
+        );
+        // ...and no new mailbox was created.
+        assert_eq!(q.mailboxes.len(), MAX_MAILBOXES);
+
+        // A deposit into an already-existing mailbox still succeeds at capacity.
+        assert!(q
+            .deposit(&token, &existing_hex, ACCOUNT_SLOT, "y".into(), 0)
+            .is_ok());
+    }
+
+    #[test]
+    fn challenge_map_is_bounded_under_a_flood() {
+        // Fix 3: challenge() is unauthenticated; before the fix, only TTL pruning
+        // bounded it, so a burst of fresh challenges at one instant grew the map
+        // without limit. Now the map stays at the ceiling by evicting the oldest.
+        let mut q = Queue::new();
+        let a = Identity::generate(&mut P(51)).unwrap();
+        // Issue well past the ceiling at a fixed clock (so TTL never fires).
+        for _ in 0..MAX_CHALLENGES + 25 {
+            let _ = q.challenge(a.wallet_public(), 0);
+        }
+        assert!(
+            q.challenges.len() <= MAX_CHALLENGES,
+            "challenge map must stay bounded (was {})",
+            q.challenges.len()
+        );
+    }
+
     /// End-to-end proof of the UnifiedPush push path (#71): a deposit through the
     /// **running queue server** fans out a **contentless** wake POST to a mock
     /// UnifiedPush distributor, and a distributor that reports `410 Gone` has its
@@ -1506,6 +1652,18 @@ mod tests {
             spawn_mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         let (gone_url, _gone_hit) =
             spawn_mock("HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+        // These mocks live on loopback, which the SSRF guard blocks by default.
+        // Register them as operator-allowlisted internal distributors (exact
+        // host:port) so the *delivery* path can reach them — mirroring an operator
+        // self-hosting a UnifiedPush distributor on an internal address. Subscribe
+        // stays strict; these subs are seeded directly below.
+        for url in [&good_url, &gone_url] {
+            if let Some((_, authority)) = url.split_once("://") {
+                let authority = authority.split('/').next().unwrap_or(authority);
+                push::allow_authority_for_test(authority);
+            }
+        }
 
         // A shared queue the routes mutate and the test can seed/inspect.
         let queue = Arc::new(Mutex::new(Queue::new()));
