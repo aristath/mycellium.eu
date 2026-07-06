@@ -31,4 +31,8 @@ The engine picks a transport behind the core `Transport` trait, so app and hands
 
 Because `Libp2pNode` owns a background Tokio runtime with its own send buffers, call `Libp2pNode::drain(millis)` before dropping the node so queued writes actually flush before the runtime tears down.
 
-NAT traversal (DHT, relay, DCUtR) is the remaining libp2p increment. It belongs in the swarm inside `Libp2pNode`, with no change to the app above.
+Circuit Relay v2 support is implemented: a node can reserve on a relay and dial a
+`…/p2p-circuit/…` address, and the `mycellium-relay` binary runs the public relay
+side. The remaining libp2p reachability increments are DHT/identify/AutoNAT/DCUtR
+and relay discovery/selection, all still inside `Libp2pNode` with no change to the
+app above.

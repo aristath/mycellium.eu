@@ -59,10 +59,10 @@ a shell drives the engine.
         │  and compile to wasm; native orchestration (app/*) is behind the      │
         │  `native` feature; `wireops` is the shared, platform-agnostic crypto. │
         └──────▲────────────────────────────────────────────────▲──────────────┘
-        drives │ (two shells over one engine)                    │ HTTP clients
+        drives │ (shells over one engine)                        │ HTTP clients
       ┌────────┴────────┐  ┌───────────────────────────┐  ┌──────┴───────────────┐
-      │ mycellium-cli   │  │ mycellium-wasm → clients/ │  │ directory-client      │
-      │ (clap + TUI)    │  │ web PWA (Web Worker + IDB)│  │ queue-client          │
+      │ cli + sdk       │  │ mycellium-wasm → clients/ │  │ directory-client      │
+      │ native shells   │  │ web PWA (Web Worker + IDB)│  │ queue-client          │
       └─────────────────┘  └───────────────────────────┘  └──────┬───────────────┘
                                                                  │ HTTP (+ CORS, TLS)
                                     ┌────────────────────────────┴────────────┐
@@ -84,14 +84,17 @@ the native and browser builds: same engine, different `Transport` / `Storage` /
 ## Clients: native-first (the product target)
 
 The engine is the shared **brain**; every client is a thin shell over it. Architecturally
-the shells are **peers** — the CLI, the PWA, and the coming native apps all drive the
+the shells are **peers** — the CLI, PWA, SDK, and native app shells all drive the
 same engine through the same ports — but they are not peers in *product priority*:
 
-- **Native apps — the target product (roadmap, not yet built).** Android, iOS, macOS,
-  Linux, and Windows apps, each a thin platform-native UI over the same core + engine,
-  bound through a **native SDK** (`mycellium-sdk`: **UniFFI** for Kotlin/Swift, a
-  **C-ABI** for desktop — #64). Native is where the things a real messenger needs
-  live: OS secure storage (Keychain / Keystore / DPAPI / libsecret — #65), native
+- **Native apps — the target product (early scaffolds exist).** Android, iOS/macOS,
+  Linux, and Windows apps are thin platform-native UI shells over the same core +
+  engine, bound through a **native SDK** (`mycellium-sdk`: **UniFFI** for
+  Kotlin/Swift, a **C-ABI**/Rust crate path for desktop — #64). Early Android,
+  Apple, and Tauri desktop shells now live under `clients/` and exercise the
+  SDK, email onboarding, messaging, and OS-backed `SecretStore` adapters. They are
+  not product-complete yet. Native is where the things a real messenger needs live:
+  OS secure storage (Keychain / Keystore / DPAPI / libsecret — #65), native
   push/wake (APNs / FCM — #71), background delivery, direct P2P reachability
   (#59/#60), and platform-native UX. Tracked as the native client roadmap (#74):
   Android #67, iOS #68, macOS #69, Linux #70, Windows #72.
@@ -115,18 +118,20 @@ reimplementing the protocol. Privacy / metadata / trust direction is tracked in 
 | [`mycellium-directory`](../crates/mycellium-directory/README.md) | service (lib) | The name registry: login + signed-record store + presence. Holds only self-signed records it cannot forge. |
 | [`mycellium-server`](../crates/mycellium-server/README.md) | service (bin) | Deployable binary that serves the directory over HTTP. |
 | [`mycellium-queue`](../crates/mycellium-queue/README.md) | service (lib+bin) | Per-recipient store-and-forward mailbox, **keyed by wallet**, decoupled from the directory. Holds only ciphertext. |
+| [`mycellium-relay`](../crates/mycellium-relay/README.md) | service (bin) | Deployable libp2p Circuit Relay v2 server for online-but-NAT'd peers. Forwards opaque Noise-encrypted circuit traffic. |
 | [`mycellium-directory-client`](../crates/mycellium-directory-client/README.md) | adapter | HTTP client for the directory (login, publish, lookup, presence, email claim). Generic over `HttpTransport`. |
-| [`mycellium-queue-client`](../crates/mycellium-queue-client/README.md) | adapter | HTTP client for the queue (login, deposit, collect, Web Push). Generic over `HttpTransport`. |
+| [`mycellium-queue-client`](../crates/mycellium-queue-client/README.md) | adapter | HTTP client for the queue (login, deposit, collect, push wake targets, pairing rendezvous). Generic over `HttpTransport`. |
 | [`mycellium-http`](../crates/mycellium-http/README.md) | adapter | The **native** `HttpTransport` (ureq). The browser supplies its own (in `mycellium-wasm`). |
 | [`mycellium-transport`](../crates/mycellium-transport/README.md) | adapter | `Transport` implementations: framed TCP and libp2p (Noise + Yamux). |
 | [`mycellium-storage`](../crates/mycellium-storage/README.md) | adapter | `Storage` implementation: an encrypted local file KV, plus at-rest identity. |
 | [`mycellium-observe`](../crates/mycellium-observe/README.md) | support | Zero-dependency server metrics (`/metrics`) + JSON access logs. |
 | [`mycellium-engine`](../crates/mycellium-engine/README.md) | engine | The headless peer — all orchestration, minus presentation. Domain modules compile to wasm; `app/*` is behind the `native` feature. |
+| [`mycellium-sdk`](../crates/mycellium-sdk/README.md) | shell boundary | Stable UniFFI API for Android, Apple, and desktop clients: account setup, email verification, messaging, sync, contacts/trust, pairing, groups, push registration, backup/restore, and platform `SecretStore` injection. |
 | [`mycellium-cli`](../crates/mycellium-cli/README.md) | shell | A terminal shell over the engine (clap + interactive UI). |
 | [`mycellium-wasm`](../crates/mycellium-wasm/README.md) | shell | The engine as WebAssembly: a `Session` façade + browser `HttpTransport`/`Storage`/`Platform`, driving `clients/web` (the PWA). |
 
-Dependency graph is acyclic: `core ← {directory ← server, queue, transport,
-storage, directory-client, queue-client, http, observe} ← engine ← {cli, wasm}`.
+Dependency graph is acyclic: `core ← {directory ← server, queue, transport ← relay,
+storage, directory-client, queue-client, http, observe} ← engine ← {cli, sdk, wasm}`.
 The servers (`directory`, `queue`) persist to embedded **redb** when `MYCELLIUM_DATA`
 is set, and share `mycellium-observe` for metrics and logs.
 

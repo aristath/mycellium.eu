@@ -1,4 +1,5 @@
-//! A thin HTTP client for the message queue (login, deposit, collect).
+//! A thin HTTP client for the message queue (login, deposit, collect, push wake
+//! targets, and seedless-pairing rendezvous).
 //!
 //! The queue is keyed by **wallet**, not handle: you deposit a blob for a
 //! recipient wallet, and you may only collect your own. Separate from the

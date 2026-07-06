@@ -92,8 +92,10 @@ impl ApiError {
     }
 }
 
-/// The in-memory directory state (POC). A real deployment swaps the maps for a
-/// database or, ultimately, an on-chain registry — the logic is unchanged.
+/// The directory state. In-memory maps hold the hot working set; when opened
+/// with [`Directory::open`], records and email claims are loaded from and written
+/// through to the durable redb store. A future on-chain registry can reuse the
+/// same signed-record rules.
 #[derive(Default)]
 pub struct Directory {
     /// Outstanding login challenges: nonce → `(wallet, issued_at)`. Pruned by

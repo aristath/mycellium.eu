@@ -6,9 +6,12 @@ app is a thin, platform-native UI over the **one** `mycellium-sdk`. This documen
 is the contract they all follow so they don't diverge — write it once here, apply
 it five times.*
 
-**Status: none of these apps exist yet.** This is the design each one implements,
-not a description of running code. What *does* exist and is covered by tests is
-the SDK surface they bind to (`crates/mycellium-sdk`, issue #64). Align with
+**Status: early scaffolds now exist.** Android (`clients/android`), Apple
+(`clients/apple`), and desktop (`clients/desktop`) bind to the SDK and exercise
+email onboarding, messaging, and OS-backed secret stores. They are not
+product-complete apps yet; this document remains the shared contract for bringing
+the five platform clients to production without diverging. The SDK surface they
+bind to lives in `crates/mycellium-sdk` (issue #64). Align with
 [`ARCHITECTURE.md`](ARCHITECTURE.md#clients-native-first-the-product-target) and
 the N1–N5 frontier in
 [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md#native-client-readiness-the-new-frontier);
@@ -36,8 +39,8 @@ model in [`ARCHITECTURE.md`](ARCHITECTURE.md#design-principle-ports-and-adapters
    └───────────────┬──────────────────────────────────────┬───────────────┘
                    │  language bindings                     │
         ┌──────────┴───────────┐                 ┌──────────┴───────────┐
-        │ UniFFI-generated     │                 │ C-ABI (cdylib/       │
-        │ Kotlin  /  Swift     │                 │ staticlib) — desktop │
+        │ UniFFI-generated     │                 │ Rust crate path      │
+        │ Kotlin  /  Swift     │                 │ (C-ABI fallback)     │
         └──────────┬───────────┘                 └──────────┬───────────┘
                    └───────────────┬────────────────────────┘
                        ┌───────────┴────────────┐
@@ -75,8 +78,8 @@ ships a `uniffi-bindgen` bin, so all three binding artifacts come from one build
 | **Android** (#67) | UniFFI → **Kotlin** | `.so` per ABI | `cargo-ndk` | Kotlin + **Jetpack Compose** |
 | **iOS** (#68) | UniFFI → **Swift** | `.xcframework` (staticlib) | `xcodebuild -create-xcframework` | Swift + **SwiftUI** |
 | **macOS** (#69) | UniFFI → **Swift** | same xcframework (add macOS slices) | same | Swift + **SwiftUI** |
-| **Linux** (#70) | **C-ABI** (cdylib) | `.so` + generated header | `cargo build` | shared desktop stack (below) |
-| **Windows** (#72) | **C-ABI** (cdylib) | `.dll` + header | `cargo build` | shared desktop stack (below) |
+| **Linux** (#70) | Direct Rust SDK crate | Tauri backend binary | `cargo build` / `cargo tauri build` | shared desktop stack (below); C-ABI remains a fallback for non-Rust hosts |
+| **Windows** (#72) | Direct Rust SDK crate | Tauri backend binary | `cargo build` / `cargo tauri build` | shared desktop stack (below); C-ABI remains a fallback for non-Rust hosts |
 
 **Mobile / Apple — UniFFI, settled.** Android gets generated Kotlin; iOS and
 macOS share one generated Swift module packaged as an `.xcframework`. This is the
@@ -88,8 +91,10 @@ conditionals, so #68 and #69 are largely one effort.
 
 **Desktop — one shared stack across Linux and Windows.** Linux and Windows should
 be a **single** desktop app, not two, sharing all UI code; only packaging differs.
-The binding is the **C-ABI** (`cdylib`) — UniFFI does not emit a native desktop
-binding, so desktop consumes the SDK through a small C header. Evaluated options:
+The current desktop shell is Tauri, so its Rust backend depends on
+`mycellium-sdk` directly. UniFFI does not emit a native desktop binding; the
+C-ABI (`cdylib` + header) remains the fallback for a future non-Rust desktop
+host. Evaluated options:
 
 - **Tauri (Rust core + web UI)** — *recommended.* The app process is already Rust,
   so it can depend on `mycellium-sdk` **directly as a crate** and skip the C-ABI
@@ -121,11 +126,9 @@ Screens differ per platform; the call sequences must not.
 - `MyceliumClient::new(data_dir)` — load-or-create the device identity and open
   the encrypted store. Idempotent; call once at launch.
 - **Email verification** — prove control of an email before publishing a handle.
-  *Gap to close (#64):* the directory client has `auth_start` / `auth_confirm` /
-  `auth_status`, but the SDK does **not** yet expose them; today `register` only
-  publishes the record. The apps must not talk to the directory directly, so the
-  SDK needs `verify_email_start(email)` / `verify_email_confirm(code)` (or
-  equivalent) added to the boundary. The apps design against that shape now.
+  The SDK exposes this as `start_email_verification(dir_url, handle, email)` and
+  `confirm_email_verification(dir_url, pending, code)`; platform apps must go
+  through those methods rather than talking to the directory directly.
 - `register(dir_url, queue_url, handle, name)` — publish the signed record
   (merging into any existing record so sibling devices are never dropped) and
   persist config. On a fresh device with the same email this is also the
@@ -193,13 +196,13 @@ landed in the seedless-pairing work):
 These live outside the SDK because they are inherently OS-specific. The SDK
 provides the seam; the app provides the OS glue.
 
-- **Secure storage (#65 / N2).** Today the device secret is a `0600` sidecar file
-  (`data_dir/identity.json`); the store under `data_dir/store` is encrypted by the
-  identity. #65 slots an OS keystore **behind the same SDK API** — a coming
-  `SecretStore` adapter — so the wallet/device secret lives in **Keychain**
-  (iOS/macOS), **Keystore** (Android), **DPAPI** (Windows), **libsecret** (Linux).
-  The app supplies the platform keystore handle at `new(...)` time; it never sees
-  key material (only the public `wallet_address` ever crosses the boundary).
+- **Secure storage (#65 / N2).** The device secret is behind the SDK
+  `SecretStore` boundary. Production apps call `new_with_secret_store(...)` with
+  an OS-backed adapter, so the wallet/device secret lives in **Keychain**
+  (iOS/macOS), **Keystore** (Android), **DPAPI** (Windows), or **libsecret**
+  (Linux). The encrypted message/config store still lives under
+  `data_dir/store`, keyed by the identity. `new(data_dir)` remains a dev-only
+  plaintext-file fallback for tests and local experiments.
 - **Native push / wake (#71 / N3).** APNs (Apple) and FCM (Android) via a push
   relay explicitly **not** hosted by a US company (the native counterpart to the
   PWA's contentless Web Push). The push carries **no** sender or content; on wake
@@ -228,7 +231,7 @@ clients/
   rust/       (exists — e2e harness)
   android/    (#67) — Gradle project; consumes generated Kotlin + cargo-ndk .so
   apple/      (#68/#69) — Xcode project; consumes the Swift xcframework
-  desktop/    (#70/#72) — Tauri app; depends on mycellium-sdk (or the C-ABI)
+  desktop/    (#70/#72) — Tauri app; depends on mycellium-sdk directly
 ```
 
 Rationale: the SDK's foreign contract (`types.rs`) and the apps that consume it
@@ -255,15 +258,18 @@ cadence or store/CI constraints later force it.
 
 ## 6. Per-platform status & first-milestone MVP
 
-**Status today: all five are unstarted (#67/#68/#69/#70/#72).** The realistic
-first milestone for each is **"usable 1:1 messaging"** — deliberately *not* groups,
+**Status today: first scaffolds exist for Android, Apple, and desktop
+(#67/#68/#69/#70/#72), but none are product-complete.** The realistic first
+milestone for each is **"usable 1:1 messaging"** — deliberately *not* groups,
 attachments, or privacy modes at MVP.
 
 ### Shared prerequisites (block every app)
-- **SDK method completeness (#64 / N1)** — mainly the **email-verify** methods
-  (§3.1) the boundary is still missing, plus the generated-binding smoke tests.
-- **OS secure storage (#65 / N2)** — required before a real user's key sits on a
-  device; an MVP may ship on the `0600` sidecar for internal testing only.
+- **SDK method completeness (#64 / N1)** — the email-verify onboarding methods are
+  now in the SDK and used by the platform shells; remaining work is generated-binding
+  smoke tests and any gaps found while productizing the apps.
+- **OS secure storage (#65 / N2)** — Android Keystore, Apple Keychain, and desktop
+  keyring adapters exist behind the SDK `SecretStore`; remaining work is hardening,
+  packaging, and platform policy for production builds.
 - **Native push / wake (#71 / N3)** — foreground `sync()` works without it, so an
   MVP can demo with polling; a *usable* messenger needs it before general use.
 
@@ -312,17 +318,18 @@ almost free.
 ```
 
 **Phasing.**
-1. **Phase 0 — unblock the SDK.** Land the missing email-verify methods and the
-   generated-binding smoke tests (#64); stand up #65 behind the same API.
-2. **Phase 1 — Android (#67).** First real app; drives #65 (Keystore) and #71
-   (FCM) to done. Deliver the §6 MVP.
-3. **Phase 2 — Apple (#68 → #69).** iOS on the shared Swift binding + APNs; macOS
-   folds in on the same SwiftUI codebase.
-4. **Phase 3 — Desktop (#70 + #72).** One Tauri app depending on the SDK crate;
-   Linux and Windows ship together.
+1. **Phase 0 — harden the SDK.** Email-verify methods and the `SecretStore` seam
+   exist; add generated-binding smoke tests (#64), finish C-ABI release shape, and
+   keep platform shells compiling against the generated artifacts.
+2. **Phase 1 — Android (#67).** The Compose shell and Keystore adapter exist; drive
+   #71 (FCM/UnifiedPush) and deliver the §6 MVP.
+3. **Phase 2 — Apple (#68 → #69).** The SwiftUI shell and Keychain adapter exist;
+   add APNs and productize iOS, with macOS folding in on the same Swift codebase.
+4. **Phase 3 — Desktop (#70 + #72).** The Tauri shell and keyring adapter exist;
+   finish installers, desktop notifications/push strategy, and platform QA.
 5. **Later — N5 direct P2P (#59/#60)** and the full privacy-mode UI (#50) layer on
    top once 1:1 messaging is solid across platforms.
 
-The gating dependency throughout is the **SDK boundary**: freeze its shape early
-(§3's method set is nearly there), and the five apps become parallelizable UI work
-over a stable contract rather than five chances to reinvent the protocol.
+The gating dependency throughout is the **SDK boundary**: keep its shape stable,
+exercise the generated artifacts in CI, and the five apps become parallelizable UI
+work over a shared contract rather than five chances to reinvent the protocol.

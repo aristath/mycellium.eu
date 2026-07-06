@@ -16,7 +16,7 @@ to run everything [`QUICKSTART.md`](QUICKSTART.md).
 ## Build & test
 
 ```sh
-cargo test --workspace                      # ~129 native tests
+cargo test --workspace                      # ~244 native tests
 cargo clippy --workspace --all-targets      # keep it warning-clean
 cargo build -p mycellium-core --no-default-features   # the no_std core still builds
 
@@ -26,9 +26,11 @@ cargo test -p mycellium-cli --test e2e      # two-account e2e (TCP + libp2p + ma
 node clients/rust/e2e/pwa.test.mjs           # full browser PWA flow (needs the build)
 ```
 
-The browser suites live in [`clients/rust/e2e`](../clients/rust/e2e) — `wasm-*.test.mjs`
-drive the `Session` directly; `pwa.test.mjs` drives the real UI in headless Chrome.
-They spin up a real directory + queue per run.
+The browser/load suites live in [`clients/rust/e2e`](../clients/rust/e2e) —
+`wasm-*.test.mjs` drive the `Session` directly; `pwa.test.mjs` and
+`browser.test.mjs` drive the real UI in headless Chrome; `http-limits` and `load`
+exercise the shared server runtime. They spin up a real directory + queue per run
+where needed.
 
 ## Where things live
 
@@ -63,8 +65,9 @@ They spin up a real directory + queue per run.
 The rough edges in [`IMPROVEMENTS.md`](IMPROVEMENTS.md) are sized and scoped — e.g.
 routing group control messages through the outbox, merging the device list on browser
 `register`, or GC'ing deleted attachments. The open frontier
-([`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md)) is larger: NAT traversal, a
-non-US push relay, and the security audit.
+([`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md)) is larger: native-client
+completion, NAT traversal beyond Circuit Relay v2, a non-US push relay, and the
+security audit.
 
 ## Reporting security issues
 

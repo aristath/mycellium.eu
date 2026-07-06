@@ -1,6 +1,6 @@
 # mycellium-queue-client
 
-> Thin HTTP client for the message queue: log in, deposit for a recipient wallet, collect your own, and register for Web Push.
+> Thin HTTP client for the message queue: log in, deposit for a recipient wallet, collect your own, register push wake targets, and relay pairing payloads.
 
 **Layer:** adapter · **Depends on:** mycellium-core, serde, anyhow (and `ureq` via mycellium-http under the `native` feature)
 
@@ -11,9 +11,9 @@ An HTTP client for a running `mycellium-queue`. The queue is keyed by
 wallet (as lowercase hex), and you may only `collect` from your own wallet's
 mailbox. Login is SIWE-style — fetch a challenge, sign it with your identity,
 exchange it for a bearer token — using the shared login contract in
-`mycellium-core`. It also registers a browser for Web Push so the queue can wake
-a sleeping app when mail arrives. It is separate from the directory client
-because the queue is a separate service.
+`mycellium-core`. It also registers contentless push wake targets and relays the
+opaque sealed payloads used by seedless device pairing. It is separate from the
+directory client because the queue is a separate service.
 
 ## Public API
 
@@ -40,13 +40,24 @@ transport.
 - `collect(&self, token: &str, wallet_hex: &str, slot: &str) -> Result<Vec<String>>`
   — drain one slot of your own mailbox.
 
-**Web Push**
+**Push wake targets**
 
 - `push_key(&self) -> Result<String>` — fetch the queue's VAPID public key, for
   use as the browser's `applicationServerKey` when subscribing.
 - `push_subscribe(&self, token: &str, endpoint: &str) -> Result<()>` — register a
-  browser push `endpoint` for the logged-in wallet, so the queue can send a push
-  notification to wake the app when a blob is deposited.
+  browser push `endpoint` for the logged-in wallet using the legacy bare-endpoint
+  form.
+- `push_subscribe_sub(&self, token: &str, sub: &PushSub) -> Result<()>` — register
+  a tagged Web Push/APNs/FCM/UnifiedPush subscription for the logged-in wallet.
+- `push_unsubscribe_sub(&self, token: &str, sub: &PushSub) -> Result<()>` — remove
+  that exact tagged subscription.
+
+**Pairing rendezvous**
+
+- `pair_post(&self, rid: &str, msg: &str) -> Result<()>` — relay one sealed
+  pairing payload to rendezvous `rid`.
+- `pair_fetch(&self, rid: &str) -> Result<Vec<String>>` — drain sealed pairing
+  payloads for `rid`.
 
 **Helper**
 

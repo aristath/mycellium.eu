@@ -27,6 +27,8 @@ wallet may collect.
 | GET    | `/push/key`                | none          | The queue's VAPID public key (for `applicationServerKey`). |
 | POST   | `/push/subscribe`          | Bearer token  | Register a Web Push endpoint (HTTPS; capped + deduped per wallet). |
 | POST   | `/push/unsubscribe`        | Bearer token  | Remove a previously registered push endpoint. |
+| POST   | `/pair/{rid}`              | none          | Relay an opaque sealed pairing payload to a one-time rendezvous id. |
+| GET    | `/pair/{rid}`              | none          | Drain pairing payloads for that rendezvous id. |
 | GET    | `/metrics`                 | none          | Prometheus counters (via `mycellium-observe`).   |
 
 Login is the SIWE-style wallet contract from `mycellium_core::login`. The token is
@@ -42,8 +44,9 @@ capped (413 above 1 MiB).
 - `Queue::verify(wallet, nonce, signature)` — step 2: verify and issue a session token.
 - `Queue::deposit(token, recipient_wallet_hex, slot, blob, now)` — deposit an opaque blob (rate-limited per sender wallet); triggers a contentless Web Push wake to the recipient's subscriptions.
 - `Queue::collect(token, wallet_hex, slot)` — drain one slot; caller may only collect their own wallet.
-- `Queue::subscribe(token, endpoint)` / `subscriptions(wallet_hex)` — register / list Web Push endpoints for a wallet.
-- `ApiError` — a rejected request and its HTTP status (`BadChallenge`, `BadSignature`, `Unauthorized`, `Forbidden`, `RateLimited`, `MailboxFull`, `BadRequest`); `.status()` / `.reason()`.
+- `Queue::subscribe(token, subscription)` / `unsubscribe(token, subscription)` / `subscriptions(wallet_hex)` — register, remove, and list tagged Web Push/APNs/FCM/UnifiedPush wake targets for a wallet.
+- `Queue::pair_post(rid, msg, now)` / `pair_fetch(rid, now)` — short-lived unauthenticated rendezvous for seedless device pairing; the id is the capability and the payload is already sealed.
+- `ApiError` — a rejected request and its HTTP status (`BadChallenge`, `BadSignature`, `Unauthorized`, `Forbidden`, `RateLimited`, `MailboxFull`, `Capacity`, `BadRequest`, `Storage`); `.status()` / `.reason()`.
 - `serve(addr)` — run the queue as an HTTP service on `addr` (blocks).
 - `hex33(&[u8; 33])` — lowercase hex of a 33-byte compressed wallet key.
 - `MAX_MAILBOX` (256) — max queued messages per `(wallet, slot)` mailbox.
@@ -73,6 +76,7 @@ provider's — either way it reads nothing but ciphertext.
 | `MYCELLIUM_DATA` | Directory for the durable redb store **and** the persisted `vapid.key`. Unset ⇒ in-memory + an ephemeral VAPID key. |
 | `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` | Serve HTTPS directly (PEM). Unset ⇒ plain HTTP behind a proxy. |
 | `MYCELLIUM_LOG` | Set (≠ `"0"`) for a JSON access-log line per request (5xx always logged). |
+| `MYCELLIUM_PUSH_ALLOW_HOSTS` | Comma-separated host allow-list that may receive push POSTs even when the endpoint is private/link-local/loopback. Use only for self-hosted push relays. |
 
 ## Notes
 

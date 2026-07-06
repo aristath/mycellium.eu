@@ -69,9 +69,10 @@ person. See [`BROWSER.md`](BROWSER.md) and [`clients/web/README.md`](../clients/
 ## 4. Run the tests
 
 ```sh
-cargo test --workspace                        # ~129 native tests
+cargo test --workspace                        # ~244 native tests
 cargo test -p mycellium-cli --test e2e        # two-account e2e over TCP + libp2p + mailbox
 node clients/rust/e2e/pwa.test.mjs            # full browser PWA flow (needs step 3's build)
+# or run any of the 11 standalone browser/load suites in clients/rust/e2e
 ```
 
 ## Next steps

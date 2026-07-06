@@ -144,10 +144,11 @@ then become thin adapters. This single refactor unifies live delivery + relay ac
   `lib.rs` while the directory isolates `http.rs` (give the queue an `http.rs`).
 - **`reachability::record` rewrites the whole score store + prunes unconditionally per attempt**
   (`reachability.rs:228`). Prune only near the cap / on a timer; skip the rewrite when unchanged.
-- **`push_agent()` has no timeouts** (`queue/push.rs:169`) and is rebuilt per send — a slow endpoint
-  hangs a detached thread. One `OnceLock` agent with the 5s/15s timeouts (mirror `mycellium-http`).
-- **`MYCELLIUM_PUSH_ALLOW_HOSTS` (the SSRF-guard escape hatch) is undocumented**; document it +
-  the other bind/name env vars in DEPLOY.md.
+- **Resolved after this review:** `push_agent()` now uses one `OnceLock` `ureq` agent with
+  5s connect / 15s read-write timeouts and still refuses redirects. The broader detached-thread
+  pool/semaphore and push-failure metrics items above remain open.
+- **Resolved after this review:** `MYCELLIUM_PUSH_ALLOW_HOSTS` is documented in `DEPLOY.md`
+  as the operator-only send-time allowlist for self-hosted push distributors.
 
 ## P3 — nits
 
@@ -156,16 +157,16 @@ then become thin adapters. This single refactor unifies live delivery + relay ac
   (across the 3 service bins) are all copy-pasted — hoist into `mycellium-core`/`serve`.
 - Env-var reading inconsistent (`is_empty()` vs `trim().is_empty()`, three helper styles) — one
   `env_nonempty(key)`.
-- Two stale "(POC) … swap the maps for a database" labels (`directory/lib.rs:95`, `queue/lib.rs:168`)
-  though durable redb persistence shipped; `PRODUCTION-READINESS.md` has a multi-device checkbox
-  contradicting the shipped (and tested) pairing.
+- **Resolved after the docs sweep:** the stale "(POC) … swap the maps for a database"
+  rustdoc labels and the `PRODUCTION-READINESS.md` multi-device checkbox now match
+  the durable redb stores and shipped seedless pairing flow.
 - Non-atomic local writes (`filestore.rs:105` `fs::write`, no temp+rename/fsync) — a crash mid-write
   can drop queued outbox mail. Write-temp + atomic rename.
 - No dead-letter visibility (outbox drops past `MAX_ATTEMPTS`/`TTL` silently); `directory parse()`
   mislabels bad bodies as `InvalidRecord`(422); dead code (`Error::StaleRecord`, `Server::metrics()`,
   `Directory::challenge_message`); CI gaps (no `cargo doc`/`cargo-deny`/coverage; wasm never
-  fmt/clippy/tested); `mycellium-sdk` has no README + is missing from the ARCHITECTURE crate table;
-  `mycellium-relay` uses `thread::park()` with no SIGTERM drain; naming (`hex`/`hex33`/`wallet_hex`);
+  fmt/clippy/tested); `mycellium-relay` uses `thread::park()` with no SIGTERM drain;
+  naming (`hex`/`hex33`/`wallet_hex`);
   `MAX_SKIP` means 1024-evict in `group.rs` vs 256-hard-error in `ratchet.rs`.
 
 ## Strengths (all four reviewers, consistently)

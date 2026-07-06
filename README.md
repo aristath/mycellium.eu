@@ -25,6 +25,7 @@ crates/
   mycellium-server/             deployable binary that serves the directory
   mycellium-queue/              per-recipient store-and-forward mailbox, keyed
                                 by wallet, decoupled from the directory (lib+bin)
+  mycellium-relay/              deployable libp2p Circuit Relay v2 server
   ── adapters (implement the core ports / talk to the services) ──
   mycellium-transport/          Transport ports: framed TCP + libp2p (feature-gated)
   mycellium-storage/            Storage port: encrypted file KV + at-rest identity
@@ -38,32 +39,40 @@ crates/
   ── engine + shells ──
   mycellium-engine/             the headless peer: conversations, groups,
                                 multi-device delivery, outbox retry, contacts
+  mycellium-sdk/                UniFFI native SDK for Android, Apple, desktop
   mycellium-cli/                a shell: clap arg-parsing + terminal UI
   mycellium-wasm/               the engine compiled to WebAssembly (browser)
 clients/
   rust/                         local Rust server + PWA (a native-backed client)
   web/                          the browser-native PWA — the engine runs as
                                 WASM in the page, no local binary
+  android/                      early Kotlin/Compose native shell over the SDK
+  apple/                        early SwiftUI iOS/macOS shell over the SDK
+  desktop/                      early Tauri desktop shell over the SDK
 ```
 
 **Product direction — native-first.** The target clients are **native apps**
 (Android, iOS, macOS, Linux, Windows): thin, platform-native UI shells over the shared
 Rust core + engine, bound through a native SDK (`mycellium-sdk` — UniFFI for
-Kotlin/Swift, a C-ABI for desktop). Native is where a messenger's essentials live — OS
+Kotlin/Swift, and a direct Rust crate path or C-ABI fallback for desktop). Native is where a messenger's essentials live — OS
 secure storage, native push/wake, background delivery, direct P2P reachability, and
-platform-native UX. **These apps don't exist yet**; they're the roadmap (native client
-roadmap, #74).
+platform-native UX. Early Android, Apple, and desktop shells now live under
+`clients/`; they prove the SDK/secure-storage/onboarding path, but are not yet
+product-complete apps. The native client roadmap (#74) is still the product frontier.
 
-What runs **today** is two shells over that same engine: the **CLI** (below) and a
-**browser PWA** ([`clients/web`](clients/web)) — open a link, pick a username, and
-message someone with the whole client (identity, X3DH + Double Ratchet, delivery,
-history) running as WebAssembly in the page. The PWA is a **proof-of-concept /
-fallback / demo** surface, not the primary product; see [the browser app](#browser-app-pwa).
+The most mature user-facing shells **today** are the **CLI** (below) and a
+**browser PWA** ([`clients/web`](clients/web)) — open a link, pick a username,
+and message someone with the whole client (identity, X3DH + Double Ratchet,
+delivery, history) running as WebAssembly in the page. Early SDK-backed Android,
+Apple, and desktop shells also exist, but are not product-complete. The PWA is a
+**proof-of-concept / fallback / demo** surface, not the primary product; see
+[the browser app](#browser-app-pwa).
 
 Every crate links its own README: [core](crates/mycellium-core/README.md) ·
 [directory](crates/mycellium-directory/README.md) ·
 [server](crates/mycellium-server/README.md) ·
 [queue](crates/mycellium-queue/README.md) ·
+[relay](crates/mycellium-relay/README.md) ·
 [transport](crates/mycellium-transport/README.md) ·
 [storage](crates/mycellium-storage/README.md) ·
 [directory-client](crates/mycellium-directory-client/README.md) ·
@@ -72,6 +81,7 @@ Every crate links its own README: [core](crates/mycellium-core/README.md) ·
 [observe](crates/mycellium-observe/README.md) ·
 [serve](crates/mycellium-serve/README.md) ·
 [engine](crates/mycellium-engine/README.md) ·
+[sdk](crates/mycellium-sdk/README.md) ·
 [cli](crates/mycellium-cli/README.md) ·
 [wasm](crates/mycellium-wasm/README.md).
 New to the project? Start with [`docs/QUICKSTART.md`](docs/QUICKSTART.md); for the
@@ -82,8 +92,9 @@ The core depends only on the `Transport`, `Storage`, and `Platform` traits, so
 the same protocol runs from a microcontroller to a desktop. The CLI ships two
 transports behind that trait — raw **TCP** and **libp2p** (TCP + Noise + Yamux,
 PeerId derived from the device key). Add `--libp2p` to `register`/`listen`;
-`chat` auto-detects which to use from the peer's published address. NAT
-traversal (DHT/relay) is the remaining libp2p increment.
+`chat` auto-detects which to use from the peer's published address. Circuit Relay
+v2 is implemented (`mycellium-relay` plus `serve --relay`); DHT/AutoNAT/DCUtR
+hole-punching remains the next libp2p reachability increment.
 
 ## Build & test
 
@@ -101,9 +112,9 @@ both transports and the offline mailbox. A separate `robustness` suite fuzzes
 the wire decoders with garbage/truncated/bit-flipped bytes (never panics, never
 accepts a tampered record) and checks the ratchet rejects replays and bounds
 skips. A `model` suite checks correctness properties over random inputs — the
-ratchet decrypts under many random two-way interleavings. ~160 workspace tests in
-all, plus ten real-browser suites (WASM crypto, sealing, storage, networked
-messaging, groups, multi-device pairing, and the full two-user PWA flow) under
+ratchet decrypts under many random two-way interleavings. ~244 workspace tests in
+all, plus 11 real-browser/load suites (WASM crypto, sealing, storage, networked
+messaging, groups, multi-device pairing, HTTP limits, load, and the full two-user PWA flow) under
 [`clients/rust/e2e`](clients/rust/e2e). (The e2e suite throttles itself to a few
 concurrent subprocess-heavy tests to stay reliable under parallel runs.)
 
@@ -126,9 +137,10 @@ cargo install wasm-bindgen-cli --version 0.2.100
 Everything runs in the page: passwordless identity (persisted in IndexedDB, so it
 survives reloads), record publishing, X3DH-sealed send, queue deposit/collect,
 decryption, and history — plus desktop notifications, reply / react / delete, and
-Web Push wiring. Six headless-Chrome suites in
-[`clients/rust/e2e`](clients/rust/e2e) (`wasm*.test.mjs`, `pwa.test.mjs`) cover it
-end to end, up to a two-user message delivered *browser → servers → browser*.
+Web Push wiring. The 11 standalone browser/load suites in
+[`clients/rust/e2e`](clients/rust/e2e) (`browser`, `pwa`, `wasm*`, `http-limits`,
+and `load`) cover the page end to end, up to a two-user message delivered
+*browser → servers → browser*.
 
 > HTTPS is required off `localhost` (service workers + Web Push). Deploy behind
 > Caddy/nginx — see [`docs/DEPLOY.md`](docs/DEPLOY.md). Production readiness is
@@ -351,8 +363,8 @@ the directory can neither read nor forge.
 
 ## Status
 
-Feature-complete for its scope, ~160 workspace tests (unit, real-binary e2e,
-fuzz/robustness, randomized model) plus ten real-browser suites, clippy-clean,
+Feature-complete for its scope, ~244 workspace tests (unit, real-binary e2e,
+fuzz/robustness, randomized model) plus 11 real-browser/load suites, clippy-clean,
 `no_std` core. See [`docs/PRODUCTION-READINESS.md`](docs/PRODUCTION-READINESS.md)
 for the path to a public launch.
 
@@ -379,12 +391,13 @@ notifications + Web Push, multi-device linking by QR or link, all client-side. T
 directory and queue now **persist** (embedded redb), send real verification email
 with account **recovery**, terminate TLS, rate-limit, and expose `/metrics` + logs.
 
-**Native clients (the product frontier):** the native apps are the target surface and
-**don't exist yet**. The roadmap is a `mycellium-sdk` (UniFFI + C-ABI over the shared
-engine, #64), OS secure storage (Keychain / Keystore / DPAPI / libsecret, #65), native
-push/wake (APNs / FCM, #71), and the platform apps (Android #67, iOS #68, macOS #69,
-Linux #70, Windows #72) — tracked as the native client roadmap (#74). Privacy /
-metadata / trust direction is #48.
+**Native clients (the product frontier):** the SDK and early platform shells now
+exist: Android (Kotlin/Compose + Keystore), Apple (SwiftUI + Keychain), and desktop
+(Tauri + OS keyring) all bind to `mycellium-sdk`. They are still pre-product
+scaffolds; native push/wake, app polish, packaging, and broader platform coverage
+remain tracked under the native client roadmap (#74). Privacy / metadata / trust
+direction is #48.
 
-**Deferred frontier:** NAT traversal (DHT/relay), a non-US mobile push relay, and
+**Deferred frontier:** NAT traversal beyond Circuit Relay v2 (DHT/AutoNAT/DCUtR),
+a non-US mobile push relay, and
 an independent security audit before a public launch.

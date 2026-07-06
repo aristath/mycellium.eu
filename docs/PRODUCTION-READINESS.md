@@ -10,12 +10,13 @@ deployment shape, and the operational essentials** around them.
 **Two separate readiness questions.** This doc has always tracked **protocol &
 service readiness** — the directory, queue, crypto, and their operational essentials
 — which is largely done (tiers T0–T2 below). **Native-client readiness** is a
-distinct, mostly-open track: Mycellium is **native-first**, and the native apps that
-are the target product don't exist yet. That frontier — the native SDK, OS secure
-storage, native push/wake, and the platform apps — is tracked separately (see
+distinct, partly-built track: Mycellium is **native-first**, and the target product is
+the native app family. Early SDK-backed Android, Apple, and desktop shells exist, but
+they are not product-complete. That frontier — SDK hardening, OS secure storage,
+native push/wake, packaging, QA, and the platform apps — is tracked separately (see
 [Native-client readiness](#native-client-readiness-the-new-frontier) below and the
 native client roadmap, #74). The tiers here concern the shared services and engine;
-they are what the native clients will build on.
+they are what the native clients build on.
 
 | Tier | Focus | Status |
 |------|-------|--------|
@@ -77,8 +78,9 @@ for smaller refinements found in the doc audit.
 - [x] **T1.1 — Consumer distribution (WASM PWA).** *(done)* The engine is
   compiled to WASM and served as a static PWA that runs entirely in the browser,
   talking straight to the directory/queue — no local Rust server. Same engine
-  code as native (feature-gating + `wireops` + a `Session` façade), native never
-  regressed (125 tests). Six headless-Chrome suites cover it end to end. The
+  code as native (feature-gating + `wireops` + a `Session` façade), native stays
+  covered by ~244 workspace tests, and 11 standalone browser/load suites cover
+  the PWA/WASM path end to end. The
   staged path:
   - [x] **Stage 1 — pipeline + core crypto in-browser.** `crates/mycellium-wasm`
     (excluded from the native workspace) exposes `user_id` + device-key
@@ -102,7 +104,7 @@ for smaller refinements found in the doc audit.
     `Session` now does `register`/`send`/`sync` — a headless-Chrome test delivers
     a full message **browser → real directory+queue → browser** (register, X3DH
     seal, queue deposit, collect, decrypt, history), same engine code as native.
-    Five browser suites green.
+    The browser/load suite now covers 11 standalone paths.
   - [x] **Stage 4 — the PWA.** *(done)* `clients/web` is now a real static
     messenger (setup → username registration → threads → compose → send, polling
     to receive) driving the WASM `Session` — no local server. Identity persists
@@ -115,9 +117,12 @@ for smaller refinements found in the doc audit.
   channel (WebSocket/SSE) while the app is open — instant messages, far less
   load on the shared services. Keep Web Push for the closed case.
 
-- [ ] **T1.3 — Multi-device.** People expect the same account on phone + laptop.
-  Impossible without the seed today. Needs device-linking (QR) or email-based
-  multi-device, with safety-number warnings.
+- [x] **T1.3 — Multi-device.** *(done)* Seedless device pairing is implemented:
+  a new device mints a one-time offer, an existing device seals the account key
+  over the queue rendezvous, and the record merge preserves sibling devices.
+  CLI, PWA, and SDK flows expose the QR/link path. Safety-number UX still belongs
+  with the broader native-client polish work, but the account model no longer
+  depends on manually copying a seed.
 
 - [~] **T1.4 — Web Push: verify + persist VAPID.** *(persist done)* The queue now
   loads its VAPID keypair from `MYCELLIUM_DATA/vapid.key` (0600), generating +
@@ -181,32 +186,39 @@ for smaller refinements found in the doc audit.
 ## Native-client readiness (the new frontier)
 
 Separate from the protocol/service readiness above: the **native apps are the primary
-product and are not built yet**. What runs today is the CLI and the browser PWA (a
-POC/fallback surface). This track is what turns "the service works" into "there's an
-app people install." Tracked as the native client roadmap (**#74**); privacy /
-metadata / trust work is **#48**.
+product and are still pre-product**. What runs today is the CLI, the browser PWA
+(a POC/fallback surface), and early Android / Apple / desktop shells that prove the
+SDK, email onboarding, messaging, and OS-backed secret-store path. This track is
+what turns "the service works" into "there's an app people install." Tracked as
+the native client roadmap (**#74**); privacy / metadata / trust work is **#48**.
 
-- [ ] **N1 — Native SDK.** A `mycellium-sdk` crate over the shared core + engine:
-  **UniFFI** bindings for Kotlin/Swift and a **C-ABI** for desktop, so every platform
-  UI binds to one implementation (no protocol/crypto in app code). (#64)
-- [ ] **N2 — OS secure storage.** Hold the account key in the platform keystore —
-  Keychain (iOS/macOS), Keystore (Android), DPAPI (Windows), libsecret (Linux) —
-  instead of a plain file / IndexedDB snapshot. (#65)
+- [ ] **N1 — Native SDK.** *(partly done)* `mycellium-sdk` exists over the shared core + engine:
+  **UniFFI** bindings for Kotlin/Swift and a desktop-consumable Rust/C-ABI shape, so
+  every platform UI binds to one implementation (no protocol/crypto in app code).
+  Remaining: harden/release the generated binding artifacts and fill any app-facing
+  gaps found by the platform shells. (#64)
+- [ ] **N2 — OS secure storage.** *(partly done)* The SDK has a `SecretStore` seam and the early
+  Android, Apple, and desktop clients implement it over Keystore, Keychain, and the
+  OS keyring/credential store. Remaining: complete production hardening, packaging,
+  and any missing platform-specific policy before real-user builds. (#65)
 - [ ] **N3 — Native push / wake.** Wake a closed app via **APNs / FCM** (through a
   push relay explicitly **not** hosted by a US company), the native counterpart to the
   PWA's contentless Web Push. (#71)
-- [ ] **N4 — Platform apps.** Thin platform-native UI shells over the SDK:
-  **Android (#67)**, **iOS (#68)**, **macOS (#69)**, **Linux (#70)**, **Windows (#72)**.
-- [ ] **N5 — Direct P2P reachability.** NAT traversal / relay so native peers reach
-  each other directly where possible. (#59/#60)
+- [ ] **N4 — Platform apps.** *(partly done)* Early thin UI shells exist for **Android (#67)**,
+  **iOS/macOS (#68/#69)**, and **Linux/Windows desktop (#70/#72)**. Remaining:
+  production UX, packaging/signing, push integration, and platform QA.
+- [ ] **N5 — Direct P2P reachability.** *(partly done)* Circuit Relay v2 exists (`mycellium-relay`,
+  `serve --relay`, relay-aware delivery scoring). Remaining: AutoNAT/DHT/DCUtR and
+  broader relay selection/operations. (#59/#60)
 
 ---
 
 ## Current focus
 
-**Durability first, then the WASM/hosted PWA.** Nothing is safe to build on
-in-memory state, and the WASM PWA is what turns "run a binary" into "open a
-link." TLS, SMTP, and recovery land alongside, since real onboarding needs them.
+**Native productization plus external audit.** Durability, TLS, SMTP/recovery, the
+browser PWA, and the first SDK/platform shells exist. The next focus is turning the
+native scaffolds into usable apps, wiring native push/wake, finishing reachability
+beyond Circuit Relay v2, and freezing an audit target.
 
 Working order: **T0.1 + T0.2 (directory) → T0.1 + T0.2 (queue) → T0.4 → T0.3 →
 T0.5 → T1.1 …**

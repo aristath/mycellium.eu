@@ -27,8 +27,8 @@ ungated [`wireops`](src/wireops.rs) module, supplying its own `Platform` (Web
 Crypto RNG + `Date.now`) and `Storage` (IndexedDB-backed). `wireops` holds the
 platform-agnostic crypto plumbing — sealing/opening envelopes, building records,
 message/id construction — taking the `Platform` explicitly instead of a singleton,
-which is exactly what makes it callable from WASM. So the native CLI and the
-browser PWA are two shells over one engine.
+which is exactly what makes it callable from WASM. The CLI, SDK/native shells,
+and browser PWA are all thin shells over one engine.
 
 ## Modules
 

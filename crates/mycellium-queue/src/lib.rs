@@ -165,8 +165,9 @@ pub const MAX_RENDEZVOUS: usize = 10_000;
 /// Largest single pairing message accepted (base64 of a small sealed payload).
 pub const MAX_PAIR_MSG: usize = 8192;
 
-/// The in-memory queue state (POC). A real deployment swaps the maps for a
-/// durable store; the logic is unchanged.
+/// The queue state. In-memory maps hold the hot working set; when opened with
+/// [`Queue::open`], mailboxes and push subscriptions are loaded from and written
+/// through to the durable redb store.
 #[derive(Default)]
 pub struct Queue {
     /// Outstanding login challenges: nonce → (wallet, issued_at). Pruned past

@@ -32,6 +32,12 @@ Directory only (signup email — see below):
 > longer silently drops to the code-logging dev path — a misconfiguration is a startup
 > error, not a quiet weakening of auth.
 
+Queue only (push wake delivery):
+
+| Variable | Purpose |
+|---|---|
+| `MYCELLIUM_PUSH_ALLOW_HOSTS` | Comma-separated exact `host:port` authorities that may bypass the queue's send-time internal-address SSRF guard for operator-owned push distributors, e.g. a self-hosted UnifiedPush/ntfy endpoint on a private LAN. This does **not** relax subscribe-time validation of client-supplied endpoints. |
+
 ## TLS
 
 HTTPS is required off `localhost` — service workers, Web Push, and PWA install

@@ -16,7 +16,9 @@ async fn main() {
         "mycellium-queue {} — store-and-forward on http://{addr}",
         env!("CARGO_PKG_VERSION")
     );
-    println!("  routes: /health · /login/{{challenge,verify}} · /mailbox/{{wallet}}/{{slot}}");
+    println!(
+        "  routes: /health · /login/{{challenge,verify}} · /mailbox/{{wallet}}/{{slot}} · /push/* · /pair/{{rid}}"
+    );
     println!("  holds opaque E2E blobs keyed by wallet; reads nothing");
     if let Err(err) = mycellium_queue::serve(&addr).await {
         eprintln!("mycellium-queue failed: {err}");
