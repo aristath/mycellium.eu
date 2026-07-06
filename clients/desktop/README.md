@@ -28,6 +28,7 @@ clients/desktop/
 │   ├── styles.css
 │   └── app.js                 every action → window.__TAURI__.core.invoke(cmd, args)
 └── src-tauri/                 the backend — its OWN Cargo project (not in the workspace)
+    ├── README.md              backend package boundary: commands, keyring, tests
     ├── Cargo.toml             tauri v2, mycellium-sdk (path dep), keyring v3, tokio
     ├── build.rs               tauri_build::build()
     ├── tauri.conf.json        identifier eu.mycellium.desktop, single window, frontendDist ../src
@@ -55,6 +56,10 @@ exposes these `#[tauri::command]`s, each wrapping the matching SDK call:
 | `register(handle, name)` | `register` |
 | `account()` | `account` |
 | `send_text(peer, text)` | `send_text` |
+| `reply(peer, reply_to, text)` | `reply` |
+| `react(peer, target, emoji)` | `react` |
+| `delete_message(peer, target)` | `delete_message` |
+| `send_file(peer, name, mime, bytes)` | `send_file` |
 | `sync()` | `sync` |
 | `conversations()` | `conversations` |
 | `thread(peer)` | `thread` |
@@ -62,6 +67,17 @@ exposes these `#[tauri::command]`s, each wrapping the matching SDK call:
 | `contacts()` | `contacts` |
 | `safety_number(peer)` | `safety_number` |
 | `mark_verified(peer)` | `mark_verified` |
+| `contact_card()` | `contact_card` |
+| `verify_card(card)` | `verify_card` |
+| `group_create(name, members)` | `group_create` |
+| `group_add(group_id, member)` | `group_add` |
+| `group_send(group_id, text)` | `group_send` |
+| `group_leave(group_id)` | `group_leave` |
+| `groups()` | `groups` |
+| `group_thread(group_id)` | `group_thread` |
+| `export_backup()` | `export_backup` |
+| `import_backup(bytes)` | `import_backup` |
+| `register_unified_push(endpoint)` | `register_push(UnifiedPush, endpoint)` |
 
 **Threading.** Every SDK method blocks (encrypted `FileStore` I/O + blocking
 `ureq` directory/queue calls). Commands are `async` and run each SDK call on

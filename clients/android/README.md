@@ -126,6 +126,7 @@ clients/android/
 ├── README.md
 ├── .gitignore
 └── app/
+    ├── README.md              app-module boundary: Gradle package, generated artifacts, tests
     ├── build.gradle.kts        Compose BOM, coroutines, JNA @aar, jniLibs + generated source sets
     ├── proguard-rules.pro      keep JNA + generated binding + callbacks
     └── src/main/
