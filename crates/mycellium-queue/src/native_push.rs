@@ -62,12 +62,12 @@ pub struct NativePush {
 }
 
 impl NativePush {
-    /// Load transports from operator env/config. The in-repo slice ships the
+    /// Build an unconfigured native push dispatcher. The in-repo slice ships the
     /// payload + auth **construction** only; wiring real APNs (`.p8`) / FCM
     /// (service-account) credential loading + delivery lands with the on-device
     /// phases (`docs/research/NATIVE-PUSH.md` §8.2). Until then this is
     /// unconfigured, so native fan-out is skipped and mail waits for `sync()`.
-    pub fn from_env() -> Self {
+    pub fn unconfigured() -> Self {
         Self::default()
     }
 
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn unconfigured_native_transports_are_skipped() {
-        let native = NativePush::from_env(); // no operator creds in-repo
+        let native = NativePush::unconfigured(); // no operator creds in-repo
         assert_eq!(
             native.wake(
                 &Subscription::Apns {

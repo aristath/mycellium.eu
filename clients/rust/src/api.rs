@@ -95,7 +95,7 @@ fn ensure_identity() -> anyhow::Result<Identity> {
 }
 
 fn status(directory: &str) -> anyhow::Result<Value> {
-    let queue = std::env::var("MYCELLIUM_QUEUE").unwrap_or_default();
+    let queue = store::queue_url();
     let wallet = store::load_identity()
         .ok()
         .map(|id| hex(&id.wallet_public().0));
@@ -124,7 +124,7 @@ fn signup(state: &Mutex<State>, req: &Value, directory: &str) -> anyhow::Result<
     }
     if !reachable(directory) {
         anyhow::bail!(
-            "Can't reach the directory at {directory}. Start it first:  cargo run -p mycellium-server -- --addr 127.0.0.1:8080"
+            "Can't reach the directory at {directory}. Start it first with `mycellium-server --dev` or `mycellium-server --config path/to/directory.json`"
         );
     }
     let identity = ensure_identity()?;
@@ -177,7 +177,7 @@ fn finalize(client: &DirectoryClient, uid: &str) -> anyhow::Result<()> {
     let handle = Handle::new(uid).map_err(|_| anyhow::anyhow!("invalid id"))?;
     let token = client.login(&identity)?;
     // Empty addr: a polling client isn't reachable for live push, so mail flows
-    // through its queue. The record's name comes from MYCELLIUM_NAME (set above).
+    // through its configured queue.
     let record = app::build_record(&identity, &handle, "");
     client.publish(&token, &handle, &record)?;
     write_handle(uid)?;
@@ -345,7 +345,7 @@ fn group_send(id: &str, req: &Value, directory: &str) -> anyhow::Result<Value> {
 // ---- push -------------------------------------------------------------------
 
 fn queue_url() -> String {
-    std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
+    store::queue_url()
 }
 
 /// The queue's VAPID public key, for the browser's push subscription.
@@ -481,15 +481,14 @@ fn read_name() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Persist our display name and make it live immediately (the engine reads it
-/// from `MYCELLIUM_NAME` when building our record).
+/// Persist our display name and make it live immediately.
 fn save_name(name: &str) -> anyhow::Result<()> {
     let path = name_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, name)?;
-    std::env::set_var("MYCELLIUM_NAME", name);
+    store::set_display_name(name);
     Ok(())
 }
 

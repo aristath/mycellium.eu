@@ -28,16 +28,14 @@ fn free_port() -> u16 {
 }
 
 fn start() -> String {
-    // These integration tests run without SMTP, so opt into explicit dev auth
-    // (the server now fails closed on an unconfigured email-auth setup — #47).
-    std::env::set_var("MYCELLIUM_DEV_AUTH", "1");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let serve = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_directory::serve(&serve).await;
+            let _ =
+                mycellium_directory::serve(&serve, mycellium_directory::ServeConfig::dev()).await;
         });
     });
     let deadline = Instant::now() + Duration::from_secs(10);

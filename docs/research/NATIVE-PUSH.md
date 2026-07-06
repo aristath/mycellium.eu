@@ -267,12 +267,12 @@ it (fail soft — the message still queues, §6):
 
 | Transport | Operator config (proposed env, mirrors SMTP/VAPID) | Secret |
 |---|---|---|
-| Web Push (VAPID) | `MYCELLIUM_DATA/vapid.key` (already; 0600, persisted) | P-256 seed |
-| APNs | `MYCELLIUM_APNS_KEY` (`.p8`), `MYCELLIUM_APNS_KEY_ID`, `MYCELLIUM_APNS_TEAM_ID`, `MYCELLIUM_APNS_TOPIC`, `MYCELLIUM_APNS_ENV` (prod/sandbox) | `.p8` auth key |
-| FCM | `MYCELLIUM_FCM_CREDENTIALS` (service-account JSON path) | service-account JSON |
+| Web Push (VAPID) | `queue.data_dir/vapid.key` (0600, persisted) | P-256 seed |
+| APNs | queue JSON fields for key path, key id, team id, topic, and environment | `.p8` auth key |
+| FCM | queue JSON field for service-account JSON path | service-account JSON |
 | UnifiedPush | none at the queue (endpoint is client-supplied); operator may run an ntfy server | — |
 
-Store secrets like the VAPID key: read from `MYCELLIUM_DATA` / env, restrict file
+Store secrets like the VAPID key: read paths from queue JSON config, restrict file
 perms (0600), never log. A transport is **enabled iff its credentials are
 present** — no credentials → that variant's fan-out is skipped, not an error.
 Follow the existing **fail-closed durable-store** discipline (#45) but **fail-soft

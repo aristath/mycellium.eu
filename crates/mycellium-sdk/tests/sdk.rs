@@ -53,7 +53,9 @@ fn ensure_queue() -> String {
                 // Each async server gets its own tokio runtime (the harness is sync).
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async {
-                    let _ = mycellium_queue::serve(&serve_addr).await;
+                    let _ =
+                        mycellium_queue::serve(&serve_addr, mycellium_queue::ServeConfig::dev())
+                            .await;
                 });
             });
             wait_port(port);
@@ -73,7 +75,12 @@ fn start_inspectable_queue() -> (String, Arc<Mutex<Queue>>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_queue::serve_with(&serve_addr, served).await;
+            let _ = mycellium_queue::serve_with(
+                &serve_addr,
+                served,
+                mycellium_queue::ServeConfig::dev(),
+            )
+            .await;
         });
     });
     wait_port(port);
@@ -82,15 +89,15 @@ fn start_inspectable_queue() -> (String, Arc<Mutex<Queue>>) {
 
 /// Start a directory on a fresh port. Returns its URL.
 fn start_directory() -> String {
-    // The directory fails closed without SMTP unless dev auth is explicit (#47).
-    std::env::set_var("MYCELLIUM_DEV_AUTH", "1");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_directory::serve(&serve_addr).await;
+            let _ =
+                mycellium_directory::serve(&serve_addr, mycellium_directory::ServeConfig::dev())
+                    .await;
         });
     });
     wait_port(port);
@@ -379,9 +386,8 @@ fn reply_and_react_round_trip() {
 
 #[test]
 fn email_verified_registration() {
-    // The in-process directory runs with MYCELLIUM_DEV_AUTH=1 (set by
-    // start_directory), so auth_start echoes the code back as dev_code — the
-    // local flow needs no real inbox.
+    // The in-process directory runs with explicit dev auth, so auth_start echoes
+    // the code back as dev_code and the local flow needs no real inbox.
     let dir = start_directory();
     let queue = ensure_queue();
 

@@ -7,12 +7,13 @@
 //! the passphrase means losing this on-disk copy; the account is then recovered by
 //! re-binding the handle from a fresh device via email verification.
 //!
-//! The passphrase comes from `MYCELLIUM_PASSPHRASE` if set (for non-interactive
-//! use — convenient but it lands in the environment/process table, so prefer the
-//! prompt for real use), otherwise it is read from a **no-echo** terminal prompt.
+//! Interactive callers can type the passphrase at a **no-echo** terminal prompt.
+//! Noninteractive callers pass an explicit [`ClientConfig`] before using the
+//! store.
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::Argon2;
@@ -21,6 +22,66 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
 
 use mycellium_core::identity::Identity;
+
+/// Process-local client configuration.
+#[derive(Clone, Debug)]
+pub struct ClientConfig {
+    /// Root directory for identity, history, downloads, and other local state.
+    pub data_dir: PathBuf,
+    /// Optional noninteractive passphrase for identity encryption.
+    pub passphrase: Option<String>,
+    /// This account's queue URL, recorded in directory records.
+    pub queue_url: String,
+    /// This account's display name, recorded in directory records.
+    pub display_name: String,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from(".mycellium"),
+            passphrase: None,
+            queue_url: String::new(),
+            display_name: String::new(),
+        }
+    }
+}
+
+static CONFIG: OnceLock<Mutex<ClientConfig>> = OnceLock::new();
+
+fn config_cell() -> &'static Mutex<ClientConfig> {
+    CONFIG.get_or_init(|| Mutex::new(ClientConfig::default()))
+}
+
+/// Replace the process-local client config.
+pub fn configure(config: ClientConfig) {
+    *config_cell().lock().unwrap() = config;
+}
+
+/// Return the current process-local client config.
+pub fn config() -> ClientConfig {
+    config_cell().lock().unwrap().clone()
+}
+
+/// Update just the configured queue URL.
+pub fn set_queue_url(queue_url: impl Into<String>) {
+    config_cell().lock().unwrap().queue_url = queue_url.into();
+}
+
+/// Update just the configured display name.
+pub fn set_display_name(display_name: impl Into<String>) {
+    config_cell().lock().unwrap().display_name = display_name.into();
+}
+
+/// This account's queue URL, recorded in directory records.
+pub fn queue_url() -> String {
+    config().queue_url
+}
+
+/// This account's display name, recorded in directory records.
+pub fn display_name() -> String {
+    config().display_name
+}
 
 /// On-disk encrypted identity.
 #[derive(Serialize, Deserialize)]
@@ -38,11 +99,9 @@ struct Secret {
     device_seed: Vec<u8>,
 }
 
-/// The data directory (`MYCELLIUM_HOME`, default `.mycellium`).
+/// The configured data directory.
 fn home() -> PathBuf {
-    std::env::var("MYCELLIUM_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(".mycellium"))
+    config().data_dir
 }
 
 /// Path to the encrypted identity file.
@@ -50,7 +109,7 @@ pub fn path() -> PathBuf {
     home().join("identity.enc")
 }
 
-/// The data directory root (`MYCELLIUM_HOME`), for other local state.
+/// The data directory root, for other local state.
 pub fn data_dir() -> PathBuf {
     home()
 }
@@ -148,10 +207,10 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// Obtain the passphrase from the environment or, failing that, a **no-echo**
-/// terminal prompt (so it isn't left in scrollback / screen shares).
+/// Obtain the configured passphrase or, failing that, a **no-echo** terminal
+/// prompt (so it isn't left in scrollback / screen shares).
 fn passphrase(prompt: &str) -> Result<String> {
-    if let Ok(p) = std::env::var("MYCELLIUM_PASSPHRASE") {
+    if let Some(p) = config().passphrase {
         return Ok(p);
     }
     let line = rpassword::prompt_password(format!("{prompt}: "))?;
@@ -165,7 +224,7 @@ fn passphrase(prompt: &str) -> Result<String> {
 /// Like [`passphrase`], but on interactive creation prompts a second time and
 /// requires the two to match (typos in a new passphrase are unrecoverable).
 fn new_passphrase(prompt: &str) -> Result<String> {
-    if std::env::var("MYCELLIUM_PASSPHRASE").is_ok() {
+    if config().passphrase.is_some() {
         return passphrase(prompt); // noninteractive: nothing to confirm against
     }
     let first = passphrase(prompt)?;

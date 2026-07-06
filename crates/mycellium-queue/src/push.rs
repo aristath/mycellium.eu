@@ -18,7 +18,7 @@ use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Bound outbound push attempts so a dead push provider cannot strand one OS
@@ -35,12 +35,19 @@ pub struct Vapid {
     /// base64url (unpadded) of the 65-byte uncompressed public key.
     public_b64: String,
     subject: String,
+    push_allow_hosts: HashSet<String>,
 }
 
 impl Vapid {
     /// Generate a fresh VAPID keypair. Persist its [`seed`](Self::seed) so
     /// existing browser subscriptions keep working across restarts.
     pub fn generate() -> Self {
+        Self::generate_with_allowlist(HashSet::new())
+    }
+
+    /// Generate a fresh VAPID keypair with an explicit send-time internal-host
+    /// allowlist.
+    pub fn generate_with_allowlist(push_allow_hosts: HashSet<String>) -> Self {
         let signing = loop {
             let mut bytes = [0u8; 32];
             getrandom::getrandom(&mut bytes).expect("OS RNG");
@@ -48,12 +55,18 @@ impl Vapid {
                 break key;
             }
         };
-        Self::from_signing(signing)
+        Self::from_signing(signing, push_allow_hosts)
     }
 
-    /// Reconstruct the keypair from a persisted 32-byte private scalar.
-    pub fn from_seed(seed: &[u8; 32]) -> Option<Self> {
-        SigningKey::from_slice(seed).ok().map(Self::from_signing)
+    /// Reconstruct the keypair with an explicit send-time internal-host
+    /// allowlist.
+    pub fn from_seed_with_allowlist(
+        seed: &[u8; 32],
+        push_allow_hosts: HashSet<String>,
+    ) -> Option<Self> {
+        SigningKey::from_slice(seed)
+            .ok()
+            .map(|signing| Self::from_signing(signing, push_allow_hosts))
     }
 
     /// The 32-byte private scalar, to persist so the public key is stable.
@@ -64,13 +77,14 @@ impl Vapid {
         out
     }
 
-    fn from_signing(signing: SigningKey) -> Self {
+    fn from_signing(signing: SigningKey, push_allow_hosts: HashSet<String>) -> Self {
         let point = signing.verifying_key().to_encoded_point(false);
         let public_b64 = b64url(point.as_bytes());
         Vapid {
             signing,
             public_b64,
             subject: "mailto:push@mycellium.invalid".to_string(),
+            push_allow_hosts,
         }
     }
 
@@ -85,7 +99,7 @@ impl Vapid {
         // range (loopback / link-local / private / metadata). Done here — not
         // only at subscribe time — so a DNS name that *resolves* to an internal
         // IP (or a rebind) can't get us to POST to it.
-        if !endpoint_is_safe_to_connect(endpoint) {
+        if !endpoint_is_safe_to_connect(endpoint, &self.push_allow_hosts) {
             return SendResult::Failed;
         }
         let aud = match origin_of(endpoint) {
@@ -130,10 +144,14 @@ impl Vapid {
 /// gone (the distributor was uninstalled or the topic revoked) so the caller
 /// should drop the subscription; any other error is transient (mail stays
 /// queued).
-pub(crate) fn unifiedpush_send(endpoint: &str, _now: u64) -> SendResult {
+pub(crate) fn unifiedpush_send(
+    endpoint: &str,
+    _now: u64,
+    push_allow_hosts: &HashSet<String>,
+) -> SendResult {
     // Same SSRF guard as the VAPID path: resolve and refuse an internal target
     // before we ever open a socket.
-    if !endpoint_is_safe_to_connect(endpoint) {
+    if !endpoint_is_safe_to_connect(endpoint, push_allow_hosts) {
         return SendResult::Failed;
     }
     match push_agent().post(endpoint).set("TTL", "60").send_bytes(&[])
@@ -270,48 +288,14 @@ fn authority_of(url: &str) -> Option<String> {
     (!authority.is_empty()).then(|| authority.to_ascii_lowercase())
 }
 
-/// Operator-configured `host:port` authorities that bypass the internal-target
-/// guard **at send time only** — for a self-hosted push distributor an operator
-/// deliberately runs on an otherwise-blocked address (loopback / LAN). Seeded
-/// once from `MYCELLIUM_PUSH_ALLOW_HOSTS` (comma-separated `host:port`). This
-/// never relaxes *subscribe*-time validation of client-supplied endpoints, so a
-/// client still cannot register an internal endpoint.
-fn allow_registry() -> &'static Mutex<HashSet<String>> {
-    static REG: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    REG.get_or_init(|| {
-        let mut set = HashSet::new();
-        if let Ok(v) = std::env::var("MYCELLIUM_PUSH_ALLOW_HOSTS") {
-            for h in v.split(',') {
-                let h = h.trim().to_ascii_lowercase();
-                if !h.is_empty() {
-                    set.insert(h);
-                }
-            }
-        }
-        Mutex::new(set)
-    })
-}
-
-/// Test-only: register an exact `host:port` authority the send-time guard should
-/// treat as an operator-allowlisted internal distributor (mirrors seeding subs
-/// an operator configured). Exact-match so it can't relax the strict checks other
-/// tests assert on different addresses/ports.
-#[cfg(test)]
-pub(crate) fn allow_authority_for_test(authority: &str) {
-    allow_registry()
-        .lock()
-        .unwrap()
-        .insert(authority.to_ascii_lowercase());
-}
-
 /// The full SSRF check applied immediately before connecting: reject anything
 /// statically-internal, then **resolve** the host and reject if *any* resolved
 /// address is internal (guards DNS names and rebinding). Returns `false` — do
 /// not connect — if resolution fails or yields no address. An operator-allowlisted
 /// authority bypasses the guard (self-hosted internal distributor).
-pub(crate) fn endpoint_is_safe_to_connect(url: &str) -> bool {
+pub(crate) fn endpoint_is_safe_to_connect(url: &str, push_allow_hosts: &HashSet<String>) -> bool {
     if let Some(auth) = authority_of(url) {
-        if allow_registry().lock().unwrap().contains(&auth) {
+        if push_allow_hosts.contains(&auth) {
             return true;
         }
     }
@@ -411,7 +395,7 @@ mod tests {
                 "expected {bad} to be blocked statically"
             );
             assert!(
-                !endpoint_is_safe_to_connect(bad),
+                !endpoint_is_safe_to_connect(bad, &HashSet::new()),
                 "expected {bad} to be refused before connecting"
             );
         }
@@ -438,7 +422,7 @@ mod tests {
         assert_eq!(v.send("https://127.0.0.1:1/x", 0), SendResult::Failed);
         assert_eq!(v.send("https://169.254.169.254/x", 0), SendResult::Failed);
         assert_eq!(
-            unifiedpush_send("https://127.0.0.1:1/x", 0),
+            unifiedpush_send("https://127.0.0.1:1/x", 0, &HashSet::new()),
             SendResult::Failed
         );
     }

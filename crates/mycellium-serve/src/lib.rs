@@ -13,7 +13,7 @@
 //! - a metrics counter + structured access log per request, where the logged
 //!   path is axum's **matched route template** (e.g. `/records/{handle}`), so a
 //!   looked-up handle or wallet never lands in a log line;
-//! - optional TLS from `MYCELLIUM_TLS_CERT` / `MYCELLIUM_TLS_KEY` (rustls);
+//! - optional TLS from explicit config (rustls);
 //! - **graceful shutdown** on `SIGINT`/`SIGTERM`, so in-flight requests finish
 //!   and the durable store is dropped cleanly.
 
@@ -30,6 +30,20 @@ use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
 pub use mycellium_observe::Metrics;
+
+/// TLS PEM paths for the shared HTTP runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+/// Explicit HTTP serving options.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpConfig {
+    pub tls: Option<TlsConfig>,
+    pub access_log: bool,
+}
 
 /// A configured HTTP server for one Mycellium service.
 pub struct Server {
@@ -59,7 +73,7 @@ impl Server {
     /// `addr` until a shutdown signal arrives, wrapping it in the shared
     /// middleware stack + `/health` + `/metrics` and terminating TLS when
     /// configured. Returns when the server has shut down gracefully.
-    pub async fn run(self, addr: &str, app: Router) -> std::io::Result<()> {
+    pub async fn run(self, addr: &str, app: Router, config: HttpConfig) -> std::io::Result<()> {
         let Server {
             service,
             metrics,
@@ -82,6 +96,7 @@ impl Server {
         let ctx = ObserveCtx {
             metrics: Arc::clone(&metrics),
             service,
+            access_log: config.access_log,
         };
 
         // Layer order is outermost-last: the observe layer wraps everything (so it
@@ -98,24 +113,30 @@ impl Server {
         let handle = axum_server::Handle::new();
         tokio::spawn(shutdown_signal(handle.clone()));
 
-        match tls_paths() {
-            Some((cert, key)) => {
+        match config.tls {
+            Some(tls) => {
                 // rustls 0.23 requires a process-wide crypto provider; install the
                 // ring backend once (idempotent — a second call is a no-op).
                 let _ = rustls::crypto::ring::default_provider().install_default();
-                let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-                    .await
-                    .map_err(|e| {
-                        std::io::Error::other(format!("TLS config from {cert}/{key}: {e}"))
-                    })?;
-                println!("  tls: enabled ({cert}) — rustls");
-                axum_server::bind_rustls(sockaddr, config)
+                let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                    &tls.cert_path,
+                    &tls.key_path,
+                )
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "TLS config from {}/{}: {e}",
+                        tls.cert_path, tls.key_path
+                    ))
+                })?;
+                println!("  tls: enabled ({}) — rustls", tls.cert_path);
+                axum_server::bind_rustls(sockaddr, rustls_config)
                     .handle(handle)
                     .serve(app.into_make_service())
                     .await
             }
             None => {
-                println!("  tls: disabled (set MYCELLIUM_TLS_CERT + MYCELLIUM_TLS_KEY, or terminate at a proxy)");
+                println!("  tls: disabled (terminate at a proxy or configure TLS)");
                 axum_server::bind(sockaddr)
                     .handle(handle)
                     .serve(app.into_make_service())
@@ -130,6 +151,7 @@ impl Server {
 struct ObserveCtx {
     metrics: Arc<Metrics>,
     service: &'static str,
+    access_log: bool,
 }
 
 /// Count every response and emit an access-log line whose path is the **matched
@@ -158,6 +180,7 @@ async fn observe(
         &path,
         status,
         start.elapsed().as_millis(),
+        ctx.access_log,
     );
     resp
 }
@@ -169,12 +192,6 @@ fn cors_layer() -> CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
-}
-
-/// The configured TLS PEM paths, if both are set and non-empty.
-fn tls_paths() -> Option<(String, String)> {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    Some((env("MYCELLIUM_TLS_CERT")?, env("MYCELLIUM_TLS_KEY")?))
 }
 
 /// Resolve a `HOST:PORT` bind string to a concrete socket address.

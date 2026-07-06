@@ -50,7 +50,7 @@ fn deposit_fails_over_from_down_primary_to_backup() {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_queue::serve(&serve_addr).await;
+            let _ = mycellium_queue::serve(&serve_addr, mycellium_queue::ServeConfig::dev()).await;
         });
     });
     wait_port(backup_port);

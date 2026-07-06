@@ -11,6 +11,7 @@ mod web;
 
 use std::sync::Mutex;
 
+use mycellium_storage::store;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Shared server state (the client is single-user: one identity per process).
@@ -28,8 +29,8 @@ const DEFAULT_PORT: u16 = 8800;
 
 fn main() {
     let mut port = DEFAULT_PORT;
-    let mut directory = env_or("MYCELLIUM_DIRECTORY", DEFAULT_DIRECTORY);
-    let mut queue = env_or("MYCELLIUM_QUEUE", DEFAULT_QUEUE);
+    let mut directory = DEFAULT_DIRECTORY.to_string();
+    let mut queue = DEFAULT_QUEUE.to_string();
     let mut data_dir = default_data_dir();
 
     // Minimal arg parsing: --port, --directory, --queue, --data-dir, --help.
@@ -65,19 +66,20 @@ fn main() {
         i += 1;
     }
 
-    // The engine reads these from the environment; set them once for the process.
-    std::env::set_var("MYCELLIUM_HOME", &data_dir);
-    std::env::set_var("MYCELLIUM_QUEUE", &queue);
     // Passwordless: the identity is encrypted at rest with a random per-device
     // key kept in the data dir — no user password or seed phrase to manage.
-    std::env::set_var("MYCELLIUM_PASSPHRASE", ensure_device_key(&data_dir));
-    // The display name (set at signup) is what others see; the engine reads it
-    // from MYCELLIUM_NAME when building our record.
-    if let Ok(name) = std::fs::read_to_string(std::path::Path::new(&data_dir).join("name")) {
-        if !name.trim().is_empty() {
-            std::env::set_var("MYCELLIUM_NAME", name.trim());
-        }
-    }
+    let passphrase = ensure_device_key(&data_dir);
+    let display_name = std::fs::read_to_string(std::path::Path::new(&data_dir).join("name"))
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default();
+    store::configure(store::ClientConfig {
+        data_dir: std::path::PathBuf::from(&data_dir),
+        passphrase: Some(passphrase),
+        queue_url: queue.clone(),
+        display_name,
+    });
 
     let state = Mutex::new(State {
         directory,
@@ -95,10 +97,7 @@ fn main() {
     println!("Mycellium client on  http://{addr}");
     println!("  data:      {data_dir}");
     println!("  directory: {}", state.lock().unwrap().directory);
-    println!(
-        "  queue:     {}",
-        std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
-    );
+    println!("  queue:     {}", store::queue_url());
     println!("Open the URL above in your browser.");
 
     for request in server.incoming_requests() {
@@ -146,10 +145,6 @@ fn handle(state: &Mutex<State>, mut request: Request) {
     }
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 /// The per-device secret that encrypts the identity at rest. Generated once and
 /// kept in the data dir — the user never sees or types it (no seed/password).
 fn ensure_device_key(data_dir: &str) -> String {
@@ -169,11 +164,7 @@ fn ensure_device_key(data_dir: &str) -> String {
 }
 
 fn default_data_dir() -> String {
-    if let Ok(home) = std::env::var("MYCELLIUM_HOME") {
-        return home;
-    }
-    let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{base}/.mycellium")
+    ".mycellium".to_string()
 }
 
 fn print_help() {

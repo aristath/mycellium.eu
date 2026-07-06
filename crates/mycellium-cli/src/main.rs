@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 
 use mycellium_core::identity::Handle;
 use mycellium_core::message::AppMessage;
@@ -41,6 +42,10 @@ const DEFAULT_DIRECTORY: &str = "http://127.0.0.1:8080";
     about = "Mycellium peer-to-peer messenger (POC client)"
 )]
 struct Cli {
+    /// JSON client config. If omitted, the CLI uses `.mycellium` plus
+    /// interactive passphrase prompts and no advertised queue.
+    #[arg(long, global = true)]
+    config: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -320,7 +325,7 @@ enum Command {
         /// Destination path.
         path: String,
     },
-    /// Import a backup into a fresh MYCELLIUM_HOME.
+    /// Import a backup into a fresh configured data directory.
     Import {
         /// Backup file path.
         path: String,
@@ -495,7 +500,9 @@ enum GroupAction {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    init_client_config(cli.config.as_deref())?;
+    match cli.command {
         Command::IdentityNew => identity_new(),
         Command::Pair {
             handle,
@@ -670,6 +677,36 @@ fn main() -> Result<()> {
         },
         Command::Wipe { yes } => wipe(yes),
     }
+}
+
+#[derive(Default, Deserialize)]
+struct ClientConfigFile {
+    data_dir: Option<String>,
+    passphrase: Option<String>,
+    queue: Option<String>,
+    name: Option<String>,
+}
+
+fn init_client_config(path: Option<&str>) -> Result<()> {
+    let file = match path {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("could not read client config '{path}'"))?;
+            serde_json::from_str::<ClientConfigFile>(&raw)
+                .with_context(|| format!("could not parse client config '{path}'"))?
+        }
+        None => ClientConfigFile::default(),
+    };
+    store::configure(store::ClientConfig {
+        data_dir: file
+            .data_dir
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(".mycellium")),
+        passphrase: file.passphrase,
+        queue_url: file.queue.unwrap_or_default(),
+        display_name: file.name.unwrap_or_default(),
+    });
+    Ok(())
 }
 
 fn listen(addr: &str, libp2p: bool, tui: bool) -> Result<()> {

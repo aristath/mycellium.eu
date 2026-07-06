@@ -50,25 +50,22 @@ fn start_queue() -> String {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_queue::serve(&serve).await;
+            let _ = mycellium_queue::serve(&serve, mycellium_queue::ServeConfig::dev()).await;
         });
     });
     wait_port(port);
     format!("http://{addr}")
 }
 
-/// Serve `mycellium-directory` in a background thread; returns its base URL. The
-/// directory fails closed without SMTP unless dev auth is explicit (#47), so we
-/// set `MYCELLIUM_DEV_AUTH=1` — which also makes email verification echo the code.
+/// Serve `mycellium-directory` in a background thread; returns its base URL.
 fn start_directory() -> String {
-    std::env::set_var("MYCELLIUM_DEV_AUTH", "1");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let serve = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_directory::serve(&serve).await;
+            let _ = mycellium_directory::serve(&serve, mycellium_directory::ServeConfig::dev()).await;
         });
     });
     wait_port(port);

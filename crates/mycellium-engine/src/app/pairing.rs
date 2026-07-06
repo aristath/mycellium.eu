@@ -29,9 +29,7 @@ pub fn pair_new(
     directory: &str,
 ) -> Result<()> {
     if store::exists() {
-        bail!(
-            "an identity already exists here — pair runs on a fresh device (a new MYCELLIUM_HOME)"
-        );
+        bail!("an identity already exists here — pair runs with a fresh client config");
     }
     if queue.is_empty() {
         bail!("--queue is required: it is the rendezvous both devices talk through");

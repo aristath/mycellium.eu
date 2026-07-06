@@ -20,9 +20,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
-// The directory fails closed without SMTP unless dev auth is explicit (#47).
-process.env.MYCELLIUM_DEV_AUTH = '1';
-
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = (n) => path.join(ROOT, 'target/debug', n);
 const CHROME = '/usr/bin/google-chrome';
@@ -36,6 +33,7 @@ function cleanup() {
 }
 function tmpdir(tag) { const d = fs.mkdtempSync(path.join(os.tmpdir(), `myc-e2e-${tag}-`)); tmps.push(d); return d; }
 function freePort() { return new Promise((res) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); }); }
+function serviceConfig(name, config) { const file = path.join(ROOT, 'target', name + '-' + config.addr.split(':').pop() + '.json'); fs.writeFileSync(file, JSON.stringify(config)); return file; }
 async function waitHttp(u, ms = 10000) { const e = Date.now() + ms; while (Date.now() < e) { try { const r = await fetch(u); if (r.status < 500) return; } catch {} await sleep(150); } throw new Error('timeout ' + u); }
 function spawnBin(name, args) { const p = spawn(BIN(name), args, { stdio: 'ignore' }); procs.push(p); return p; }
 
@@ -124,8 +122,8 @@ async function main() {
   const [dP, qP, caP, cbP] = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
   const dir = `http://127.0.0.1:${dP}`, q = `http://127.0.0.1:${qP}`, aUrl = `http://127.0.0.1:${caP}`, bUrl = `http://127.0.0.1:${cbP}`;
 
-  spawnBin('mycellium-server', ['--addr', `127.0.0.1:${dP}`]);
-  spawnBin('mycellium-queue', ['--addr', `127.0.0.1:${qP}`]);
+  spawnBin('mycellium-server', ['--config', serviceConfig('directory', { addr: `127.0.0.1:${dP}`, dev_auth: true })]);
+  spawnBin('mycellium-queue', ['--config', serviceConfig('queue', { addr: `127.0.0.1:${qP}` })]);
   await Promise.all([waitHttp(dir + '/health'), waitHttp(q + '/health')]);
   spawnBin('mycellium-client', ['--port', String(caP), '--directory', dir, '--queue', q, '--data-dir', tmpdir('a')]);
   spawnBin('mycellium-client', ['--port', String(cbP), '--directory', dir, '--queue', q, '--data-dir', tmpdir('b')]);

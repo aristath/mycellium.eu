@@ -75,10 +75,9 @@ fn wait_port(port: u16) {
 }
 
 /// One shared message queue for the whole test binary. It's keyed by wallet, so
-/// tests (each with fresh identities) never collide. Its URL is exported as
-/// `MYCELLIUM_QUEUE` so every spawned CLI inherits it — records carry it, and
-/// send/inbox deposit/collect against it (the queue is decoupled from the
-/// directory).
+/// tests (each with fresh identities) never collide. Every spawned CLI receives
+/// it through an explicit JSON config — records carry it, and send/inbox
+/// deposit/collect against it (the queue is decoupled from the directory).
 static QUEUE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 fn ensure_queue() {
     QUEUE_URL.get_or_init(|| {
@@ -88,21 +87,18 @@ fn ensure_queue() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                let _ = mycellium_queue::serve(&serve_addr).await;
+                let _ =
+                    mycellium_queue::serve(&serve_addr, mycellium_queue::ServeConfig::dev()).await;
             });
         });
         wait_port(port);
-        let url = format!("http://{addr}");
-        std::env::set_var("MYCELLIUM_QUEUE", &url);
-        url
+        format!("http://{addr}")
     });
 }
 
 /// Start a directory on a fresh port, in a background thread. Returns its URL.
-/// Also ensures the shared queue is up (and `MYCELLIUM_QUEUE` exported).
+/// Also ensures the shared queue is up.
 fn start_directory() -> String {
-    // The directory fails closed without SMTP unless dev auth is explicit (#47).
-    std::env::set_var("MYCELLIUM_DEV_AUTH", "1");
     ensure_queue();
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -110,7 +106,9 @@ fn start_directory() -> String {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_directory::serve(&serve_addr).await;
+            let _ =
+                mycellium_directory::serve(&serve_addr, mycellium_directory::ServeConfig::dev())
+                    .await;
         });
     });
     wait_port(port);
@@ -138,13 +136,46 @@ fn cli(home: &PathBuf, args: &[&str]) -> Output {
 
 /// Like [`cli`], but with an explicit passphrase.
 fn cli_pass(home: &PathBuf, pass: &str, args: &[&str]) -> Output {
-    Command::new(CLI)
+    cli_command_pass(home, pass)
         .args(args)
-        .env("MYCELLIUM_HOME", home)
-        .env("MYCELLIUM_PASSPHRASE", pass)
         .stdin(Stdio::null())
         .output()
         .expect("failed to run mycellium-cli")
+}
+
+fn cli_command(home: &PathBuf) -> Command {
+    cli_command_pass(home, PASS)
+}
+
+fn cli_command_pass(home: &PathBuf, pass: &str) -> Command {
+    cli_command_with_queue(home, pass, &current_queue())
+}
+
+fn cli_command_no_queue(home: &PathBuf) -> Command {
+    cli_command_with_queue(home, PASS, "")
+}
+
+fn cli_command_with_queue(home: &PathBuf, pass: &str, queue: &str) -> Command {
+    let config = client_config(home, pass, queue);
+    let mut cmd = Command::new(CLI);
+    cmd.arg("--config").arg(config);
+    cmd
+}
+
+fn client_config(home: &PathBuf, pass: &str, queue: &str) -> PathBuf {
+    std::fs::create_dir_all(home).unwrap();
+    let path = home.join("client.json");
+    let json = serde_json::json!({
+        "data_dir": home,
+        "passphrase": pass,
+        "queue": queue,
+    });
+    std::fs::write(&path, json.to_string()).unwrap();
+    path
+}
+
+fn current_queue() -> String {
+    QUEUE_URL.get().cloned().unwrap_or_default()
 }
 
 /// The last whitespace-token of the first line starting with `label`.
@@ -211,7 +242,7 @@ fn live_push_delivery_when_online() {
         "bob register",
     );
 
-    let mut bob_serve = Command::new(CLI)
+    let mut bob_serve = cli_command(&bob)
         .args([
             "serve",
             "--addr",
@@ -221,8 +252,6 @@ fn live_push_delivery_when_online() {
             "--directory",
             &dir,
         ])
-        .env("MYCELLIUM_HOME", &bob)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn bob serve");
@@ -287,7 +316,7 @@ fn full_duplex_mail_over_libp2p() {
 
     let alice = account(&dir, "alice");
 
-    let mut bob_serve = Command::new(CLI)
+    let mut bob_serve = cli_command(&bob)
         .args([
             "serve",
             "--addr",
@@ -298,8 +327,6 @@ fn full_duplex_mail_over_libp2p() {
             "--directory",
             &dir,
         ])
-        .env("MYCELLIUM_HOME", &bob)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn bob serve libp2p");
@@ -412,9 +439,9 @@ fn relayed_live_delivery_through_a_relay() {
     let alice = account(&dir, "alice");
 
     // Bob serves relay-only: reserve on R, re-publish his circuit address, accept
-    // relayed streams. Empty MYCELLIUM_QUEUE ⇒ no queue fallback in his record ⇒
+    // relayed streams. Empty queue config ⇒ no queue fallback in his record ⇒
     // the relay circuit is his only reachable path.
-    let mut bob_serve = Command::new(CLI)
+    let mut bob_serve = cli_command_no_queue(&bob)
         .args([
             "serve",
             "--addr",
@@ -427,9 +454,6 @@ fn relayed_live_delivery_through_a_relay() {
             "--directory",
             &dir,
         ])
-        .env("MYCELLIUM_HOME", &bob)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_QUEUE", "")
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn bob serve relay");
@@ -493,21 +517,18 @@ fn relayed_live_delivery_through_a_relay() {
 
 /// Path to the built `mycellium-relay` binary — a sibling of the CLI binary in
 /// the same target dir. Cargo only exports `CARGO_BIN_EXE_*` for the crate that
-/// owns the binary, so we derive the relay's path from the CLI's and (when this
-/// test target is run in isolation, without a prior `cargo build --workspace`)
-/// build it on demand so the test is self-contained.
+/// owns the binary, so we derive the relay's path from the CLI's and build it on
+/// demand so the test never uses a stale binary from an earlier run.
 fn relay_bin() -> PathBuf {
     let path = PathBuf::from(CLI)
         .parent()
         .expect("CLI binary has a parent dir")
         .join("mycellium-relay");
-    if !path.exists() {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "mycellium-relay"])
-            .status()
-            .expect("run cargo build -p mycellium-relay");
-        assert!(status.success(), "failed to build mycellium-relay");
-    }
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "mycellium-relay"])
+        .status()
+        .expect("run cargo build -p mycellium-relay");
+    assert!(status.success(), "failed to build mycellium-relay");
     path
 }
 
@@ -544,11 +565,11 @@ fn read_relay_multiaddr(child: &mut std::process::Child) -> Option<String> {
 /// through the **real `mycellium-relay` binary** (not an in-process node).
 ///
 /// Mirrors `relayed_live_delivery_through_a_relay`, but the relay is the actual
-/// deployable binary: spawned as a subprocess with its own `MYCELLIUM_DATA`, its
-/// printed multiaddr parsed from stdout, and used as Bob's ONLY route.
+/// deployable binary: spawned as a subprocess with its own config, its printed
+/// multiaddr parsed from stdout, and used as Bob's ONLY route.
 ///
 /// Non-vacuity: Bob `serve`s relay-only — no direct listen address and an empty
-/// `MYCELLIUM_QUEUE`, so his record advertises only the `/p2p-circuit/` path. If
+/// empty queue config, so his record advertises only the `/p2p-circuit/` path. If
 /// the real relay binary weren't forwarding, Alice would have no route: the send
 /// would land in her outbox and the `[1 relay]` / decrypted-message asserts would
 /// both fail.
@@ -563,9 +584,19 @@ fn relayed_delivery_through_the_real_relay_binary() {
     let relay_bind = format!("127.0.0.1:{relay_port}");
     let relay_data = home("relay-data");
     std::fs::create_dir_all(&relay_data).unwrap();
+    let relay_config = relay_data.join("relay.json");
+    std::fs::write(
+        &relay_config,
+        format!(
+            r#"{{"addr":"{}","data_dir":"{}"}}"#,
+            relay_bind,
+            relay_data.display()
+        ),
+    )
+    .unwrap();
     let mut relay = Command::new(relay_bin())
-        .args(["--addr", &relay_bind])
-        .env("MYCELLIUM_DATA", &relay_data)
+        .arg("--config")
+        .arg(&relay_config)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn mycellium-relay");
@@ -609,9 +640,9 @@ fn relayed_delivery_through_the_real_relay_binary() {
     let alice = account(&dir, "alice");
 
     // Bob serves relay-only against the REAL relay: reserve on it, re-publish his
-    // circuit address, accept relayed streams. Empty MYCELLIUM_QUEUE ⇒ no queue
+    // circuit address, accept relayed streams. Empty queue config ⇒ no queue
     // fallback in his record ⇒ the relay circuit is his only reachable path.
-    let mut bob_serve = Command::new(CLI)
+    let mut bob_serve = cli_command_no_queue(&bob)
         .args([
             "serve",
             "--addr",
@@ -624,9 +655,6 @@ fn relayed_delivery_through_the_real_relay_binary() {
             "--directory",
             &dir,
         ])
-        .env("MYCELLIUM_HOME", &bob)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_QUEUE", "")
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn bob serve relay");
@@ -689,9 +717,10 @@ fn relayed_delivery_through_the_real_relay_binary() {
     );
 }
 
-/// The relay binary's identity is persistent (#59): with a fixed `MYCELLIUM_DATA`
-/// its PeerId — and therefore the whole `--relay` multiaddr clients advertise —
-/// is identical across restarts, so a redeploy never breaks existing addresses.
+/// The relay binary's identity is persistent (#59): with a fixed data directory
+/// in its config, its PeerId — and therefore the whole `--relay` multiaddr
+/// clients advertise — is identical across restarts, so a redeploy never breaks
+/// existing addresses.
 #[test]
 fn real_relay_peerid_is_stable_across_restarts() {
     let _throttle = throttle();
@@ -700,11 +729,17 @@ fn real_relay_peerid_is_stable_across_restarts() {
     std::fs::create_dir_all(&data).unwrap();
     let port = free_port();
     let bind = format!("127.0.0.1:{port}");
+    let config = data.join("relay.json");
+    std::fs::write(
+        &config,
+        format!(r#"{{"addr":"{}","data_dir":"{}"}}"#, bind, data.display()),
+    )
+    .unwrap();
 
     let spawn_and_read = || -> String {
         let mut child = Command::new(&bin)
-            .args(["--addr", &bind])
-            .env("MYCELLIUM_DATA", &data)
+            .arg("--config")
+            .arg(&config)
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn mycellium-relay");
@@ -719,7 +754,7 @@ fn real_relay_peerid_is_stable_across_restarts() {
     assert_eq!(
         first, second,
         "the relay's advertised multiaddr (incl. PeerId) must be stable across restarts \
-         with a fixed MYCELLIUM_DATA: {first} != {second}"
+         with a fixed config data_dir: {first} != {second}"
     );
     // Sanity: it really is a dialable circuit-relay address on the fixed port.
     assert!(
@@ -765,7 +800,7 @@ fn pair_device(existing: &PathBuf, handle: &str, tag: &str, dir: &str) -> PathBu
     let queue = QUEUE_URL.get().expect("queue up").clone();
     let new_home = home(tag);
     let addr = format!("127.0.0.1:{}", free_port());
-    let mut pair = Command::new(CLI)
+    let mut pair = cli_command_with_queue(&new_home, PASS, &queue)
         .args([
             "pair",
             handle,
@@ -776,9 +811,6 @@ fn pair_device(existing: &PathBuf, handle: &str, tag: &str, dir: &str) -> PathBu
             "--directory",
             dir,
         ])
-        .env("MYCELLIUM_HOME", &new_home)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_QUEUE", &queue)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -817,7 +849,7 @@ fn pairing_joins_a_second_device() {
     // in the background and read the offer it prints.
     let alice2 = home("alice2");
     let d2_addr = format!("127.0.0.1:{}", free_port());
-    let mut pair = Command::new(CLI)
+    let mut pair = cli_command_with_queue(&alice2, PASS, &queue)
         .args([
             "pair",
             "alice",
@@ -828,9 +860,6 @@ fn pairing_joins_a_second_device() {
             "--directory",
             &dir,
         ])
-        .env("MYCELLIUM_HOME", &alice2)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_QUEUE", &queue)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2648,20 +2677,16 @@ fn history_is_persisted_after_a_chat() {
     let bob_addr = format!("127.0.0.1:{bob_port}");
     let (alice, bob) = two_accounts(&dir, &bob_addr, false);
 
-    let mut bob_listener = Command::new(CLI)
+    let mut bob_listener = cli_command(&bob)
         .args(["listen", "--addr", &bob_addr])
-        .env("MYCELLIUM_HOME", &bob)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn bob listen");
     wait_port(bob_port);
 
-    let mut alice_chat = Command::new(CLI)
+    let mut alice_chat = cli_command(&alice)
         .args(["chat", "bob", "--as", "alice", "--directory", &dir])
-        .env("MYCELLIUM_HOME", &alice)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -2760,20 +2785,16 @@ fn full_duplex(libp2p: bool) {
     if libp2p {
         listen_args.push("--libp2p");
     }
-    let mut bob_listener = Command::new(CLI)
+    let mut bob_listener = cli_command(&bob)
         .args(&listen_args)
-        .env("MYCELLIUM_HOME", &bob)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn bob listen");
     wait_port(bob_port);
 
-    let mut alice_chat = Command::new(CLI)
+    let mut alice_chat = cli_command(&alice)
         .args(["chat", "bob", "--as", "alice", "--directory", &dir])
-        .env("MYCELLIUM_HOME", &alice)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -2888,14 +2909,14 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
     let dir = start_directory();
     let alice = account(&dir, "alice");
 
-    // Carol registers a serve address but publishes NO queue (empty MYCELLIUM_QUEUE),
+    // Carol registers a serve address but publishes NO queue (empty queue config),
     // and is offline — so there is nowhere for a message to land.
     let carol_port = free_port();
     let carol_addr = format!("127.0.0.1:{carol_port}");
     let carol = home("carol-noq");
     ok(&cli(&carol, &["identity-new"]), "carol id");
     ok(
-        &Command::new(CLI)
+        &cli_command_no_queue(&carol)
             .args([
                 "register",
                 "carol",
@@ -2904,9 +2925,6 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
                 "--directory",
                 &dir,
             ])
-            .env("MYCELLIUM_HOME", &carol)
-            .env("MYCELLIUM_PASSPHRASE", PASS)
-            .env("MYCELLIUM_QUEUE", "") // no queue in her record
             .stdin(Stdio::null())
             .output()
             .expect("carol register"),
@@ -2943,7 +2961,7 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
     );
 
     // Carol comes online with `serve` (announces presence before it binds).
-    let mut carol_serve = Command::new(CLI)
+    let mut carol_serve = cli_command_no_queue(&carol)
         .args([
             "serve",
             "--addr",
@@ -2953,9 +2971,6 @@ fn outbox_parks_undeliverable_then_delivers_on_retry() {
             "--directory",
             &dir,
         ])
-        .env("MYCELLIUM_HOME", &carol)
-        .env("MYCELLIUM_PASSPHRASE", PASS)
-        .env("MYCELLIUM_QUEUE", "")
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn carol serve");

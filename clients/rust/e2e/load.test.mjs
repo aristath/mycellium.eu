@@ -13,9 +13,6 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
-// The directory fails closed without SMTP unless dev auth is explicit (#47).
-process.env.MYCELLIUM_DEV_AUTH = '1';
-
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = (n) => path.join(ROOT, 'target/debug', n);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -25,6 +22,7 @@ const CONCURRENCY = 64;
 
 const procs = [];
 function freePort() { return new Promise((res) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); }); }
+function serviceConfig(name, config) { const file = path.join(ROOT, 'target', name + '-' + config.addr.split(':').pop() + '.json'); fs.writeFileSync(file, JSON.stringify(config)); return file; }
 async function waitHttp(u, ms = 10000) { const e = Date.now() + ms; while (Date.now() < e) { try { const r = await fetch(u); if (r.status < 500) return; } catch {} await sleep(150); } throw new Error('timeout ' + u); }
 
 let failed = false;
@@ -51,7 +49,7 @@ async function main() {
   if (!fs.existsSync(BIN('mycellium-server'))) throw new Error('run: cargo build');
   const dp = await freePort();
   const dir = `http://127.0.0.1:${dp}`;
-  procs.push(spawn(BIN('mycellium-server'), ['--addr', `127.0.0.1:${dp}`], { stdio: 'ignore' }));
+  procs.push(spawn(BIN('mycellium-server'), ['--config', serviceConfig('directory', { addr: `127.0.0.1:${dp}`, dev_auth: true })], { stdio: 'ignore' }));
   await waitHttp(dir + '/health');
 
   // Warm up.

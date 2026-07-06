@@ -16,7 +16,7 @@
 //! and only the owning wallet may collect. (Removing the queue's view of the
 //! sender is the separate sealed-sender lever; see docs/research/SEALED-SENDER.md.)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub mod native_push;
@@ -483,39 +483,73 @@ pub struct QueueState {
     queue: Arc<Mutex<Queue>>,
     vapid: Arc<push::Vapid>,
     native: Arc<native_push::NativePush>,
+    push_allow_hosts: Arc<HashSet<String>>,
+}
+
+/// Queue HTTP serving config.
+#[derive(Clone, Debug, Default)]
+pub struct ServeConfig {
+    /// Durable data directory. `None` means explicit in-memory development mode.
+    pub data_dir: Option<String>,
+    /// Shared HTTP runtime options.
+    pub http: mycellium_serve::HttpConfig,
+    /// Exact `host:port` authorities that may receive push POSTs even if they
+    /// resolve to private/internal addresses. This is only for operator-owned
+    /// self-hosted push distributors; subscribe-time validation remains strict.
+    pub push_allow_hosts: Vec<String>,
+}
+
+impl ServeConfig {
+    /// Explicit in-memory development config.
+    pub fn dev() -> Self {
+        Self::default()
+    }
 }
 
 /// Bind `addr` and serve the queue until a shutdown signal arrives.
-pub async fn serve(addr: &str) -> std::io::Result<()> {
-    serve_with(addr, Arc::new(Mutex::new(open_queue()?))).await
+pub async fn serve(addr: &str, config: ServeConfig) -> std::io::Result<()> {
+    serve_with(
+        addr,
+        Arc::new(Mutex::new(open_queue(config.data_dir.as_deref())?)),
+        config,
+    )
+    .await
 }
 
 /// Serve the queue over an **externally-owned** queue handle, so an embedder or
-/// test can seed/observe the same [`Queue`] the routes mutate. Uses the
-/// persisted-or-generated VAPID key and env-configured native push, exactly like
-/// [`serve`].
-pub async fn serve_with(addr: &str, queue: Arc<Mutex<Queue>>) -> std::io::Result<()> {
-    let vapid = Arc::new(load_or_generate_vapid());
-    let native = Arc::new(native_push::NativePush::from_env());
+/// test can seed/observe the same [`Queue`] the routes mutate.
+pub async fn serve_with(
+    addr: &str,
+    queue: Arc<Mutex<Queue>>,
+    config: ServeConfig,
+) -> std::io::Result<()> {
+    let push_allow_hosts = Arc::new(normalize_allow_hosts(config.push_allow_hosts));
+    let vapid = Arc::new(load_or_generate_vapid(
+        config.data_dir.as_deref(),
+        (*push_allow_hosts).clone(),
+    ));
+    let native = Arc::new(native_push::NativePush::default());
     println!("  push: VAPID enabled");
     let state = QueueState {
         queue,
         vapid,
         native,
+        push_allow_hosts,
     };
     mycellium_serve::Server::new("queue", MAX_BODY)
-        .run(addr, router(state))
+        .run(addr, router(state), config.http)
         .await
 }
 
 /// Build the queue's [`Router`] over an externally-owned queue handle, with an
-/// ephemeral VAPID key and env-configured native push. For in-process embedding
-/// and tests that want a handle to the same [`Queue`] the routes mutate.
+/// ephemeral VAPID key. For in-process embedding and tests that want a handle to
+/// the same [`Queue`] the routes mutate.
 pub fn router_for(queue: Arc<Mutex<Queue>>) -> Router {
     router(QueueState {
         queue,
         vapid: Arc::new(push::Vapid::generate()),
-        native: Arc::new(native_push::NativePush::from_env()),
+        native: Arc::new(native_push::NativePush::default()),
+        push_allow_hosts: Arc::new(HashSet::new()),
     })
 }
 
@@ -535,6 +569,7 @@ trait Waker {
 struct LiveWaker {
     vapid: Arc<push::Vapid>,
     native: Arc<native_push::NativePush>,
+    push_allow_hosts: Arc<HashSet<String>>,
 }
 
 impl Waker for LiveWaker {
@@ -544,7 +579,11 @@ impl Waker for LiveWaker {
             Subscription::WebPush { endpoint } => Some(self.vapid.send(endpoint, now)),
             // UnifiedPush needs **no** VAPID: the distributor just accepts a bare
             // contentless POST to the endpoint. Route it through the plain sender.
-            Subscription::UnifiedPush { endpoint } => Some(push::unifiedpush_send(endpoint, now)),
+            Subscription::UnifiedPush { endpoint } => Some(push::unifiedpush_send(
+                endpoint,
+                now,
+                &self.push_allow_hosts,
+            )),
             Subscription::Apns { .. } | Subscription::Fcm { .. } => self.native.wake(sub, now),
         }
     }
@@ -580,59 +619,52 @@ pub fn router(state: QueueState) -> Router {
         .with_state(state)
 }
 
-/// Open the queue durably from `MYCELLIUM_DATA` (a data *directory*; we use
-/// `queue.redb` inside it). Setting `MYCELLIUM_DATA` expresses durable intent, so
-/// if the store can't be opened we **fail closed** rather than silently drop to
-/// in-memory (which would look healthy while mail/subscriptions don't persist —
-/// issue #45). No `MYCELLIUM_DATA` is the explicit in-memory development mode.
-fn open_queue() -> std::io::Result<Queue> {
-    let data = std::env::var("MYCELLIUM_DATA")
-        .ok()
-        .filter(|d| !d.is_empty());
-    open_queue_at(data.as_deref())
-}
-
-/// The env-free core of [`open_queue`], so the three startup modes are testable.
-fn open_queue_at(data: Option<&str>) -> std::io::Result<Queue> {
+/// Open the queue durably from an explicit data directory. `None` is explicit
+/// in-memory development mode.
+fn open_queue(data: Option<&str>) -> std::io::Result<Queue> {
     match data {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             let path = format!("{}/queue.redb", dir.trim_end_matches('/'));
             let queue = Queue::open(&path).map_err(|e| {
                 std::io::Error::other(format!(
-                    "MYCELLIUM_DATA is set but the durable store at {path} could not be opened: {e}"
+                    "the durable queue store at {path} could not be opened: {e}"
                 ))
             })?;
             println!("  persistence: {path}");
             Ok(queue)
         }
         None => {
-            println!("  storage: in-memory (set MYCELLIUM_DATA to persist)");
+            println!("  storage: in-memory development mode");
             Ok(Queue::new())
         }
     }
 }
 
-/// Load the VAPID keypair from `MYCELLIUM_DATA/vapid.key`, or generate one and
-/// persist it there (0600) so browser push subscriptions survive restarts.
-/// Without `MYCELLIUM_DATA`, use an ephemeral keypair (dev).
-fn load_or_generate_vapid() -> push::Vapid {
-    let dir = match std::env::var("MYCELLIUM_DATA") {
-        Ok(d) if !d.trim().is_empty() => d,
-        _ => return push::Vapid::generate(),
+/// Load the VAPID keypair from `{data_dir}/vapid.key`, or generate one and
+/// persist it there (0600) so browser push subscriptions survive restarts. With
+/// no data dir, use an ephemeral keypair for explicit development mode.
+fn load_or_generate_vapid(
+    data_dir: Option<&str>,
+    push_allow_hosts: HashSet<String>,
+) -> push::Vapid {
+    let dir = match data_dir {
+        Some(d) => d,
+        None => return push::Vapid::generate_with_allowlist(push_allow_hosts),
     };
     let _ = std::fs::create_dir_all(&dir);
     let path = format!("{}/vapid.key", dir.trim_end_matches('/'));
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            if let Some(v) = push::Vapid::from_seed(&seed) {
+            if let Some(v) = push::Vapid::from_seed_with_allowlist(&seed, push_allow_hosts.clone())
+            {
                 println!("  push: VAPID key loaded ({path})");
                 return v;
             }
         }
         eprintln!("  push: {path} is unreadable; regenerating");
     }
-    let v = push::Vapid::generate();
+    let v = push::Vapid::generate_with_allowlist(push_allow_hosts);
     match std::fs::write(&path, v.seed()) {
         Ok(()) => {
             restrict_perms(&path);
@@ -641,6 +673,14 @@ fn load_or_generate_vapid() -> push::Vapid {
         Err(e) => eprintln!("  push: could not persist VAPID key ({e}); it will change on restart"),
     }
     v
+}
+
+fn normalize_allow_hosts(hosts: Vec<String>) -> HashSet<String> {
+    hosts
+        .into_iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 #[cfg(unix)]
@@ -727,6 +767,7 @@ async fn mailbox_post(
         let waker = LiveWaker {
             vapid: Arc::clone(&st.vapid),
             native: Arc::clone(&st.native),
+            push_allow_hosts: Arc::clone(&st.push_allow_hosts),
         };
         let queue = Arc::clone(&st.queue);
         std::thread::spawn(move || {
@@ -1054,18 +1095,18 @@ mod tests {
     #[test]
     fn durable_open_fails_closed_on_a_bad_data_dir() {
         // No data dir → explicit in-memory development mode.
-        assert!(super::open_queue_at(None).is_ok());
+        assert!(super::open_queue(None).is_ok());
         // A valid data dir → durable mode.
         let good = std::env::temp_dir().join(format!("myc-q-good-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&good);
-        assert!(super::open_queue_at(Some(good.to_str().unwrap())).is_ok());
+        assert!(super::open_queue(Some(good.to_str().unwrap())).is_ok());
         let _ = std::fs::remove_dir_all(&good);
         // Configured but unusable (the path is a file, not a dir) → fail closed,
         // never a silent in-memory fallback.
         let bad = std::env::temp_dir().join(format!("myc-q-bad-{}", std::process::id()));
         let _ = std::fs::remove_file(&bad);
         std::fs::write(&bad, b"not a dir").unwrap();
-        assert!(super::open_queue_at(Some(bad.to_str().unwrap())).is_err());
+        assert!(super::open_queue(Some(bad.to_str().unwrap())).is_err());
         let _ = std::fs::remove_file(&bad);
     }
 
@@ -1659,12 +1700,13 @@ mod tests {
         // host:port) so the *delivery* path can reach them — mirroring an operator
         // self-hosting a UnifiedPush distributor on an internal address. Subscribe
         // stays strict; these subs are seeded directly below.
-        for url in [&good_url, &gone_url] {
-            if let Some((_, authority)) = url.split_once("://") {
-                let authority = authority.split('/').next().unwrap_or(authority);
-                push::allow_authority_for_test(authority);
-            }
-        }
+        let push_allow_hosts: Vec<String> = [&good_url, &gone_url]
+            .into_iter()
+            .filter_map(|url| {
+                let (_, authority) = url.split_once("://")?;
+                Some(authority.split('/').next().unwrap_or(authority).to_string())
+            })
+            .collect();
 
         // A shared queue the routes mutate and the test can seed/inspect.
         let queue = Arc::new(Mutex::new(Queue::new()));
@@ -1709,7 +1751,15 @@ mod tests {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                let _ = serve_with(&serve_addr, served).await;
+                let _ = serve_with(
+                    &serve_addr,
+                    served,
+                    ServeConfig {
+                        push_allow_hosts,
+                        ..ServeConfig::dev()
+                    },
+                )
+                .await;
             });
         });
         assert!(

@@ -24,7 +24,7 @@ import java.io.File
  *
  * The directory + queue run on the host; the emulator reaches them at 10.0.2.2.
  * Ports come from instrumentation args (`-Pandroid.testInstrumentationRunnerArguments.dirPort=...`),
- * defaulting to 18080/18090. The directory must run with MYCELLIUM_DEV_AUTH=1 so
+ * defaulting to 18080/18090. Start the directory with the dev JSON config so
  * `startEmailVerification` echoes the code.
  */
 @RunWith(AndroidJUnit4::class)
@@ -51,7 +51,7 @@ class MessagingE2eTest {
     private fun onboard(client: MyceliumClient, handle: String) {
         val verification = client.startEmailVerification(dir, handle, "$handle@example.test")
         val code = verification.devCode
-            ?: error("directory did not echo a dev code — is MYCELLIUM_DEV_AUTH=1 set?")
+            ?: error("directory did not echo a dev code — start it with the dev JSON config")
         client.confirmEmailVerification(dir, verification.pending, code)
         client.register(dir, queue, handle, handle.replaceFirstChar { it.uppercase() })
     }

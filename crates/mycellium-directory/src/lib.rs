@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 mod http;
 mod mailer;
 mod persist;
-pub use http::serve;
+pub use http::{serve, serve_with, AuthConfig, ServeConfig, SmtpConfig};
 
 /// A request the directory rejected, with the HTTP status it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

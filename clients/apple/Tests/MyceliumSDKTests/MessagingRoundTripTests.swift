@@ -7,11 +7,8 @@
 // start those first (see README / build-rust.sh):
 //
 //   cargo build --release -p mycellium-server -p mycellium-queue
-//   MYCELLIUM_DEV_AUTH=1 ./target/release/mycellium-server --addr 127.0.0.1:19080 &
-//   ./target/release/mycellium-queue --addr 127.0.0.1:19090 &
-//
-// Endpoints are overridable via MYCELLIUM_DIR_URL / MYCELLIUM_QUEUE_URL
-// (defaults http://127.0.0.1:19080 and http://127.0.0.1:19090).
+//   ./target/release/mycellium-server --config clients/apple/dev-directory.json &
+//   ./target/release/mycellium-queue --config clients/apple/dev-queue.json &
 
 import XCTest
 import Foundation
@@ -25,10 +22,10 @@ import FoundationNetworking
 final class MessagingRoundTripTests: XCTestCase {
 
     private var dirUrl: String {
-        ProcessInfo.processInfo.environment["MYCELLIUM_DIR_URL"] ?? "http://127.0.0.1:19080"
+        "http://127.0.0.1:19080"
     }
     private var queueUrl: String {
-        ProcessInfo.processInfo.environment["MYCELLIUM_QUEUE_URL"] ?? "http://127.0.0.1:19090"
+        "http://127.0.0.1:19090"
     }
 
     /// A unique, isolated data dir for one client, cleaned up on teardown.
@@ -57,7 +54,7 @@ final class MessagingRoundTripTests: XCTestCase {
         // In dev-auth mode the directory echoes the code back; a real inbox
         // supplies it in production (devCode == nil).
         guard let code = verification.devCode else {
-            throw XCTSkip("directory is not in dev-auth mode (no devCode); set MYCELLIUM_DEV_AUTH=1")
+            throw XCTSkip("directory is not in dev-auth mode (no devCode); start it with the dev JSON config")
         }
         try client.confirmEmailVerification(
             dirUrl: dirUrl, pending: verification.pending, code: code

@@ -206,7 +206,7 @@ service to expose a blob endpoint, but keep the two logically distinct** (separa
 routes, separate storage, separate quotas), for these reasons:
 
 - **Reuse, not a new deployment.** Operators already run `mycellium-queue` with
-  wallet login, rate limiting, `MYCELLIUM_DATA` durable/fail-closed storage, and TLS
+  wallet login, rate limiting, durable/fail-closed JSON-configured storage, and TLS
   guidance. A blob endpoint reuses all of it — one service to deploy, one auth model,
   one ops story — which is the difference between attachments being adopted and being
   an extra box nobody stands up.

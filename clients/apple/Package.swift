@@ -24,21 +24,19 @@ import Foundation
 import PackageDescription
 
 // Locate the host Rust `.so` (produced by `build-rust.sh` / `cargo build`).
-// Defaults to `<repo>/target/debug` relative to this manifest; override with
-// MYCELLIUM_RUST_LIB_DIR (e.g. `target/release`, or an xcframework staging dir).
+// Defaults to `<repo>/target/debug` relative to this manifest.
 let manifestDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-let defaultRustLibDir = manifestDir
+let rustLibDir = manifestDir
     .deletingLastPathComponent()          // clients/
     .deletingLastPathComponent()          // <repo root>
     .appendingPathComponent("target")
     .appendingPathComponent("debug")
     .path
-let rustLibDir = ProcessInfo.processInfo.environment["MYCELLIUM_RUST_LIB_DIR"] ?? defaultRustLibDir
 
 // Link the host `.so` into any product (the test bundle) that pulls in
-// MyceliumSDK, and embed an rpath so the test binary finds it at runtime
-// without LD_LIBRARY_PATH. `unsafeFlags` is fine: this is a leaf app package,
-// never consumed as a dependency by another package.
+// MyceliumSDK, and embed an rpath so the test binary finds it at runtime.
+// `unsafeFlags` is fine: this is a leaf app package, never consumed as a
+// dependency by another package.
 let sdkLinkerSettings: [LinkerSetting] = [
     .unsafeFlags([
         "-L\(rustLibDir)",
@@ -84,7 +82,7 @@ let package = Package(
 
         // The real messaging round-trip test — runs on Linux against a live
         // dev directory + queue (see build-rust.sh / README for how to start
-        // them; ports via MYCELLIUM_DIR_URL / MYCELLIUM_QUEUE_URL).
+        // them).
         .testTarget(
             name: "MyceliumSDKTests",
             dependencies: ["MyceliumSDK", "MyceliumSecrets"],

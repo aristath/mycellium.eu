@@ -50,13 +50,17 @@ impl Metrics {
     }
 }
 
-/// Emit a structured access-log line to stdout. Full access logging is on when
-/// `MYCELLIUM_LOG` is set (and not "0"); 5xx responses are always logged.
-pub fn access_log(service: &str, method: &str, path: &str, status: u16, ms: u128) {
-    let verbose = std::env::var("MYCELLIUM_LOG")
-        .map(|v| v != "0")
-        .unwrap_or(false);
-    if !verbose && status < 500 {
+/// Emit a structured access-log line to stdout. Full access logging is controlled
+/// by the caller's explicit configuration; 5xx responses are always logged.
+pub fn access_log(
+    service: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    ms: u128,
+    access_log: bool,
+) {
+    if !access_log && status < 500 {
         return;
     }
     let t = SystemTime::now()

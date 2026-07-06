@@ -12,15 +12,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The directory fails closed without SMTP unless dev auth is explicit (#47).
-process.env.MYCELLIUM_DEV_AUTH = '1';
-
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const BIN = (n) => path.join(ROOT, 'target/debug', n);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const procs = [];
 function freePort() { return new Promise((res) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); }); }
+function serviceConfig(name, config) { const file = path.join(ROOT, 'target', name + '-' + config.addr.split(':').pop() + '.json'); fs.writeFileSync(file, JSON.stringify(config)); return file; }
 async function waitHttp(u, ms = 10000) { const e = Date.now() + ms; while (Date.now() < e) { try { const r = await fetch(u); if (r.status < 500) return; } catch {} await sleep(150); } throw new Error('timeout ' + u); }
 
 let failed = false;
@@ -39,8 +37,8 @@ function chunked(port, method, pathname, body) {
 async function main() {
   for (const b of ['mycellium-server', 'mycellium-queue']) if (!fs.existsSync(BIN(b))) throw new Error('run: cargo build');
   const [dirPort, qPort] = await Promise.all([freePort(), freePort()]);
-  procs.push(spawn(BIN('mycellium-server'), ['--addr', `127.0.0.1:${dirPort}`], { stdio: 'ignore' }));
-  procs.push(spawn(BIN('mycellium-queue'), ['--addr', `127.0.0.1:${qPort}`], { stdio: 'ignore' }));
+  procs.push(spawn(BIN('mycellium-server'), ['--config', serviceConfig('directory', { addr: `127.0.0.1:${dirPort}`, dev_auth: true })], { stdio: 'ignore' }));
+  procs.push(spawn(BIN('mycellium-queue'), ['--config', serviceConfig('queue', { addr: `127.0.0.1:${qPort}` })], { stdio: 'ignore' }));
   await Promise.all([waitHttp(`http://127.0.0.1:${dirPort}/health`), waitHttp(`http://127.0.0.1:${qPort}/health`)]);
 
   const big = Buffer.alloc(300 * 1024, 0x61); // > directory cap (256 KiB)

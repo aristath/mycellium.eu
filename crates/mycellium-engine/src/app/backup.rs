@@ -68,7 +68,7 @@ pub fn export_backup(path: &str) -> Result<()> {
 pub fn import_backup(path: &str) -> Result<()> {
     if store::exists() {
         bail!(
-            "an identity already exists at {} — import into a fresh MYCELLIUM_HOME",
+            "an identity already exists at {} — import into a fresh configured data directory",
             store::path().display()
         );
     }

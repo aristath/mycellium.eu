@@ -1,17 +1,17 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
-/// This account's own message-queue endpoint, from `MYCELLIUM_QUEUE`
-/// (empty = no queue / pure P2P). Recorded in your record so senders find it.
+/// This account's own message-queue endpoint (empty = no queue / pure P2P).
+/// Recorded in your record so senders find it.
 pub fn own_queue() -> String {
-    std::env::var("MYCELLIUM_QUEUE").unwrap_or_default()
+    store::queue_url()
 }
 
-/// This account's own display name, from `MYCELLIUM_NAME`. When set (the email
-/// client sets it), it's the free-form name others see; when empty (the CLI),
-/// the identifier itself is used, preserving the old behaviour.
+/// This account's own display name. When set (the email client sets it), it's
+/// the free-form name others see; when empty (the CLI), the identifier itself is
+/// used, preserving the old behaviour.
 pub fn own_name() -> String {
-    std::env::var("MYCELLIUM_NAME").unwrap_or_default()
+    store::display_name()
 }
 
 /// The display name to publish in a record for `handle` — the account's set
@@ -166,7 +166,8 @@ pub fn guess_mime(name: &str) -> String {
     mime.to_string()
 }
 
-/// Save an attachment to `MYCELLIUM_HOME/downloads` (name sanitized to a basename).
+/// Save an attachment to the configured downloads directory (name sanitized to a
+/// basename).
 pub fn save_attachment(name: &str, data: &[u8]) -> Result<std::path::PathBuf> {
     let dir = store::data_dir().join("downloads");
     save_attachment_in(&dir, name, data)

@@ -14,23 +14,48 @@
 //! the bind address, load-or-generate a **stable** identity, start the node,
 //! print the dialable multiaddr, and stay alive.
 //!
-//! Kept dependency-lean on purpose (no arg-parsing crate): the address comes
-//! from `--addr`, else `MYCELLIUM_RELAY_ADDR`, else the default.
+//! Kept dependency-lean on purpose (no arg-parsing crate). Runtime
+//! configuration comes from `--config PATH`, or from explicit `--dev` mode for
+//! local work.
 
 use std::process::exit;
 
 use mycellium_transport::libp2p_net::{listen_multiaddr, Libp2pNode};
+use serde::Deserialize;
 
 const DEFAULT_ADDR: &str = "0.0.0.0:8700";
 
 fn main() {
-    let addr = resolve_addr();
-    let secret = load_or_generate_secret();
+    let args = match Args::parse() {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("{err}\n");
+            print_help();
+            exit(2);
+        }
+    };
+    let config = match args.config {
+        Some(path) => match load_config(&path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("mycellium-relay: {err}");
+                exit(2);
+            }
+        },
+        None if args.dev => Config::dev(),
+        None => {
+            eprintln!("mycellium-relay: pass --config PATH or --dev\n");
+            print_help();
+            exit(2);
+        }
+    };
 
-    let listen = match listen_multiaddr(&addr) {
+    let secret = load_or_generate_secret(config.data_dir.as_deref());
+
+    let listen = match listen_multiaddr(&config.addr) {
         Ok(a) => a,
         Err(err) => {
-            eprintln!("mycellium-relay: invalid --addr {addr}: {err}");
+            eprintln!("mycellium-relay: invalid addr {}: {err}", config.addr);
             exit(2);
         }
     };
@@ -80,72 +105,114 @@ fn main() {
     }
 }
 
-/// Resolve the bind address: `--addr HOST:PORT`, then `MYCELLIUM_RELAY_ADDR`,
-/// then the default. Also handles `--help`/`--version`.
-fn resolve_addr() -> String {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut addr: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--addr" => {
-                i += 1;
-                addr = Some(args.get(i).cloned().unwrap_or_else(|| {
-                    eprintln!("--addr requires a HOST:PORT value");
-                    exit(2);
-                }));
+struct Args {
+    config: Option<String>,
+    dev: bool,
+}
+
+impl Args {
+    fn parse() -> Result<Self, String> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut config = None;
+        let mut dev = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--config" => {
+                    i += 1;
+                    config = Some(
+                        args.get(i)
+                            .cloned()
+                            .ok_or_else(|| "--config requires a path".to_string())?,
+                    );
+                }
+                "--dev" => {
+                    dev = true;
+                }
+                "--help" | "-h" => {
+                    print_help();
+                    exit(0);
+                }
+                "--version" | "-V" => {
+                    println!("mycellium-relay {}", env!("CARGO_PKG_VERSION"));
+                    exit(0);
+                }
+                other => {
+                    return Err(format!("unknown argument: {other}"));
+                }
             }
-            "--help" | "-h" => {
-                print_help();
-                exit(0);
-            }
-            "--version" | "-V" => {
-                println!("mycellium-relay {}", env!("CARGO_PKG_VERSION"));
-                exit(0);
-            }
-            other => {
-                eprintln!("unknown argument: {other}\n");
-                print_help();
-                exit(2);
-            }
+            i += 1;
         }
-        i += 1;
+        if dev && config.is_some() {
+            return Err("--dev and --config are mutually exclusive".into());
+        }
+        Ok(Self { config, dev })
     }
-    addr.or_else(|| std::env::var("MYCELLIUM_RELAY_ADDR").ok())
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| DEFAULT_ADDR.into())
+}
+
+struct Config {
+    addr: String,
+    data_dir: Option<String>,
+}
+
+impl Config {
+    fn dev() -> Self {
+        Self {
+            addr: DEFAULT_ADDR.to_string(),
+            data_dir: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FileConfig {
+    addr: Option<String>,
+    data_dir: Option<String>,
+}
+
+fn load_config(path: &str) -> Result<Config, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let file: FileConfig =
+        serde_json::from_str(&raw).map_err(|e| format!("cannot parse {path}: {e}"))?;
+    Ok(Config {
+        addr: file.addr.unwrap_or_else(|| DEFAULT_ADDR.to_string()),
+        data_dir: file.data_dir,
+    })
 }
 
 fn print_help() {
     println!("mycellium-relay — the Mycellium Circuit Relay v2 server\n");
     println!("USAGE:");
-    println!("    mycellium-relay [--addr HOST:PORT]\n");
-    println!("The bind address may also be set via MYCELLIUM_RELAY_ADDR");
-    println!("(default: {DEFAULT_ADDR}).\n");
-    println!("Set MYCELLIUM_DATA to a directory so the relay's PeerId (and thus the");
-    println!("multiaddr clients pass to `serve --relay`) is STABLE across restarts.");
+    println!("    mycellium-relay --dev");
+    println!("    mycellium-relay --config PATH\n");
+    println!("Config is JSON. Example:");
+    println!(
+        r#"{{
+  "addr": "0.0.0.0:8700",
+  "data_dir": "./data/relay"
+}}"#
+    );
 }
 
-/// Load the relay's 32-byte device secret from `MYCELLIUM_DATA/relay.key`, or
+/// Load the relay's 32-byte device secret from `data_dir/relay.key`, or
 /// generate one and persist it there (0600) — mirroring the queue's VAPID key.
 ///
 /// A relay's PeerId is derived from this secret and is baked into every client's
-/// `--relay <…/p2p/<id>>` address, so it MUST be stable across restarts. Without
-/// `MYCELLIUM_DATA` we use an ephemeral secret and warn loudly that the PeerId
-/// (and every advertised relay address) will change on restart.
-fn load_or_generate_secret() -> [u8; 32] {
-    let dir = match std::env::var("MYCELLIUM_DATA") {
-        Ok(d) if !d.trim().is_empty() => d,
+/// `--relay <…/p2p/<id>>` address, so it MUST be stable across restarts. Dev
+/// mode uses an ephemeral secret and prints a warning.
+fn load_or_generate_secret(data_dir: Option<&str>) -> [u8; 32] {
+    let dir = match data_dir {
+        Some(d) if !d.trim().is_empty() => d,
         _ => {
             eprintln!(
-                "  identity: MYCELLIUM_DATA is not set — using an EPHEMERAL key; the relay's \
-                 PeerId will CHANGE on restart and break clients' --relay addresses. Set \
-                 MYCELLIUM_DATA to persist a stable identity."
+                "  identity: dev mode uses an EPHEMERAL key; the relay's PeerId will CHANGE \
+                 on restart and break clients' --relay addresses. Use --config with data_dir \
+                 to persist a stable identity."
             );
             return random_secret();
         }
     };
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir);
     let path = format!("{}/relay.key", dir.trim_end_matches('/'));
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(secret) = <[u8; 32]>::try_from(bytes.as_slice()) {
