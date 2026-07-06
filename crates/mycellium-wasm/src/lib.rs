@@ -682,6 +682,10 @@ impl Session {
             let Ok(record) = dir.lookup(&handle) else {
                 continue;
             };
+            // Never seal to an unverifiable member record (core review).
+            if record.verify().is_err() {
+                continue;
+            }
             let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
             let Ok(qtoken) = queue.login(&self.identity) else {
                 continue;
@@ -946,6 +950,11 @@ impl Session {
         let precord = dir
             .lookup(&peer)
             .map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
+        // The directory does not verify records; check the self-signature before we
+        // trust its device keys / queue (core review).
+        precord
+            .verify()
+            .map_err(|_| JsValue::from_str("peer record failed verification"))?;
         // Fail closed if the peer's wallet no longer matches the pinned/verified one
         // (impersonation) or the directory served an older record than we've seen
         // (rollback) — the browser send path must not silently trust a swapped or
@@ -1043,6 +1052,10 @@ impl Session {
             let Ok(record) = dir.lookup(&handle) else {
                 continue;
             };
+            // Never seal to an unverifiable member record (core review).
+            if record.verify().is_err() {
+                continue;
+            }
             let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
             let Ok(qtoken) = queue.login(&self.identity) else {
                 continue;

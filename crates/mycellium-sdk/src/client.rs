@@ -881,6 +881,10 @@ impl MyceliumClient {
             let Ok(record) = dir.lookup(&handle) else {
                 continue;
             };
+            // Never seal to an unverifiable member record (core review).
+            if record.verify().is_err() {
+                continue;
+            }
             let queue = QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
             let Ok(qtoken) = queue.login(&inner.identity) else {
                 continue;
@@ -1048,6 +1052,11 @@ impl MyceliumClient {
 
         let dir = DirectoryClient::with_transport(&inner.config.dir_url, Box::new(UreqTransport));
         let precord = dir.lookup(&peer).map_err(SdkError::network)?;
+        // The directory does not verify records; check the self-signature before we
+        // trust the record's device keys / queue (core review).
+        precord
+            .verify()
+            .map_err(|_| SdkError::crypto("peer record failed verification"))?;
 
         // A previously pinned/verified peer whose wallet has changed is a possible
         // impersonation — refuse and surface it (and notify the listener).
@@ -1744,6 +1753,10 @@ fn distribute_key(
         let Ok(record) = dir.lookup(&handle) else {
             continue;
         };
+        // Never seal our group sender key to an unverifiable record (core review).
+        if record.verify().is_err() {
+            continue;
+        }
         let queue = QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
         let Ok(qtoken) = queue.login(identity) else {
             continue;
