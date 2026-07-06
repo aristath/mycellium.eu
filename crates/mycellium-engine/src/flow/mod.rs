@@ -459,6 +459,180 @@ pub fn distribute_key<S, P, N>(
     }
 }
 
+/// The **shared group-send fan-out**, generic over the [`Storage`] port and the
+/// injected [`FlowNet`]. It encrypts `app` under the group's sender-key ratchet
+/// (advancing + persisting the ratchet state — it must never rewind, or members
+/// can't decrypt), builds one [`MailItem::GroupText`], and fans that single
+/// ciphertext to every member's devices (Layer 11) via `net.lookup` + `deliver`,
+/// tallying by the returned [`DeliveryPath`]. Our **own** sibling devices are just
+/// more targets (they hold our key from a group sync), so the send mirrors across
+/// our cluster; only this exact device is skipped. Finally it records our own
+/// group-transcript copy (an edit/delete is applied in place instead).
+///
+/// `deliver` owns the client-specific transport + retry policy — the engine binds
+/// its live ladder + outbox, the SDK/wasm deposit into each member's queue. The
+/// store is threaded *through* it so the seal loop and the closure's own writes
+/// share one handle. Unlike [`send_app`], group text is encrypted once under the
+/// group key (not X3DH-sealed per device), so no per-peer name/queue is needed.
+pub fn group_send<S, N>(
+    identity: &Identity,
+    store: &mut S,
+    net: &N,
+    me: &Handle,
+    group: &mut StoredGroup,
+    app: &AppMessage,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+) -> SendOutcome
+where
+    S: Storage,
+    N: FlowNet,
+{
+    let mut out = SendOutcome {
+        id: app.id.clone(),
+        ..Default::default()
+    };
+
+    // Apply an edit/delete to our own transcript before we encrypt: the ciphertext
+    // carries the same body to members, and this keeps our copy consistent.
+    match &app.body {
+        Body::Edit { to, text } => {
+            let _ = history::group_edit(store, &group.id, to, text, me.as_str());
+        }
+        Body::Delete { to } => {
+            let _ = history::group_delete(store, &group.id, to, me.as_str());
+        }
+        _ => {}
+    }
+
+    // Encrypt under the group sender-key ratchet, then persist the advanced state.
+    let Ok(mut session) = Group::import(group.state.clone()) else {
+        return out;
+    };
+    let gm = session.encrypt(&app.encode(), &wireops::group_ad(&group.id));
+    group.state = session.export();
+    let _ = groups::save(store, group);
+
+    // Fan the one ciphertext out to every member's devices — including our own
+    // siblings, but never this device itself.
+    let item = MailItem::GroupText {
+        group_id: group.id.clone(),
+        message: gm,
+    };
+    for member in &group.members {
+        let Ok(handle) = Handle::new(member.clone()) else {
+            continue;
+        };
+        let Ok(record) = net.lookup(&handle) else {
+            continue;
+        };
+        // Never deposit to an unverifiable member record.
+        if record.verify().is_err() {
+            continue;
+        }
+        for device in &record.record.devices {
+            if device.device_key == identity.device_public() {
+                continue; // never to this device itself
+            }
+            match deliver(store, &handle, &record, device, item.clone()) {
+                DeliveryPath::Direct => {
+                    out.direct += 1;
+                    out.delivered += 1;
+                }
+                DeliveryPath::Relay => {
+                    out.relay += 1;
+                    out.delivered += 1;
+                }
+                DeliveryPath::Queue => {
+                    out.queued += 1;
+                    out.delivered += 1;
+                }
+                DeliveryPath::Outbox | DeliveryPath::Failed => {
+                    out.outboxed += 1;
+                }
+            }
+        }
+    }
+
+    // Record our own copy in the group transcript (an edit/delete was already
+    // applied above, so don't add it as a fresh line).
+    if !matches!(app.body, Body::Edit { .. } | Body::Delete { .. }) {
+        let entry = GroupStoredMessage {
+            id: app.id.clone(),
+            sender: me.as_str().to_string(),
+            text: app.summary(),
+            timestamp: app.timestamp,
+            expires_at: app.expires_at,
+        };
+        let _ = history::group_append(store, &group.id, entry);
+    }
+
+    out
+}
+
+/// The **shared group-leave fan-out**, generic over the [`Storage`]/[`Platform`]
+/// ports and the injected [`FlowNet`]. It seals an **authenticated**
+/// [`MailItem::GroupLeave`] (X3DH — [`wireops::seal_to`], so members can prove the
+/// departure is genuinely ours and no one can forge someone else leaving) to every
+/// OTHER member's devices via `net.lookup` + `deliver`, so they drop us and re-key;
+/// then it removes the group locally.
+///
+/// This is the copy the SDK and wasm previously lacked entirely — they did a bare
+/// local `groups::remove` and never told the group, so a departed SDK/wasm user's
+/// client kept working keys and no other member rekeyed. `deliver` owns the
+/// client-specific transport + retry policy; the store is threaded through it.
+#[allow(clippy::too_many_arguments)]
+pub fn group_leave<S, P, N>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    net: &N,
+    me: &Handle,
+    my_name: &str,
+    my_queue: &str,
+    group: &StoredGroup,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
+) where
+    S: Storage,
+    P: Platform,
+    N: FlowNet,
+{
+    let payload = GroupLeavePayload {
+        group_id: group.id.clone(),
+    };
+    let Ok(plaintext) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    for member in &group.members {
+        if member == me.as_str() {
+            continue; // our own departure isn't announced to ourselves
+        }
+        let Ok(handle) = Handle::new(member.clone()) else {
+            continue;
+        };
+        let Ok(record) = net.lookup(&handle) else {
+            continue;
+        };
+        // Never seal to an unverifiable member record.
+        if record.verify().is_err() {
+            continue;
+        }
+        for device in &record.record.devices {
+            if device.device_key == identity.device_public() {
+                continue;
+            }
+            let Ok(env) = wireops::seal_to(
+                platform, identity, me, my_name, my_queue, device, &plaintext,
+            ) else {
+                continue;
+            };
+            deliver(store, &handle, &record, device, MailItem::GroupLeave(env));
+        }
+    }
+    // Drop our local group state last, so a mid-send failure still leaves us able
+    // to retry (the state is what the seal loop reads from).
+    let _ = groups::remove(store, &group.id);
+}
+
 /// The immutable per-item receive context, bundled so the six inbound handlers
 /// don't each thread five shared references. All fields are `Copy` shared refs, so
 /// this is `Copy` and free to pass by value.

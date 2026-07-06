@@ -766,6 +766,11 @@ impl Session {
     }
 
     /// Send a text message to a group. Returns devices delivered to.
+    ///
+    /// Runs the shared fan-out ([`flow::group_send`]): it advances the group
+    /// ratchet, fans the one ciphertext to every member's cluster (our own
+    /// siblings included) and records our transcript copy; the closure below
+    /// deposits each copy into the recipient's queue over XHR.
     #[allow(clippy::too_many_arguments)]
     pub fn group_send(
         &mut self,
@@ -776,72 +781,111 @@ impl Session {
         group_id: &str,
         text: &str,
     ) -> Result<u32, JsValue> {
-        let _ = (my_name, my_queue); // group messages use the group key, not a per-peer seal
+        let _ = (my_name, my_queue); // group text uses the group key, not a per-peer seal
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
         let mut stored = groups::load(&self.store, group_id)
             .map_err(|_| JsValue::from_str("store error"))?
             .ok_or_else(|| JsValue::from_str("no such group"))?;
-        let mut group = Group::import(stored.state.clone())
-            .map_err(|_| JsValue::from_str("bad group state"))?;
         let app = wireops::text_message(&mut BrowserPlatform, text);
-        let gm = group.encrypt(&app.encode(), &wireops::group_ad(&stored.id));
-        stored.state = group.export();
-        groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
-
-        let item = MailItem::GroupText {
-            group_id: stored.id.clone(),
-            message: gm,
+        let net = WasmNet {
+            dir: DirectoryClient::with_transport(dir_url, Box::new(XhrTransport)),
         };
-        let blob = serde_json::to_string(&item).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        let mut delivered = 0u32;
-        for member in &stored.members {
-            if member == me.as_str() {
-                continue;
+        // Disjoint field borrows: `group_send` writes `store`; the closure logs in
+        // with `identity` (the store is threaded through as its first argument).
+        let identity = &self.identity;
+        let store = &mut self.store;
+
+        let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+        let mut deliver = |_store: &mut MemStore,
+                           _handle: &Handle,
+                           record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+                let queue =
+                    QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
+                let session = queue.login(identity).ok().map(|t| (queue, t));
+                queue_cache = Some((record.record.wallet, session));
             }
-            let Ok(handle) = Handle::new(member.clone()) else {
-                continue;
-            };
-            let Ok(record) = dir.lookup(&handle) else {
-                continue;
-            };
-            // Never seal to an unverifiable member record (core review).
-            if record.verify().is_err() {
-                continue;
-            }
-            let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
-            let Ok(qtoken) = queue.login(&self.identity) else {
-                continue;
-            };
-            let peer_hex = wallet_hex(&record.record.wallet);
-            for device in &record.record.devices {
-                if queue
-                    .deposit(
-                        &qtoken,
-                        &peer_hex,
-                        &wireops::device_slot(&device.device_key),
-                        &blob,
-                    )
-                    .is_ok()
-                {
-                    delivered += 1;
+            if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    if queue
+                        .deposit(
+                            qtoken,
+                            &wallet_hex(&record.record.wallet),
+                            &wireops::device_slot(&device.device_key),
+                            &blob,
+                        )
+                        .is_ok()
+                    {
+                        return DeliveryPath::Queue;
+                    }
                 }
             }
-        }
-        let entry = history::GroupStoredMessage {
-            id: app.id.clone(),
-            sender: me.as_str().to_string(),
-            text: app.summary(),
-            timestamp: app.timestamp,
-            expires_at: app.expires_at,
+            DeliveryPath::Failed
         };
-        let _ = history::group_append(&mut self.store, &stored.id, entry);
-        Ok(delivered)
+
+        let out = flow::group_send(identity, store, &net, &me, &mut stored, &app, &mut deliver);
+        Ok(out.delivered)
     }
 
-    /// Leave a group locally (stop participating; drops its keys + state).
-    pub fn group_leave(&mut self, group_id: &str) -> Result<(), JsValue> {
-        groups::remove(&mut self.store, group_id).map_err(|_| JsValue::from_str("store error"))?;
+    /// Leave a group: announce our authenticated departure to every other member
+    /// so they drop us and re-key ([`flow::group_leave`]), then drop the local
+    /// state. Previously this was a bare local remove that never told the group —
+    /// so a departed wasm user kept working keys and no member rekeyed.
+    pub fn group_leave(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        group_id: &str,
+    ) -> Result<(), JsValue> {
+        let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
+        let stored = groups::load(&self.store, group_id)
+            .map_err(|_| JsValue::from_str("store error"))?
+            .ok_or_else(|| JsValue::from_str("no such group"))?;
+        let net = WasmNet {
+            dir: DirectoryClient::with_transport(dir_url, Box::new(XhrTransport)),
+        };
+        let identity = &self.identity;
+        let store = &mut self.store;
+
+        let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+        let mut deliver = |_store: &mut MemStore,
+                           _handle: &Handle,
+                           record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem| {
+            if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+                let queue =
+                    QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
+                let session = queue.login(identity).ok().map(|t| (queue, t));
+                queue_cache = Some((record.record.wallet, session));
+            }
+            if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    let _ = queue.deposit(
+                        qtoken,
+                        &wallet_hex(&record.record.wallet),
+                        &wireops::device_slot(&device.device_key),
+                        &blob,
+                    );
+                }
+            }
+        };
+        flow::group_leave(
+            identity,
+            store,
+            &mut BrowserPlatform,
+            &net,
+            &me,
+            my_name,
+            my_queue,
+            &stored,
+            &mut deliver,
+        );
         Ok(())
     }
 

@@ -526,42 +526,6 @@ pub fn deliver_to_cluster(
     }
 }
 
-/// Like [`deliver_to_cluster`], but parks any device we couldn't reach in the
-/// outbox for retry — so group messages aren't silently lost on a transient
-/// failure (Tier 2.3). `flush_outbox` re-attempts them on the next send.
-pub fn deliver_to_cluster_or_queue(
-    dir: &DirectoryClient,
-    identity: &Identity,
-    handle: &Handle,
-    item: &MailItem,
-    fs: &mut FileStore,
-    now: u64,
-) {
-    if let Ok(rec) = dir.lookup(handle) {
-        if rec.verify().is_ok() {
-            let queue = QueueTarget::open(identity, &rec.record);
-            for device in &rec.record.devices {
-                if !deliver_scored(
-                    fs,
-                    identity.device_secret(),
-                    dir,
-                    handle,
-                    queue.as_ref(),
-                    device,
-                    item,
-                    now,
-                )
-                .is_delivered()
-                {
-                    let slot = device_slot(&device.device_key);
-                    let _ =
-                        outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item.clone(), now);
-                }
-            }
-        }
-    }
-}
-
 /// Retry every parked outbox item once: re-resolve the recipient, re-attempt
 /// live/queue delivery, drop the delivered and the expired, bump the rest.
 /// Returns `(delivered, still_waiting)`.

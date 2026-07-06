@@ -1,10 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
+use crate::flow;
 
 // ---- groups -----------------------------------------------------------------
-
-/// Associated data binding a group message to its group.
-pub use crate::wireops::group_ad;
 
 pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
@@ -209,81 +207,59 @@ pub fn group_send(
     let _ = flush_outbox(&identity, &client, &mut fs);
 
     let mut stored = resolve_group(&fs, group)?;
-    let mut session =
-        Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
 
-    // Apply an edit/delete to our own copy of the transcript too.
-    match &app.body {
-        Body::Edit { to, text } => history::group_edit(&mut fs, &stored.id, to, text, me.as_str())?,
-        Body::Delete { to } => history::group_delete(&mut fs, &stored.id, to, me.as_str())?,
-        _ => {}
-    }
-    let gm = session.encrypt(&app.encode(), &group_ad(&stored.id));
-    stored.state = session.export();
-    groups::save(&mut fs, &stored)?;
-
-    let item = MailItem::GroupText {
-        group_id: stored.id.clone(),
-        message: gm,
-    };
-    for member in &stored.members {
-        let handle = match Handle::new(member.clone()) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        if member == me.as_str() {
-            // Mirror to my *own* other devices (they hold my key from `group
-            // sync`), so the group reads consistently across my cluster.
-            if let Ok(my_rec) = client.lookup(&me) {
-                let my_queue = QueueTarget::open(&identity, &my_rec.record);
-                for device in &my_rec.record.devices {
-                    if device.device_key != identity.device_public()
-                        && !deliver_scored(
-                            &mut fs,
-                            identity.device_secret(),
-                            &client,
-                            &me,
-                            my_queue.as_ref(),
-                            device,
-                            &item,
-                            now,
-                        )
-                        .is_delivered()
-                    {
-                        let slot = device_slot(&device.device_key);
-                        let _ = outbox::enqueue(
-                            &mut fs,
-                            random_id(),
-                            me.as_str(),
-                            &slot,
-                            item.clone(),
-                            now,
-                        );
-                    }
-                }
-            }
-            continue;
+    // The shared fan-out ([`flow::group_send`]) advances the group ratchet, fans
+    // the one ciphertext to every member's cluster (our own siblings included),
+    // and records our transcript copy; the closure below binds the *engine's*
+    // delivery policy — the reachability-scored live ladder with the outbox as the
+    // retry floor. Each member's queue is opened from the record `deliver` is
+    // handed (records arrive grouped by member), cached across their devices.
+    let net = EngineNet { client: &client };
+    let device_secret = identity.device_secret();
+    let mut queue_cache: Option<(WalletPublicKey, Option<QueueTarget>)> = None;
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+            queue_cache = Some((
+                record.record.wallet,
+                QueueTarget::open(&identity, &record.record),
+            ));
         }
-        // Fan the one ciphertext out to every device in the member's cluster,
-        // parking any we can't reach in the outbox for retry (Tier 2.3).
-        deliver_to_cluster_or_queue(&client, &identity, &handle, &item, &mut fs, now);
-    }
+        let queue = queue_cache.as_ref().and_then(|(_, q)| q.as_ref());
+        let path = deliver_scored(
+            store,
+            device_secret,
+            &client,
+            handle,
+            queue,
+            device,
+            &item,
+            now,
+        );
+        // A device we couldn't reach live or via its queue is parked for retry.
+        if matches!(path, DeliveryPath::Outbox | DeliveryPath::Failed) {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+        }
+        path
+    };
 
-    // Record our own message in the group transcript (edits/deletes already
-    // applied above, so don't add them as new lines).
-    if !matches!(app.body, Body::Edit { .. } | Body::Delete { .. }) {
-        let entry = GroupStoredMessage {
-            id: app.id.clone(),
-            sender: me.as_str().to_string(),
-            text: app.summary(),
-            timestamp: OsPlatform.now_unix_secs(),
-            expires_at: app.expires_at,
-        };
-        let _ = history::group_append(&mut fs, &stored.id, entry);
-    }
-    println!("sent to group '{}' (#{})", stored.name, app.id);
+    let out = flow::group_send(
+        &identity,
+        &mut fs,
+        &net,
+        &me,
+        &mut stored,
+        &app,
+        &mut deliver,
+    );
+    println!("sent to group '{}' (#{})", stored.name, out.id);
     Ok(())
 }
 
@@ -390,51 +366,54 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
     let stored = resolve_group(&fs, group)?;
     let now = OsPlatform.now_unix_secs();
 
-    // Announce our departure, *sealed* to each member's devices so it's
-    // authenticated as ours — no one can forge someone else leaving. They drop
-    // us and re-key. (Mirrors how invites/keys are distributed.)
-    let payload = GroupLeavePayload {
-        group_id: stored.id.clone(),
+    // The shared fan-out ([`flow::group_leave`]) seals an authenticated departure
+    // to every other member's cluster (so they drop us + re-key) and removes our
+    // local state; the closure below binds the engine's live ladder + outbox floor,
+    // opening each member's queue from the record it is handed.
+    let net = EngineNet { client: &client };
+    let device_secret = identity.device_secret();
+    let my_name = display_name_for(&me);
+    let my_queue = own_queue();
+    let mut queue_cache: Option<(WalletPublicKey, Option<QueueTarget>)> = None;
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem| {
+        if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+            queue_cache = Some((
+                record.record.wallet,
+                QueueTarget::open(&identity, &record.record),
+            ));
+        }
+        let queue = queue_cache.as_ref().and_then(|(_, q)| q.as_ref());
+        if !deliver_scored(
+            store,
+            device_secret,
+            &client,
+            handle,
+            queue,
+            device,
+            &item,
+            now,
+        )
+        .is_delivered()
+        {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+        }
     };
-    let plaintext = serde_json::to_vec(&payload)?;
-    for member in &stored.members {
-        if member == me.as_str() {
-            continue;
-        }
-        let Ok(handle) = Handle::new(member.clone()) else {
-            continue;
-        };
-        let record = match client.lookup(&handle) {
-            Ok(r) if r.verify().is_ok() => r,
-            _ => continue,
-        };
-        let queue = QueueTarget::open(&identity, &record.record);
-        for device in &record.record.devices {
-            if device.device_key == identity.device_public() {
-                continue;
-            }
-            let Ok(env) = seal_to(&identity, &me, device, &plaintext) else {
-                continue;
-            };
-            let item = MailItem::GroupLeave(env);
-            if !deliver_scored(
-                &mut fs,
-                identity.device_secret(),
-                &client,
-                &handle,
-                queue.as_ref(),
-                device,
-                &item,
-                now,
-            )
-            .is_delivered()
-            {
-                let slot = device_slot(&device.device_key);
-                let _ = outbox::enqueue(&mut fs, random_id(), handle.as_str(), &slot, item, now);
-            }
-        }
-    }
-    groups::remove(&mut fs, &stored.id)?;
+    flow::group_leave(
+        &identity,
+        &mut fs,
+        &mut OsPlatform,
+        &net,
+        &me,
+        &my_name,
+        &my_queue,
+        &stored,
+        &mut deliver,
+    );
     println!("left group '{}'", stored.name);
     Ok(())
 }

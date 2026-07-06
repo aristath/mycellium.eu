@@ -84,7 +84,7 @@ async function main() {
         // Capture Bob's state, then have him leave the group.
         const bobGroups = JSON.parse(bob.groups());
         const bobThread = JSON.parse(bob.group_thread(gid));
-        bob.group_leave(gid);
+        bob.group_leave(dir, 'bob', 'Bob', q, gid);
         const bobAfterLeave = JSON.parse(bob.groups()).length;
 
         return {

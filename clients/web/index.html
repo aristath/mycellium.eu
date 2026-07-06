@@ -470,7 +470,7 @@
       byId('gleave').onclick = async () => {
         close();
         if (!confirm('Leave this group?')) return;
-        try { await rpc('group_leave', [gid]); og = null; render(); }
+        try { await rpc('group_leave', [cfg.dir, me.handle, me.name, cfg.queue, gid]); og = null; render(); }
         catch (e) { alert('Leave failed: ' + e); }
       };
     }

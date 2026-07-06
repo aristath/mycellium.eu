@@ -835,6 +835,12 @@ impl MyceliumClient {
     }
 
     /// Send a text message to a group. Returns the stored [`Message`].
+    ///
+    /// Runs the shared fan-out ([`flow::group_send`]): it advances the group
+    /// ratchet, fans the one ciphertext to every member's cluster (our own
+    /// siblings included, so the group reads consistently across our devices), and
+    /// records our transcript copy. The closure below deposits each copy into the
+    /// recipient's queue.
     pub fn group_send(&self, group_id: String, text: String) -> Result<Message, SdkError> {
         let mut inner = self.lock();
         let me = require_handle(&inner)?;
@@ -843,70 +849,59 @@ impl MyceliumClient {
         let mut stored = groups::load(&inner.store, &group_id)
             .map_err(SdkError::storage)?
             .ok_or_else(|| SdkError::invalid("no such group"))?;
-        let mut group = CoreGroup::import(stored.state.clone())
-            .map_err(|e| SdkError::crypto(format!("{e:?}")))?;
         let app = wireops::text_message(&mut OsPlatform, &text);
-        let gm = group.encrypt(&app.encode(), &wireops::group_ad(&stored.id));
-        stored.state = group.export();
-        groups::save(&mut inner.store, &stored).map_err(SdkError::storage)?;
-
-        let item = MailItem::GroupText {
-            group_id: stored.id.clone(),
-            message: gm,
+        let net = SdkNet {
+            dir: DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport)),
         };
-        let blob = serde_json::to_string(&item).map_err(SdkError::crypto)?;
-        let dir = DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport));
-        let mut delivered = 0u32;
-        for member in &stored.members {
-            if member == me.as_str() {
-                continue;
+
+        // Disjoint field borrows: `group_send` writes `store`; the closure logs in
+        // with `identity` (the store is threaded through as its first argument).
+        let inner = &mut *inner;
+        let identity = &inner.identity;
+        let store = &mut inner.store;
+
+        // The recipient's queue session is per-member but `deliver` is per-device;
+        // cache it so we log in once per member, re-logging when the record changes.
+        let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+        let mut deliver = |_store: &mut FileStore,
+                           _handle: &Handle,
+                           record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+                let queue =
+                    QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
+                let session = queue.login(identity).ok().map(|t| (queue, t));
+                queue_cache = Some((record.record.wallet, session));
             }
-            let Ok(handle) = Handle::new(member.clone()) else {
-                continue;
-            };
-            let Ok(record) = dir.lookup(&handle) else {
-                continue;
-            };
-            // Never seal to an unverifiable member record (core review).
-            if record.verify().is_err() {
-                continue;
-            }
-            let queue = QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
-            let Ok(qtoken) = queue.login(&inner.identity) else {
-                continue;
-            };
-            let peer_hex = wallet_hex(&record.record.wallet);
-            for device in &record.record.devices {
-                if queue
-                    .deposit(
-                        &qtoken,
-                        &peer_hex,
-                        &wireops::device_slot(&device.device_key),
-                        &blob,
-                    )
-                    .is_ok()
-                {
-                    delivered += 1;
+            if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    if queue
+                        .deposit(
+                            qtoken,
+                            &wallet_hex(&record.record.wallet),
+                            &wireops::device_slot(&device.device_key),
+                            &blob,
+                        )
+                        .is_ok()
+                    {
+                        return DeliveryPath::Queue;
+                    }
                 }
             }
-        }
-
-        let entry = history::GroupStoredMessage {
-            id: app.id.clone(),
-            sender: me.as_str().to_string(),
-            text: app.summary(),
-            timestamp: app.timestamp,
-            expires_at: app.expires_at,
+            DeliveryPath::Failed
         };
-        history::group_append(&mut inner.store, &stored.id, entry).map_err(SdkError::storage)?;
 
-        let delivery = if delivered > 0 {
+        let out = flow::group_send(identity, store, &net, &me, &mut stored, &app, &mut deliver);
+
+        let delivery = if out.delivered > 0 {
             DeliveryState::Sent
         } else {
             DeliveryState::Queued
         };
         Ok(Message {
-            id: app.id.clone(),
+            id: out.id,
             thread: group_id,
             from_me: true,
             sender: me.as_str().to_string(),
@@ -916,10 +911,64 @@ impl MyceliumClient {
         })
     }
 
-    /// Leave a group locally (stop participating; drops its keys + state).
+    /// Leave a group: announce our authenticated departure to every other member
+    /// so they drop us and re-key ([`flow::group_leave`]), then drop the local
+    /// state. Previously this was a bare local remove that never told the group —
+    /// so a departed SDK user kept working keys and no member rekeyed.
     pub fn group_leave(&self, group_id: String) -> Result<(), SdkError> {
         let mut inner = self.lock();
-        groups::remove(&mut inner.store, &group_id).map_err(SdkError::storage)
+        let me = require_handle(&inner)?;
+        let stored = groups::load(&inner.store, &group_id)
+            .map_err(SdkError::storage)?
+            .ok_or_else(|| SdkError::invalid("no such group"))?;
+        let dir_url = inner.config.dir_url.clone();
+        let my_name = inner.config.name.clone();
+        let my_queue = inner.config.queue_url.clone();
+        let net = SdkNet {
+            dir: DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport)),
+        };
+
+        // Disjoint field borrows: `group_leave` writes `store`; the closure logs in
+        // with `identity` (the store is threaded through as its first argument).
+        let inner = &mut *inner;
+        let identity = &inner.identity;
+        let store = &mut inner.store;
+
+        let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+        let mut deliver = |_store: &mut FileStore,
+                           _handle: &Handle,
+                           record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem| {
+            if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+                let queue =
+                    QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
+                let session = queue.login(identity).ok().map(|t| (queue, t));
+                queue_cache = Some((record.record.wallet, session));
+            }
+            if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    let _ = queue.deposit(
+                        qtoken,
+                        &wallet_hex(&record.record.wallet),
+                        &wireops::device_slot(&device.device_key),
+                        &blob,
+                    );
+                }
+            }
+        };
+        flow::group_leave(
+            identity,
+            store,
+            &mut OsPlatform,
+            &net,
+            &me,
+            &my_name,
+            &my_queue,
+            &stored,
+            &mut deliver,
+        );
+        Ok(())
     }
 
     /// The groups this account belongs to.
