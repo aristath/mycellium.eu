@@ -21,9 +21,7 @@ use mycellium_core::userid::user_id;
 use mycellium_core::{safety, wire};
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::flow;
-use mycellium_engine::groups::{
-    self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
-};
+use mycellium_engine::groups::{self, MailItem, StoredGroup};
 use mycellium_engine::platform::OsPlatform;
 use mycellium_engine::{
     contacts, history, inbound, names, reachability::DeliveryPath, verified, wireops,
@@ -392,23 +390,28 @@ impl MyceliumClient {
             }
             inbound::save(&mut inner.store, &pending).map_err(SdkError::storage)?;
 
-            let mut received = Vec::new();
+            let mut sink = SdkSink {
+                messages: Vec::new(),
+                my_handle: inner.config.handle.clone(),
+                now,
+            };
             let mut survivors = Vec::new();
             for mut entry in pending {
                 if entry.is_expired(now) {
                     continue; // dead-letter: give up
                 }
-                match process_blob(&mut inner, &entry.blob) {
-                    Processed::Done(Some(msg)) => received.push(msg),
-                    Processed::Done(None) => {}
-                    Processed::Retry => {
-                        entry.attempts += 1;
-                        survivors.push(entry);
-                    }
+                let outcome = match serde_json::from_str::<MailItem>(&entry.blob) {
+                    Ok(item) => process_inbound(&mut inner, item, &mut sink),
+                    // Unparseable — keep it until it dead-letters.
+                    Err(_) => flow::ItemOutcome::Retry,
+                };
+                if outcome == flow::ItemOutcome::Retry {
+                    entry.attempts += 1;
+                    survivors.push(entry);
                 }
             }
             inbound::save(&mut inner.store, &survivors).map_err(SdkError::storage)?;
-            (received, inner.listener.clone())
+            (sink.messages, inner.listener.clone())
         };
 
         if let Some(l) = listener {
@@ -1338,330 +1341,139 @@ fn platform_to_sub(platform: PushPlatform, token: String) -> PushSub {
     }
 }
 
-/// The outcome of processing one inbound blob.
-enum Processed {
-    /// Handled — optionally surfacing a new visible [`Message`] to the caller.
-    Done(Option<Message>),
-    /// Not handled yet (couldn't decrypt / its group key hasn't arrived / a
-    /// transient error) — keep it in the retry store for a later sync.
-    Retry,
+/// The SDK [`flow::FlowSink`]: turn the message-bearing inbound events into
+/// boundary [`Message`] DTOs the caller collects and the listener is fired with.
+/// Edits/deletes are already applied to history by the flow (no DTO); receipts
+/// stay unsurfaced; attachments the SDK doesn't persist.
+struct SdkSink {
+    messages: Vec<Message>,
+    my_handle: String,
+    now: u64,
 }
 
-/// Process one collected blob, mirroring the engine's `process_item`: direct
-/// 1:1 messages, self-sync mirrors of our own sends, and the group lifecycle
-/// (invite, text, sync, leave).
-fn process_blob(inner: &mut Inner, blob: &str) -> Processed {
-    let Ok(item) = serde_json::from_str::<MailItem>(blob) else {
-        return Processed::Retry; // unparseable — keep until it dead-letters
-    };
-    match item {
-        MailItem::Direct(env) => process_direct(inner, &env),
-        MailItem::SelfSync { peer, envelope } => process_self_sync(inner, &peer, &envelope),
-        MailItem::GroupInvite(env) => process_group_invite(inner, &env),
-        MailItem::GroupText { group_id, message } => process_group_text(inner, &group_id, &message),
-        MailItem::GroupSync(env) => process_group_sync(inner, &env),
-        // A leave we can't authenticate/decrypt safely no-ops (as in the engine);
-        // treat it as handled so it doesn't retry forever.
-        MailItem::GroupLeave(env) => {
-            let _ = process_group_leave(inner, &env);
-            Processed::Done(None)
-        }
-    }
-}
-
-/// Decrypt and apply a one-to-one offline message.
-fn process_direct(inner: &mut Inner, env: &mycellium_core::offline::Envelope) -> Processed {
-    let Ok((from, plaintext)) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env)
-    else {
-        return Processed::Retry;
-    };
-    let Ok(app) = AppMessage::decode(&plaintext) else {
-        return Processed::Retry;
-    };
-    // Learn the sender's self-set display name (from their signed record).
-    let _ = names::note(
-        &mut inner.store,
-        from.as_str(),
-        &env.sender_record.record.name,
-    );
-
-    match &app.body {
-        // Edits/deletes/receipts mutate or acknowledge — not new visible messages.
-        Body::Edit { to, text } => {
-            let _ = history::edit(&mut inner.store, from.as_str(), to, text, false);
-            Processed::Done(None)
-        }
-        Body::Delete { to } => {
-            let _ = history::delete(&mut inner.store, from.as_str(), to, false);
-            Processed::Done(None)
-        }
-        Body::Receipt { .. } => Processed::Done(None),
-        _ => {
-            let stored = history::StoredMessage {
-                id: app.id.clone(),
+impl flow::FlowSink for SdkSink {
+    fn emit(&mut self, event: flow::FlowEvent) {
+        use flow::FlowEvent::*;
+        match event {
+            DirectMessage { from, id, text, .. } => self.messages.push(Message {
+                id,
+                thread: from.clone(),
                 from_me: false,
-                text: app.summary(),
-                timestamp: app.timestamp,
-                expires_at: app.expires_at,
-            };
-            if history::append(&mut inner.store, from.as_str(), stored.clone()).is_err() {
-                return Processed::Retry;
-            }
-            Processed::Done(Some(Message {
-                id: stored.id,
-                thread: from.as_str().to_string(),
-                from_me: false,
-                sender: from.as_str().to_string(),
-                text: stored.text,
-                sent_at: stored.timestamp,
+                sender: from,
+                text,
+                sent_at: self.now,
                 delivery: DeliveryState::Delivered,
-            }))
-        }
-    }
-}
-
-/// Apply a mirror of a message *this account* sent from another device (Layer 11
-/// self-sync): record it in the peer's transcript as our own outgoing message.
-/// Not surfaced as inbound (it isn't a new message *to* us).
-fn process_self_sync(
-    inner: &mut Inner,
-    peer: &str,
-    env: &mycellium_core::offline::Envelope,
-) -> Processed {
-    let Ok((_from, bytes)) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env) else {
-        return Processed::Retry;
-    };
-    // A self-sync mirror must be sealed by our OWN wallet; otherwise any peer who
-    // can seal an envelope to us could forge one and inject or edit/delete our
-    // transcript (core review, HIGH).
-    if env.sender_record.record.wallet != inner.identity.wallet_public() {
-        return Processed::Done(None);
-    }
-    let Ok(app) = AppMessage::decode(&bytes) else {
-        return Processed::Done(None); // unusable mirror — nothing to keep
-    };
-    match &app.body {
-        Body::Edit { to, text } => {
-            let _ = history::edit(&mut inner.store, peer, to, text, true);
-        }
-        Body::Delete { to } => {
-            let _ = history::delete(&mut inner.store, peer, to, true);
-        }
-        Body::Receipt { .. } => {}
-        _ => {
-            let entry = history::StoredMessage {
-                id: app.id.clone(),
-                from_me: true,
-                text: app.summary(),
-                timestamp: app.timestamp,
-                expires_at: app.expires_at,
-            };
-            let _ = history::append(&mut inner.store, peer, entry);
-        }
-    }
-    Processed::Done(None)
-}
-
-/// Process a received group invite: join the group (or learn a member's key) and
-/// reply with our own sender key so members can decrypt us too.
-fn process_group_invite(inner: &mut Inner, env: &mycellium_core::offline::Envelope) -> Processed {
-    let Ok((from, bytes)) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env) else {
-        return Processed::Retry;
-    };
-    let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else {
-        return Processed::Retry;
-    };
-    let mine = inner.config.handle.clone();
-    let Ok(me) = Handle::new(mine.clone()) else {
-        return Processed::Retry;
-    };
-    let sender_id = payload.sender_id.clone();
-
-    match groups::load(&inner.store, &payload.group_id).ok().flatten() {
-        Some(mut stored) => {
-            // An invite for a group we're already in is only trustworthy from an
-            // existing member — the group id is cleartext in every group MailItem,
-            // so anyone who learns it could otherwise inject a key (MEDIUM).
-            if !stored.members.iter().any(|m| m == from.as_str()) {
-                return Processed::Done(None);
-            }
-            let Ok(mut group) = CoreGroup::import(stored.state.clone()) else {
-                return Processed::Retry;
-            };
-            let _ = group.add_member(sender_id.clone(), &payload.distribution);
-            stored.note_sender(sender_id, from.as_str());
-            let newcomers: Vec<String> = payload
-                .members
-                .iter()
-                .filter(|m| !stored.members.iter().any(|x| x == *m))
-                .cloned()
-                .collect();
-            stored.members.extend(newcomers.iter().cloned());
-            stored.state = group.export();
-            let _ = groups::save(&mut inner.store, &stored);
-            if !newcomers.is_empty() {
-                distribute_key(inner, &me, &stored, &group, &newcomers);
-            }
-        }
-        None => {
-            let mut group = CoreGroup::new(&mut OsPlatform, wireops::my_group_id(&inner.identity));
-            let _ = group.add_member(sender_id.clone(), &payload.distribution);
-            let mut stored = StoredGroup {
-                id: payload.group_id.clone(),
-                name: payload.name.clone(),
-                members: payload.members.clone(),
-                me: mine,
-                sender_handles: Vec::new(),
-                state: group.export(),
-            };
-            stored.note_sender(sender_id, from.as_str());
-            stored.note_sender(wireops::my_group_id(&inner.identity), me.as_str());
-            let _ = groups::save(&mut inner.store, &stored);
-            let targets = stored.members.clone();
-            distribute_key(inner, &me, &stored, &group, &targets);
-        }
-    }
-    Processed::Done(None)
-}
-
-/// Decrypt a received group message and store it. Returns [`Processed::Retry`] if
-/// we don't have the group / sender key yet (the invite hasn't arrived).
-fn process_group_text(
-    inner: &mut Inner,
-    group_id: &str,
-    message: &mycellium_core::group::GroupMessage,
-) -> Processed {
-    let Some(mut stored) = groups::load(&inner.store, group_id).ok().flatten() else {
-        return Processed::Retry;
-    };
-    let sender = stored
-        .handle_of(&message.sender)
-        .map(str::to_string)
-        .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
-    let Ok(mut group) = CoreGroup::import(stored.state.clone()) else {
-        return Processed::Retry;
-    };
-    let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) else {
-        return Processed::Retry; // missing that sender's key yet
-    };
-    stored.state = group.export();
-    let _ = groups::save(&mut inner.store, &stored);
-
-    let Ok(app) = AppMessage::decode(&plaintext) else {
-        return Processed::Done(None);
-    };
-    match &app.body {
-        Body::Edit { to, text } => {
-            let _ = history::group_edit(&mut inner.store, group_id, to, text, &sender);
-            Processed::Done(None)
-        }
-        Body::Delete { to } => {
-            let _ = history::group_delete(&mut inner.store, group_id, to, &sender);
-            Processed::Done(None)
-        }
-        Body::Receipt { .. } => Processed::Done(None),
-        _ => {
-            let entry = history::GroupStoredMessage {
-                id: app.id.clone(),
-                sender: sender.clone(),
-                text: app.summary(),
-                timestamp: app.timestamp,
-                expires_at: app.expires_at,
-            };
-            let _ = history::group_append(&mut inner.store, group_id, entry);
-            Processed::Done(Some(Message {
-                id: app.id.clone(),
-                thread: group_id.to_string(),
+            }),
+            GroupMessage {
+                group_id,
+                sender,
+                id,
+                text,
+                ..
+            } => self.messages.push(Message {
+                id,
+                thread: group_id,
                 from_me: false,
                 sender,
-                text: app.summary(),
-                sent_at: app.timestamp,
+                text,
+                sent_at: self.now,
                 delivery: DeliveryState::Delivered,
-            }))
+            }),
+            SelfMirror { peer, id, text } => self.messages.push(Message {
+                id,
+                thread: peer,
+                from_me: true,
+                sender: self.my_handle.clone(),
+                text,
+                sent_at: self.now,
+                delivery: DeliveryState::Sent,
+            }),
+            // Receipts/edits/deletes/attachments carry no new visible message.
+            _ => {}
         }
     }
 }
 
-/// Bootstrap this device into a group from a sibling's [`GroupSyncPayload`].
-fn process_group_sync(inner: &mut Inner, env: &mycellium_core::offline::Envelope) -> Processed {
-    let Ok((_from, bytes)) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env) else {
-        return Processed::Retry;
+/// Process one inbound [`MailItem`] through the shared [`flow::process_item`]: the
+/// flow applies all state (history, groups, keys) and emits DTO-bearing events to
+/// `sink`; the SDK closures below deposit any follow-up send (a read receipt, a
+/// group key (re)distribution) into the recipient's queue, matching the SDK's
+/// queue-only delivery.
+fn process_inbound(inner: &mut Inner, item: MailItem, sink: &mut SdkSink) -> flow::ItemOutcome {
+    let me = match Handle::new(inner.config.handle.clone()) {
+        Ok(h) => h,
+        Err(_) => return flow::ItemOutcome::Retry,
     };
-    // A group-sync bootstrap must come from our OWN cluster, else a peer could
-    // hand us an attacker-chosen group and make us leak our sender key (MEDIUM).
-    if env.sender_record.record.wallet != inner.identity.wallet_public() {
-        return Processed::Done(None);
-    }
-    let Ok(payload) = serde_json::from_slice::<GroupSyncPayload>(&bytes) else {
-        return Processed::Retry;
+    let my_name = inner.config.name.clone();
+    let my_queue_url = inner.config.queue_url.clone();
+    let dir_url = inner.config.dir_url.clone();
+    let my_hex = wallet_hex(&inner.identity.wallet_public());
+    let net = SdkNet {
+        dir: DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport)),
     };
-    if groups::load(&inner.store, &payload.group_id)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return Processed::Done(None); // already have this group
-    }
-    let Ok(me) = Handle::new(inner.config.handle.clone()) else {
-        return Processed::Retry;
+    // Our own queue session for the read-receipt self-sync mirror (best-effort).
+    let my_session: Option<(QueueClient, String)> = {
+        let q = QueueClient::with_transport(&my_queue_url, Box::new(UreqTransport));
+        q.login(&inner.identity).ok().map(|t| (q, t))
     };
-    let mut group = CoreGroup::new(&mut OsPlatform, wireops::my_group_id(&inner.identity));
-    for (id, dist) in &payload.keys {
-        let _ = group.add_member(id.clone(), dist);
-    }
-    let mut stored = StoredGroup {
-        id: payload.group_id.clone(),
-        name: payload.name.clone(),
-        members: payload.members.clone(),
-        me: me.as_str().to_string(),
-        sender_handles: payload.sender_handles.clone(),
-        state: group.export(),
-    };
-    stored.note_sender(wireops::my_group_id(&inner.identity), me.as_str());
-    let _ = groups::save(&mut inner.store, &stored);
-    let targets = stored.members.clone();
-    distribute_key(inner, &me, &stored, &group, &targets);
-    Processed::Done(None)
-}
 
-/// React to a member's **authenticated** departure: drop their sender key, re-key
-/// so they can't read future messages, and redistribute our fresh key. The leaver
-/// is the envelope's authenticated sender, so this can only remove who actually
-/// left.
-fn process_group_leave(
-    inner: &mut Inner,
-    env: &mycellium_core::offline::Envelope,
-) -> Result<(), SdkError> {
-    let (from, bytes) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env)
-        .map_err(|e| SdkError::crypto(format!("{e:?}")))?;
-    let payload: GroupLeavePayload = serde_json::from_slice(&bytes).map_err(SdkError::crypto)?;
-    let member = from.as_str().to_string();
-    let me = inner.config.handle.clone();
-    if member == me {
-        return Ok(());
-    }
-    let Some(mut stored) = groups::load(&inner.store, &payload.group_id).ok().flatten() else {
-        return Ok(());
-    };
-    if !stored.members.iter().any(|m| m == &member) {
-        return Ok(());
-    }
-    let me_handle = Handle::new(me).map_err(SdkError::invalid)?;
-    stored.members.retain(|m| m != &member);
-    let mut session =
-        CoreGroup::import(stored.state.clone()).map_err(|e| SdkError::crypto(format!("{e:?}")))?;
-    for (id, handle) in &stored.sender_handles {
-        if handle == &member {
-            session.remove_member(id);
+    // Disjoint field borrows: the flow writes `store`; the closures don't touch it
+    // (the store is threaded through as their first argument).
+    let inner = &mut *inner;
+    let identity = &inner.identity;
+    let store = &mut inner.store;
+
+    // The recipient's queue session is per-member but `deliver` is called
+    // per-device; cache the login so we only open it once per recipient.
+    let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+    let mut deliver = |_store: &mut FileStore,
+                       _handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+            let queue = QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
+            let session = queue.login(identity).ok().map(|t| (queue, t));
+            queue_cache = Some((record.record.wallet, session));
         }
-    }
-    stored.sender_handles.retain(|(_, h)| h != &member);
-    session.rotate(&mut OsPlatform);
-    stored.state = session.export();
-    let _ = groups::save(&mut inner.store, &stored);
-    let targets = stored.members.clone();
-    distribute_key(inner, &me_handle, &stored, &session, &targets);
-    Ok(())
+        if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+            if let Ok(blob) = serde_json::to_string(&item) {
+                let slot = wireops::device_slot(&device.device_key);
+                if queue
+                    .deposit(qtoken, &wallet_hex(&record.record.wallet), &slot, &blob)
+                    .is_ok()
+                {
+                    return DeliveryPath::Queue;
+                }
+            }
+        }
+        DeliveryPath::Failed
+    };
+    let mut self_deliver =
+        |_store: &mut FileStore, _handle: &Handle, device: &Device, item: MailItem| {
+            if let Some((q, t)) = &my_session {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    let slot = wireops::device_slot(&device.device_key);
+                    let _ = q.deposit(t, &my_hex, &slot, &blob);
+                }
+            }
+        };
+
+    flow::process_item(
+        identity,
+        store,
+        &mut OsPlatform,
+        &net,
+        &me,
+        &my_name,
+        &my_queue_url,
+        &[],
+        item,
+        sink,
+        &mut deliver,
+        &mut self_deliver,
+    )
 }
 
 /// The SDK's [`flow::FlowNet`]: directory lookups over the native `ureq`

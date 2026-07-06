@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use mycellium_core::group::{Group, GroupMessage};
+use mycellium_core::group::Group;
 use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
@@ -23,12 +23,9 @@ use crate::blocklist;
 use crate::contacts::{self, Contact};
 use crate::draft;
 use crate::expiry;
-use crate::groups::{
-    self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
-};
-use crate::history::{self, GroupStoredMessage, StoredMessage};
+use crate::groups::{self, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup};
+use crate::history::{self, GroupStoredMessage};
 use crate::inbound;
-use crate::names;
 use crate::outbox;
 use crate::platform::OsPlatform;
 use crate::reachability::{self, DeliveryPath};

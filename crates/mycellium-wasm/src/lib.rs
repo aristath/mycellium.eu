@@ -13,7 +13,7 @@ use base64::Engine as _;
 /// Maximum attachment size, matching the native engine (attachments ride inline
 /// inside the sealed envelope, so this stays well under the queue's body cap).
 const MAX_ATTACHMENT: usize = 256 * 1024;
-use mycellium_core::group::{Group, GroupMessage};
+use mycellium_core::group::Group;
 use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
@@ -26,7 +26,7 @@ use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::flow;
-use mycellium_engine::groups::{self, GroupInvitePayload, MailItem, StoredGroup};
+use mycellium_engine::groups::{self, MailItem, StoredGroup};
 use mycellium_engine::{history, names, reachability::DeliveryPath, wireops};
 use mycellium_queue_client::{wallet_hex, QueueClient};
 use wasm_bindgen::prelude::*;
@@ -99,6 +99,53 @@ struct WasmNet {
 impl flow::FlowNet for WasmNet {
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
         self.dir.lookup(handle)
+    }
+}
+
+/// The wasm [`flow::FlowSink`]: the flow applies all inbound *state* (history,
+/// groups, keys) directly to the browser store, so this is a no-op except for the
+/// one thing the generic transcript can't do — keep an inbound attachment as a
+/// renderable `data:` URL (and drop it when the message is deleted). It buffers
+/// those store writes because `emit` is called while the flow still holds the
+/// store; [`WasmSink::apply`] flushes them once it returns.
+#[derive(Default)]
+struct WasmSink {
+    ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl WasmSink {
+    /// Flush the buffered writes (`Some` = put a `data:` URL, `None` = delete).
+    fn apply(self, store: &mut MemStore) {
+        for (key, value) in self.ops {
+            match value {
+                Some(val) => {
+                    let _ = store.put(&key, &val);
+                }
+                None => {
+                    let _ = store.delete(&key);
+                }
+            }
+        }
+    }
+}
+
+impl flow::FlowSink for WasmSink {
+    fn emit(&mut self, event: flow::FlowEvent) {
+        match event {
+            flow::FlowEvent::Attachment { id, mime, data, .. } => {
+                // Keep the bytes as a data: URL, keyed by message id, for the UI to
+                // render (history itself keeps just the "📎 name" summary).
+                let url = format!("data:{mime};base64,{}", B64.encode(&data));
+                self.ops
+                    .push((format!("file:{id}").into_bytes(), Some(url.into_bytes())));
+            }
+            flow::FlowEvent::Deleted { id, .. } => {
+                // Drop the attachment blob so a deleted image doesn't linger.
+                self.ops.push((format!("file:{id}").into_bytes(), None));
+            }
+            // Everything else is already applied to the store by the flow.
+            _ => {}
+        }
     }
 }
 
@@ -541,51 +588,114 @@ impl Session {
             if entry.is_expired(now) {
                 continue; // dead-letter: give up
             }
-            if self.process_blob(&entry.blob) {
-                received += 1;
-            } else {
-                entry.attempts += 1;
-                survivors.push(entry);
+            let item = match serde_json::from_str::<MailItem>(&entry.blob) {
+                Ok(item) => item,
+                // Unparseable — keep it until it dead-letters.
+                Err(_) => {
+                    entry.attempts += 1;
+                    survivors.push(entry);
+                    continue;
+                }
+            };
+            let mut sink = WasmSink::default();
+            let outcome = self.process_inbound(item, &mut sink);
+            // Apply the sink's buffered store writes (attachment `data:` URLs, and
+            // dropping a deleted attachment) now that the flow has released `store`.
+            sink.apply(&mut self.store);
+            match outcome {
+                flow::ItemOutcome::Handled => received += 1,
+                flow::ItemOutcome::Retry => {
+                    entry.attempts += 1;
+                    survivors.push(entry);
+                }
             }
         }
         let _ = mycellium_engine::inbound::save(&mut self.store, &survivors);
         Ok(received)
     }
 
-    /// Process one collected blob; returns whether it was handled (false ⇒ keep
-    /// it in the retry store for a later sync — e.g. its group key hasn't arrived).
-    fn process_blob(&mut self, blob: &str) -> bool {
-        let Ok(item) = serde_json::from_str::<MailItem>(blob) else {
-            return false;
+    /// Process one collected [`MailItem`] through the shared [`flow::process_item`]:
+    /// the flow applies all inbound state (history, groups, keys) directly to this
+    /// session's store and now handles **all six** variants — closing the old
+    /// `_ => true` hole that silently dropped `SelfSync`, `GroupSync`, and
+    /// `GroupLeave`. The browser closures deposit any follow-up send (a read
+    /// receipt, a group key (re)distribution) into the recipient's queue over XHR;
+    /// the sink only buffers attachment bytes the flow can't store generically.
+    fn process_inbound(&mut self, item: MailItem, sink: &mut WasmSink) -> flow::ItemOutcome {
+        let (dir_url, my_name, my_queue, mine) = (
+            self.cfg(b"myc:dir"),
+            self.cfg(b"myc:name"),
+            self.cfg(b"myc:queue"),
+            self.cfg(b"myc:handle"),
+        );
+        let me = match Handle::new(mine.clone()) {
+            Ok(h) => h,
+            Err(_) => return flow::ItemOutcome::Retry,
         };
-        match item {
-            MailItem::Direct(env) => {
-                let Ok((from, plaintext)) =
-                    wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env)
-                else {
-                    return false;
-                };
-                let Ok(app) = AppMessage::decode(&plaintext) else {
-                    return false;
-                };
-                // Learn the sender's self-set display name (carried in their record).
-                let _ = names::note(
-                    &mut self.store,
-                    from.as_str(),
-                    &env.sender_record.record.name,
-                );
-                apply_to_history(&mut self.store, from.as_str(), &app, false);
-                true
+        let net = WasmNet {
+            dir: DirectoryClient::with_transport(&dir_url, Box::new(XhrTransport)),
+        };
+        let my_hex = wallet_hex(&self.identity.wallet_public());
+        // Our own queue session for the read-receipt self-sync mirror (best-effort).
+        let my_session: Option<(QueueClient, String)> = {
+            let q = QueueClient::with_transport(&my_queue, Box::new(XhrTransport));
+            q.login(&self.identity).ok().map(|t| (q, t))
+        };
+
+        // Disjoint field borrows: the flow writes `store`; the closures don't.
+        let identity = &self.identity;
+        let store = &mut self.store;
+
+        let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+        let mut deliver = |_store: &mut MemStore,
+                           _handle: &Handle,
+                           record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+                let queue =
+                    QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
+                let session = queue.login(identity).ok().map(|t| (queue, t));
+                queue_cache = Some((record.record.wallet, session));
             }
-            MailItem::GroupInvite(env) => self.handle_group_invite(&env),
-            MailItem::GroupText { group_id, message } => {
-                self.handle_group_text(&group_id, &message)
+            if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    let slot = wireops::device_slot(&device.device_key);
+                    if queue
+                        .deposit(qtoken, &wallet_hex(&record.record.wallet), &slot, &blob)
+                        .is_ok()
+                    {
+                        return DeliveryPath::Queue;
+                    }
+                }
             }
-            // GroupSync / GroupLeave / SelfSync aren't handled in the browser yet
-            // (a leave still safely no-ops here rather than applying a removal);
-            // treat as processed so they don't retry forever.
-            _ => true,
-        }
+            DeliveryPath::Failed
+        };
+        let mut self_deliver =
+            |_store: &mut MemStore, _handle: &Handle, device: &Device, item: MailItem| {
+                if let Some((q, t)) = &my_session {
+                    if let Ok(blob) = serde_json::to_string(&item) {
+                        let slot = wireops::device_slot(&device.device_key);
+                        let _ = q.deposit(t, &my_hex, &slot, &blob);
+                    }
+                }
+            };
+
+        flow::process_item(
+            identity,
+            store,
+            &mut BrowserPlatform,
+            &net,
+            &me,
+            &my_name,
+            &my_queue,
+            &[],
+            item,
+            sink,
+            &mut deliver,
+            &mut self_deliver,
+        )
     }
 
     /// Create a group with `members` (a JSON array of handles) and distribute our
@@ -1151,156 +1261,6 @@ impl Session {
             &mut deliver,
         );
         Ok(())
-    }
-
-    /// Process a received group invite: join the group (or learn a member's key)
-    /// and record the sender key so we can decrypt their messages.
-    /// Returns whether the invite was processed (false ⇒ keep it for retry).
-    fn handle_group_invite(&mut self, env: &Envelope) -> bool {
-        let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env)
-        else {
-            return false;
-        };
-        let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else {
-            return false;
-        };
-        let sender_id = payload.sender_id.clone();
-        let (dir, name, queue, mine) = (
-            self.cfg(b"myc:dir"),
-            self.cfg(b"myc:name"),
-            self.cfg(b"myc:queue"),
-            self.cfg(b"myc:handle"),
-        );
-        let Ok(me) = Handle::new(mine.clone()) else {
-            return false;
-        };
-        match groups::load(&self.store, &payload.group_id).ok().flatten() {
-            Some(mut stored) => {
-                // An invite for a group we're already in is only trustworthy from
-                // an existing member (the group id is cleartext in every group
-                // MailItem) — ignore non-members (core review, MEDIUM).
-                if !stored.members.iter().any(|m| m == from.as_str()) {
-                    return true;
-                }
-                let Ok(mut group) = Group::import(stored.state.clone()) else {
-                    return false;
-                };
-                let _ = group.add_member(sender_id.clone(), &payload.distribution);
-                stored.note_sender(sender_id, from.as_str());
-                // Learn any members we didn't know about, and send them our key.
-                let newcomers: Vec<String> = payload
-                    .members
-                    .iter()
-                    .filter(|m| !stored.members.iter().any(|x| x == *m))
-                    .cloned()
-                    .collect();
-                stored.members.extend(newcomers.iter().cloned());
-                stored.state = group.export();
-                let _ = groups::save(&mut self.store, &stored);
-                if !newcomers.is_empty() {
-                    let _ =
-                        self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &newcomers);
-                }
-            }
-            None => {
-                let mut group =
-                    Group::new(&mut BrowserPlatform, wireops::my_group_id(&self.identity));
-                let _ = group.add_member(sender_id.clone(), &payload.distribution);
-                let mut stored = StoredGroup {
-                    id: payload.group_id.clone(),
-                    name: payload.name.clone(),
-                    members: payload.members.clone(),
-                    me: mine.clone(),
-                    sender_handles: Vec::new(),
-                    state: group.export(),
-                };
-                stored.note_sender(sender_id, from.as_str());
-                stored.note_sender(wireops::my_group_id(&self.identity), &mine);
-                let _ = groups::save(&mut self.store, &stored);
-                // Reply with our own sender key so everyone can read us too.
-                let targets = stored.members.clone();
-                let _ = self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &targets);
-            }
-        }
-        true
-    }
-
-    /// Decrypt a received group message and store it. Returns whether it was
-    /// processed (false ⇒ we don't have the group/sender key yet — keep for retry).
-    fn handle_group_text(&mut self, group_id: &str, message: &GroupMessage) -> bool {
-        let Some(mut stored) = groups::load(&self.store, group_id).ok().flatten() else {
-            return false;
-        };
-        let sender = stored
-            .handle_of(&message.sender)
-            .map(str::to_string)
-            .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
-        let Ok(mut group) = Group::import(stored.state.clone()) else {
-            return false;
-        };
-        let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) else {
-            return false;
-        };
-        {
-            stored.state = group.export();
-            let _ = groups::save(&mut self.store, &stored);
-            if let Ok(app) = AppMessage::decode(&plaintext) {
-                match &app.body {
-                    Body::Edit { to, text } => {
-                        let _ = history::group_edit(&mut self.store, group_id, to, text, &sender);
-                    }
-                    Body::Delete { to } => {
-                        let _ = history::group_delete(&mut self.store, group_id, to, &sender);
-                    }
-                    Body::Receipt { .. } => {}
-                    _ => {
-                        let entry = history::GroupStoredMessage {
-                            id: app.id.clone(),
-                            sender,
-                            text: app.summary(),
-                            timestamp: app.timestamp,
-                            expires_at: app.expires_at,
-                        };
-                        let _ = history::group_append(&mut self.store, group_id, entry);
-                    }
-                }
-            }
-        }
-        true
-    }
-}
-
-/// Apply a sent/received message to a conversation: edits/deletes mutate the
-/// referenced message, everything else appends. `from_me` marks the direction.
-fn apply_to_history(store: &mut MemStore, peer: &str, app: &AppMessage, from_me: bool) {
-    match &app.body {
-        Body::Edit { to, text } => {
-            let _ = history::edit(store, peer, to, text, from_me);
-        }
-        Body::Delete { to } => {
-            let _ = history::delete(store, peer, to, from_me);
-            // Drop the attachment blob too, so a deleted image doesn't linger.
-            let _ = store.delete(format!("file:{to}").as_bytes());
-        }
-        Body::Receipt { .. } => {
-            // A delivery/read acknowledgment — not a visible message.
-        }
-        _ => {
-            // Stash attachment bytes as a data: URL, keyed by message id, so the
-            // UI can render it (history itself keeps just the "📎 name" summary).
-            if let Body::File { mime, data, .. } = &app.body {
-                let url = format!("data:{mime};base64,{}", B64.encode(data));
-                let _ = store.put(format!("file:{}", app.id).as_bytes(), url.as_bytes());
-            }
-            let msg = history::StoredMessage {
-                id: app.id.clone(),
-                from_me,
-                text: app.summary(),
-                timestamp: app.timestamp,
-                expires_at: app.expires_at,
-            };
-            let _ = history::append(store, peer, msg);
-        }
     }
 }
 

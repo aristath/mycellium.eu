@@ -844,16 +844,17 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
             continue; // dead-letter: drop
         }
         let processed = match serde_json::from_str::<MailItem>(&entry.blob) {
-            Ok(item) => process_item(
-                &identity,
-                &me,
-                &client,
-                &blocked,
-                &mut platform,
-                &mut fs,
-                item,
-            )
-            .is_ok(),
+            Ok(item) => {
+                process_item(
+                    &identity,
+                    &me,
+                    &client,
+                    &blocked,
+                    &mut platform,
+                    &mut fs,
+                    item,
+                ) == flow::ItemOutcome::Handled
+            }
             Err(_) => false, // unparseable — keep retrying until it dead-letters
         };
         if !processed {
@@ -866,7 +867,73 @@ pub fn inbox(whoami: &str, directory: &str) -> Result<()> {
     Ok(())
 }
 
-/// Handle one mailbox/pushed item (shared by `inbox` and `serve`).
+/// The native CLI [`flow::FlowSink`]: render each inbound event to stdout with the
+/// engine's terminal wording, saving attachments to the downloads dir. Stateless —
+/// all inbound *state* (history, groups, keys) is applied inside
+/// [`flow::process_item`]; this only presents what happened.
+struct CliSink;
+
+impl flow::FlowSink for CliSink {
+    fn emit(&mut self, event: flow::FlowEvent) {
+        use flow::FlowEvent::*;
+        match event {
+            DirectMessage { from, id, text, .. } => {
+                if id.is_empty() {
+                    println!("from {from}: {text}");
+                } else {
+                    println!("from {from}: {text}  (#{id})");
+                }
+            }
+            SelfMirror { peer, id, text } => println!("→ {peer}: {text}  (#{id})"),
+            GroupMessage {
+                name,
+                sender,
+                id,
+                text,
+                ..
+            } => println!("[{name}] {sender}: {text}  (#{id})"),
+            Edited {
+                thread, id, group, ..
+            } => {
+                if group {
+                    println!("[{thread}] edited #{id}");
+                } else {
+                    println!("from {thread}: edited #{id}");
+                }
+            }
+            Deleted { thread, id, group } => {
+                if group {
+                    println!("[{thread}] deleted #{id}");
+                } else {
+                    println!("from {thread}: deleted #{id}");
+                }
+            }
+            Receipt {
+                from,
+                message_id,
+                read,
+            } => {
+                let mark = if read { "read" } else { "delivered" };
+                println!("✓ {from} {mark} your message #{message_id}");
+            }
+            GroupJoined { name, inviter, .. } => {
+                println!("joined group '{name}' (invited by {inviter})")
+            }
+            GroupLeft { name, member, .. } => println!("'{member}' left '{name}' — re-keyed"),
+            GroupBootstrapped { name, .. } => println!("bootstrapped into group '{name}'"),
+            Attachment { name, data, .. } => match save_attachment(&name, &data) {
+                Ok(path) => println!("(saved attachment to {})", path.display()),
+                Err(err) => eprintln!("(could not save attachment: {err})"),
+            },
+            Warn(msg) => eprintln!("({msg})"),
+        }
+    }
+}
+
+/// Handle one mailbox/pushed item (shared by `inbox` and `serve`): build the CLI
+/// sink + the engine's delivery closures (the reachability-scored live ladder with
+/// the outbox as the retry floor) and run the item through the shared
+/// [`flow::process_item`]. Returns whether it was handled or must be retried.
 #[allow(clippy::too_many_arguments)]
 pub fn process_item(
     identity: &Identity,
@@ -876,181 +943,86 @@ pub fn process_item(
     platform: &mut OsPlatform,
     fs: &mut FileStore,
     item: MailItem,
-) -> Result<()> {
-    match item {
-        MailItem::Direct(env) => handle_direct(identity, me, client, blocked, platform, fs, &env),
-        MailItem::SelfSync { peer, envelope } => {
-            handle_self_sync(identity, platform, fs, &peer, &envelope)
-        }
-        MailItem::GroupSync(env) => handle_group_sync(identity, me, client, platform, fs, &env),
-        MailItem::GroupInvite(env) => handle_group_invite(identity, me, client, fs, platform, &env),
-        MailItem::GroupText { group_id, message } => {
-            handle_group_text(blocked, fs, &group_id, &message)
-        }
-        MailItem::GroupLeave(env) => handle_group_leave(identity, me, client, fs, &env),
-    }
-}
+) -> flow::ItemOutcome {
+    let now = platform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let net = EngineNet { dir: client };
+    let my_name = display_name_for(me);
+    let my_queue = own_queue();
+    // Our own record's queue endpoints, for the read-receipt self-sync deposit
+    // floor (only ever used by a multi-device account).
+    let my_queue_target = client
+        .lookup(me)
+        .ok()
+        .and_then(|r| QueueTarget::open(identity, &r.record));
 
-/// Process a mirror of a message *this account* sent from another device: record
-/// it in the peer's transcript as our own outgoing message (Layer 11 self-sync).
-pub fn handle_self_sync(
-    identity: &Identity,
-    platform: &mut OsPlatform,
-    fs: &mut FileStore,
-    peer: &str,
-    env: &Envelope,
-) -> Result<()> {
-    let (_from, bytes) = open_envelope(identity, platform, env)?;
-    // A self-sync mirror must come from our OWN cluster: the envelope's sender
-    // record has to be signed by our own wallet. Otherwise any peer who can seal
-    // a valid envelope to us could forge a `SelfSync` and inject (`from_me:true`)
-    // or edit/delete (`by_me:true`) our real outgoing transcript. Fail closed on
-    // a foreign sender (core review, HIGH).
-    if env.sender_record.record.wallet != identity.wallet_public() {
-        return Ok(());
-    }
-    let app = match AppMessage::decode(&bytes) {
-        Ok(app) => app,
-        Err(_) => return Ok(()),
-    };
-    match &app.body {
-        Body::Edit { to, text } => history::edit(fs, peer, to, text, true)?,
-        Body::Delete { to } => history::delete(fs, peer, to, true)?,
-        Body::Receipt { .. } => {} // receipts aren't mirrored
-        _ => {
-            println!("→ {peer}: {}  (#{})", app.summary(), app.id);
-            let entry = StoredMessage {
-                id: app.id.clone(),
-                from_me: true,
-                text: app.summary(),
-                timestamp: OsPlatform.now_unix_secs(),
-                expires_at: app.expires_at,
-            };
-            history::append(fs, peer, entry)?;
+    // The recipient's queue endpoints are per-member but `deliver` is called
+    // per-device; cache the logged-in target so we open it once per recipient
+    // (records arrive grouped by recipient), rebuilding when the record changes.
+    let mut queue_cache: Option<(WalletPublicKey, Option<QueueTarget>)> = None;
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+            queue_cache = Some((
+                record.record.wallet,
+                QueueTarget::open(identity, &record.record),
+            ));
         }
-    }
-    Ok(())
-}
-
-/// Decrypt and act on a one-to-one offline message: display + persist real
-/// messages (and reply with a read receipt), or show an incoming receipt.
-#[allow(clippy::too_many_arguments)]
-pub fn handle_direct(
-    identity: &Identity,
-    me: &Handle,
-    client: &DirectoryClient,
-    blocked: &[String],
-    platform: &mut OsPlatform,
-    fs: &mut FileStore,
-    env: &Envelope,
-) -> Result<()> {
-    let (from, bytes) = open_envelope(identity, platform, env)?;
-    if blocklist::is_blocked(blocked, from.as_str()) {
-        return Ok(()); // silently drop — no display, storage, or receipt
-    }
-    // Learn the sender's self-set name (from their signed record), so an unsaved
-    // sender shows "Mary" rather than a raw id. A saved contact still wins.
-    let _ = names::note(fs, from.as_str(), &env.sender_record.record.name);
-
-    match AppMessage::decode(&bytes) {
-        Ok(app) => match &app.body {
-            // A receipt: show the status; never receipt a receipt (no loops).
-            Body::Receipt { message_id, read } => {
-                let mark = if *read { "read" } else { "delivered" };
-                println!("✓ {} {mark} your message #{message_id}", from.as_str());
-            }
-            // An edit or deletion of an earlier message: apply to the transcript.
-            Body::Edit { to, text } => {
-                history::edit(fs, from.as_str(), to, text, false)?;
-                println!("from {}: edited #{to}", from.as_str());
-            }
-            Body::Delete { to } => {
-                history::delete(fs, from.as_str(), to, false)?;
-                println!("from {}: deleted #{to}", from.as_str());
-            }
-            // Already expired in transit? drop it entirely.
-            _ if app.is_expired(OsPlatform.now_unix_secs()) => {}
-            // A real message: display, persist, and send a read receipt back.
-            _ => {
-                if let Some(path) = maybe_save_attachment(&app) {
-                    println!("(saved attachment to {})", path.display());
-                }
-                println!("from {}: {}  (#{})", from.as_str(), app.summary(), app.id);
-                let entry = StoredMessage {
-                    id: app.id.clone(),
-                    from_me: false,
-                    text: app.summary(),
-                    timestamp: OsPlatform.now_unix_secs(),
-                    expires_at: app.expires_at,
-                };
-                history::append(fs, from.as_str(), entry)?;
-                send_receipt(identity, me, client, &from, &app.id);
-            }
-        },
-        Err(_) => {
-            // Older/raw payloads: best-effort display.
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            println!("from {}: {text}", from.as_str());
-            let entry = StoredMessage {
-                id: String::new(),
-                from_me: false,
-                text,
-                timestamp: OsPlatform.now_unix_secs(),
-                expires_at: None,
-            };
-            history::append(fs, from.as_str(), entry)?;
-        }
-    }
-    Ok(())
-}
-
-/// Send a read receipt for `message_id` back to `to` (best-effort).
-pub fn send_receipt(
-    identity: &Identity,
-    me: &Handle,
-    client: &DirectoryClient,
-    to: &Handle,
-    message_id: &str,
-) {
-    let record = match client.lookup(to) {
-        Ok(r) if r.verify().is_ok() => r,
-        _ => return,
-    };
-    let receipt = AppMessage {
-        id: random_id(),
-        timestamp: OsPlatform.now_unix_secs(),
-        expires_at: None,
-        body: Body::Receipt {
-            message_id: message_id.to_string(),
-            read: true,
-        },
-    };
-    // Fan the receipt out to every device of the original sender (Layer 11), so
-    // whichever device they sent from sees the read status.
-    let encoded = receipt.encode();
-    let queue = QueueTarget::open(identity, &record.record);
-    for device in &record.record.devices {
-        let Ok(env) = seal_to(identity, me, device, &encoded) else {
-            continue;
-        };
-        let _ = deliver(
-            identity.device_secret(),
+        let queue = queue_cache.as_ref().and_then(|(_, q)| q.as_ref());
+        let path = deliver_scored(
+            store,
+            device_secret,
             client,
-            to,
-            queue.as_ref(),
+            handle,
+            queue,
             device,
-            &MailItem::Direct(env),
+            &item,
+            now,
         );
-    }
-}
+        if matches!(path, DeliveryPath::Outbox | DeliveryPath::Failed) {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+        }
+        path
+    };
+    let mut self_deliver =
+        |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
+            if !deliver_scored(
+                store,
+                device_secret,
+                client,
+                handle,
+                my_queue_target.as_ref(),
+                device,
+                &item,
+                now,
+            )
+            .is_delivered()
+            {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+            }
+        };
 
-/// Authenticate the sender and decrypt one offline envelope to raw bytes.
-pub fn open_envelope(
-    identity: &Identity,
-    platform: &mut OsPlatform,
-    env: &Envelope,
-) -> Result<(Handle, Vec<u8>)> {
-    crate::wireops::open_envelope(platform, identity, env)
+    let mut sink = CliSink;
+    flow::process_item(
+        identity,
+        fs,
+        &mut OsPlatform,
+        &net,
+        me,
+        &my_name,
+        &my_queue,
+        blocked,
+        item,
+        &mut sink,
+        &mut deliver,
+        &mut self_deliver,
+    )
 }
 
 #[cfg(test)]
@@ -1353,40 +1325,5 @@ mod transport_tests {
             DirectTransport::None,
             "a non-UTF-8 peer_id has no usable direct address"
         );
-    }
-}
-
-#[cfg(test)]
-mod self_sync_binding_tests {
-    use super::*;
-
-    // A forged `SelfSync` from a FOREIGN identity must not touch our transcript.
-    // Pre-fix, `handle_self_sync` discarded the authenticated sender and wrote
-    // `from_me:true`, so any peer who could seal an envelope to us could inject
-    // (or edit/delete) our own outgoing history (core review, HIGH).
-    #[test]
-    fn self_sync_rejects_a_forged_mirror_from_a_foreign_identity() {
-        let mut p = OsPlatform;
-        let victim = mycellium_core::identity::Identity::generate(&mut p).unwrap();
-        let attacker = mycellium_core::identity::Identity::generate(&mut p).unwrap();
-        let vh = Handle::new("victimhandle").unwrap();
-        let ah = Handle::new("attackerhandle").unwrap();
-        // The victim's public device record — what any sender seals to.
-        let vrec = crate::wireops::build_record(&mut p, &victim, &vh, "", "", "");
-        let vdev = vrec.record.primary();
-
-        let dir = std::env::temp_dir().join(format!("myc-ss-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut fs = FileStore::open(dir.join("h"), [7u8; 32]).unwrap();
-
-        // ATTACK: a foreign identity seals a mirror to the victim, wrapped as SelfSync.
-        let forged = text_message("forged outgoing").encode();
-        let env = seal_to(&attacker, &ah, vdev, &forged).unwrap();
-        handle_self_sync(&victim, &mut p, &mut fs, "someone", &env).unwrap();
-        assert!(
-            history::load(&fs, "someone").unwrap().is_empty(),
-            "a forged self-sync from a foreign identity must NOT touch our history",
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
