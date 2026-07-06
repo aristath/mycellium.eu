@@ -169,12 +169,11 @@ async fn login_challenge(State(dir): State<AppState>, body: String) -> Result<Re
 
 async fn login_verify(State(dir): State<AppState>, body: String) -> Result<Response, ApiError> {
     let req: VerifyReq = parse(&body)?;
-    let token = dir.directory.lock().unwrap().verify(
-        &req.wallet,
-        &req.nonce,
-        &req.signature,
-        now_secs(),
-    )?;
+    let token = dir
+        .directory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .verify(&req.wallet, &req.nonce, &req.signature, now_secs())?;
     Ok(Json(VerifyResp { token }).into_response())
 }
 
@@ -199,7 +198,12 @@ async fn get_record(
     Path(handle): Path<String>,
 ) -> Result<Response, ApiError> {
     let handle = Handle::new(&handle).map_err(|_| ApiError::HandleMismatch)?;
-    match dir.directory.lock().unwrap().lookup(&handle) {
+    match dir
+        .directory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .lookup(&handle)
+    {
         Some(record) => Ok(Json(record).into_response()),
         None => Err(ApiError::NotFound),
     }
@@ -250,7 +254,12 @@ async fn auth_confirm(State(dir): State<AppState>, body: String) -> Result<Respo
 
 async fn auth_status(State(dir): State<AppState>, body: String) -> Result<Response, ApiError> {
     let req: AuthStatusReq = parse(&body)?;
-    match dir.directory.lock().unwrap().auth_status(&req.pending) {
+    match dir
+        .directory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .auth_status(&req.pending)
+    {
         Some((verified, username)) => Ok(Json(
             serde_json::json!({ "verified": verified, "username": username }),
         )
@@ -279,7 +288,11 @@ async fn presence_get(
     Path(handle): Path<String>,
 ) -> Result<Response, ApiError> {
     let handle = Handle::new(&handle).map_err(|_| ApiError::NotFound)?;
-    let online = dir.directory.lock().unwrap().presence(&handle, now_secs());
+    let online = dir
+        .directory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .presence(&handle, now_secs());
     Ok(Json(Presence { online }).into_response())
 }
 

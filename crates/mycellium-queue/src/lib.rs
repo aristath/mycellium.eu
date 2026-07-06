@@ -695,7 +695,11 @@ fn restrict_perms(_path: &str) {}
 
 async fn login_challenge(State(st): State<QueueState>, body: String) -> Result<Response, ApiError> {
     let req: ChallengeReq = parse(&body)?;
-    let nonce = st.queue.lock().unwrap().challenge(req.wallet, now_secs());
+    let nonce = st
+        .queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .challenge(req.wallet, now_secs());
     Ok(Json(ChallengeResp { nonce }).into_response())
 }
 
@@ -762,7 +766,11 @@ async fn mailbox_post(
     // to its transport (Web Push over VAPID, UnifiedPush over a bare POST, APNs /
     // FCM over the native transports, skipped when the operator hasn't configured
     // them).
-    let subs = st.queue.lock().unwrap().subscriptions(&wallet);
+    let subs = st
+        .queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .subscriptions(&wallet);
     if !subs.is_empty() {
         let waker = LiveWaker {
             vapid: Arc::clone(&st.vapid),
@@ -775,7 +783,10 @@ async fn mailbox_post(
             // wake them on every future deposit.
             let gone = wake_all(subs, &waker, now);
             if !gone.is_empty() {
-                queue.lock().unwrap().remove_subs(&wallet, &gone);
+                queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove_subs(&wallet, &gone);
             }
         });
     }
@@ -815,7 +826,11 @@ async fn pair_get(
     State(st): State<QueueState>,
     Path(rid): Path<String>,
 ) -> Result<Response, ApiError> {
-    let msgs = st.queue.lock().unwrap().pair_fetch(&rid, now_secs())?;
+    let msgs = st
+        .queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pair_fetch(&rid, now_secs())?;
     Ok(Json(PairFetch { msgs }).into_response())
 }
 
@@ -1662,7 +1677,7 @@ mod tests {
                     let mut first = head.lines().next().unwrap_or("").split_whitespace();
                     let method = first.next().unwrap_or("").to_string();
                     let path = first.next().unwrap_or("").to_string();
-                    *out.lock().unwrap() = Some(Hit {
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(Hit {
                         method,
                         path,
                         body_len: buf.len() - body_start,
@@ -1721,7 +1736,7 @@ mod tests {
         // path itself.
         let now = now_secs();
         let atoken = {
-            let mut g = queue.lock().unwrap();
+            let mut g = queue.lock().unwrap_or_else(|e| e.into_inner());
             let nonce = g.challenge(alice.wallet_public(), now);
             let sig = alice.sign(&mycellium_core::login::challenge_message(&nonce));
             let t = g.verify(&alice.wallet_public(), &nonce, &sig, now).unwrap();
@@ -1779,8 +1794,11 @@ mod tests {
         assert!(resp.is_ok(), "deposit failed: {resp:?}");
 
         // The healthy distributor received a POST with an EMPTY body (contentless).
-        let hit = poll(|| good_hit.lock().unwrap().clone(), Duration::from_secs(5))
-            .expect("UnifiedPush distributor never received the wake — delivery is broken");
+        let hit = poll(
+            || good_hit.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            Duration::from_secs(5),
+        )
+        .expect("UnifiedPush distributor never received the wake — delivery is broken");
         assert_eq!(hit.method, "POST", "the wake must be a POST");
         assert_eq!(hit.path, "/up", "the wake must hit the endpoint path");
         assert_eq!(
@@ -1792,7 +1810,10 @@ mod tests {
         // the healthy sub survives the prune.
         let pruned = poll(
             || {
-                let subs = queue.lock().unwrap().subscriptions(&bob_hex);
+                let subs = queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .subscriptions(&bob_hex);
                 let gone_present = subs.iter().any(|s| {
                     matches!(s, Subscription::UnifiedPush { endpoint } if *endpoint == gone_url)
                 });

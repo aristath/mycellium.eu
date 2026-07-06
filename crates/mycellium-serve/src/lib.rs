@@ -105,6 +105,12 @@ impl Server {
         let app = app
             .route("/health", get(|| async { "\"ok\"" }))
             .route("/metrics", get(metrics_route))
+            // Innermost app layer: turn a handler panic into a `500` instead of
+            // killing the task/connection. Combined with poison-tolerant state
+            // locks in the services, one panicking request can no longer take the
+            // whole service down (it stays inside the `observe` layer, so the 500
+            // is still counted + logged).
+            .layer(tower_http::catch_panic::CatchPanicLayer::new())
             .layer(axum::extract::DefaultBodyLimit::max(max_body))
             .layer(cors_layer())
             .layer(middleware::from_fn_with_state(ctx, observe));
@@ -229,4 +235,63 @@ async fn shutdown_signal(handle: axum_server::Handle) {
 
     println!("shutting down — draining in-flight requests");
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
+}
+
+#[cfg(test)]
+mod panic_recovery_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    // One handler panic (while holding the state lock) must NOT take the service
+    // down: CatchPanicLayer turns it into a 500, and the poison-tolerant lock lets
+    // the very next request still succeed — no poison cascade.
+    #[tokio::test]
+    async fn a_handler_panic_does_not_poison_the_service() {
+        let state = Arc::new(Mutex::new(0u32));
+        let panic_state = Arc::clone(&state);
+        let ping_state = Arc::clone(&state);
+
+        let app = Router::new()
+            .route(
+                "/panic",
+                get(move || {
+                    let s = Arc::clone(&panic_state);
+                    async move {
+                        let _g = s.lock().unwrap_or_else(|e| e.into_inner());
+                        panic!("boom while holding the lock");
+                        #[allow(unreachable_code)]
+                        ""
+                    }
+                }),
+            )
+            .route(
+                "/ping",
+                get(move || {
+                    let s = Arc::clone(&ping_state);
+                    async move {
+                        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+                        *g += 1;
+                        "ok"
+                    }
+                }),
+            )
+            .layer(tower_http::catch_panic::CatchPanicLayer::new());
+
+        let r1 = app
+            .clone()
+            .oneshot(Request::get("/panic").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // The mutex is poisoned now, but the next request still works.
+        let r2 = app
+            .oneshot(Request::get("/ping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+    }
 }
