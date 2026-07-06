@@ -24,6 +24,8 @@ mycellium-queue-client = { path = "../mycellium-queue-client", default-features 
 mycellium-engine = { path = "../mycellium-engine", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The `engine::flow` seam (`FlowNet`) returns `anyhow::Result`.
+anyhow = "1"
 base64 = "0.22"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 wasm-bindgen = "=0.2.100"

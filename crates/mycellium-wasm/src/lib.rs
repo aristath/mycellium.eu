@@ -15,16 +15,17 @@ use base64::Engine as _;
 const MAX_ATTACHMENT: usize = 256 * 1024;
 use mycellium_core::group::{Group, GroupMessage};
 use mycellium_core::http::{HttpResponse, HttpTransport};
-use mycellium_core::identity::{Handle, Identity};
+use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
 use mycellium_core::platform::Platform;
-use mycellium_core::record::{Record, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
+use mycellium_engine::flow;
 use mycellium_engine::groups::{self, GroupInvitePayload, MailItem, StoredGroup};
 use mycellium_engine::{antirollback, history, names, verified, wireops};
 use mycellium_queue_client::{wallet_hex, QueueClient};
@@ -86,6 +87,18 @@ impl Storage for MemStore {
     fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error> {
         self.map.remove(key);
         Ok(())
+    }
+}
+
+/// The wasm client's [`flow::FlowNet`]: directory lookups over the browser
+/// [`XhrTransport`].
+struct WasmNet {
+    dir: DirectoryClient,
+}
+
+impl flow::FlowNet for WasmNet {
+    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
+        self.dir.lookup(handle)
     }
 }
 
@@ -1024,9 +1037,15 @@ impl Session {
     }
 
     /// Seal our group sender-key (a `GroupInvitePayload`) to `targets`' devices.
+    ///
+    /// The shared lookup/verify/**pin-check**/seal loop lives in
+    /// [`flow::distribute_key`]; this only supplies wasm's per-device delivery
+    /// (deposit into the recipient's queue over XHR). Routing the pin check
+    /// through the shared flow is what gives wasm the fail-closed-on-changed-wallet
+    /// guard it previously lacked.
     #[allow(clippy::too_many_arguments)]
     fn distribute_key(
-        &self,
+        &mut self,
         dir_url: &str,
         my_name: &str,
         my_queue: &str,
@@ -1035,58 +1054,54 @@ impl Session {
         group: &Group,
         targets: &[String],
     ) -> Result<(), JsValue> {
-        let payload = GroupInvitePayload {
-            group_id: stored.id.clone(),
-            name: stored.name.clone(),
-            members: stored.members.clone(),
-            sender_id: wireops::my_group_id(&self.identity),
-            distribution: group.distribution(),
+        let net = WasmNet {
+            dir: DirectoryClient::with_transport(dir_url, Box::new(XhrTransport)),
         };
-        let plaintext =
-            serde_json::to_vec(&payload).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        for member in targets {
-            let Ok(handle) = Handle::new(member.clone()) else {
-                continue;
-            };
-            let Ok(record) = dir.lookup(&handle) else {
-                continue;
-            };
-            // Never seal to an unverifiable member record (core review).
-            if record.verify().is_err() {
-                continue;
+        // Disjoint field borrows: the pin check reads `store`; the deliver closure
+        // logs in with `identity`.
+        let identity = &self.identity;
+        let store = &mut self.store;
+
+        // The recipient's queue session is per-member, but `deliver` is called
+        // per-device; cache it so we only log in once per member.
+        let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+        let mut deliver = |_store: &mut MemStore,
+                           _handle: &Handle,
+                           record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem| {
+            if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+                let queue =
+                    QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
+                let session = queue.login(identity).ok().map(|t| (queue, t));
+                queue_cache = Some((record.record.wallet, session));
             }
-            let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
-            let Ok(qtoken) = queue.login(&self.identity) else {
-                continue;
-            };
-            let peer_hex = wallet_hex(&record.record.wallet);
-            for device in &record.record.devices {
-                if device.device_key == self.identity.device_public() {
-                    continue; // never this exact device
+            if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+                if let Ok(blob) = serde_json::to_string(&item) {
+                    let _ = queue.deposit(
+                        qtoken,
+                        &wallet_hex(&record.record.wallet),
+                        &wireops::device_slot(&device.device_key),
+                        &blob,
+                    );
                 }
-                let Ok(env) = wireops::seal_to(
-                    &mut BrowserPlatform,
-                    &self.identity,
-                    me,
-                    my_name,
-                    my_queue,
-                    device,
-                    &plaintext,
-                ) else {
-                    continue;
-                };
-                let Ok(blob) = serde_json::to_string(&MailItem::GroupInvite(env)) else {
-                    continue;
-                };
-                let _ = queue.deposit(
-                    &qtoken,
-                    &peer_hex,
-                    &wireops::device_slot(&device.device_key),
-                    &blob,
-                );
             }
-        }
+        };
+        flow::distribute_key(
+            identity,
+            store,
+            &mut BrowserPlatform,
+            &net,
+            me,
+            my_name,
+            my_queue,
+            &stored.id,
+            &stored.name,
+            &group.distribution(),
+            &stored.members,
+            targets,
+            &mut deliver,
+        );
         Ok(())
     }
 

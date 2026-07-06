@@ -75,9 +75,25 @@ pub fn distribute_key(
     );
 }
 
+/// The engine's [`flow::FlowNet`]: directory lookups over the native blocking
+/// `DirectoryClient`.
+struct EngineNet<'a> {
+    client: &'a DirectoryClient,
+}
+
+impl crate::flow::FlowNet for EngineNet<'_> {
+    fn lookup(&self, handle: &Handle) -> Result<SignedRecord> {
+        self.client.lookup(handle)
+    }
+}
+
 /// Send our sender-key distribution to a specific set of members. Any device we
 /// can't reach live or via its queue is parked in the outbox for retry — so key
 /// distribution (like group text) isn't silently lost on a transient failure.
+///
+/// The shared lookup/verify/pin-check/seal loop lives in [`crate::flow::distribute_key`];
+/// this only supplies the engine's per-device delivery (the reachability-scored
+/// live ladder, with the outbox as the guaranteed fallback).
 #[allow(clippy::too_many_arguments)]
 pub fn distribute_key_to(
     identity: &Identity,
@@ -89,67 +105,56 @@ pub fn distribute_key_to(
     fs: &mut FileStore,
     now: u64,
 ) {
-    let payload = GroupInvitePayload {
-        group_id: stored.id.clone(),
-        name: stored.name.clone(),
-        members: stored.members.clone(),
-        sender_id: my_group_id(identity),
-        distribution: group.distribution(),
-    };
-    let plaintext = match serde_json::to_vec(&payload) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    for member in targets {
-        let handle = match Handle::new(member.clone()) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        let record = match client.lookup(&handle) {
-            // Fail closed if the member's wallet no longer matches the pinned or
-            // verified one — a compelled directory that swaps a member's wallet
-            // must not trick us into sealing our group sender key to the impostor
-            // (the same fail-closed check 1:1 sends make; core review).
-            Ok(r)
-                if r.verify().is_ok()
-                    && crate::verified::level(fs, handle.as_str(), &r.record.wallet)
-                        != crate::verified::TrustLevel::Changed =>
-            {
-                r
-            }
-            _ => {
-                eprintln!("(skipping '{member}': unreachable or identity changed)");
-                continue;
-            }
-        };
-        // Seal the sender key to every device in the member's cluster (Layer 11) —
-        // including our *own* siblings, but never this device itself.
-        let queue = QueueTarget::open(identity, &record.record);
-        for device in &record.record.devices {
-            if device.device_key == identity.device_public() {
-                continue;
-            }
-            let Ok(env) = seal_to(identity, me, device, &plaintext) else {
-                continue;
-            };
-            let item = MailItem::GroupInvite(env);
-            if !deliver_scored(
-                fs,
-                identity.device_secret(),
-                client,
-                &handle,
-                queue.as_ref(),
-                device,
-                &item,
-                now,
-            )
-            .is_delivered()
-            {
-                let slot = device_slot(&device.device_key);
-                let _ = outbox::enqueue(fs, random_id(), handle.as_str(), &slot, item, now);
-            }
+    let net = EngineNet { client };
+    let my_name = display_name_for(me);
+    let my_queue = own_queue();
+    // The recipient's queue endpoints are per-member, but `deliver` is called
+    // per-device; cache the logged-in target so we only open it once per member
+    // (records arrive grouped by member), rebuilding when the record changes.
+    let mut queue_cache: Option<(WalletPublicKey, Option<QueueTarget>)> = None;
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem| {
+        if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+            queue_cache = Some((
+                record.record.wallet,
+                QueueTarget::open(identity, &record.record),
+            ));
         }
-    }
+        let queue = queue_cache.as_ref().and_then(|(_, q)| q.as_ref());
+        if !deliver_scored(
+            store,
+            identity.device_secret(),
+            client,
+            handle,
+            queue,
+            device,
+            &item,
+            now,
+        )
+        .is_delivered()
+        {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+        }
+    };
+    crate::flow::distribute_key(
+        identity,
+        fs,
+        &mut OsPlatform,
+        &net,
+        me,
+        &my_name,
+        &my_queue,
+        &stored.id,
+        &stored.name,
+        &group.distribution(),
+        &stored.members,
+        targets,
+        &mut deliver,
+    );
 }
 
 pub fn handle_group_invite(

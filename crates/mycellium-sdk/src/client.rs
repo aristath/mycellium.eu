@@ -12,14 +12,15 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use mycellium_core::group::Group as CoreGroup;
-use mycellium_core::identity::{Handle, Identity};
+use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
-use mycellium_core::record::{Record, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id;
 use mycellium_core::{safety, wire};
 use mycellium_directory_client::DirectoryClient;
+use mycellium_engine::flow;
 use mycellium_engine::groups::{
     self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
 };
@@ -781,7 +782,6 @@ impl MyceliumClient {
     pub fn group_create(&self, name: String, members: Vec<String>) -> Result<String, SdkError> {
         let mut inner = self.lock();
         let me = require_handle(&inner)?;
-        let (dir_url, my_name, my_queue) = cfg_triple(&inner);
 
         let mut id_bytes = [0u8; 8];
         OsPlatform.fill_random(&mut id_bytes);
@@ -805,16 +805,7 @@ impl MyceliumClient {
         groups::save(&mut inner.store, &stored).map_err(SdkError::storage)?;
 
         let targets = stored.members.clone();
-        distribute_key(
-            &inner.identity,
-            &dir_url,
-            &my_name,
-            &my_queue,
-            &me,
-            &stored,
-            &group,
-            &targets,
-        );
+        distribute_key(&mut inner, &me, &stored, &group, &targets);
         Ok(group_id)
     }
 
@@ -822,7 +813,6 @@ impl MyceliumClient {
     pub fn group_add(&self, group_id: String, member: String) -> Result<(), SdkError> {
         let mut inner = self.lock();
         let me = require_handle(&inner)?;
-        let (dir_url, my_name, my_queue) = cfg_triple(&inner);
 
         let mut stored = groups::load(&inner.store, &group_id)
             .map_err(SdkError::storage)?
@@ -835,16 +825,7 @@ impl MyceliumClient {
         let group = CoreGroup::import(stored.state.clone())
             .map_err(|e| SdkError::crypto(format!("{e:?}")))?;
         let targets = stored.members.clone();
-        distribute_key(
-            &inner.identity,
-            &dir_url,
-            &my_name,
-            &my_queue,
-            &me,
-            &stored,
-            &group,
-            &targets,
-        );
+        distribute_key(&mut inner, &me, &stored, &group, &targets);
         Ok(())
     }
 
@@ -1488,7 +1469,6 @@ fn process_group_invite(inner: &mut Inner, env: &mycellium_core::offline::Envelo
     let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else {
         return Processed::Retry;
     };
-    let (dir_url, my_name, my_queue) = cfg_triple(inner);
     let mine = inner.config.handle.clone();
     let Ok(me) = Handle::new(mine.clone()) else {
         return Processed::Retry;
@@ -1518,16 +1498,7 @@ fn process_group_invite(inner: &mut Inner, env: &mycellium_core::offline::Envelo
             stored.state = group.export();
             let _ = groups::save(&mut inner.store, &stored);
             if !newcomers.is_empty() {
-                distribute_key(
-                    &inner.identity,
-                    &dir_url,
-                    &my_name,
-                    &my_queue,
-                    &me,
-                    &stored,
-                    &group,
-                    &newcomers,
-                );
+                distribute_key(inner, &me, &stored, &group, &newcomers);
             }
         }
         None => {
@@ -1545,16 +1516,7 @@ fn process_group_invite(inner: &mut Inner, env: &mycellium_core::offline::Envelo
             stored.note_sender(wireops::my_group_id(&inner.identity), me.as_str());
             let _ = groups::save(&mut inner.store, &stored);
             let targets = stored.members.clone();
-            distribute_key(
-                &inner.identity,
-                &dir_url,
-                &my_name,
-                &my_queue,
-                &me,
-                &stored,
-                &group,
-                &targets,
-            );
+            distribute_key(inner, &me, &stored, &group, &targets);
         }
     }
     Processed::Done(None)
@@ -1638,7 +1600,6 @@ fn process_group_sync(inner: &mut Inner, env: &mycellium_core::offline::Envelope
     {
         return Processed::Done(None); // already have this group
     }
-    let (dir_url, my_name, my_queue) = cfg_triple(inner);
     let Ok(me) = Handle::new(inner.config.handle.clone()) else {
         return Processed::Retry;
     };
@@ -1657,16 +1618,7 @@ fn process_group_sync(inner: &mut Inner, env: &mycellium_core::offline::Envelope
     stored.note_sender(wireops::my_group_id(&inner.identity), me.as_str());
     let _ = groups::save(&mut inner.store, &stored);
     let targets = stored.members.clone();
-    distribute_key(
-        &inner.identity,
-        &dir_url,
-        &my_name,
-        &my_queue,
-        &me,
-        &stored,
-        &group,
-        &targets,
-    );
+    distribute_key(inner, &me, &stored, &group, &targets);
     Processed::Done(None)
 }
 
@@ -1692,7 +1644,6 @@ fn process_group_leave(
     if !stored.members.iter().any(|m| m == &member) {
         return Ok(());
     }
-    let (dir_url, my_name, my_queue) = cfg_triple(inner);
     let me_handle = Handle::new(me).map_err(SdkError::invalid)?;
     stored.members.retain(|m| m != &member);
     let mut session =
@@ -1707,87 +1658,88 @@ fn process_group_leave(
     stored.state = session.export();
     let _ = groups::save(&mut inner.store, &stored);
     let targets = stored.members.clone();
-    distribute_key(
-        &inner.identity,
-        &dir_url,
-        &my_name,
-        &my_queue,
-        &me_handle,
-        &stored,
-        &session,
-        &targets,
-    );
+    distribute_key(inner, &me_handle, &stored, &session, &targets);
     Ok(())
+}
+
+/// The SDK's [`flow::FlowNet`]: directory lookups over the native `ureq`
+/// [`UreqTransport`].
+struct SdkNet {
+    dir: DirectoryClient,
+}
+
+impl flow::FlowNet for SdkNet {
+    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
+        self.dir.lookup(handle)
+    }
 }
 
 /// Seal our group sender-key (a [`GroupInvitePayload`]) to every device of each
 /// `targets` handle over the pairwise E2E channel (never this exact device).
-/// Best-effort: unreachable members are skipped (the engine's outbox retry isn't
-/// wired into the SDK yet; a re-invite re-distributes).
-#[allow(clippy::too_many_arguments)]
+///
+/// The shared lookup/verify/**pin-check**/seal loop lives in
+/// [`flow::distribute_key`]; this only supplies the SDK's per-device delivery
+/// (deposit into the recipient's queue). Best-effort: unreachable members are
+/// skipped (a re-invite re-distributes). Routing the pin check through the shared
+/// flow is what gives the SDK the fail-closed-on-changed-wallet guard.
 fn distribute_key(
-    identity: &Identity,
-    dir_url: &str,
-    my_name: &str,
-    my_queue: &str,
+    inner: &mut Inner,
     me: &Handle,
     stored: &StoredGroup,
     group: &CoreGroup,
     targets: &[String],
 ) {
-    let payload = GroupInvitePayload {
-        group_id: stored.id.clone(),
-        name: stored.name.clone(),
-        members: stored.members.clone(),
-        sender_id: wireops::my_group_id(identity),
-        distribution: group.distribution(),
+    let dir_url = inner.config.dir_url.clone();
+    let my_name = inner.config.name.clone();
+    let my_queue = inner.config.queue_url.clone();
+    let net = SdkNet {
+        dir: DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport)),
     };
-    let Ok(plaintext) = serde_json::to_vec(&payload) else {
-        return;
-    };
-    let dir = DirectoryClient::with_transport(dir_url, Box::new(UreqTransport));
-    for member in targets {
-        let Ok(handle) = Handle::new(member.clone()) else {
-            continue;
-        };
-        let Ok(record) = dir.lookup(&handle) else {
-            continue;
-        };
-        // Never seal our group sender key to an unverifiable record (core review).
-        if record.verify().is_err() {
-            continue;
+    // Disjoint field borrows: the pin check reads `store`; the deliver closure
+    // logs in with `identity`.
+    let identity = &inner.identity;
+    let store = &mut inner.store;
+
+    // The recipient's queue session is per-member, but `deliver` is called
+    // per-device; cache it so we only log in once per member (records arrive
+    // grouped by member), re-logging when the record changes.
+    let mut queue_cache: Option<(WalletPublicKey, Option<(QueueClient, String)>)> = None;
+    let mut deliver = |_store: &mut FileStore,
+                       _handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem| {
+        if queue_cache.as_ref().map(|(w, _)| *w) != Some(record.record.wallet) {
+            let queue = QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
+            let session = queue.login(identity).ok().map(|t| (queue, t));
+            queue_cache = Some((record.record.wallet, session));
         }
-        let queue = QueueClient::with_transport(&record.record.queue, Box::new(UreqTransport));
-        let Ok(qtoken) = queue.login(identity) else {
-            continue;
-        };
-        let peer_hex = wallet_hex(&record.record.wallet);
-        for device in &record.record.devices {
-            if device.device_key == identity.device_public() {
-                continue; // never this exact device
+        if let Some((_, Some((queue, qtoken)))) = queue_cache.as_ref() {
+            if let Ok(blob) = serde_json::to_string(&item) {
+                let _ = queue.deposit(
+                    qtoken,
+                    &wallet_hex(&record.record.wallet),
+                    &wireops::device_slot(&device.device_key),
+                    &blob,
+                );
             }
-            let Ok(env) = wireops::seal_to(
-                &mut OsPlatform,
-                identity,
-                me,
-                my_name,
-                my_queue,
-                device,
-                &plaintext,
-            ) else {
-                continue;
-            };
-            let Ok(blob) = serde_json::to_string(&MailItem::GroupInvite(env)) else {
-                continue;
-            };
-            let _ = queue.deposit(
-                &qtoken,
-                &peer_hex,
-                &wireops::device_slot(&device.device_key),
-                &blob,
-            );
         }
-    }
+    };
+    flow::distribute_key(
+        identity,
+        store,
+        &mut OsPlatform,
+        &net,
+        me,
+        &my_name,
+        &my_queue,
+        &stored.id,
+        &stored.name,
+        &group.distribution(),
+        &stored.members,
+        targets,
+        &mut deliver,
+    );
 }
 
 /// The registered handle, or [`SdkError::NotRegistered`] if `register` hasn't run.
@@ -1796,15 +1748,6 @@ fn require_handle(inner: &Inner) -> Result<Handle, SdkError> {
         return Err(SdkError::NotRegistered);
     }
     Handle::new(inner.config.handle.clone()).map_err(SdkError::invalid)
-}
-
-/// The `(dir_url, name, queue_url)` config triple, cloned for network use.
-fn cfg_triple(inner: &Inner) -> (String, String, String) {
-    (
-        inner.config.dir_url.clone(),
-        inner.config.name.clone(),
-        inner.config.queue_url.clone(),
-    )
 }
 
 /// Decode lowercase hex, mapping malformed input to [`SdkError::InvalidInput`].

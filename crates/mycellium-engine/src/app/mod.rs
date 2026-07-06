@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 
 use mycellium_core::group::{Group, GroupMessage};
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;

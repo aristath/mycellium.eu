@@ -22,6 +22,7 @@ pub mod blocklist;
 pub mod contacts;
 pub mod draft;
 pub mod expiry;
+pub mod flow;
 pub mod groups;
 pub mod history;
 pub mod inbound;
