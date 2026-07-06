@@ -111,6 +111,7 @@ impl Drop for SenderKey {
 }
 
 /// The state needed to decrypt one sender's messages.
+#[derive(Clone)]
 struct ReceiverKey {
     chain_key: [u8; 32],
     iteration: u32,
@@ -137,8 +138,15 @@ impl ReceiverKey {
             .verify_strict(&signed_bytes(msg.iteration, &msg.ciphertext), &signature)
             .map_err(|_| Error::BadSignature)?;
 
-        let mk = self.message_key(msg.iteration)?;
-        aead_decrypt(&mk, &msg.ciphertext, ad)
+        // Advance/remove keys on a private copy and commit only after the AEAD
+        // verifies. A valid message tried with the wrong associated data must
+        // not consume the live chain key and desync the receiver.
+        let mut next = self.clone();
+        let mut mk = next.message_key(msg.iteration)?;
+        let plaintext = aead_decrypt(&mk, &msg.ciphertext, ad)?;
+        mk.zeroize();
+        *self = next;
+        Ok(plaintext)
     }
 
     /// The message key for `target`, ratcheting forward (and banking skipped
@@ -455,6 +463,26 @@ mod tests {
         // must fail (signature covers it, and the AEAD tag too).
         msg.ciphertext[0] ^= 0xff;
         assert!(b.decrypt(&msg, AD).is_err());
+    }
+
+    #[test]
+    fn wrong_ad_does_not_advance_receiver_chain() {
+        let (mut a, mut b, _c) = three_members();
+        let msg = a.encrypt(b"bound to group", AD);
+
+        assert!(b.decrypt(&msg, b"wrong-group").is_err());
+        assert_eq!(b.decrypt(&msg, AD).unwrap(), b"bound to group");
+    }
+
+    #[test]
+    fn wrong_ad_on_skipped_message_does_not_consume_banked_key() {
+        let (mut a, mut b, _c) = three_members();
+        let m0 = a.encrypt(b"first", AD);
+        let m1 = a.encrypt(b"second", AD);
+
+        assert_eq!(b.decrypt(&m1, AD).unwrap(), b"second");
+        assert!(b.decrypt(&m0, b"wrong-group").is_err());
+        assert_eq!(b.decrypt(&m0, AD).unwrap(), b"first");
     }
 
     #[test]

@@ -19,6 +19,13 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+/// Bound outbound push attempts so a dead push provider cannot strand one OS
+/// thread per deposit forever. These run off the request path, but still need a
+/// finite lifetime under load.
+const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PUSH_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The server's VAPID identity — a P-256 keypair that authenticates our pushes
 /// to the browser push services. The public key is handed to clients so they can
@@ -166,8 +173,16 @@ pub(crate) fn origin_of(url: &str) -> Option<String> {
 /// A ureq agent that **never follows redirects**, so a push service answering a
 /// wake with a `302` to an internal URL can't slip past the SSRF guard (which
 /// only vetted the original endpoint). Every outbound push goes through this.
-fn push_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().redirects(0).build()
+fn push_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(PUSH_CONNECT_TIMEOUT)
+            .timeout_read(PUSH_IO_TIMEOUT)
+            .timeout_write(PUSH_IO_TIMEOUT)
+            .redirects(0)
+            .build()
+    })
 }
 
 /// Hostnames that always name an internal service and must never be POSTed to,

@@ -205,9 +205,15 @@ impl Ratchet {
         let dh = msg.header.dh.0;
         let n = msg.header.n;
         if let Some(pos) = self.skipped.iter().position(|s| s.dh == dh && s.n == n) {
-            let mut entry = self.skipped.remove(pos);
+            // Fail closed: peek → decrypt → remove-on-success only. Verify the
+            // AEAD against a reference to the banked key *without* removing it
+            // first. A corrupted out-of-order copy (active attacker or queue
+            // corruption of one copy) then leaves the banked key untouched, so
+            // the legitimate copy of the same message can still decrypt. Only on
+            // a successful decrypt do we consume and zeroize the used key.
             let aad = associated_data(ad, &msg.header);
-            let plaintext = aead_decrypt(&entry.mk, &msg.ciphertext, &aad)?;
+            let plaintext = aead_decrypt(&self.skipped[pos].mk, &msg.ciphertext, &aad)?;
+            let mut entry = self.skipped.remove(pos);
             entry.mk.zeroize();
             Ok(Some(plaintext))
         } else {
@@ -517,5 +523,31 @@ mod tests {
         assert!(bob.decrypt(&mut p, &m1, AD).is_err());
         // The next legitimate message must still decrypt.
         assert_eq!(bob.decrypt(&mut p, &m2, AD).unwrap(), b"two");
+    }
+
+    /// A corrupted *out-of-order* copy of a message whose key is banked in
+    /// `skipped` must fail closed WITHOUT consuming the banked key: the
+    /// legitimate copy of that same message must still decrypt afterwards.
+    /// Pre-fix, `try_skipped` removed the banked key before running the AEAD, so
+    /// a corrupt copy burned the key and the real copy could never decrypt.
+    #[test]
+    fn corrupt_skipped_copy_does_not_consume_banked_key() {
+        let mut p = SeededPlatform(0);
+        let (mut alice, mut bob) = established(&mut p);
+        let m0 = alice.encrypt(b"zero", AD);
+        let m1 = alice.encrypt(b"one", AD);
+
+        // Deliver m1 first: bob advances past n=0, banking the skipped key for m0.
+        assert_eq!(bob.decrypt(&mut p, &m1, AD).unwrap(), b"one");
+
+        // (1) A corrupted copy of m0 (active attacker or queue corruption of one
+        // copy) must fail — not panic, not silently succeed.
+        let mut corrupt = m0.clone();
+        corrupt.ciphertext[0] ^= 0xff;
+        assert!(bob.decrypt(&mut p, &corrupt, AD).is_err());
+
+        // (2) The banked key must still be present, so the legitimate copy of m0
+        // decrypts. Pre-fix this failed: the corrupt copy had already consumed it.
+        assert_eq!(bob.decrypt(&mut p, &m0, AD).unwrap(), b"zero");
     }
 }
