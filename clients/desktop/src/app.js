@@ -470,6 +470,23 @@ $("verify-card-btn").addEventListener("click", async () => {
   }
 });
 
+// ---- Push notifications: register a UnifiedPush endpoint ------------------
+
+$("unifiedpush-btn").addEventListener("click", async () => {
+  const endpoint = $("unifiedpush-endpoint").value.trim();
+  $("settings-msg").textContent = "";
+  if (!endpoint) {
+    $("settings-msg").textContent = "Paste a UnifiedPush endpoint URL first.";
+    return;
+  }
+  try {
+    await invoke("register_unified_push", { endpoint });
+    $("settings-msg").textContent = "UnifiedPush endpoint registered.";
+  } catch (e) {
+    $("settings-msg").textContent = String(e);
+  }
+});
+
 // ---- Backup: export / import ---------------------------------------------
 
 $("export-btn").addEventListener("click", async () => {

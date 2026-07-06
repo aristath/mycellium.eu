@@ -32,7 +32,7 @@ use tauri::{Manager, State};
 
 use mycellium_sdk::{
     Account, Contact, Conversation, DeliveryState, EmailVerification, Group, Message,
-    MyceliumClient, SdkError, TrustLevel,
+    MyceliumClient, PushPlatform, SdkError, TrustLevel,
 };
 
 use keyring_store::KeyringSecretStore;
@@ -567,6 +567,20 @@ async fn import_backup(state: State<'_, AppState>, bytes: Vec<u8>) -> Result<(),
     blocking(move || client.import_backup(bytes)).await
 }
 
+// ---- push notifications ---------------------------------------------------
+
+/// Register a **UnifiedPush** endpoint (ntfy / any self-hosted distributor) with
+/// the account's queue, so the queue can wake this device **contentlessly** on
+/// deposit. The `endpoint` is the distributor URL the user obtained from their
+/// UnifiedPush app; the queue only ever POSTs a bodyless wake to it — no sender,
+/// handle, or message content. Getting the endpoint is the user's step; the app
+/// just registers it.
+#[tauri::command]
+async fn register_unified_push(state: State<'_, AppState>, endpoint: String) -> Result<(), String> {
+    let client = state.client()?;
+    blocking(move || client.register_push(PushPlatform::UnifiedPush, endpoint)).await
+}
+
 // ---------------------------------------------------------------------------
 
 fn main() {
@@ -611,6 +625,7 @@ fn main() {
             pair_approve,
             export_backup,
             import_backup,
+            register_unified_push,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Mycellium desktop app");

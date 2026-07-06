@@ -490,8 +490,9 @@ trait Waker {
     fn wake(&self, sub: &Subscription, now: u64) -> Option<push::SendResult>;
 }
 
-/// The live dispatcher: Web Push / UnifiedPush over VAPID (the shipping path),
-/// APNs / FCM over the native transports.
+/// The live dispatcher: Web Push over VAPID and UnifiedPush over a bare
+/// contentless POST (the shipping self-hostable paths), APNs / FCM over the
+/// native transports.
 struct LiveWaker {
     vapid: Arc<push::Vapid>,
     native: Arc<native_push::NativePush>,
@@ -500,9 +501,11 @@ struct LiveWaker {
 impl Waker for LiveWaker {
     fn wake(&self, sub: &Subscription, now: u64) -> Option<push::SendResult> {
         match sub {
-            Subscription::WebPush { endpoint } | Subscription::UnifiedPush { endpoint } => {
-                Some(self.vapid.send(endpoint, now))
-            }
+            // Web Push is VAPID (RFC 8292) — a signed, contentless POST.
+            Subscription::WebPush { endpoint } => Some(self.vapid.send(endpoint, now)),
+            // UnifiedPush needs **no** VAPID: the distributor just accepts a bare
+            // contentless POST to the endpoint. Route it through the plain sender.
+            Subscription::UnifiedPush { endpoint } => Some(push::unifiedpush_send(endpoint, now)),
             Subscription::Apns { .. } | Subscription::Fcm { .. } => self.native.wake(sub, now),
         }
     }
@@ -677,8 +680,9 @@ async fn mailbox_post(
         .deposit(token, &wallet, &slot, body, now)?;
     // Wake the recipient's devices — contentless, and off the lock/thread so a
     // slow push transport never stalls the queue. Each subscription dispatches
-    // to its transport (Web Push / UnifiedPush over VAPID, APNs / FCM over the
-    // native transports, skipped when the operator hasn't configured them).
+    // to its transport (Web Push over VAPID, UnifiedPush over a bare POST, APNs /
+    // FCM over the native transports, skipped when the operator hasn't configured
+    // them).
     let subs = st.queue.lock().unwrap().subscriptions(&wallet);
     if !subs.is_empty() {
         let waker = LiveWaker {
@@ -1400,5 +1404,199 @@ mod tests {
         assert!(q
             .deposit(&token, &bob_hex, ACCOUNT_SLOT, "x".into(), RATE_WINDOW)
             .is_ok());
+    }
+
+    /// End-to-end proof of the UnifiedPush push path (#71): a deposit through the
+    /// **running queue server** fans out a **contentless** wake POST to a mock
+    /// UnifiedPush distributor, and a distributor that reports `410 Gone` has its
+    /// subscription pruned. This exercises the *real* `push::unifiedpush_send` (via
+    /// the deposit handler's fan-out), not a stub — if delivery breaks, the mock
+    /// never sees the POST and the poll below times out, so the test fails
+    /// (non-vacuous: pointing the sub at a dead port yields `Failed`, no request is
+    /// recorded, and this assertion fails).
+    #[test]
+    fn deposit_wakes_unifiedpush_contentless_end_to_end() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        // A one-shot mock UnifiedPush distributor: accept one connection, record
+        // the request's (method, path, body length), reply `status_line`, exit.
+        #[derive(Clone, Debug)]
+        struct Hit {
+            method: String,
+            path: String,
+            body_len: usize,
+        }
+        fn spawn_mock(status_line: &'static str) -> (String, Arc<Mutex<Option<Hit>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/up", listener.local_addr().unwrap());
+            let slot: Arc<Mutex<Option<Hit>>> = Arc::new(Mutex::new(None));
+            let out = slot.clone();
+            std::thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 512];
+                // Read until the header terminator, then the declared body.
+                let head_end = loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(p);
+                            }
+                        }
+                    }
+                };
+                if let Some(p) = head_end {
+                    let head = String::from_utf8_lossy(&buf[..p]).into_owned();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    let body_start = p + 4;
+                    while buf.len() - body_start < content_length {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    *out.lock().unwrap() = Some(Hit {
+                        method,
+                        path,
+                        body_len: buf.len() - body_start,
+                    });
+                }
+                let _ = stream.write_all(status_line.as_bytes());
+                let _ = stream.flush();
+            });
+            (url, slot)
+        }
+
+        // Poll `f` until it yields `Some`, or give up after `within`.
+        fn poll<T>(mut f: impl FnMut() -> Option<T>, within: Duration) -> Option<T> {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(v) = f() {
+                    return Some(v);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // Two mock distributors: one healthy (200 → the contentless wake lands),
+        // one that reports the endpoint gone (410 → the sub must be pruned).
+        let (good_url, good_hit) =
+            spawn_mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (gone_url, _gone_hit) =
+            spawn_mock("HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+        // A shared queue the routes mutate and the test can seed/inspect.
+        let queue = Arc::new(Mutex::new(Queue::new()));
+        let alice = Identity::generate(&mut P(1)).unwrap();
+        let bob = Identity::generate(&mut P(90)).unwrap();
+        let bob_hex = hex33(&bob.wallet_public().0);
+
+        // Log Alice in on the shared queue with the real clock (so the token the
+        // HTTP deposit presents is valid), and seed Bob's UnifiedPush subs
+        // directly: the mock is plain-http, which `/push/subscribe`'s HTTPS check
+        // rightly rejects, so we install the subs behind it to drive the delivery
+        // path itself.
+        let now = now_secs();
+        let atoken = {
+            let mut g = queue.lock().unwrap();
+            let nonce = g.challenge(alice.wallet_public(), now);
+            let sig = alice.sign(&mycellium_core::login::challenge_message(&nonce));
+            let t = g.verify(&alice.wallet_public(), &nonce, &sig, now).unwrap();
+            g.subs.insert(
+                bob_hex.clone(),
+                vec![
+                    Subscription::UnifiedPush {
+                        endpoint: good_url.clone(),
+                    },
+                    Subscription::UnifiedPush {
+                        endpoint: gone_url.clone(),
+                    },
+                ],
+            );
+            t
+        };
+
+        // Bind a free port, then start the real async queue server over the handle.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let serve_addr = addr.clone();
+        let served = queue.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                let _ = serve_with(&serve_addr, served).await;
+            });
+        });
+        assert!(
+            poll(
+                || TcpStream::connect(&addr).ok().map(|_| ()),
+                Duration::from_secs(5)
+            )
+            .is_some(),
+            "queue server never came up"
+        );
+
+        // Deposit through the running server → the handler's fan-out wakes Bob's
+        // subscriptions off-thread.
+        let resp = ureq::post(&format!("http://{addr}/mailbox/{bob_hex}/account"))
+            .set("Authorization", &format!("Bearer {atoken}"))
+            .send_string("sealed-envelope");
+        assert!(resp.is_ok(), "deposit failed: {resp:?}");
+
+        // The healthy distributor received a POST with an EMPTY body (contentless).
+        let hit = poll(|| good_hit.lock().unwrap().clone(), Duration::from_secs(5))
+            .expect("UnifiedPush distributor never received the wake — delivery is broken");
+        assert_eq!(hit.method, "POST", "the wake must be a POST");
+        assert_eq!(hit.path, "/up", "the wake must hit the endpoint path");
+        assert_eq!(
+            hit.body_len, 0,
+            "the UnifiedPush wake MUST be contentless (empty body)"
+        );
+
+        // Bonus: the 410 endpoint is reported Gone, so its sub is pruned e2e, while
+        // the healthy sub survives the prune.
+        let pruned = poll(
+            || {
+                let subs = queue.lock().unwrap().subscriptions(&bob_hex);
+                let gone_present = subs.iter().any(|s| {
+                    matches!(s, Subscription::UnifiedPush { endpoint } if *endpoint == gone_url)
+                });
+                (!gone_present).then_some(subs)
+            },
+            Duration::from_secs(5),
+        )
+        .expect("the 410 UnifiedPush sub was never pruned");
+        assert!(
+            pruned.iter().any(
+                |s| matches!(s, Subscription::UnifiedPush { endpoint } if *endpoint == good_url)
+            ),
+            "the healthy UnifiedPush sub must remain after pruning the gone one"
+        );
     }
 }

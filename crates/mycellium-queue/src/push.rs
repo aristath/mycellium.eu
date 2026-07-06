@@ -100,6 +100,28 @@ impl Vapid {
     }
 }
 
+/// Send a single **contentless** wake to a UnifiedPush endpoint (e.g. ntfy
+/// `?up=1`, or any self-hosted distributor).
+///
+/// Unlike Web Push, UnifiedPush requires **no VAPID**: the push provider simply
+/// accepts a bare POST to the endpoint URL and forwards it to the device's
+/// distributor. So this is a plain contentless POST — the body MUST be empty; no
+/// sender, wallet, handle, or text ever crosses to the distributor, exactly like
+/// the VAPID path in [`Vapid::send`]. A short `TTL` bounds how long the provider
+/// holds the wake if the device is offline. `404`/`410` mean the endpoint is
+/// gone (the distributor was uninstalled or the topic revoked) so the caller
+/// should drop the subscription; any other error is transient (mail stays
+/// queued).
+pub(crate) fn unifiedpush_send(endpoint: &str, _now: u64) -> SendResult {
+    match ureq::post(endpoint).set("TTL", "60").send_bytes(&[])
+    // empty body → wake only, never content
+    {
+        Ok(_) => SendResult::Ok,
+        Err(ureq::Error::Status(404 | 410, _)) => SendResult::Gone,
+        Err(_) => SendResult::Failed,
+    }
+}
+
 /// The outcome of a push send, so callers can prune dead subscriptions.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendResult {
