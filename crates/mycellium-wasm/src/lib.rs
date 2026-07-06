@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 
 /// Maximum attachment size, matching the native engine (attachments ride inline
 /// inside the sealed envelope, so this stays well under the queue's body cap).
@@ -26,7 +26,7 @@ use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::groups::{self, GroupInvitePayload, MailItem, StoredGroup};
-use mycellium_engine::{history, names, wireops};
+use mycellium_engine::{antirollback, history, names, verified, wireops};
 use mycellium_queue_client::{wallet_hex, QueueClient};
 use wasm_bindgen::prelude::*;
 
@@ -47,7 +47,8 @@ pub fn user_id(input: &str) -> String {
 /// key (hex). Proves real key material is produced from browser entropy.
 #[wasm_bindgen]
 pub fn generate_wallet() -> Result<String, JsValue> {
-    let identity = Identity::generate(&mut BrowserPlatform).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+    let identity = Identity::generate(&mut BrowserPlatform)
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
     Ok(hex(&identity.wallet_public().0))
 }
 
@@ -57,9 +58,12 @@ pub fn generate_wallet() -> Result<String, JsValue> {
 /// logic, and crypto — runs in WASM against a real server.
 #[wasm_bindgen]
 pub fn directory_login(base: &str) -> Result<String, JsValue> {
-    let identity = Identity::generate(&mut BrowserPlatform).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+    let identity = Identity::generate(&mut BrowserPlatform)
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
     let client = DirectoryClient::with_transport(base, Box::new(XhrTransport));
-    client.login(&identity).map_err(|e| JsValue::from_str(&e.to_string()))
+    client
+        .login(&identity)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// An in-memory [`Storage`] for the browser. Engine state lives here during a
@@ -122,28 +126,39 @@ fn store_identity(store: &mut MemStore, identity: &Identity) {
 impl Session {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Session {
-        let identity = Identity::generate(&mut BrowserPlatform).expect("browser CSPRNG must be available");
+        let identity =
+            Identity::generate(&mut BrowserPlatform).expect("browser CSPRNG must be available");
         let mut store = MemStore::default();
         store_identity(&mut store, &identity);
-        Session { store, identity, pairing: None }
+        Session {
+            store,
+            identity,
+            pairing: None,
+        }
     }
 
     /// Restore a session — **the same device identity** and all state — from a
     /// snapshot previously produced by [`Session::export`].
     pub fn restore(snapshot: &[u8]) -> Result<Session, JsValue> {
-        let entries: Vec<(Vec<u8>, Vec<u8>)> =
-            mycellium_core::wire::decode(snapshot).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
-        let store = MemStore { map: entries.into_iter().collect() };
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = mycellium_core::wire::decode(snapshot)
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        let store = MemStore {
+            map: entries.into_iter().collect(),
+        };
         let raw = store
             .get(IDENTITY_KEY)
             .ok()
             .flatten()
             .ok_or_else(|| JsValue::from_str("snapshot has no identity"))?;
-        let secret: StoredIdentity =
-            serde_json::from_slice(&raw).map_err(|e| JsValue::from_str(&format!("corrupt identity: {e}")))?;
+        let secret: StoredIdentity = serde_json::from_slice(&raw)
+            .map_err(|e| JsValue::from_str(&format!("corrupt identity: {e}")))?;
         let identity = Identity::from_wallet_secret(secret.wallet_secret, secret.device_seed)
             .map_err(|_| JsValue::from_str("stored identity is invalid"))?;
-        Ok(Session { store, identity, pairing: None })
+        Ok(Session {
+            store,
+            identity,
+            pairing: None,
+        })
     }
 
     /// This session's wallet public key (hex) — a stable id for the device.
@@ -155,15 +170,24 @@ impl Session {
     /// seal messages to it. `handle` is the account name, `queue` its endpoint.
     pub fn record(&mut self, handle: &str, name: &str, queue: &str) -> Result<Vec<u8>, JsValue> {
         let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let record = wireops::build_record(&mut BrowserPlatform, &self.identity, &me, name, queue, "");
+        let record =
+            wireops::build_record(&mut BrowserPlatform, &self.identity, &me, name, queue, "");
         Ok(wire::encode(&record))
     }
 
     /// Seal a text message to `peer_record` (their wire-encoded [`SignedRecord`]),
     /// returning the encrypted envelope (wire-encoded) to hand to the queue.
-    pub fn seal(&mut self, my_handle: &str, my_name: &str, my_queue: &str, peer_record: &[u8], text: &str) -> Result<Vec<u8>, JsValue> {
+    pub fn seal(
+        &mut self,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_record: &[u8],
+        text: &str,
+    ) -> Result<Vec<u8>, JsValue> {
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let record: SignedRecord = wire::decode(peer_record).map_err(|e| JsValue::from_str(&format!("bad peer record: {e:?}")))?;
+        let record: SignedRecord = wire::decode(peer_record)
+            .map_err(|e| JsValue::from_str(&format!("bad peer record: {e:?}")))?;
         let plaintext = wireops::text_message(&mut BrowserPlatform, text).encode();
         let envelope = wireops::seal_to(
             &mut BrowserPlatform,
@@ -181,10 +205,12 @@ impl Session {
     /// Open an encrypted envelope addressed to this session. Returns
     /// `{"from":"…","text":"…"}` JSON.
     pub fn open(&mut self, envelope: &[u8]) -> Result<String, JsValue> {
-        let env: Envelope = wire::decode(envelope).map_err(|e| JsValue::from_str(&format!("bad envelope: {e:?}")))?;
-        let (from, plaintext) =
-            wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let app = AppMessage::decode(&plaintext).map_err(|e| JsValue::from_str(&format!("bad message: {e:?}")))?;
+        let env: Envelope = wire::decode(envelope)
+            .map_err(|e| JsValue::from_str(&format!("bad envelope: {e:?}")))?;
+        let (from, plaintext) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let app = AppMessage::decode(&plaintext)
+            .map_err(|e| JsValue::from_str(&format!("bad message: {e:?}")))?;
         let text = match app.body {
             Body::Text(t) => t,
             other => format!("{other:?}"),
@@ -193,7 +219,13 @@ impl Session {
     }
 
     /// Publish this identity's record to the directory so peers can find us.
-    pub fn register(&mut self, dir_url: &str, queue_url: &str, handle: &str, name: &str) -> Result<(), JsValue> {
+    pub fn register(
+        &mut self,
+        dir_url: &str,
+        queue_url: &str,
+        handle: &str,
+        name: &str,
+    ) -> Result<(), JsValue> {
         // Merge into any existing record so renaming/re-registering never drops
         // a device that a prior link_device added to the account.
         self.publish_merged(dir_url, handle, name, queue_url)?;
@@ -209,30 +241,72 @@ impl Session {
     /// Send a text message to `peer_handle`. Returns the number of recipient
     /// devices delivered to.
     #[allow(clippy::too_many_arguments)]
-    pub fn send(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, text: &str) -> Result<u32, JsValue> {
+    pub fn send(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_handle: &str,
+        text: &str,
+    ) -> Result<u32, JsValue> {
         let app = wireops::text_message(&mut BrowserPlatform, text);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
     /// Reply to message `reply_to` in the conversation with `peer_handle`.
     #[allow(clippy::too_many_arguments)]
-    pub fn reply(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, reply_to: &str, text: &str) -> Result<u32, JsValue> {
-        let body = Body::Reply { to: reply_to.to_string(), text: text.to_string() };
+    pub fn reply(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_handle: &str,
+        reply_to: &str,
+        text: &str,
+    ) -> Result<u32, JsValue> {
+        let body = Body::Reply {
+            to: reply_to.to_string(),
+            text: text.to_string(),
+        };
         let app = wireops::app_message(&mut BrowserPlatform, body);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
     /// React to message `target` with an emoji.
     #[allow(clippy::too_many_arguments)]
-    pub fn react(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, target: &str, emoji: &str) -> Result<u32, JsValue> {
-        let body = Body::Reaction { to: target.to_string(), emoji: emoji.to_string() };
+    pub fn react(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_handle: &str,
+        target: &str,
+        emoji: &str,
+    ) -> Result<u32, JsValue> {
+        let body = Body::Reaction {
+            to: target.to_string(),
+            emoji: emoji.to_string(),
+        };
         let app = wireops::app_message(&mut BrowserPlatform, body);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
     /// Delete message `target` for everyone (a tombstone, applied to history).
-    pub fn delete_message(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, target: &str) -> Result<u32, JsValue> {
-        let body = Body::Delete { to: target.to_string() };
+    pub fn delete_message(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_handle: &str,
+        target: &str,
+    ) -> Result<u32, JsValue> {
+        let body = Body::Delete {
+            to: target.to_string(),
+        };
         let app = wireops::app_message(&mut BrowserPlatform, body);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
@@ -240,19 +314,36 @@ impl Session {
     /// Send a file attachment (`data` is base64). Carried end-to-end like any
     /// other message; the servers never see the bytes in the clear.
     #[allow(clippy::too_many_arguments)]
-    pub fn send_file(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, name: &str, mime: &str, data_b64: &str) -> Result<u32, JsValue> {
-        let data = B64.decode(data_b64).map_err(|e| JsValue::from_str(&format!("bad base64: {e}")))?;
+    pub fn send_file(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_handle: &str,
+        name: &str,
+        mime: &str,
+        data_b64: &str,
+    ) -> Result<u32, JsValue> {
+        let data = B64
+            .decode(data_b64)
+            .map_err(|e| JsValue::from_str(&format!("bad base64: {e}")))?;
         if data.len() > MAX_ATTACHMENT {
             return Err(JsValue::from_str("attachment too large (max 256 KiB)"));
         }
-        let body = Body::File { mime: mime.to_string(), name: name.to_string(), data };
+        let body = Body::File {
+            mime: mime.to_string(),
+            name: name.to_string(),
+            data,
+        };
         let app = wireops::app_message(&mut BrowserPlatform, body);
         self.deliver_app(dir_url, my_handle, my_name, my_queue, peer_handle, app)
     }
 
     /// A scannable QR (SVG string) encoding `text` — e.g. a pairing offer.
     pub fn qr_svg(&self, text: &str) -> Result<String, JsValue> {
-        let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| JsValue::from_str(&format!("qr: {e}")))?;
+        let code = qrcode::QrCode::new(text.as_bytes())
+            .map_err(|e| JsValue::from_str(&format!("qr: {e}")))?;
         Ok(code
             .render::<qrcode::render::svg::Color>()
             .min_dimensions(240, 240)
@@ -287,10 +378,14 @@ impl Session {
             None => return Err(JsValue::from_str("call pair_offer first")),
         };
         let qclient = QueueClient::with_transport(queue, Box::new(XhrTransport));
-        let msgs = qclient.pair_fetch(&rid).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let msgs = qclient
+            .pair_fetch(&rid)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         for m in msgs {
             let Ok(raw) = from_hex(&m) else { continue };
-            let Ok(pm) = wire::decode::<PairingMessage>(&raw) else { continue };
+            let Ok(pm) = wire::decode::<PairingMessage>(&raw) else {
+                continue;
+            };
             let opened = self.pairing.as_ref().and_then(|(r, _)| r.open(&pm).ok());
             if let Some(payload) = opened {
                 return self.adopt_from_payload(&payload).map(Some);
@@ -304,15 +399,23 @@ impl Session {
     /// user really means to add a device before calling this.
     pub fn pair_approve(&mut self, offer: &str, handle: &str, dir: &str) -> Result<(), JsValue> {
         let bytes = from_hex(offer.trim())?;
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| JsValue::from_str("invalid pairing offer"))?;
-        let rid = v["r"].as_str().ok_or_else(|| JsValue::from_str("bad offer"))?;
-        let k = from_hex(v["k"].as_str().ok_or_else(|| JsValue::from_str("bad offer"))?)?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| JsValue::from_str("invalid pairing offer"))?;
+        let rid = v["r"]
+            .as_str()
+            .ok_or_else(|| JsValue::from_str("bad offer"))?;
+        let k = from_hex(
+            v["k"]
+                .as_str()
+                .ok_or_else(|| JsValue::from_str("bad offer"))?,
+        )?;
         let k: [u8; 32] = k
             .as_slice()
             .try_into()
             .map_err(|_| JsValue::from_str("bad ephemeral key"))?;
-        let queue = v["q"].as_str().ok_or_else(|| JsValue::from_str("bad offer"))?;
+        let queue = v["q"]
+            .as_str()
+            .ok_or_else(|| JsValue::from_str("bad offer"))?;
         let payload = serde_json::json!({
             "ws": hex(&self.identity.wallet_secret()),
             "h": handle,
@@ -350,14 +453,20 @@ impl Session {
     /// The queue's VAPID public key, for the browser's `applicationServerKey`.
     pub fn push_key(&self, queue_url: &str) -> Result<String, JsValue> {
         let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
-        queue.push_key().map_err(|e| JsValue::from_str(&e.to_string()))
+        queue
+            .push_key()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Register a browser push `endpoint` so the queue can wake us when closed.
     pub fn push_subscribe(&self, queue_url: &str, endpoint: &str) -> Result<(), JsValue> {
         let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
-        let token = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        queue.push_subscribe(&token, endpoint).map_err(|e| JsValue::from_str(&e.to_string()))
+        let token = queue
+            .login(&self.identity)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        queue
+            .push_subscribe(&token, endpoint)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Drain our queue, decrypt direct messages, and store them. Returns the
@@ -378,17 +487,29 @@ impl Session {
     /// how many blobs were collected.
     pub fn sync_collect(&mut self, queue_url: &str) -> Result<u32, JsValue> {
         let queue = QueueClient::with_transport(queue_url, Box::new(XhrTransport));
-        let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let qtoken = queue
+            .login(&self.identity)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let my_hex = wallet_hex(&self.identity.wallet_public());
         let my_slot = wireops::device_slot(&self.identity.device_public());
-        let mut blobs = queue.collect(&qtoken, &my_hex, &my_slot).unwrap_or_default();
-        blobs.extend(queue.collect(&qtoken, &my_hex, "account").unwrap_or_default());
+        let mut blobs = queue
+            .collect(&qtoken, &my_hex, &my_slot)
+            .unwrap_or_default();
+        blobs.extend(
+            queue
+                .collect(&qtoken, &my_hex, "account")
+                .unwrap_or_default(),
+        );
 
         let now = BrowserPlatform.now_unix_secs();
         let mut pending = mycellium_engine::inbound::load(&self.store).unwrap_or_default();
         let collected = blobs.len() as u32;
         for blob in blobs {
-            pending.push(mycellium_engine::inbound::PendingItem { blob, created_at: now, attempts: 0 });
+            pending.push(mycellium_engine::inbound::PendingItem {
+                blob,
+                created_at: now,
+                attempts: 0,
+            });
         }
         let _ = mycellium_engine::inbound::save(&mut self.store, &pending);
         Ok(collected)
@@ -421,18 +542,32 @@ impl Session {
     /// Process one collected blob; returns whether it was handled (false ⇒ keep
     /// it in the retry store for a later sync — e.g. its group key hasn't arrived).
     fn process_blob(&mut self, blob: &str) -> bool {
-        let Ok(item) = serde_json::from_str::<MailItem>(blob) else { return false };
+        let Ok(item) = serde_json::from_str::<MailItem>(blob) else {
+            return false;
+        };
         match item {
             MailItem::Direct(env) => {
-                let Ok((from, plaintext)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env) else { return false };
-                let Ok(app) = AppMessage::decode(&plaintext) else { return false };
+                let Ok((from, plaintext)) =
+                    wireops::open_envelope(&mut BrowserPlatform, &self.identity, &env)
+                else {
+                    return false;
+                };
+                let Ok(app) = AppMessage::decode(&plaintext) else {
+                    return false;
+                };
                 // Learn the sender's self-set display name (carried in their record).
-                let _ = names::note(&mut self.store, from.as_str(), &env.sender_record.record.name);
+                let _ = names::note(
+                    &mut self.store,
+                    from.as_str(),
+                    &env.sender_record.record.name,
+                );
                 apply_to_history(&mut self.store, from.as_str(), &app, false);
                 true
             }
             MailItem::GroupInvite(env) => self.handle_group_invite(&env),
-            MailItem::GroupText { group_id, message } => self.handle_group_text(&group_id, &message),
+            MailItem::GroupText { group_id, message } => {
+                self.handle_group_text(&group_id, &message)
+            }
             // GroupSync / GroupLeave / SelfSync aren't handled in the browser yet
             // (a leave still safely no-ops here rather than applying a removal);
             // treat as processed so they don't retry forever.
@@ -443,9 +578,18 @@ impl Session {
     /// Create a group with `members` (a JSON array of handles) and distribute our
     /// sender key to them. Returns the new group id.
     #[allow(clippy::too_many_arguments)]
-    pub fn group_create(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, name: &str, members_json: &str) -> Result<String, JsValue> {
+    pub fn group_create(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        name: &str,
+        members_json: &str,
+    ) -> Result<String, JsValue> {
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let members: Vec<String> = serde_json::from_str(members_json).map_err(|e| JsValue::from_str(&format!("bad members: {e}")))?;
+        let members: Vec<String> = serde_json::from_str(members_json)
+            .map_err(|e| JsValue::from_str(&format!("bad members: {e}")))?;
         let mut id_bytes = [0u8; 8];
         getrandom::getrandom(&mut id_bytes).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let group_id = wireops::hex(&id_bytes);
@@ -473,16 +617,26 @@ impl Session {
     /// Add `new_member` to a group and re-distribute keys with the updated
     /// roster (the newcomer joins; existing members learn them and reciprocate).
     #[allow(clippy::too_many_arguments)]
-    pub fn group_add(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, group_id: &str, new_member: &str) -> Result<(), JsValue> {
+    pub fn group_add(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        group_id: &str,
+        new_member: &str,
+    ) -> Result<(), JsValue> {
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let mut stored =
-            groups::load(&self.store, group_id).map_err(|_| JsValue::from_str("store error"))?.ok_or_else(|| JsValue::from_str("no such group"))?;
+        let mut stored = groups::load(&self.store, group_id)
+            .map_err(|_| JsValue::from_str("store error"))?
+            .ok_or_else(|| JsValue::from_str("no such group"))?;
         if stored.members.iter().any(|m| m == new_member) {
             return Err(JsValue::from_str("already a member"));
         }
         stored.members.push(new_member.to_string());
         groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
-        let group = Group::import(stored.state.clone()).map_err(|_| JsValue::from_str("bad group state"))?;
+        let group = Group::import(stored.state.clone())
+            .map_err(|_| JsValue::from_str("bad group state"))?;
         let targets = stored.members.clone();
         self.distribute_key(dir_url, my_name, my_queue, &me, &stored, &group, &targets)?;
         Ok(())
@@ -490,18 +644,31 @@ impl Session {
 
     /// Send a text message to a group. Returns devices delivered to.
     #[allow(clippy::too_many_arguments)]
-    pub fn group_send(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, group_id: &str, text: &str) -> Result<u32, JsValue> {
+    pub fn group_send(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        group_id: &str,
+        text: &str,
+    ) -> Result<u32, JsValue> {
         let _ = (my_name, my_queue); // group messages use the group key, not a per-peer seal
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let mut stored =
-            groups::load(&self.store, group_id).map_err(|_| JsValue::from_str("store error"))?.ok_or_else(|| JsValue::from_str("no such group"))?;
-        let mut group = Group::import(stored.state.clone()).map_err(|_| JsValue::from_str("bad group state"))?;
+        let mut stored = groups::load(&self.store, group_id)
+            .map_err(|_| JsValue::from_str("store error"))?
+            .ok_or_else(|| JsValue::from_str("no such group"))?;
+        let mut group = Group::import(stored.state.clone())
+            .map_err(|_| JsValue::from_str("bad group state"))?;
         let app = wireops::text_message(&mut BrowserPlatform, text);
         let gm = group.encrypt(&app.encode(), &wireops::group_ad(&stored.id));
         stored.state = group.export();
         groups::save(&mut self.store, &stored).map_err(|_| JsValue::from_str("store error"))?;
 
-        let item = MailItem::GroupText { group_id: stored.id.clone(), message: gm };
+        let item = MailItem::GroupText {
+            group_id: stored.id.clone(),
+            message: gm,
+        };
         let blob = serde_json::to_string(&item).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
         let mut delivered = 0u32;
@@ -509,13 +676,27 @@ impl Session {
             if member == me.as_str() {
                 continue;
             }
-            let Ok(handle) = Handle::new(member.clone()) else { continue };
-            let Ok(record) = dir.lookup(&handle) else { continue };
+            let Ok(handle) = Handle::new(member.clone()) else {
+                continue;
+            };
+            let Ok(record) = dir.lookup(&handle) else {
+                continue;
+            };
             let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
-            let Ok(qtoken) = queue.login(&self.identity) else { continue };
+            let Ok(qtoken) = queue.login(&self.identity) else {
+                continue;
+            };
             let peer_hex = wallet_hex(&record.record.wallet);
             for device in &record.record.devices {
-                if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
+                if queue
+                    .deposit(
+                        &qtoken,
+                        &peer_hex,
+                        &wireops::device_slot(&device.device_key),
+                        &blob,
+                    )
+                    .is_ok()
+                {
                     delivered += 1;
                 }
             }
@@ -552,7 +733,8 @@ impl Session {
     /// A group's messages as JSON: `[{id, sender, text, timestamp}]`.
     pub fn group_thread(&mut self, group_id: &str) -> Result<String, JsValue> {
         let now = BrowserPlatform.now_unix_secs();
-        let msgs = history::group_load_active(&mut self.store, group_id, now).map_err(|_| JsValue::from_str("store error"))?;
+        let msgs = history::group_load_active(&mut self.store, group_id, now)
+            .map_err(|_| JsValue::from_str("store error"))?;
         serde_json::to_string(&msgs).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -563,7 +745,11 @@ impl Session {
 
     /// Read a value, or `undefined` if absent.
     pub fn get(&self, key: &str) -> Option<String> {
-        self.store.get(key.as_bytes()).ok().flatten().map(|v| String::from_utf8_lossy(&v).into_owned())
+        self.store
+            .get(key.as_bytes())
+            .ok()
+            .flatten()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
     }
 
     /// Remove a key.
@@ -573,7 +759,13 @@ impl Session {
 
     /// Append a message to a peer's conversation, using the **engine's own**
     /// generic history module against the browser store. Returns the message id.
-    pub fn add_message(&mut self, peer: &str, text: &str, from_me: bool, expires_at: Option<u64>) -> Result<String, JsValue> {
+    pub fn add_message(
+        &mut self,
+        peer: &str,
+        text: &str,
+        from_me: bool,
+        expires_at: Option<u64>,
+    ) -> Result<String, JsValue> {
         let mut id_bytes = [0u8; 8];
         getrandom::getrandom(&mut id_bytes).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let id = hex(&id_bytes);
@@ -594,8 +786,8 @@ impl Session {
         // load_active prunes disappearing messages that have expired, so they
         // drop out of the view (and, on the next write, the snapshot).
         let now = BrowserPlatform.now_unix_secs();
-        let messages =
-            mycellium_engine::history::load_active(&mut self.store, peer, now).map_err(|_| JsValue::from_str("store error"))?;
+        let messages = mycellium_engine::history::load_active(&mut self.store, peer, now)
+            .map_err(|_| JsValue::from_str("store error"))?;
         serde_json::to_string(&messages).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -603,13 +795,17 @@ impl Session {
     /// first — for rendering the threads screen.
     pub fn peers(&mut self) -> Result<String, JsValue> {
         let now = BrowserPlatform.now_unix_secs();
-        let peers = mycellium_engine::history::peers(&self.store).map_err(|_| JsValue::from_str("store error"))?;
+        let peers = mycellium_engine::history::peers(&self.store)
+            .map_err(|_| JsValue::from_str("store error"))?;
         let mut out = Vec::new();
         for peer in peers {
-            let msgs =
-                mycellium_engine::history::load_active(&mut self.store, &peer, now).map_err(|_| JsValue::from_str("store error"))?;
+            let msgs = mycellium_engine::history::load_active(&mut self.store, &peer, now)
+                .map_err(|_| JsValue::from_str("store error"))?;
             let last = msgs.last();
-            let name = names::get(&self.store, &peer).ok().flatten().unwrap_or_default();
+            let name = names::get(&self.store, &peer)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             out.push(serde_json::json!({
                 "peer": peer,
                 "name": name,
@@ -624,14 +820,19 @@ impl Session {
 
     /// Serialize the whole store for the host to persist (→ IndexedDB).
     pub fn export(&self) -> Vec<u8> {
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = self.store.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .store
+            .map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         mycellium_core::wire::encode(&entries)
     }
 
     /// Restore a previously exported snapshot (from IndexedDB).
     pub fn import(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
-        let entries: Vec<(Vec<u8>, Vec<u8>)> =
-            mycellium_core::wire::decode(bytes).map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = mycellium_core::wire::decode(bytes)
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
         self.store.map = entries.into_iter().collect();
         Ok(())
     }
@@ -644,18 +845,24 @@ impl Session {
     fn adopt_from_payload(&mut self, payload: &[u8]) -> Result<String, JsValue> {
         let v: serde_json::Value =
             serde_json::from_slice(payload).map_err(|_| JsValue::from_str("bad provisioning"))?;
-        let ws = from_hex(v["ws"].as_str().ok_or_else(|| JsValue::from_str("bad provisioning"))?)?;
+        let ws = from_hex(
+            v["ws"]
+                .as_str()
+                .ok_or_else(|| JsValue::from_str("bad provisioning"))?,
+        )?;
         let ws: [u8; 32] = ws
             .as_slice()
             .try_into()
             .map_err(|_| JsValue::from_str("bad account key"))?;
-        let handle = v["h"].as_str().ok_or_else(|| JsValue::from_str("bad provisioning"))?;
+        let handle = v["h"]
+            .as_str()
+            .ok_or_else(|| JsValue::from_str("bad provisioning"))?;
         let name = v["n"].as_str().filter(|s| !s.is_empty()).unwrap_or(handle);
         let dir = v["d"].as_str().unwrap_or("");
         let queue = v["q"].as_str().unwrap_or("");
 
-        self.identity =
-            Identity::adopt(&mut BrowserPlatform, ws).map_err(|_| JsValue::from_str("invalid account key"))?;
+        self.identity = Identity::adopt(&mut BrowserPlatform, ws)
+            .map_err(|_| JsValue::from_str("invalid account key"))?;
         store_identity(&mut self.store, &self.identity);
         self.publish_merged(dir, handle, name, queue)?;
         let _ = self.store.put(b"myc:handle", handle.as_bytes());
@@ -664,26 +871,44 @@ impl Session {
         let _ = self.store.put(b"myc:queue", queue.as_bytes());
         let _ = self.store.put(
             b"myc:me",
-            serde_json::json!({ "handle": handle, "name": name }).to_string().as_bytes(),
+            serde_json::json!({ "handle": handle, "name": name })
+                .to_string()
+                .as_bytes(),
         );
         self.pairing = None;
-        Ok(serde_json::json!({ "dir": dir, "queue": queue, "handle": handle, "name": name }).to_string())
+        Ok(
+            serde_json::json!({ "dir": dir, "queue": queue, "handle": handle, "name": name })
+                .to_string(),
+        )
     }
 
     /// Publish our record, **merging** this device into any record that already
     /// exists for the handle, so re-registering or linking never drops sibling
     /// devices. Bumps `seq` past the existing one.
-    fn publish_merged(&self, dir_url: &str, handle: &str, name: &str, queue_url: &str) -> Result<(), JsValue> {
+    fn publish_merged(
+        &self,
+        dir_url: &str,
+        handle: &str,
+        name: &str,
+        queue_url: &str,
+    ) -> Result<(), JsValue> {
         let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
         let existing = dir.lookup(&me).ok();
-        let mut devices = existing.as_ref().map(|r| r.record.devices.clone()).unwrap_or_default();
+        let mut devices = existing
+            .as_ref()
+            .map(|r| r.record.devices.clone())
+            .unwrap_or_default();
         let mine = wireops::this_device(&self.identity, "");
         if !devices.iter().any(|d| d.device_key == mine.device_key) {
             devices.push(mine);
         }
         let now = BrowserPlatform.now_unix_secs();
-        let seq = existing.as_ref().map(|r| r.record.seq + 1).unwrap_or(now).max(now);
+        let seq = existing
+            .as_ref()
+            .map(|r| r.record.seq + 1)
+            .unwrap_or(now)
+            .max(now);
         let record = Record {
             handle: core_user_id(handle),
             name: name.to_string(),
@@ -694,30 +919,84 @@ impl Session {
             seq,
         };
         let signed = SignedRecord::sign(record, &self.identity);
-        let token = dir.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        dir.publish(&token, &me, &signed).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let token = dir
+            .login(&self.identity)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        dir.publish(&token, &me, &signed)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(())
     }
 
     /// Shared delivery path: look up the peer, X3DH-seal `app` to each of their
     /// devices, deposit to their queue, and record our own copy.
     #[allow(clippy::too_many_arguments)]
-    fn deliver_app(&mut self, dir_url: &str, my_handle: &str, my_name: &str, my_queue: &str, peer_handle: &str, app: AppMessage) -> Result<u32, JsValue> {
+    fn deliver_app(
+        &mut self,
+        dir_url: &str,
+        my_handle: &str,
+        my_name: &str,
+        my_queue: &str,
+        peer_handle: &str,
+        app: AppMessage,
+    ) -> Result<u32, JsValue> {
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let peer = Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
+        let peer =
+            Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        let precord = dir.lookup(&peer).map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
+        let precord = dir
+            .lookup(&peer)
+            .map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
+        // Fail closed if the peer's wallet no longer matches the pinned/verified one
+        // (impersonation) or the directory served an older record than we've seen
+        // (rollback) — the browser send path must not silently trust a swapped or
+        // stale record (core review, HIGH).
+        if matches!(
+            verified::level(&self.store, peer.as_str(), &precord.record.wallet),
+            verified::TrustLevel::Changed
+        ) {
+            return Err(JsValue::from_str(
+                "identity changed for this peer — refusing to send",
+            ));
+        }
+        if let Ok(false) =
+            antirollback::check_and_pin(&mut self.store, peer.as_str(), precord.record.seq)
+        {
+            return Err(JsValue::from_str(
+                "stale record for this peer — refusing to send",
+            ));
+        }
         // Learn the peer's chosen display name from their record.
         let _ = names::note(&mut self.store, peer_handle, &precord.record.name);
         let plaintext = app.encode();
         let queue = QueueClient::with_transport(&precord.record.queue, Box::new(XhrTransport));
-        let qtoken = queue.login(&self.identity).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let qtoken = queue
+            .login(&self.identity)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let peer_hex = wallet_hex(&precord.record.wallet);
         let mut delivered = 0u32;
         for device in &precord.record.devices {
-            let Ok(env) = wireops::seal_to(&mut BrowserPlatform, &self.identity, &me, my_name, my_queue, device, &plaintext) else { continue };
-            let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            if queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob).is_ok() {
+            let Ok(env) = wireops::seal_to(
+                &mut BrowserPlatform,
+                &self.identity,
+                &me,
+                my_name,
+                my_queue,
+                device,
+                &plaintext,
+            ) else {
+                continue;
+            };
+            let blob = serde_json::to_string(&MailItem::Direct(env))
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            if queue
+                .deposit(
+                    &qtoken,
+                    &peer_hex,
+                    &wireops::device_slot(&device.device_key),
+                    &blob,
+                )
+                .is_ok()
+            {
                 delivered += 1;
             }
         }
@@ -727,12 +1006,26 @@ impl Session {
 
     /// Read a stored config value (empty if unset).
     fn cfg(&self, key: &[u8]) -> String {
-        self.store.get(key).ok().flatten().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
+        self.store
+            .get(key)
+            .ok()
+            .flatten()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default()
     }
 
     /// Seal our group sender-key (a `GroupInvitePayload`) to `targets`' devices.
     #[allow(clippy::too_many_arguments)]
-    fn distribute_key(&self, dir_url: &str, my_name: &str, my_queue: &str, me: &Handle, stored: &StoredGroup, group: &Group, targets: &[String]) -> Result<(), JsValue> {
+    fn distribute_key(
+        &self,
+        dir_url: &str,
+        my_name: &str,
+        my_queue: &str,
+        me: &Handle,
+        stored: &StoredGroup,
+        group: &Group,
+        targets: &[String],
+    ) -> Result<(), JsValue> {
         let payload = GroupInvitePayload {
             group_id: stored.id.clone(),
             name: stored.name.clone(),
@@ -740,21 +1033,45 @@ impl Session {
             sender_id: wireops::my_group_id(&self.identity),
             distribution: group.distribution(),
         };
-        let plaintext = serde_json::to_vec(&payload).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let plaintext =
+            serde_json::to_vec(&payload).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
         for member in targets {
-            let Ok(handle) = Handle::new(member.clone()) else { continue };
-            let Ok(record) = dir.lookup(&handle) else { continue };
+            let Ok(handle) = Handle::new(member.clone()) else {
+                continue;
+            };
+            let Ok(record) = dir.lookup(&handle) else {
+                continue;
+            };
             let queue = QueueClient::with_transport(&record.record.queue, Box::new(XhrTransport));
-            let Ok(qtoken) = queue.login(&self.identity) else { continue };
+            let Ok(qtoken) = queue.login(&self.identity) else {
+                continue;
+            };
             let peer_hex = wallet_hex(&record.record.wallet);
             for device in &record.record.devices {
                 if device.device_key == self.identity.device_public() {
                     continue; // never this exact device
                 }
-                let Ok(env) = wireops::seal_to(&mut BrowserPlatform, &self.identity, me, my_name, my_queue, device, &plaintext) else { continue };
-                let Ok(blob) = serde_json::to_string(&MailItem::GroupInvite(env)) else { continue };
-                let _ = queue.deposit(&qtoken, &peer_hex, &wireops::device_slot(&device.device_key), &blob);
+                let Ok(env) = wireops::seal_to(
+                    &mut BrowserPlatform,
+                    &self.identity,
+                    me,
+                    my_name,
+                    my_queue,
+                    device,
+                    &plaintext,
+                ) else {
+                    continue;
+                };
+                let Ok(blob) = serde_json::to_string(&MailItem::GroupInvite(env)) else {
+                    continue;
+                };
+                let _ = queue.deposit(
+                    &qtoken,
+                    &peer_hex,
+                    &wireops::device_slot(&device.device_key),
+                    &blob,
+                );
             }
         }
         Ok(())
@@ -764,28 +1081,54 @@ impl Session {
     /// and record the sender key so we can decrypt their messages.
     /// Returns whether the invite was processed (false ⇒ keep it for retry).
     fn handle_group_invite(&mut self, env: &Envelope) -> bool {
-        let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env) else { return false };
-        let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else { return false };
+        let Ok((from, bytes)) = wireops::open_envelope(&mut BrowserPlatform, &self.identity, env)
+        else {
+            return false;
+        };
+        let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else {
+            return false;
+        };
         let sender_id = payload.sender_id.clone();
-        let (dir, name, queue, mine) = (self.cfg(b"myc:dir"), self.cfg(b"myc:name"), self.cfg(b"myc:queue"), self.cfg(b"myc:handle"));
-        let Ok(me) = Handle::new(mine.clone()) else { return false };
+        let (dir, name, queue, mine) = (
+            self.cfg(b"myc:dir"),
+            self.cfg(b"myc:name"),
+            self.cfg(b"myc:queue"),
+            self.cfg(b"myc:handle"),
+        );
+        let Ok(me) = Handle::new(mine.clone()) else {
+            return false;
+        };
         match groups::load(&self.store, &payload.group_id).ok().flatten() {
             Some(mut stored) => {
-                let Ok(mut group) = Group::import(stored.state.clone()) else { return false };
+                // An invite for a group we're already in is only trustworthy from
+                // an existing member (the group id is cleartext in every group
+                // MailItem) — ignore non-members (core review, MEDIUM).
+                if !stored.members.iter().any(|m| m == from.as_str()) {
+                    return true;
+                }
+                let Ok(mut group) = Group::import(stored.state.clone()) else {
+                    return false;
+                };
                 let _ = group.add_member(sender_id.clone(), &payload.distribution);
                 stored.note_sender(sender_id, from.as_str());
                 // Learn any members we didn't know about, and send them our key.
-                let newcomers: Vec<String> =
-                    payload.members.iter().filter(|m| !stored.members.iter().any(|x| x == *m)).cloned().collect();
+                let newcomers: Vec<String> = payload
+                    .members
+                    .iter()
+                    .filter(|m| !stored.members.iter().any(|x| x == *m))
+                    .cloned()
+                    .collect();
                 stored.members.extend(newcomers.iter().cloned());
                 stored.state = group.export();
                 let _ = groups::save(&mut self.store, &stored);
                 if !newcomers.is_empty() {
-                    let _ = self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &newcomers);
+                    let _ =
+                        self.distribute_key(&dir, &name, &queue, &me, &stored, &group, &newcomers);
                 }
             }
             None => {
-                let mut group = Group::new(&mut BrowserPlatform, wireops::my_group_id(&self.identity));
+                let mut group =
+                    Group::new(&mut BrowserPlatform, wireops::my_group_id(&self.identity));
                 let _ = group.add_member(sender_id.clone(), &payload.distribution);
                 let mut stored = StoredGroup {
                     id: payload.group_id.clone(),
@@ -809,13 +1152,19 @@ impl Session {
     /// Decrypt a received group message and store it. Returns whether it was
     /// processed (false ⇒ we don't have the group/sender key yet — keep for retry).
     fn handle_group_text(&mut self, group_id: &str, message: &GroupMessage) -> bool {
-        let Some(mut stored) = groups::load(&self.store, group_id).ok().flatten() else { return false };
+        let Some(mut stored) = groups::load(&self.store, group_id).ok().flatten() else {
+            return false;
+        };
         let sender = stored
             .handle_of(&message.sender)
             .map(str::to_string)
             .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
-        let Ok(mut group) = Group::import(stored.state.clone()) else { return false };
-        let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) else { return false };
+        let Ok(mut group) = Group::import(stored.state.clone()) else {
+            return false;
+        };
+        let Ok(plaintext) = group.decrypt(message, &wireops::group_ad(group_id)) else {
+            return false;
+        };
         {
             stored.state = group.export();
             let _ = groups::save(&mut self.store, &stored);
@@ -899,7 +1248,8 @@ impl HttpTransport for XhrTransport {
         body: Option<&[u8]>,
     ) -> Result<HttpResponse, String> {
         let xhr = web_sys::XmlHttpRequest::new().map_err(|_| "XHR unavailable".to_string())?;
-        xhr.open_with_async(method, url, false).map_err(|e| format!("open: {e:?}"))?;
+        xhr.open_with_async(method, url, false)
+            .map_err(|e| format!("open: {e:?}"))?;
         for (k, v) in headers {
             let _ = xhr.set_request_header(k, v);
         }
@@ -910,7 +1260,10 @@ impl HttpTransport for XhrTransport {
         sent.map_err(|e| format!("send: {e:?}"))?;
         let status = xhr.status().map_err(|e| format!("status: {e:?}"))?;
         let text = xhr.response_text().ok().flatten().unwrap_or_default();
-        Ok(HttpResponse { status, body: text.into_bytes() })
+        Ok(HttpResponse {
+            status,
+            body: text.into_bytes(),
+        })
     }
 }
 
@@ -940,6 +1293,8 @@ fn from_hex(s: &str) -> Result<Vec<u8>, JsValue> {
         return Err(JsValue::from_str("odd-length hex"));
     }
     (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| JsValue::from_str("bad hex")))
+        .map(|i| {
+            u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| JsValue::from_str("bad hex"))
+        })
         .collect()
 }

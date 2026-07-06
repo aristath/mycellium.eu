@@ -24,7 +24,7 @@ use mycellium_engine::groups::{
     self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
 };
 use mycellium_engine::platform::OsPlatform;
-use mycellium_engine::{contacts, history, inbound, names, verified, wireops};
+use mycellium_engine::{antirollback, contacts, history, inbound, names, verified, wireops};
 use mycellium_http::UreqTransport;
 use mycellium_queue_client::{wallet_hex, PushSub, QueueClient};
 
@@ -1063,6 +1063,20 @@ impl MyceliumClient {
             });
         }
 
+        // Anti-rollback: refuse a record older than one we've pinned for this peer
+        // — a compelled directory could otherwise serve a stale (still validly
+        // signed, same-wallet) record to re-introduce a device we removed (HIGH).
+        if let Ok(false) =
+            antirollback::check_and_pin(&mut inner.store, peer.as_str(), precord.record.seq)
+        {
+            if let Some(l) = inner.listener.clone() {
+                l.on_key_change(peer_handle.clone());
+            }
+            return Err(SdkError::IdentityChanged {
+                handle: peer_handle,
+            });
+        }
+
         // Learn the peer's chosen display name from their record.
         let _ = names::note(&mut inner.store, peer.as_str(), &precord.record.name);
 
@@ -1425,6 +1439,12 @@ fn process_self_sync(
     let Ok((_from, bytes)) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env) else {
         return Processed::Retry;
     };
+    // A self-sync mirror must be sealed by our OWN wallet; otherwise any peer who
+    // can seal an envelope to us could forge one and inject or edit/delete our
+    // transcript (core review, HIGH).
+    if env.sender_record.record.wallet != inner.identity.wallet_public() {
+        return Processed::Done(None);
+    }
     let Ok(app) = AppMessage::decode(&bytes) else {
         return Processed::Done(None); // unusable mirror — nothing to keep
     };
@@ -1468,6 +1488,12 @@ fn process_group_invite(inner: &mut Inner, env: &mycellium_core::offline::Envelo
 
     match groups::load(&inner.store, &payload.group_id).ok().flatten() {
         Some(mut stored) => {
+            // An invite for a group we're already in is only trustworthy from an
+            // existing member — the group id is cleartext in every group MailItem,
+            // so anyone who learns it could otherwise inject a key (MEDIUM).
+            if !stored.members.iter().any(|m| m == from.as_str()) {
+                return Processed::Done(None);
+            }
             let Ok(mut group) = CoreGroup::import(stored.state.clone()) else {
                 return Processed::Retry;
             };
@@ -1588,6 +1614,11 @@ fn process_group_sync(inner: &mut Inner, env: &mycellium_core::offline::Envelope
     let Ok((_from, bytes)) = wireops::open_envelope(&mut OsPlatform, &inner.identity, env) else {
         return Processed::Retry;
     };
+    // A group-sync bootstrap must come from our OWN cluster, else a peer could
+    // hand us an attacker-chosen group and make us leak our sender key (MEDIUM).
+    if env.sender_record.record.wallet != inner.identity.wallet_public() {
+        return Processed::Done(None);
+    }
     let Ok(payload) = serde_json::from_slice::<GroupSyncPayload>(&bytes) else {
         return Processed::Retry;
     };
