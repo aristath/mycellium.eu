@@ -1,6 +1,7 @@
 package eu.mycellium.android
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -16,12 +17,17 @@ import uniffi.mycellium_sdk.Contact
 import uniffi.mycellium_sdk.Conversation
 import uniffi.mycellium_sdk.DeliveryState
 import uniffi.mycellium_sdk.EventListener
+import uniffi.mycellium_sdk.Group
 import uniffi.mycellium_sdk.Message
 import uniffi.mycellium_sdk.MyceliumClient
+import uniffi.mycellium_sdk.PushPlatform
 import uniffi.mycellium_sdk.SdkException
 
 /** Which screen is currently shown (simple state-driven router — no nav lib). */
-enum class Screen { LOADING, SETUP, ONBOARDING, CONVERSATIONS, THREAD, CONTACTS }
+enum class Screen {
+    LOADING, SETUP, ONBOARDING, CONVERSATIONS, THREAD, CONTACTS,
+    GROUPS, GROUP_THREAD, PAIRING, SETTINGS,
+}
 
 /** Two-step onboarding: collect handle+email, then enter the emailed code. */
 enum class OnboardingStage { DETAILS, CODE }
@@ -47,9 +53,22 @@ data class UiState(
     val conversations: List<Conversation> = emptyList(),
     val openPeer: String? = null,
     val thread: List<Message> = emptyList(),
+    // The message currently being replied to in the open 1:1 thread, or null.
+    val replyTo: Message? = null,
     val contacts: List<Contact> = emptyList(),
     // A safety number to compare out of band, plus the peer it belongs to.
     val safetyNumber: Pair<String, String>? = null,
+    // Groups the account belongs to, and the currently open group thread.
+    val groups: List<Group> = emptyList(),
+    val openGroupId: String? = null,
+    val openGroupName: String = "",
+    val groupThread: List<Message> = emptyList(),
+    // Verification: this account's contact card (hex), shown out of band.
+    val myCard: String? = null,
+    // Pairing: the one-time offer minted on this (new) device, if any.
+    val pairOffer: String? = null,
+    // Transient status line for Settings/Pairing actions (backup, push, cards…).
+    val status: String? = null,
 )
 
 /**
@@ -203,22 +222,78 @@ class MessengerViewModel(app: Application) : AndroidViewModel(app) {
         launchSdk { c ->
             val messages = c.thread(peer)
             _uiState.update {
-                it.copy(openPeer = peer, thread = messages, screen = Screen.THREAD)
+                it.copy(openPeer = peer, thread = messages, replyTo = null, screen = Screen.THREAD)
             }
         }
     }
 
+    /**
+     * Send into the open 1:1 thread. If a message is staged for reply, this sends
+     * a threaded [MyceliumClient.reply]; otherwise a plain [MyceliumClient.sendText].
+     */
     fun sendText(text: String) {
         val peer = _uiState.value.openPeer ?: return
         val body = text.trim()
         if (body.isEmpty()) return
+        val replyTo = _uiState.value.replyTo
         launchSdk { c ->
             // Returns the stored Message with an optimistic DeliveryState
             // (SENT/QUEUED) so the UI can render a pending tick immediately.
-            c.sendText(peer, body)
+            if (replyTo != null) c.reply(peer, replyTo.id, body) else c.sendText(peer, body)
+            val messages = c.thread(peer)
+            _uiState.update { it.copy(thread = messages, replyTo = null) }
+        }
+    }
+
+    /** Stage a message to reply to (shows a reply banner above the composer). */
+    fun startReply(message: Message) = _uiState.update { it.copy(replyTo = message) }
+
+    fun cancelReply() = _uiState.update { it.copy(replyTo = null) }
+
+    /** Quick-emoji reaction to a message in the open 1:1 thread. */
+    fun reactTo(targetId: String, emoji: String) {
+        val peer = _uiState.value.openPeer ?: return
+        launchSdk { c ->
+            c.react(peer, targetId, emoji)
             val messages = c.thread(peer)
             _uiState.update { it.copy(thread = messages) }
         }
+    }
+
+    /** Delete one of our own messages for everyone in the open 1:1 thread. */
+    fun deleteOwn(targetId: String) {
+        val peer = _uiState.value.openPeer ?: return
+        launchSdk { c ->
+            c.deleteMessage(peer, targetId)
+            val messages = c.thread(peer)
+            _uiState.update { it.copy(thread = messages) }
+        }
+    }
+
+    /** Attach a file to the open 1:1 thread: read the picked Uri's bytes and send. */
+    fun sendFile(uri: Uri) {
+        val peer = _uiState.value.openPeer ?: return
+        launchSdk { c ->
+            val resolver = getApplication<Application>().contentResolver
+            val name = queryDisplayName(uri) ?: "attachment"
+            val mime = resolver.getType(uri) ?: "application/octet-stream"
+            val data = resolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw SdkException.InvalidInput("could not read the selected file")
+            c.sendFile(peer, name, mime, data)
+            val messages = c.thread(peer)
+            _uiState.update { it.copy(thread = messages) }
+        }
+    }
+
+    /** Best-effort human name for a content Uri (falls back to the last path segment). */
+    private fun queryDisplayName(uri: Uri): String? {
+        val resolver = getApplication<Application>().contentResolver
+        return runCatching {
+            resolver.query(uri, null, null, null, null)?.use { cursor ->
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx) else null
+            }
+        }.getOrNull() ?: uri.lastPathSegment
     }
 
     /** Foreground receive: drain the queue, decrypt, persist, refresh visible view. */
@@ -261,13 +336,221 @@ class MessengerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearSafetyNumber() = _uiState.update { it.copy(safetyNumber = null) }
 
+    /** Pin the wallet the directory serves for [peer] now as verified. */
+    fun markVerified(peer: String) {
+        launchSdk { c ->
+            c.markVerified(peer)
+            val contacts = c.contacts()
+            _uiState.update { it.copy(contacts = contacts, status = "$peer marked verified.") }
+        }
+    }
+
+    // ---- Groups ----------------------------------------------------------
+
+    fun openGroups() {
+        launchSdk { c ->
+            val groups = c.groups()
+            _uiState.update { it.copy(groups = groups, screen = Screen.GROUPS) }
+        }
+    }
+
+    fun refreshGroups() = launchSdk { c ->
+        val groups = c.groups()
+        _uiState.update { it.copy(groups = groups) }
+    }
+
+    /** Create a group from a name + comma-separated member handles, then open it. */
+    fun createGroup(name: String, membersCsv: String) {
+        val groupName = name.trim()
+        if (groupName.isEmpty()) {
+            _uiState.update { it.copy(error = "Group name is required") }
+            return
+        }
+        val members = membersCsv.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        launchSdk { c ->
+            val id = c.groupCreate(groupName, members)
+            val groups = c.groups()
+            val messages = c.groupThread(id)
+            _uiState.update {
+                it.copy(
+                    groups = groups,
+                    openGroupId = id,
+                    openGroupName = groupName,
+                    groupThread = messages,
+                    screen = Screen.GROUP_THREAD,
+                )
+            }
+        }
+    }
+
+    fun openGroupThread(groupId: String, name: String) {
+        launchSdk { c ->
+            val messages = c.groupThread(groupId)
+            _uiState.update {
+                it.copy(
+                    openGroupId = groupId,
+                    openGroupName = name,
+                    groupThread = messages,
+                    screen = Screen.GROUP_THREAD,
+                )
+            }
+        }
+    }
+
+    fun sendGroupText(text: String) {
+        val groupId = _uiState.value.openGroupId ?: return
+        val body = text.trim()
+        if (body.isEmpty()) return
+        launchSdk { c ->
+            c.groupSend(groupId, body)
+            val messages = c.groupThread(groupId)
+            _uiState.update { it.copy(groupThread = messages) }
+        }
+    }
+
+    fun leaveGroup() {
+        val groupId = _uiState.value.openGroupId ?: return
+        launchSdk { c ->
+            c.groupLeave(groupId)
+            val groups = c.groups()
+            _uiState.update {
+                it.copy(
+                    groups = groups,
+                    openGroupId = null,
+                    openGroupName = "",
+                    groupThread = emptyList(),
+                    screen = Screen.GROUPS,
+                )
+            }
+        }
+    }
+
+    // ---- Verification: contact cards -------------------------------------
+
+    /** Load this account's contact card (hex) to show a peer out of band. */
+    fun loadContactCard() {
+        launchSdk { c ->
+            val card = c.contactCard()
+            _uiState.update { it.copy(myCard = card) }
+        }
+    }
+
+    /** Verify a peer's pasted contact card; on a match the handle is verified. */
+    fun verifyCard(card: String) {
+        val trimmed = card.trim()
+        if (trimmed.isEmpty()) return
+        launchSdk { c ->
+            val handle = c.verifyCard(trimmed)
+            val contacts = c.contacts()
+            _uiState.update { it.copy(contacts = contacts, status = "Verified $handle.") }
+        }
+    }
+
+    // ---- Seedless device pairing -----------------------------------------
+
+    /** Open the pairing screen (a new device mints the offer, an existing device approves). */
+    fun openPairing() = _uiState.update { it.copy(pairOffer = null, screen = Screen.PAIRING) }
+
+    /** **New device**: mint a one-time pairing offer to show an existing device. */
+    fun makePairOffer() {
+        val queue = _uiState.value.queueUrl
+        launchSdk { c ->
+            val offer = c.pairOffer(queue)
+            _uiState.update { it.copy(pairOffer = offer) }
+        }
+    }
+
+    /** **New device**: poll the rendezvous once; adopt the account on success. */
+    fun pollPairing() {
+        val queue = _uiState.value.queueUrl
+        launchSdk { c ->
+            val adopted = c.pairPoll(queue)
+            if (adopted != null && adopted.handle.isNotEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        account = adopted,
+                        status = "Paired as ${adopted.handle}.",
+                        screen = Screen.CONVERSATIONS,
+                    )
+                }
+                refreshConversationsBlocking(c)
+            } else {
+                _uiState.update { it.copy(status = "No approval yet — keep polling.") }
+            }
+        }
+    }
+
+    /** **Existing device**: approve a new device's pasted pairing offer. */
+    fun approveDevice(offer: String) {
+        val trimmed = offer.trim()
+        if (trimmed.isEmpty()) return
+        val queue = _uiState.value.queueUrl
+        launchSdk { c ->
+            c.pairApprove(trimmed, queue)
+            _uiState.update { it.copy(status = "Device approved — it can now adopt this account.") }
+        }
+    }
+
+    // ---- Settings: backup / push -----------------------------------------
+
+    fun openSettings() = _uiState.update { it.copy(status = null, screen = Screen.SETTINGS) }
+
+    /** Export the encrypted store snapshot to a user-picked Uri. */
+    fun exportBackup(target: Uri) {
+        launchSdk { c ->
+            val bytes = c.exportBackup()
+            val resolver = getApplication<Application>().contentResolver
+            resolver.openOutputStream(target)?.use { it.write(bytes) }
+                ?: throw SdkException.Storage("could not open the chosen file for writing")
+            _uiState.update { it.copy(status = "Backup exported (${bytes.size} bytes).") }
+        }
+    }
+
+    /** Restore a store snapshot from a user-picked Uri, then refresh visible lists. */
+    fun importBackup(source: Uri) {
+        launchSdk { c ->
+            val resolver = getApplication<Application>().contentResolver
+            val bytes = resolver.openInputStream(source)?.use { it.readBytes() }
+                ?: throw SdkException.InvalidInput("could not read the chosen backup file")
+            c.importBackup(bytes)
+            val convos = c.conversations()
+            val contacts = c.contacts()
+            val groups = c.groups()
+            _uiState.update {
+                it.copy(
+                    conversations = convos,
+                    contacts = contacts,
+                    groups = groups,
+                    status = "Backup imported.",
+                )
+            }
+        }
+    }
+
+    /** Register a UnifiedPush endpoint so the queue can wake this device contentlessly. */
+    fun registerUnifiedPush(endpoint: String) {
+        val trimmed = endpoint.trim()
+        if (trimmed.isEmpty()) {
+            _uiState.update { it.copy(status = "Paste a UnifiedPush endpoint URL first.") }
+            return
+        }
+        launchSdk { c ->
+            c.registerPush(PushPlatform.UnifiedPush, trimmed)
+            _uiState.update { it.copy(status = "UnifiedPush endpoint registered.") }
+        }
+    }
+
+    fun clearStatus() = _uiState.update { it.copy(status = null) }
+
     // ---- Navigation helpers ---------------------------------------------
 
     fun back() {
         _uiState.update {
             when (it.screen) {
-                Screen.THREAD, Screen.CONTACTS ->
-                    it.copy(screen = Screen.CONVERSATIONS, openPeer = null)
+                Screen.THREAD, Screen.CONTACTS, Screen.GROUPS, Screen.SETTINGS, Screen.PAIRING ->
+                    it.copy(screen = Screen.CONVERSATIONS, openPeer = null, replyTo = null)
+                Screen.GROUP_THREAD ->
+                    it.copy(screen = Screen.GROUPS, openGroupId = null, openGroupName = "")
                 else -> it
             }
         }
@@ -313,7 +596,9 @@ class MessengerViewModel(app: Application) : AndroidViewModel(app) {
             while (true) {
                 delay(POLL_INTERVAL_MS)
                 val screen = _uiState.value.screen
-                if (screen == Screen.CONVERSATIONS || screen == Screen.THREAD) {
+                if (screen == Screen.CONVERSATIONS || screen == Screen.THREAD ||
+                    screen == Screen.GROUPS || screen == Screen.GROUP_THREAD
+                ) {
                     try {
                         withContext(Dispatchers.IO) {
                             val c = ClientHolder.get(getApplication())
@@ -335,6 +620,15 @@ class MessengerViewModel(app: Application) : AndroidViewModel(app) {
                 val messages = c.thread(peer)
                 val convos = c.conversations()
                 _uiState.update { it.copy(thread = messages, conversations = convos) }
+            }
+            Screen.GROUP_THREAD -> _uiState.value.openGroupId?.let { gid ->
+                val messages = c.groupThread(gid)
+                val groups = c.groups()
+                _uiState.update { it.copy(groupThread = messages, groups = groups) }
+            }
+            Screen.GROUPS -> {
+                val groups = c.groups()
+                _uiState.update { it.copy(groups = groups) }
             }
             else -> {
                 val convos = c.conversations()

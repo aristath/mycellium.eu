@@ -88,6 +88,72 @@ class MessagingE2eTest {
         )
     }
 
+    /**
+     * A multi-step GROUP flow over the real native stack (mirrors the desktop
+     * `group_round_trip`): alice creates a group with bob; bob `sync()`s to process
+     * the `GroupInvite` and join (learning the SAME group id from the invite);
+     * alice sends to the group; bob receives it in his group thread on a later
+     * `sync()`. Non-vacuous — a group message is actually sealed, delivered, and
+     * decrypted between two in-process clients through the live directory+queue.
+     */
+    @Test
+    fun group_round_trip_on_device() {
+        val alice = freshClient("alice")
+        val bob = freshClient("bob")
+
+        onboard(alice, "alicedroid")
+        onboard(bob, "bobdroid")
+
+        // Alice creates the group with bob; the SDK seals her group sender-key to
+        // bob as a GroupInvite deposited on his queue.
+        val gid = alice.groupCreate("g", listOf("bobdroid"))
+        assertTrue(
+            "alice's own group list should contain the new group",
+            alice.groups().any { it.id == gid },
+        )
+
+        // Bob must sync() to process the invite and join. He learns the group (and
+        // its shared id) from the invite; poll a few ticks for eventual delivery.
+        var joined = false
+        for (attempt in 0 until 40) {
+            bob.sync()
+            if (bob.groups().any { it.id == gid }) {
+                joined = true
+                break
+            }
+            Thread.sleep(100)
+        }
+        assertTrue("bob never joined the group via the invite", joined)
+
+        // Bob's group id matches alice's (both refer to the same group), with name.
+        val bobGroup = bob.groups().first { it.id == gid }
+        val bobGid = bobGroup.id
+        assertEquals("bob learned the group name from the invite", "g", bobGroup.name)
+
+        // Alice sends a message to the group; bob receives it in the group thread.
+        val text = "hi group from a real android device"
+        alice.groupSend(gid, text)
+
+        var delivered = false
+        for (attempt in 0 until 40) {
+            bob.sync()
+            if (bob.groupThread(bobGid).any { it.text == text }) {
+                delivered = true
+                break
+            }
+            Thread.sleep(100)
+        }
+        assertTrue("bob never received alice's group message via sync", delivered)
+
+        // And it lands in bob's group transcript, attributed to alice.
+        val thread = bob.groupThread(bobGid)
+        assertTrue(
+            "group message should be in bob's group thread, attributed to alice; " +
+                "got ${thread.map { it.sender to it.text }}",
+            thread.any { it.text == text && !it.fromMe && it.sender == "alicedroid" },
+        )
+    }
+
     @Test
     fun keystore_identity_persists_across_reopen() {
         val dataDir = File(ctx.filesDir, "e2e-persist").apply { deleteRecursively(); mkdirs() }
