@@ -12,13 +12,17 @@
 
 use mycellium_core::group::SenderKeyDistribution;
 use mycellium_core::identity::{Handle, Identity};
+use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
 
 use crate::groups::{GroupInvitePayload, MailItem};
+use crate::history::{self, StoredMessage};
+use crate::reachability::DeliveryPath;
 use crate::verified;
 use crate::wireops;
+use crate::{antirollback, verified::TrustLevel};
 
 /// The directory lookup seam. Each client wraps its own `DirectoryClient`
 /// (bound to `ureq` / `xhr` / the native blocking transport); `flow` only needs
@@ -26,6 +30,202 @@ use crate::wireops;
 pub trait FlowNet {
     /// Look up a peer's signed directory record.
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord>;
+}
+
+/// Why the shared trust chokepoint ([`lookup_verified`]) refused a record.
+///
+/// The three clients each render this differently (the CLI prints a rich
+/// out-of-band-verification hint, the SDK maps to `SdkError` + fires
+/// `on_key_change`, wasm returns a `JsValue` string), so `flow` returns the
+/// *reason* and leaves presentation to the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustError {
+    /// The wallet the directory served no longer matches the pinned/verified one
+    /// — a possible impersonation, or the peer re-registered with a new key.
+    IdentityChanged,
+    /// The directory served a record older than one we've already pinned (a
+    /// rollback that could re-introduce a removed device or redirect mail).
+    StaleRecord,
+    /// The record's self-signature did not verify.
+    Unverified,
+    /// The handle was malformed, or no record could be resolved for it.
+    BadHandle,
+}
+
+/// The **shared trust chokepoint** for every outbound path (1:1 send, forward,
+/// broadcast, chat, and the group paths): resolve `handle`, look it up through
+/// the injected [`FlowNet`], check the record's self-signature, fail closed on a
+/// changed pinned wallet ([`verified::level`]), and refuse a rolled-back record
+/// ([`antirollback::check_and_pin`], which also pins the seq on success).
+///
+/// Contacts-nickname resolution is host-specific (the native CLI resolves a
+/// saved nickname to a handle first), so this takes an already-resolved handle
+/// string. Owns no presentation: it returns a bare [`TrustError`] the host maps
+/// to its own error surface.
+pub fn lookup_verified<S, N>(
+    store: &mut S,
+    net: &N,
+    handle: &str,
+) -> Result<(Handle, SignedRecord), TrustError>
+where
+    S: Storage,
+    N: FlowNet,
+{
+    let handle = Handle::new(handle.to_string()).map_err(|_| TrustError::BadHandle)?;
+    let record = net.lookup(&handle).map_err(|_| TrustError::BadHandle)?;
+    // The directory does not verify records; check the self-signature before we
+    // trust the record's device keys / queue (core review).
+    record.verify().map_err(|_| TrustError::Unverified)?;
+    // Fail closed if the current wallet doesn't match a pinned/verified one: the
+    // peer re-registered, or someone is impersonating them (core review).
+    if verified::level(store, handle.as_str(), &record.record.wallet) == TrustLevel::Changed {
+        return Err(TrustError::IdentityChanged);
+    }
+    // Anti-rollback: refuse (and never pin) a record older than one we've already
+    // seen for this handle — a downgrade the wallet-change guard cannot see (HIGH).
+    if !antirollback::check_and_pin(store, handle.as_str(), record.record.seq)
+        .map_err(|_| TrustError::StaleRecord)?
+    {
+        return Err(TrustError::StaleRecord);
+    }
+    Ok((handle, record))
+}
+
+/// The per-path tally of one 1:1 send (Layer 11 device fan-out), returned by
+/// [`send_app`]. `delivered` counts devices handed off live or into the queue;
+/// `outboxed` counts devices parked for retry (or that couldn't be sealed).
+/// `direct`/`relay`/`queued` break the live/queue delivery down for reporting.
+#[derive(Debug, Clone, Default)]
+pub struct SendOutcome {
+    /// The sent message's id (`AppMessage::id`).
+    pub id: String,
+    /// Devices the copy reached (direct + relay + queued).
+    pub delivered: u32,
+    /// Devices reached by a live direct push.
+    pub direct: u32,
+    /// Devices reached live through a Circuit Relay v2 node.
+    pub relay: u32,
+    /// Devices reached by a queue deposit.
+    pub queued: u32,
+    /// Devices we couldn't reach (parked in the outbox for retry).
+    pub outboxed: u32,
+}
+
+/// The **shared 1:1 send fan-out**, generic over the [`Storage`]/[`Platform`]
+/// ports and the injected [`FlowNet`]. For each of the peer's devices (Layer 11)
+/// it X3DH-seals one copy ([`wireops::seal_to`]) into a [`MailItem::Direct`] and
+/// hands it to `deliver`, tallying by the returned [`DeliveryPath`]; then it
+/// records our own transcript copy; then it self-syncs the send to our *own*
+/// other devices via `self_deliver`.
+///
+/// The two closures own the client-specific transport + retry policy: the engine
+/// binds its live delivery ladder (direct TCP/libp2p + relay + reachability
+/// scoring) with an outbox fallback, while the SDK/wasm deposit into the
+/// recipient's queue. The store is threaded *through* the closures (rather than
+/// captured) so the seal loop and the closures' own writes share one handle.
+///
+/// The caller resolves and trust-checks the peer via [`lookup_verified`] first
+/// and passes the already-verified `peer_record` in, so this never re-fetches or
+/// re-checks it — the trust decision stays at the one chokepoint.
+#[allow(clippy::too_many_arguments)]
+pub fn send_app<S, P, N>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    net: &N,
+    me: &Handle,
+    my_name: &str,
+    my_queue: &str,
+    peer: &Handle,
+    peer_record: &SignedRecord,
+    app: &AppMessage,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    self_deliver: &mut dyn FnMut(&mut S, &Handle, &Device, MailItem),
+) -> SendOutcome
+where
+    S: Storage,
+    P: Platform,
+    N: FlowNet,
+{
+    let encoded = app.encode();
+    let mut out = SendOutcome {
+        id: app.id.clone(),
+        ..Default::default()
+    };
+
+    // Fan out one sealed copy per recipient device (Layer 11) — each device has
+    // its own keys. A device we can't reach is parked by the `deliver` closure.
+    for device in &peer_record.record.devices {
+        let Ok(env) = wireops::seal_to(platform, identity, me, my_name, my_queue, device, &encoded)
+        else {
+            continue;
+        };
+        match deliver(store, peer, peer_record, device, MailItem::Direct(env)) {
+            DeliveryPath::Direct => {
+                out.direct += 1;
+                out.delivered += 1;
+            }
+            DeliveryPath::Relay => {
+                out.relay += 1;
+                out.delivered += 1;
+            }
+            DeliveryPath::Queue => {
+                out.queued += 1;
+                out.delivered += 1;
+            }
+            DeliveryPath::Outbox | DeliveryPath::Failed => {}
+        }
+    }
+    let total = peer_record.record.devices.len() as u32;
+    out.outboxed = total - out.delivered;
+
+    // Record our own copy in this device's transcript, so the conversation shows
+    // what we sent (edits/deletes apply to it; other kinds append).
+    match &app.body {
+        Body::Edit { to, text } => {
+            let _ = history::edit(store, peer.as_str(), to, text, true);
+        }
+        Body::Delete { to } => {
+            let _ = history::delete(store, peer.as_str(), to, true);
+        }
+        Body::Receipt { .. } => {}
+        _ => {
+            let _ = history::append(
+                store,
+                peer.as_str(),
+                StoredMessage {
+                    id: app.id.clone(),
+                    from_me: true,
+                    text: app.summary(),
+                    timestamp: app.timestamp,
+                    expires_at: app.expires_at,
+                },
+            );
+        }
+    }
+
+    // Self-sync: mirror this message to our own other devices (Layer 11), so a
+    // sibling device shows what we sent from here. Never to this device itself.
+    if let Ok(my_record) = net.lookup(me) {
+        let my_key = identity.device_public();
+        for device in &my_record.record.devices {
+            if device.device_key == my_key {
+                continue;
+            }
+            let Ok(env) =
+                wireops::seal_to(platform, identity, me, my_name, my_queue, device, &encoded)
+            else {
+                continue;
+            };
+            let sync = MailItem::SelfSync {
+                peer: peer.as_str().to_string(),
+                envelope: env,
+            };
+            self_deliver(store, me, device, sync);
+        }
+    }
+
+    out
 }
 
 /// Seal our current group sender key to every device of each `targets` handle,

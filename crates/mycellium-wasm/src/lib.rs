@@ -27,7 +27,7 @@ use mycellium_core::wire;
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::flow;
 use mycellium_engine::groups::{self, GroupInvitePayload, MailItem, StoredGroup};
-use mycellium_engine::{antirollback, history, names, verified, wireops};
+use mycellium_engine::{history, names, reachability::DeliveryPath, wireops};
 use mycellium_queue_client::{wallet_hex, QueueClient};
 use wasm_bindgen::prelude::*;
 
@@ -944,8 +944,12 @@ impl Session {
         Ok(())
     }
 
-    /// Shared delivery path: look up the peer, X3DH-seal `app` to each of their
-    /// devices, deposit to their queue, and record our own copy.
+    /// Shared delivery path: run the shared trust chokepoint
+    /// ([`flow::lookup_verified`]) then the shared fan-out ([`flow::send_app`]).
+    /// The browser closures deposit each sealed copy into the recipient's queue
+    /// (over XHR, with endpoint failover), and the self-sync closure mirrors the
+    /// send to our own other devices — the unification that gives wasm the
+    /// self-sync it previously lacked. Returns the count of devices delivered to.
     #[allow(clippy::too_many_arguments)]
     fn deliver_app(
         &mut self,
@@ -957,73 +961,117 @@ impl Session {
         app: AppMessage,
     ) -> Result<u32, JsValue> {
         let me = Handle::new(my_handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let peer =
-            Handle::new(peer_handle).map_err(|_| JsValue::from_str("invalid peer handle"))?;
-        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        let precord = dir
-            .lookup(&peer)
-            .map_err(|e| JsValue::from_str(&format!("lookup: {e}")))?;
-        // The directory does not verify records; check the self-signature before we
-        // trust its device keys / queue (core review).
-        precord
-            .verify()
-            .map_err(|_| JsValue::from_str("peer record failed verification"))?;
-        // Fail closed if the peer's wallet no longer matches the pinned/verified one
-        // (impersonation) or the directory served an older record than we've seen
-        // (rollback) — the browser send path must not silently trust a swapped or
-        // stale record (core review, HIGH).
-        if matches!(
-            verified::level(&self.store, peer.as_str(), &precord.record.wallet),
-            verified::TrustLevel::Changed
-        ) {
-            return Err(JsValue::from_str(
-                "identity changed for this peer — refusing to send",
-            ));
-        }
-        if let Ok(false) =
-            antirollback::check_and_pin(&mut self.store, peer.as_str(), precord.record.seq)
-        {
-            return Err(JsValue::from_str(
-                "stale record for this peer — refusing to send",
-            ));
-        }
+        let net = WasmNet {
+            dir: DirectoryClient::with_transport(dir_url, Box::new(XhrTransport)),
+        };
+        // The shared trust chokepoint: resolve + verify + fail closed on a changed
+        // pinned wallet (impersonation) or a rolled-back record — the browser send
+        // path must not silently trust a swapped or stale record (core review, HIGH).
+        let (peer, precord) = match flow::lookup_verified(&mut self.store, &net, peer_handle) {
+            Ok(pair) => pair,
+            Err(flow::TrustError::IdentityChanged) => {
+                return Err(JsValue::from_str(
+                    "identity changed for this peer — refusing to send",
+                ));
+            }
+            Err(flow::TrustError::StaleRecord) => {
+                return Err(JsValue::from_str(
+                    "stale record for this peer — refusing to send",
+                ));
+            }
+            Err(flow::TrustError::Unverified) => {
+                return Err(JsValue::from_str("peer record failed verification"));
+            }
+            Err(flow::TrustError::BadHandle) => {
+                return Err(JsValue::from_str("could not look up peer record"));
+            }
+        };
         // Learn the peer's chosen display name from their record.
-        let _ = names::note(&mut self.store, peer_handle, &precord.record.name);
-        let plaintext = app.encode();
-        let queue = QueueClient::with_transport(&precord.record.queue, Box::new(XhrTransport));
-        let qtoken = queue
-            .login(&self.identity)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let peer_hex = wallet_hex(&precord.record.wallet);
-        let mut delivered = 0u32;
-        for device in &precord.record.devices {
-            let Ok(env) = wireops::seal_to(
-                &mut BrowserPlatform,
-                &self.identity,
-                &me,
-                my_name,
-                my_queue,
-                device,
-                &plaintext,
-            ) else {
-                continue;
-            };
-            let blob = serde_json::to_string(&MailItem::Direct(env))
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            if queue
-                .deposit(
-                    &qtoken,
-                    &peer_hex,
-                    &wireops::device_slot(&device.device_key),
-                    &blob,
-                )
-                .is_ok()
-            {
-                delivered += 1;
+        let _ = names::note(&mut self.store, peer.as_str(), &precord.record.name);
+
+        // Log in to each of the peer's queue endpoints in preference order (#54),
+        // so a deposit can fail over from a down primary to a backup.
+        let mut sessions: Vec<(QueueClient, String)> = Vec::new();
+        for url in precord.record.endpoints() {
+            let q = QueueClient::with_transport(url, Box::new(XhrTransport));
+            if let Ok(t) = q.login(&self.identity) {
+                sessions.push((q, t));
             }
         }
-        apply_to_history(&mut self.store, peer_handle, &app, true);
-        Ok(delivered)
+        let peer_hex = wallet_hex(&precord.record.wallet);
+        let my_hex = wallet_hex(&self.identity.wallet_public());
+        // A session to our own queue for the self-sync mirror (best-effort).
+        let my_session: Option<(QueueClient, String)> = {
+            let q = QueueClient::with_transport(my_queue, Box::new(XhrTransport));
+            q.login(&self.identity).ok().map(|t| (q, t))
+        };
+
+        // Disjoint field borrows: `send_app` writes `store`; the closures don't.
+        let identity = &self.identity;
+        let store = &mut self.store;
+
+        let mut deliver = |_store: &mut MemStore,
+                           _handle: &Handle,
+                           _record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            let Ok(blob) = serde_json::to_string(&item) else {
+                return DeliveryPath::Failed;
+            };
+            let slot = wireops::device_slot(&device.device_key);
+            if sessions
+                .iter()
+                .any(|(q, t)| q.deposit(t, &peer_hex, &slot, &blob).is_ok())
+            {
+                DeliveryPath::Queue
+            } else {
+                DeliveryPath::Failed
+            }
+        };
+        let mut self_deliver =
+            |_store: &mut MemStore, _handle: &Handle, device: &Device, item: MailItem| {
+                if let Some((q, t)) = &my_session {
+                    if let Ok(blob) = serde_json::to_string(&item) {
+                        let slot = wireops::device_slot(&device.device_key);
+                        let _ = q.deposit(t, &my_hex, &slot, &blob);
+                    }
+                }
+            };
+
+        let out = flow::send_app(
+            identity,
+            store,
+            &mut BrowserPlatform,
+            &net,
+            &me,
+            my_name,
+            my_queue,
+            &peer,
+            &precord,
+            &app,
+            &mut deliver,
+            &mut self_deliver,
+        );
+
+        // The browser keeps attachment bytes as a data: URL for rendering (history
+        // itself keeps just the "📎 name" summary, which the shared `send_app`
+        // already recorded). Stash a sent file, and drop the blob on a delete so a
+        // deleted image doesn't linger — the two things `send_app`'s generic
+        // transcript record can't do without a browser store.
+        match &app.body {
+            Body::File { mime, data, .. } => {
+                let url = format!("data:{mime};base64,{}", B64.encode(data));
+                let _ = self
+                    .store
+                    .put(format!("file:{}", app.id).as_bytes(), url.as_bytes());
+            }
+            Body::Delete { to } => {
+                let _ = self.store.delete(format!("file:{to}").as_bytes());
+            }
+            _ => {}
+        }
+        Ok(out.delivered)
     }
 
     /// Read a stored config value (empty if unset).

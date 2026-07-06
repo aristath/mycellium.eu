@@ -45,6 +45,19 @@ use mycellium_transport::net::{self, TcpTransport};
 /// several submodules, so it lives at the `app` root (reached via `super::*`).
 const ACCOUNT_SLOT: &str = "account";
 
+/// The engine (native CLI) [`crate::flow::FlowNet`]: directory lookups over the
+/// native blocking [`DirectoryClient`]. Borrows the client so the send shell and
+/// the trust chokepoint share one connection without cloning.
+pub(crate) struct EngineNet<'a> {
+    pub dir: &'a DirectoryClient,
+}
+
+impl crate::flow::FlowNet for EngineNet<'_> {
+    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
+        self.dir.lookup(handle)
+    }
+}
+
 mod backup;
 mod devices;
 mod directory_ops;

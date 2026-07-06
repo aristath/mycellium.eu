@@ -1,6 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
+use crate::flow;
+
 pub fn forward(
     message_id: &str,
     from: &str,
@@ -64,133 +66,107 @@ pub fn send(
 
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
-    let encoded = app.encode();
 
-    // Fan out one sealed copy per recipient device (Layer 11) — each device has
-    // its own keys, so every device in the cluster receives it. A device we
-    // can't reach (offline, no reachable queue) is parked in the outbox.
-    let queue = QueueTarget::open(&identity, &peer_record.record);
+    // The shared fan-out ([`flow::send_app`]) drives the per-device seal loop,
+    // transcript record, and self-sync; the two closures below bind the *engine's*
+    // delivery policy — the live ladder ([`deliver_scored`]: direct TCP/libp2p +
+    // Circuit Relay + reachability scoring) with the outbox as the retry floor.
+    // The store is threaded *through* the closures, so they never capture `fs`.
     let now = OsPlatform.now_unix_secs();
-    let mut delivered = 0;
-    // Per-path tally for observability (#59): how many went out live (direct or
-    // relayed) vs into the recipient's queue.
-    let mut direct = 0;
-    let mut relay = 0;
-    let mut queued_live = 0;
-    for device in &peer_record.record.devices {
-        let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else {
-            continue;
-        };
-        let slot = device_slot(&device.device_key);
-        let item = MailItem::Direct(envelope);
+    let device_secret = identity.device_secret();
+    let net = EngineNet { dir: &client };
+    let peer_queue = QueueTarget::open(&identity, &peer_record.record);
+    // Our own record's queue endpoints, for the self-sync deposit floor.
+    let my_queue_target = client
+        .lookup(&me)
+        .ok()
+        .and_then(|r| QueueTarget::open(&identity, &r.record));
+    let my_name = display_name_for(&me);
+    let my_queue = own_queue();
+
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
         let path = deliver_scored(
-            &mut fs,
-            identity.device_secret(),
+            store,
+            device_secret,
             &client,
-            &peer_handle,
-            queue.as_ref(),
+            handle,
+            peer_queue.as_ref(),
             device,
             &item,
             now,
         );
-        match path {
-            DeliveryPath::Direct => {
-                direct += 1;
-                delivered += 1;
-            }
-            DeliveryPath::Relay => {
-                relay += 1;
-                delivered += 1;
-            }
-            DeliveryPath::Queue => {
-                queued_live += 1;
-                delivered += 1;
-            }
-            DeliveryPath::Outbox | DeliveryPath::Failed => {
-                let _ =
-                    outbox::enqueue(&mut fs, random_id(), peer_handle.as_str(), &slot, item, now);
-            }
+        // A device we couldn't reach live or via its queue is parked for retry.
+        if matches!(path, DeliveryPath::Outbox | DeliveryPath::Failed) {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
         }
-    }
-    let total = peer_record.record.devices.len();
-    let outboxed = total - delivered;
-    // Keep the "queued for retry" wording (the outbox); append the live-path
-    // breakdown so the delivery path is observable (#59).
-    let note = if outboxed > 0 {
-        format!(" — {outboxed} queued for retry")
-    } else {
-        String::new()
+        path
     };
-    let breakdown = if direct > 0 || queued_live > 0 {
-        format!(" [{direct} direct, {queued_live} queued]")
-    } else {
-        String::new()
-    };
-    // A relayed live delivery (through a Circuit Relay v2 node, #59) is reported
-    // as its own path so it's observable as neither a plain direct push nor a
-    // queue deposit.
-    let relay_note = if relay > 0 {
-        format!(" [{relay} relay]")
-    } else {
-        String::new()
-    };
-    println!(
-        "sent to '{}' — {delivered}/{total} device(s) (#{}){note}{breakdown}{relay_note}",
-        peer_handle.as_str(),
-        app.id
-    );
-
-    // Record our own copy in this device's transcript, so the conversation shows
-    // what we sent (edits/deletes apply to it; other kinds append).
-    match &app.body {
-        Body::Edit { to, text } => history::edit(&mut fs, peer_handle.as_str(), to, text, true)?,
-        Body::Delete { to } => history::delete(&mut fs, peer_handle.as_str(), to, true)?,
-        Body::Receipt { .. } => {}
-        _ => history::append(
-            &mut fs,
-            peer_handle.as_str(),
-            StoredMessage {
-                id: app.id.clone(),
-                from_me: true,
-                text: app.summary(),
-                timestamp: now,
-                expires_at: app.expires_at,
-            },
-        )?,
-    }
-
-    // Self-sync: mirror this message to my own other devices (Layer 11).
-    if let Ok(my_record) = client.lookup(&me) {
-        let my_queue = QueueTarget::open(&identity, &my_record.record);
-        let my_key = identity.device_public();
-        for device in &my_record.record.devices {
-            if device.device_key == my_key {
-                continue;
-            }
-            let Ok(envelope) = seal_to(&identity, &me, device, &encoded) else {
-                continue;
-            };
-            let sync = MailItem::SelfSync {
-                peer: peer_handle.as_str().to_string(),
-                envelope,
-            };
+    let mut self_deliver =
+        |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
             if !deliver_scored(
-                &mut fs,
-                identity.device_secret(),
+                store,
+                device_secret,
                 &client,
-                &me,
-                my_queue.as_ref(),
+                handle,
+                my_queue_target.as_ref(),
                 device,
-                &sync,
+                &item,
                 now,
             )
             .is_delivered()
             {
                 let slot = device_slot(&device.device_key);
-                let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, sync, now);
+                let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
             }
-        }
-    }
+        };
+
+    let out = flow::send_app(
+        &identity,
+        &mut fs,
+        &mut OsPlatform,
+        &net,
+        &me,
+        &my_name,
+        &my_queue,
+        &peer_handle,
+        &peer_record,
+        &app,
+        &mut deliver,
+        &mut self_deliver,
+    );
+
+    // Report the per-path tally with the exact wording clients depend on: keep
+    // the "queued for retry" (outbox) note, and append the live-path breakdown so
+    // the delivery path is observable (#59) — a relay hop reported on its own.
+    let total = out.delivered + out.outboxed;
+    let note = if out.outboxed > 0 {
+        format!(" — {} queued for retry", out.outboxed)
+    } else {
+        String::new()
+    };
+    let breakdown = if out.direct > 0 || out.queued > 0 {
+        format!(" [{} direct, {} queued]", out.direct, out.queued)
+    } else {
+        String::new()
+    };
+    let relay_note = if out.relay > 0 {
+        format!(" [{} relay]", out.relay)
+    } else {
+        String::new()
+    };
+    println!(
+        "sent to '{}' — {}/{total} device(s) (#{}){note}{breakdown}{relay_note}",
+        peer_handle.as_str(),
+        out.delivered,
+        out.id
+    );
+
     Ok(())
 }
 

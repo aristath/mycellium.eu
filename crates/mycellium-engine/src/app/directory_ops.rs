@@ -108,47 +108,43 @@ pub fn presence(peer: &str, directory: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a nickname to a handle (or pass a raw handle through), then verify
-/// the record matches any pinned wallet for that contact (TOFU).
+/// Resolve a nickname to a handle (or pass a raw handle through), then run the
+/// shared trust chokepoint ([`crate::flow::lookup_verified`]) — verify the
+/// record, fail closed on a changed pinned wallet, and refuse a rolled-back one.
+///
+/// This is the native CLI adapter over the shared flow: it owns the two
+/// CLI-specific pieces the platform-generic flow deliberately does not — saved
+/// **nickname** resolution, and rendering a refusal as a rich, plain-language,
+/// out-of-band-verification hint.
 pub fn lookup_verified(
     client: &DirectoryClient,
     fs: &mut FileStore,
     input: &str,
 ) -> Result<(Handle, SignedRecord)> {
     let resolved = contacts::resolve(fs, input)?;
-    let handle = Handle::new(resolved).map_err(|_| anyhow!("invalid handle or nickname"))?;
-    let record = client.lookup(&handle)?;
-    record
-        .verify()
-        .map_err(|_| anyhow!("peer's record failed verification"))?;
-
-    // Fail closed if the current wallet doesn't match a pinned or verified one:
-    // either the peer re-registered (e.g. after email recovery) or someone is
-    // impersonating them. Either way, don't silently trust the new identity.
-    if verified::level(fs, handle.as_str(), &record.record.wallet) == TrustLevel::Changed {
-        bail!(
+    let net = EngineNet { dir: client };
+    match crate::flow::lookup_verified(fs, &net, &resolved) {
+        Ok(pair) => Ok(pair),
+        Err(crate::flow::TrustError::BadHandle) => {
+            Err(anyhow!("no record for '{resolved}' — is the handle registered?"))
+        }
+        Err(crate::flow::TrustError::Unverified) => {
+            Err(anyhow!("peer's record failed verification"))
+        }
+        Err(crate::flow::TrustError::IdentityChanged) => bail!(
             "⚠ IDENTITY CHANGED for '{h}'.\n   \
              The wallet the directory returned does NOT match the one you {verb} — someone may be\n   \
              impersonating '{h}', or '{h}' recovered/re-registered with a new key.\n   \
              Do NOT trust it until you re-check the safety number out of band, then run:\n   \
              verify {h} --confirm   (to accept the new identity), or `contact add` to re-pin.",
-            h = handle.as_str(),
-            verb = if verified::get(fs, handle.as_str())?.is_some() { "verified" } else { "pinned" },
-        );
-    }
-
-    // Anti-rollback: refuse a record older than one we've already pinned for this
-    // handle. A malicious/compelled directory can serve a stale (still validly
-    // signed, same-wallet) record to re-introduce a removed device or redirect
-    // our mail — a downgrade the wallet-change guard above cannot see (HIGH).
-    if !crate::antirollback::check_and_pin(fs, handle.as_str(), record.record.seq)? {
-        bail!(
-            "⚠ STALE RECORD for '{h}': the directory returned an older record (seq {seq}) than one \
-             you've already seen. Refusing — a rollback could re-introduce a device you removed or \
+            h = resolved,
+            verb = if verified::get(fs, &resolved)?.is_some() { "verified" } else { "pinned" },
+        ),
+        Err(crate::flow::TrustError::StaleRecord) => bail!(
+            "⚠ STALE RECORD for '{h}': the directory returned an older record than one you've \
+             already seen. Refusing — a rollback could re-introduce a device you removed or \
              redirect your messages. If '{h}' legitimately rolled back, clear the pin and re-verify.",
-            h = handle.as_str(),
-            seq = record.record.seq,
-        );
+            h = resolved,
+        ),
     }
-    Ok((handle, record))
 }

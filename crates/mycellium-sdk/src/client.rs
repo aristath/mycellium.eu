@@ -25,7 +25,9 @@ use mycellium_engine::groups::{
     self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
 };
 use mycellium_engine::platform::OsPlatform;
-use mycellium_engine::{antirollback, contacts, history, inbound, names, verified, wireops};
+use mycellium_engine::{
+    contacts, history, inbound, names, reachability::DeliveryPath, verified, wireops,
+};
 use mycellium_http::UreqTransport;
 use mycellium_queue_client::{wallet_hex, PushSub, QueueClient};
 
@@ -1020,61 +1022,55 @@ impl MyceliumClient {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Shared 1:1 delivery path: look up the peer, refuse a changed identity, seal
-    /// `app` to each of their devices, deposit to their queue, and record our own
-    /// copy (edits/deletes mutate the referenced message; everything else appends).
+    /// Shared 1:1 delivery path: run the shared trust chokepoint
+    /// ([`flow::lookup_verified`]), then the shared fan-out ([`flow::send_app`]).
+    /// The SDK's closures deposit each sealed copy into the recipient's queue
+    /// (with endpoint failover, #54); the self-sync closure mirrors the send to
+    /// our own other devices' slots in our own queue — the unification that gives
+    /// the SDK the self-sync it previously lacked. `send_app` records our own
+    /// transcript copy and returns the tally we map to a [`DeliveryState`].
     fn deliver_app(&self, peer_handle: String, app: AppMessage) -> Result<Message, SdkError> {
         let mut inner = self.lock();
         if inner.config.handle.is_empty() {
             return Err(SdkError::NotRegistered);
         }
         let me = Handle::new(inner.config.handle.clone()).map_err(SdkError::invalid)?;
-        let peer = Handle::new(peer_handle.clone()).map_err(SdkError::invalid)?;
+        let my_handle = inner.config.handle.clone();
+        let my_name = inner.config.name.clone();
+        let my_queue_url = inner.config.queue_url.clone();
+        let dir_url = inner.config.dir_url.clone();
+        let net = SdkNet {
+            dir: DirectoryClient::with_transport(&dir_url, Box::new(UreqTransport)),
+        };
 
-        let dir = DirectoryClient::with_transport(&inner.config.dir_url, Box::new(UreqTransport));
-        let precord = dir.lookup(&peer).map_err(SdkError::network)?;
-        // The directory does not verify records; check the self-signature before we
-        // trust the record's device keys / queue (core review).
-        precord
-            .verify()
-            .map_err(|_| SdkError::crypto("peer record failed verification"))?;
-
-        // A previously pinned/verified peer whose wallet has changed is a possible
-        // impersonation — refuse and surface it (and notify the listener).
-        if matches!(
-            verified::level(&inner.store, peer.as_str(), &precord.record.wallet),
-            verified::TrustLevel::Changed
-        ) {
-            if let Some(l) = inner.listener.clone() {
-                l.on_key_change(peer_handle.clone());
+        // The shared trust chokepoint: resolve + verify + fail closed on a changed
+        // pinned wallet or a rolled-back record. A refusal is surfaced as
+        // `IdentityChanged` (and fires the listener) exactly as before.
+        let (peer, precord) = match flow::lookup_verified(&mut inner.store, &net, &peer_handle) {
+            Ok(pair) => pair,
+            Err(flow::TrustError::IdentityChanged) | Err(flow::TrustError::StaleRecord) => {
+                if let Some(l) = inner.listener.clone() {
+                    l.on_key_change(peer_handle.clone());
+                }
+                return Err(SdkError::IdentityChanged {
+                    handle: peer_handle,
+                });
             }
-            return Err(SdkError::IdentityChanged {
-                handle: peer_handle,
-            });
-        }
-
-        // Anti-rollback: refuse a record older than one we've pinned for this peer
-        // — a compelled directory could otherwise serve a stale (still validly
-        // signed, same-wallet) record to re-introduce a device we removed (HIGH).
-        if let Ok(false) =
-            antirollback::check_and_pin(&mut inner.store, peer.as_str(), precord.record.seq)
-        {
-            if let Some(l) = inner.listener.clone() {
-                l.on_key_change(peer_handle.clone());
+            Err(flow::TrustError::Unverified) => {
+                return Err(SdkError::crypto("peer record failed verification"));
             }
-            return Err(SdkError::IdentityChanged {
-                handle: peer_handle,
-            });
-        }
+            Err(flow::TrustError::BadHandle) => {
+                return Err(SdkError::network("could not look up peer record"));
+            }
+        };
 
         // Learn the peer's chosen display name from their record.
         let _ = names::note(&mut inner.store, peer.as_str(), &precord.record.name);
 
-        let encoded = app.encode();
         // Log in to each of the peer's queue endpoints in preference order
-        // (primary `queue` then `queues`), so a deposit can fail over from a
-        // down primary to a backup (#54). Unreachable endpoints are skipped; we
-        // only surface the error if *none* of them are reachable.
+        // (primary `queue` then `queues`), so a deposit can fail over from a down
+        // primary to a backup (#54). We surface an error only if *none* of them are
+        // reachable — otherwise a queue deposit is the guaranteed floor.
         let mut sessions: Vec<(QueueClient, String)> = Vec::new();
         let mut last_err: Option<SdkError> = None;
         for url in precord.record.endpoints() {
@@ -1089,68 +1085,74 @@ impl MyceliumClient {
                 .unwrap_or_else(|| SdkError::network("recipient advertises no queue endpoint")));
         }
         let peer_hex = wallet_hex(&precord.record.wallet);
-        let my_name = inner.config.name.clone();
-        let my_queue = inner.config.queue_url.clone();
+        let my_hex = wallet_hex(&inner.identity.wallet_public());
+        // A session to our own queue for the self-sync mirror (best-effort — a
+        // single-device account has no siblings, so this is often unused).
+        let my_session: Option<(QueueClient, String)> = {
+            let q = QueueClient::with_transport(&my_queue_url, Box::new(UreqTransport));
+            q.login(&inner.identity).ok().map(|t| (q, t))
+        };
 
-        let mut delivered = 0u32;
-        for device in &precord.record.devices {
-            let Ok(env) = wireops::seal_to(
-                &mut OsPlatform,
-                &inner.identity,
-                &me,
-                &my_name,
-                &my_queue,
-                device,
-                &encoded,
-            ) else {
-                continue;
+        // Disjoint field borrows: `send_app` writes `store`; the closures don't
+        // touch it (the store is threaded through as their first argument).
+        let inner = &mut *inner;
+        let identity = &inner.identity;
+        let store = &mut inner.store;
+
+        let mut deliver = |_store: &mut FileStore,
+                           _handle: &Handle,
+                           _record: &SignedRecord,
+                           device: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            let Ok(blob) = serde_json::to_string(&item) else {
+                return DeliveryPath::Failed;
             };
-            let blob = serde_json::to_string(&MailItem::Direct(env)).map_err(SdkError::crypto)?;
             let slot = wireops::device_slot(&device.device_key);
-            // Try each endpoint until one accepts this device's copy (#54).
             if sessions
                 .iter()
                 .any(|(q, t)| q.deposit(t, &peer_hex, &slot, &blob).is_ok())
             {
-                delivered += 1;
+                DeliveryPath::Queue
+            } else {
+                DeliveryPath::Failed
             }
-        }
+        };
+        let mut self_deliver =
+            |_store: &mut FileStore, _handle: &Handle, device: &Device, item: MailItem| {
+                if let Some((q, t)) = &my_session {
+                    if let Ok(blob) = serde_json::to_string(&item) {
+                        let slot = wireops::device_slot(&device.device_key);
+                        let _ = q.deposit(t, &my_hex, &slot, &blob);
+                    }
+                }
+            };
 
-        let delivery = if delivered > 0 {
+        let out = flow::send_app(
+            identity,
+            store,
+            &mut OsPlatform,
+            &net,
+            &me,
+            &my_name,
+            &my_queue_url,
+            &peer,
+            &precord,
+            &app,
+            &mut deliver,
+            &mut self_deliver,
+        );
+
+        let delivery = if out.delivered > 0 {
             DeliveryState::Sent
         } else {
             DeliveryState::Queued
         };
-
-        // Record our own copy in this peer's transcript (mirrors the native `send`).
-        match &app.body {
-            Body::Edit { to, text } => {
-                history::edit(&mut inner.store, peer.as_str(), to, text, true)
-                    .map_err(SdkError::storage)?;
-            }
-            Body::Delete { to } => {
-                history::delete(&mut inner.store, peer.as_str(), to, true)
-                    .map_err(SdkError::storage)?;
-            }
-            Body::Receipt { .. } => {}
-            _ => {
-                let stored = history::StoredMessage {
-                    id: app.id.clone(),
-                    from_me: true,
-                    text: app.summary(),
-                    timestamp: app.timestamp,
-                    expires_at: app.expires_at,
-                };
-                history::append(&mut inner.store, peer.as_str(), stored)
-                    .map_err(SdkError::storage)?;
-            }
-        }
-
         Ok(Message {
-            id: app.id.clone(),
+            id: out.id,
             thread: peer_handle,
             from_me: true,
-            sender: inner.config.handle.clone(),
+            sender: my_handle,
             text: app.summary(),
             sent_at: app.timestamp,
             delivery,
