@@ -31,8 +31,8 @@ use serde::Serialize;
 use tauri::{Manager, State};
 
 use mycellium_sdk::{
-    Account, Contact, Conversation, DeliveryState, EmailVerification, Message, MyceliumClient,
-    SdkError, TrustLevel,
+    Account, Contact, Conversation, DeliveryState, EmailVerification, Group, Message,
+    MyceliumClient, SdkError, TrustLevel,
 };
 
 use keyring_store::KeyringSecretStore;
@@ -145,6 +145,22 @@ impl From<Conversation> for ConversationDto {
             display_name: c.display_name,
             last_preview: c.last_preview,
             last_at: c.last_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct GroupDto {
+    id: String,
+    name: String,
+    members: Vec<String>,
+}
+impl From<Group> for GroupDto {
+    fn from(g: Group) -> Self {
+        Self {
+            id: g.id,
+            name: g.name,
+            members: g.members,
         }
     }
 }
@@ -361,6 +377,196 @@ async fn mark_verified(state: State<'_, AppState>, peer: String) -> Result<(), S
     blocking(move || client.mark_verified(peer)).await
 }
 
+// ---- message kinds (reply / react / delete / attach) ----------------------
+
+/// Reply to message `reply_to` in the conversation with `peer`.
+#[tauri::command]
+async fn reply(
+    state: State<'_, AppState>,
+    peer: String,
+    reply_to: String,
+    text: String,
+) -> Result<MessageDto, String> {
+    let client = state.client()?;
+    blocking(move || client.reply(peer, reply_to, text))
+        .await
+        .map(Into::into)
+}
+
+/// React to message `target` (in the conversation with `peer`) with an emoji.
+#[tauri::command]
+async fn react(
+    state: State<'_, AppState>,
+    peer: String,
+    target: String,
+    emoji: String,
+) -> Result<MessageDto, String> {
+    let client = state.client()?;
+    blocking(move || client.react(peer, target, emoji))
+        .await
+        .map(Into::into)
+}
+
+/// Delete message `target` for everyone in the conversation with `peer`.
+#[tauri::command]
+async fn delete_message(
+    state: State<'_, AppState>,
+    peer: String,
+    target: String,
+) -> Result<(), String> {
+    let client = state.client()?;
+    blocking(move || client.delete_message(peer, target)).await
+}
+
+/// Send a file attachment (`data` bytes) to `peer`. Carried end-to-end inside the
+/// sealed envelope like any other message.
+#[tauri::command]
+async fn send_file(
+    state: State<'_, AppState>,
+    peer: String,
+    name: String,
+    mime: String,
+    data: Vec<u8>,
+) -> Result<MessageDto, String> {
+    let client = state.client()?;
+    blocking(move || client.send_file(peer, name, mime, data))
+        .await
+        .map(Into::into)
+}
+
+// ---- groups ---------------------------------------------------------------
+
+/// Create a group with `members` (handles) and return the new group id.
+#[tauri::command]
+async fn group_create(
+    state: State<'_, AppState>,
+    name: String,
+    members: Vec<String>,
+) -> Result<String, String> {
+    let client = state.client()?;
+    blocking(move || client.group_create(name, members)).await
+}
+
+/// Add `member` to a group and re-distribute keys with the updated roster.
+#[tauri::command]
+async fn group_add(
+    state: State<'_, AppState>,
+    group_id: String,
+    member: String,
+) -> Result<(), String> {
+    let client = state.client()?;
+    blocking(move || client.group_add(group_id, member)).await
+}
+
+/// Send a text message to a group.
+#[tauri::command]
+async fn group_send(
+    state: State<'_, AppState>,
+    group_id: String,
+    text: String,
+) -> Result<MessageDto, String> {
+    let client = state.client()?;
+    blocking(move || client.group_send(group_id, text))
+        .await
+        .map(Into::into)
+}
+
+/// Leave a group locally (stop participating; drops its keys + state).
+#[tauri::command]
+async fn group_leave(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
+    let client = state.client()?;
+    blocking(move || {
+        client.group_leave(group_id)?;
+        Ok(())
+    })
+    .await
+}
+
+/// The groups this account belongs to.
+#[tauri::command]
+async fn groups(state: State<'_, AppState>) -> Result<Vec<GroupDto>, String> {
+    let client = state.client()?;
+    let list = blocking(move || Ok(client.groups())).await?;
+    Ok(list.into_iter().map(Into::into).collect())
+}
+
+/// A group's transcript, oldest first.
+#[tauri::command]
+async fn group_thread(
+    state: State<'_, AppState>,
+    group_id: String,
+) -> Result<Vec<MessageDto>, String> {
+    let client = state.client()?;
+    let msgs = blocking(move || client.group_thread(group_id)).await?;
+    Ok(msgs.into_iter().map(Into::into).collect())
+}
+
+// ---- verification (contact cards) -----------------------------------------
+
+/// This account's contact card (hex) to show a peer out of band.
+#[tauri::command]
+async fn contact_card(state: State<'_, AppState>) -> Result<String, String> {
+    let client = state.client()?;
+    blocking(move || client.contact_card()).await
+}
+
+/// Verify a peer's contact `card`: on a match, mark the handle verified and
+/// return it; a mismatch surfaces as an identity-changed error.
+#[tauri::command]
+async fn verify_card(state: State<'_, AppState>, card: String) -> Result<String, String> {
+    let client = state.client()?;
+    blocking(move || client.verify_card(card)).await
+}
+
+// ---- seedless device pairing ----------------------------------------------
+
+/// **New device**: mint a one-time pairing offer (hex — render it as a QR).
+#[tauri::command]
+async fn pair_offer(state: State<'_, AppState>, queue_url: String) -> Result<String, String> {
+    let client = state.client()?;
+    blocking(move || client.pair_offer(queue_url)).await
+}
+
+/// **New device**: poll the rendezvous once; returns the adopted account on
+/// success, or `None` to keep polling.
+#[tauri::command]
+async fn pair_poll(
+    state: State<'_, AppState>,
+    queue_url: String,
+) -> Result<Option<AccountDto>, String> {
+    let client = state.client()?;
+    let adopted = blocking(move || client.pair_poll(queue_url)).await?;
+    Ok(adopted.map(Into::into))
+}
+
+/// **Existing device**: seal this account's key to a pairing `offer` and relay it
+/// through the rendezvous so a new device can adopt the account.
+#[tauri::command]
+async fn pair_approve(
+    state: State<'_, AppState>,
+    offer: String,
+    queue_url: String,
+) -> Result<(), String> {
+    let client = state.client()?;
+    blocking(move || client.pair_approve(offer, queue_url)).await
+}
+
+// ---- backup / restore -----------------------------------------------------
+
+/// A portable snapshot of the encrypted store (still encrypted at rest).
+#[tauri::command]
+async fn export_backup(state: State<'_, AppState>) -> Result<Vec<u8>, String> {
+    let client = state.client()?;
+    blocking(move || Ok(client.export_backup())).await
+}
+
+/// Restore a store snapshot produced by `export_backup` into this account.
+#[tauri::command]
+async fn import_backup(state: State<'_, AppState>, bytes: Vec<u8>) -> Result<(), String> {
+    let client = state.client()?;
+    blocking(move || client.import_backup(bytes)).await
+}
+
 // ---------------------------------------------------------------------------
 
 fn main() {
@@ -388,6 +594,23 @@ fn main() {
             contacts,
             safety_number,
             mark_verified,
+            reply,
+            react,
+            delete_message,
+            send_file,
+            group_create,
+            group_add,
+            group_send,
+            group_leave,
+            groups,
+            group_thread,
+            contact_card,
+            verify_card,
+            pair_offer,
+            pair_poll,
+            pair_approve,
+            export_backup,
+            import_backup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Mycellium desktop app");

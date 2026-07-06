@@ -117,5 +117,67 @@ button:disabled { opacity: 0.5; cursor: default; }
 .msg .meta { font-size: 10px; color: rgba(255,255,255,0.55); margin-top: 3px; text-align: right; }
 .msg.them .meta { color: var(--muted); }
 
-.compose { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #2a333d; }
-.compose input { flex: 1; }
+.compose { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #2a333d; align-items: center; }
+.compose #compose-input { flex: 1; }
+.icon-btn { background: var(--panel-2); color: var(--text); padding: 8px 10px; font-size: 16px; line-height: 1; }
+
+/* Per-message hover affordances (reply / react / delete) */
+.msg { position: relative; }
+.msg-actions {
+  display: none;
+  gap: 3px;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+.msg:hover .msg-actions { display: flex; }
+.mini {
+  background: rgba(0,0,0,0.25);
+  color: var(--text);
+  border: none;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.msg.them .mini { background: #2a333d; }
+.mini.emoji { padding: 2px 5px; font-size: 13px; }
+.mini:hover { background: var(--accent); }
+
+/* Reply banner above the compose box */
+.reply-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 16px;
+  background: var(--panel-2);
+  border-top: 1px solid #2a333d;
+  font-size: 12px;
+  color: var(--muted);
+}
+.reply-banner button { background: transparent; color: var(--muted); padding: 2px 8px; font-size: 13px; }
+
+/* Group create + settings forms */
+.add-contact.col { flex-direction: column; }
+.settings { padding: 14px 16px; overflow-y: auto; }
+.settings h3 { margin: 16px 0 4px; font-size: 14px; }
+.settings h3:first-child { margin-top: 0; }
+.settings p { font-size: 12px; margin: 0 0 8px; }
+.settings textarea {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid #333d48;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  resize: vertical;
+  outline: none;
+}
+.settings textarea:focus { border-color: var(--accent-2); }
+button.wide { width: 100%; margin-top: 8px; }
+.import-label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 10px;
+}
+.import-label input { display: block; margin-top: 6px; font-size: 12px; }

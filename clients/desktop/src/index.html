@@ -47,11 +47,22 @@
           </div>
           <nav class="tabs">
             <button data-tab="conversations" class="tab active">Chats</button>
+            <button data-tab="groups" class="tab">Groups</button>
             <button data-tab="contacts" class="tab">Contacts</button>
+            <button data-tab="settings" class="tab">Settings</button>
           </nav>
 
           <div id="tab-conversations" class="tabpane">
             <ul id="convo-list" class="list"></ul>
+          </div>
+
+          <div id="tab-groups" class="tabpane hidden">
+            <ul id="group-list" class="list"></ul>
+            <div class="add-contact col">
+              <input id="group-name" type="text" placeholder="group name" />
+              <input id="group-members" type="text" placeholder="members (comma-separated handles)" />
+              <button id="group-create-btn">Create group</button>
+            </div>
           </div>
 
           <div id="tab-contacts" class="tabpane hidden">
@@ -60,6 +71,29 @@
               <input id="contact-nick" type="text" placeholder="nickname" />
               <input id="contact-handle" type="text" placeholder="handle" />
               <button id="contact-add-btn">Add</button>
+            </div>
+          </div>
+
+          <div id="tab-settings" class="tabpane hidden">
+            <div class="settings">
+              <h3>My contact card</h3>
+              <p class="muted">Show this to a peer out of band so they can verify you.</p>
+              <textarea id="my-card" class="mono" rows="3" readonly placeholder="(loading…)"></textarea>
+              <button id="card-refresh-btn" class="wide">Show my card</button>
+
+              <h3>Verify a peer's card</h3>
+              <p class="muted">Paste a card you received to verify that handle.</p>
+              <textarea id="verify-card-input" class="mono" rows="3" placeholder="paste card hex…"></textarea>
+              <button id="verify-card-btn" class="wide">Verify card</button>
+
+              <h3>Backup</h3>
+              <p class="muted">Export or restore your encrypted store.</p>
+              <button id="export-btn" class="wide">Export backup</button>
+              <label class="import-label">Import backup
+                <input id="import-input" type="file" accept=".mycbak,application/octet-stream" />
+              </label>
+
+              <p id="settings-msg" class="muted"></p>
             </div>
           </div>
         </aside>
@@ -72,10 +106,17 @@
             <div class="thread-actions hidden" id="thread-actions">
               <button id="safety-btn" title="Show safety number">Safety #</button>
               <button id="verify-btn" title="Mark verified">Verify</button>
+              <button id="group-leave-btn" class="hidden" title="Leave group">Leave</button>
             </div>
           </header>
           <div id="thread-msgs" class="messages"></div>
+          <div id="reply-banner" class="reply-banner hidden">
+            <span id="reply-banner-text"></span>
+            <button id="reply-cancel" title="Cancel reply">✕</button>
+          </div>
           <form id="compose" class="compose hidden">
+            <button type="button" id="attach-btn" title="Attach a file" class="icon-btn">📎</button>
+            <input id="attach-input" type="file" class="hidden" />
             <input id="compose-input" type="text" placeholder="Message…" autocomplete="off" />
             <button type="submit">Send</button>
           </form>
