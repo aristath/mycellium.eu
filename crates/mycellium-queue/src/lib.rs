@@ -589,17 +589,28 @@ impl Waker for LiveWaker {
     }
 }
 
-/// Wake every subscription for a recipient and return the ones a transport
-/// reported `Gone` (to be pruned via [`Queue::remove_subs`]). Pure over the
-/// [`Waker`], so it's testable without touching the network.
-fn wake_all(subs: Vec<Subscription>, waker: &dyn Waker, now: u64) -> Vec<Subscription> {
-    let mut gone = Vec::new();
+/// The outcome of a deposit fan-out: subscriptions to prune (a transport said
+/// `Gone`) and how many wakes hit a transport error (`Failed`, distinct from a
+/// clean `Gone`) — so a push provider that is down is observable rather than
+/// failing silently.
+#[derive(Default)]
+struct WakeOutcome {
+    gone: Vec<Subscription>,
+    failed: usize,
+}
+
+/// Wake every subscription for a recipient. Pure over the [`Waker`], so it's
+/// testable without touching the network.
+fn wake_all(subs: Vec<Subscription>, waker: &dyn Waker, now: u64) -> WakeOutcome {
+    let mut out = WakeOutcome::default();
     for sub in subs {
-        if waker.wake(&sub, now) == Some(push::SendResult::Gone) {
-            gone.push(sub);
+        match waker.wake(&sub, now) {
+            Some(push::SendResult::Gone) => out.gone.push(sub),
+            Some(push::SendResult::Failed) => out.failed += 1,
+            _ => {}
         }
     }
-    gone
+    out
 }
 
 /// The queue's routes, over already-constructed state. Split out so tests can
@@ -781,12 +792,21 @@ async fn mailbox_post(
         std::thread::spawn(move || {
             // Prune the subscriptions a transport says are gone, so we don't
             // wake them on every future deposit.
-            let gone = wake_all(subs, &waker, now);
-            if !gone.is_empty() {
+            let outcome = wake_all(subs, &waker, now);
+            // A transport error means a push provider is unhealthy — surface it.
+            // Previously the result was discarded, so a down APNs/FCM/Web Push
+            // endpoint stopped waking recipients silently. (No wallet is logged.)
+            if outcome.failed > 0 {
+                eprintln!(
+                    "queue: {} push wake(s) failed for a recipient — a push provider may be down",
+                    outcome.failed
+                );
+            }
+            if !outcome.gone.is_empty() {
                 queue
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove_subs(&wallet, &gone);
+                    .remove_subs(&wallet, &outcome.gone);
             }
         });
     }
@@ -1342,7 +1362,7 @@ mod tests {
             },
         ];
 
-        let gone = wake_all(subs, &Stub, 0);
+        let gone = wake_all(subs, &Stub, 0).gone;
         // Only the dead web-push and the UNREGISTERED FCM are collected for
         // pruning; the live/skipped ones are left in place.
         assert_eq!(
@@ -1354,6 +1374,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn wake_all_counts_transport_failures() {
+        // A transport error (Failed, not a clean Gone) is counted so a down push
+        // provider is observable instead of silently dropping notifications.
+        struct Failing;
+        impl Waker for Failing {
+            fn wake(&self, _sub: &Subscription, _now: u64) -> Option<push::SendResult> {
+                Some(push::SendResult::Failed)
+            }
+        }
+        let subs = vec![web("https://push.example/a"), web("https://push.example/b")];
+        let out = wake_all(subs, &Failing, 0);
+        assert_eq!(out.failed, 2);
+        assert!(out.gone.is_empty());
     }
 
     #[test]
