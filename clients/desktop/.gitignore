@@ -1,0 +1,13 @@
+# Rust / Cargo build output for the Tauri backend.
+src-tauri/target/
+
+# Tauri codegen + bundling output.
+src-tauri/gen/
+
+# Cargo.lock is ignored repo-wide (see the root .gitignore) — this crate follows
+# that convention.
+
+# The frontend has no build step (static files are committed), but if a bundler
+# is ever added its output would land here:
+dist/
+node_modules/

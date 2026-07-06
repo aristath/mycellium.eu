@@ -1,0 +1,121 @@
+:root {
+  --bg: #14181d;
+  --panel: #1c2229;
+  --panel-2: #232b34;
+  --accent: #3b6ea5;
+  --accent-2: #4d86c4;
+  --text: #e7edf3;
+  --muted: #8a97a6;
+  --err: #e06c75;
+  --ok: #7bc47f;
+  --radius: 10px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+}
+
+#app, .screen { height: 100vh; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.err { color: var(--err); min-height: 1.2em; font-size: 13px; margin: 6px 0 0; }
+
+/* Centered card screens (setup, onboarding) */
+.screen { display: flex; align-items: center; justify-content: center; }
+.card {
+  background: var(--panel);
+  padding: 32px;
+  border-radius: var(--radius);
+  width: 380px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+}
+.card h1 { margin: 0 0 4px; font-size: 22px; }
+.card p { margin: 0 0 18px; font-size: 14px; }
+.card label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+.card input { width: 100%; margin-top: 4px; }
+
+input {
+  background: var(--panel-2);
+  border: 1px solid #333d48;
+  color: var(--text);
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 14px;
+  outline: none;
+}
+input:focus { border-color: var(--accent-2); }
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 9px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+button:hover { background: var(--accent-2); }
+button:disabled { opacity: 0.5; cursor: default; }
+.card button { width: 100%; margin-top: 6px; }
+
+/* Main layout */
+#screen-main { display: flex; }
+.sidebar {
+  width: 300px;
+  background: var(--panel);
+  border-right: 1px solid #2a333d;
+  display: flex;
+  flex-direction: column;
+}
+.me { padding: 14px 16px; border-bottom: 1px solid #2a333d; display: flex; flex-direction: column; gap: 2px; }
+.tabs { display: flex; gap: 4px; padding: 8px; }
+.tab { flex: 1; background: transparent; color: var(--muted); padding: 7px; }
+.tab.active { background: var(--panel-2); color: var(--text); }
+.tabpane { flex: 1; overflow-y: auto; }
+
+.list { list-style: none; margin: 0; padding: 0; }
+.list li {
+  padding: 12px 16px;
+  border-bottom: 1px solid #232b34;
+  cursor: pointer;
+}
+.list li:hover { background: var(--panel-2); }
+.list li.active { background: var(--panel-2); }
+.list .row1 { display: flex; justify-content: space-between; align-items: baseline; }
+.list .name { font-weight: 600; font-size: 14px; }
+.list .preview { color: var(--muted); font-size: 12px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; background: #333d48; color: var(--muted); }
+.badge.verified { background: #1f3a24; color: var(--ok); }
+.badge.changed { background: #3a1f1f; color: var(--err); }
+
+.add-contact { padding: 10px; display: flex; gap: 6px; border-top: 1px solid #2a333d; }
+.add-contact input { flex: 1; min-width: 0; }
+
+/* Thread */
+.thread { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.thread-head {
+  padding: 14px 18px;
+  border-bottom: 1px solid #2a333d;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.thread-actions button { background: var(--panel-2); color: var(--text); font-size: 12px; padding: 6px 10px; margin-left: 6px; }
+.messages { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 8px; }
+.msg { max-width: 68%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.35; word-wrap: break-word; }
+.msg.them { background: var(--panel-2); align-self: flex-start; border-bottom-left-radius: 3px; }
+.msg.me { background: var(--accent); align-self: flex-end; border-bottom-right-radius: 3px; }
+.msg .meta { font-size: 10px; color: rgba(255,255,255,0.55); margin-top: 3px; text-align: right; }
+.msg.them .meta { color: var(--muted); }
+
+.compose { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #2a333d; }
+.compose input { flex: 1; }

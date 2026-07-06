@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mycellium</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Setup -->
+      <section id="screen-setup" class="screen">
+        <div class="card">
+          <h1>Mycellium</h1>
+          <p class="muted">Connect to a directory and queue to begin.</p>
+          <label>Directory URL<input id="setup-dir" type="text" placeholder="http://127.0.0.1:8080" /></label>
+          <label>Queue URL<input id="setup-queue" type="text" placeholder="http://127.0.0.1:8090" /></label>
+          <button id="setup-btn">Connect</button>
+          <p id="setup-err" class="err"></p>
+        </div>
+      </section>
+
+      <!-- Onboarding -->
+      <section id="screen-onboarding" class="screen hidden">
+        <div class="card">
+          <h1>Claim your handle</h1>
+          <p class="muted">Verify an email to bind a handle to this device.</p>
+          <label>Handle<input id="ob-handle" type="text" placeholder="alice" /></label>
+          <label>Email<input id="ob-email" type="email" placeholder="you@example.com" /></label>
+          <button id="ob-start-btn">Send verification code</button>
+
+          <div id="ob-confirm" class="hidden">
+            <label>Code<input id="ob-code" type="text" placeholder="123456" /></label>
+            <label>Display name<input id="ob-name" type="text" placeholder="Alice" /></label>
+            <button id="ob-confirm-btn">Verify &amp; register</button>
+          </div>
+          <p id="ob-err" class="err"></p>
+        </div>
+      </section>
+
+      <!-- Main -->
+      <section id="screen-main" class="screen hidden">
+        <aside class="sidebar">
+          <div class="me">
+            <strong id="me-handle">—</strong>
+            <span id="me-wallet" class="muted mono"></span>
+          </div>
+          <nav class="tabs">
+            <button data-tab="conversations" class="tab active">Chats</button>
+            <button data-tab="contacts" class="tab">Contacts</button>
+          </nav>
+
+          <div id="tab-conversations" class="tabpane">
+            <ul id="convo-list" class="list"></ul>
+          </div>
+
+          <div id="tab-contacts" class="tabpane hidden">
+            <ul id="contact-list" class="list"></ul>
+            <div class="add-contact">
+              <input id="contact-nick" type="text" placeholder="nickname" />
+              <input id="contact-handle" type="text" placeholder="handle" />
+              <button id="contact-add-btn">Add</button>
+            </div>
+          </div>
+        </aside>
+
+        <main class="thread">
+          <header class="thread-head">
+            <div>
+              <strong id="thread-peer">Select a conversation</strong>
+            </div>
+            <div class="thread-actions hidden" id="thread-actions">
+              <button id="safety-btn" title="Show safety number">Safety #</button>
+              <button id="verify-btn" title="Mark verified">Verify</button>
+            </div>
+          </header>
+          <div id="thread-msgs" class="messages"></div>
+          <form id="compose" class="compose hidden">
+            <input id="compose-input" type="text" placeholder="Message…" autocomplete="off" />
+            <button type="submit">Send</button>
+          </form>
+          <p id="main-err" class="err"></p>
+        </main>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
