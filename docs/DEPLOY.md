@@ -184,6 +184,41 @@ services with separate trust.
   and handle **abuse** (deposits are rate-limited per sender wallet). A queue can
   be operated entirely independently of the directory.
 
+## Running a relay (#59)
+
+NAT'd peers that want a **live** path (rather than falling back to the queue) are
+reached through a **Circuit Relay v2** relay — `mycellium-relay`. It is a third,
+**independent** service: run it alongside the directory/queue, or entirely on its
+own box. It speaks libp2p (TCP + Noise), not HTTP, so it needs no TLS proxy.
+
+```sh
+export MYCELLIUM_DATA=/var/lib/mycellium-relay   # stable identity (see below)
+mycellium-relay --addr 0.0.0.0:8700 &
+```
+
+On start it prints the **dialable multiaddr** to advertise:
+
+```
+    /ip4/203.0.113.7/tcp/8700/p2p/12D3KooW…
+```
+
+- **Advertise that multiaddr.** Recipients pass it to their client:
+  `serve --libp2p --relay /ip4/203.0.113.7/tcp/8700/p2p/12D3KooW…`. The client
+  reserves a slot, re-publishes its `…/p2p-circuit/…` address to the directory,
+  and senders then reach it live *through* the relay.
+- **Set `MYCELLIUM_DATA` — the identity must be stable.** The relay's PeerId is
+  derived from `MYCELLIUM_DATA/relay.key` (generated once, `0600`), and that
+  PeerId is baked into the multiaddr clients advertise. Without `MYCELLIUM_DATA`
+  the key is ephemeral and the PeerId changes on every restart (the relay warns),
+  breaking every `--relay` address. Set it in production.
+- **It holds no secrets and reads nothing.** Circuit traffic is end-to-end
+  Noise-encrypted between the two peers; the relay only forwards opaque bytes. It
+  cannot read message content or metadata beyond the fact that it is forwarding a
+  circuit — the worst it can do is drop traffic, and peers then fall back to
+  another route or the queue.
+- **Address resolution** mirrors the other binaries: `--addr HOST:PORT`, then
+  `MYCELLIUM_RELAY_ADDR`, then the default `0.0.0.0:8700`.
+
 ## Scaling notes
 
 - The **directory** is read-mostly and designed to be cloned behind a load

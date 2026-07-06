@@ -1,0 +1,22 @@
+[package]
+name = "mycellium-relay"
+version = "0.0.0"
+description = "The deployable Mycellium Circuit Relay v2 server: forwards opaque circuit traffic so NAT'd peers stay reachable"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mycellium-relay"
+path = "src/main.rs"
+
+[dependencies]
+# The relay transport + server behaviour already live in the transport crate;
+# this binary is just the deployable shell around a listening `Libp2pNode`.
+mycellium-transport = { path = "../mycellium-transport", features = ["libp2p"] }
+anyhow = "1"
+getrandom = "0.2"
+
+[lints.rust]
+unsafe_code = "forbid"

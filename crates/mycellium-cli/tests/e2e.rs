@@ -491,6 +491,243 @@ fn relayed_live_delivery_through_a_relay() {
     );
 }
 
+/// Path to the built `mycellium-relay` binary — a sibling of the CLI binary in
+/// the same target dir. Cargo only exports `CARGO_BIN_EXE_*` for the crate that
+/// owns the binary, so we derive the relay's path from the CLI's and (when this
+/// test target is run in isolation, without a prior `cargo build --workspace`)
+/// build it on demand so the test is self-contained.
+fn relay_bin() -> PathBuf {
+    let path = PathBuf::from(CLI)
+        .parent()
+        .expect("CLI binary has a parent dir")
+        .join("mycellium-relay");
+    if !path.exists() {
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "mycellium-relay"])
+            .status()
+            .expect("run cargo build -p mycellium-relay");
+        assert!(status.success(), "failed to build mycellium-relay");
+    }
+    path
+}
+
+/// Read the dialable multiaddr the relay prints on startup (the first stdout
+/// token shaped `/ip4/…/tcp/…/p2p/<peer-id>`), then keep draining its stdout so
+/// the still-running relay never blocks on a full pipe. Returns `None` if the
+/// relay exits without printing one (e.g. a bind failure), so the caller fails
+/// with a clear message rather than hanging.
+fn read_relay_multiaddr(child: &mut std::process::Child) -> Option<String> {
+    let stdout = child.stdout.take().expect("relay stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let mut found = None;
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        if let Some(tok) = line
+            .split_whitespace()
+            .find(|t| t.starts_with("/ip4/") && t.contains("/p2p/"))
+        {
+            found = Some(tok.to_string());
+            break;
+        }
+        line.clear();
+    }
+    std::thread::spawn(move || {
+        let mut junk = String::new();
+        while reader.read_line(&mut junk).unwrap_or(0) > 0 {
+            junk.clear();
+        }
+    });
+    found
+}
+
+/// The proof for issue #59's relay-operator story: a live relayed delivery
+/// through the **real `mycellium-relay` binary** (not an in-process node).
+///
+/// Mirrors `relayed_live_delivery_through_a_relay`, but the relay is the actual
+/// deployable binary: spawned as a subprocess with its own `MYCELLIUM_DATA`, its
+/// printed multiaddr parsed from stdout, and used as Bob's ONLY route.
+///
+/// Non-vacuity: Bob `serve`s relay-only — no direct listen address and an empty
+/// `MYCELLIUM_QUEUE`, so his record advertises only the `/p2p-circuit/` path. If
+/// the real relay binary weren't forwarding, Alice would have no route: the send
+/// would land in her outbox and the `[1 relay]` / decrypted-message asserts would
+/// both fail.
+#[test]
+fn relayed_delivery_through_the_real_relay_binary() {
+    let _throttle = throttle();
+    let dir = start_directory();
+
+    // Spawn the REAL relay binary on a chosen free loopback port, with a durable
+    // data dir so its identity is stable (and the printed multiaddr is dialable).
+    let relay_port = free_port();
+    let relay_bind = format!("127.0.0.1:{relay_port}");
+    let relay_data = home("relay-data");
+    std::fs::create_dir_all(&relay_data).unwrap();
+    let mut relay = Command::new(relay_bin())
+        .args(["--addr", &relay_bind])
+        .env("MYCELLIUM_DATA", &relay_data)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mycellium-relay");
+
+    // Parse the dialable multiaddr the relay advertises on its stdout.
+    let relay_addr = match read_relay_multiaddr(&mut relay) {
+        Some(a) => a,
+        None => {
+            let _ = relay.kill();
+            let _ = relay.wait();
+            panic!("mycellium-relay never printed a dialable multiaddr");
+        }
+    };
+    assert!(
+        relay_addr.contains(&format!("/tcp/{relay_port}/p2p/")),
+        "relay printed an unexpected multiaddr: {relay_addr}"
+    );
+
+    // Bob registers a libp2p account (his initial direct addr is never listened
+    // on — it is overwritten by the circuit address once he reserves on the relay).
+    let bob_port = free_port();
+    let bob_addr = format!("127.0.0.1:{bob_port}");
+    let bob = home("bob-real-relay");
+    ok(&cli(&bob, &["identity-new"]), "bob id");
+    ok(
+        &cli(
+            &bob,
+            &[
+                "register",
+                "bob",
+                "--addr",
+                &bob_addr,
+                "--libp2p",
+                "--directory",
+                &dir,
+            ],
+        ),
+        "bob register libp2p",
+    );
+
+    let alice = account(&dir, "alice");
+
+    // Bob serves relay-only against the REAL relay: reserve on it, re-publish his
+    // circuit address, accept relayed streams. Empty MYCELLIUM_QUEUE ⇒ no queue
+    // fallback in his record ⇒ the relay circuit is his only reachable path.
+    let mut bob_serve = Command::new(CLI)
+        .args([
+            "serve",
+            "--addr",
+            &bob_addr,
+            "--as",
+            "bob",
+            "--libp2p",
+            "--relay",
+            &relay_addr,
+            "--directory",
+            &dir,
+        ])
+        .env("MYCELLIUM_HOME", &bob)
+        .env("MYCELLIUM_PASSPHRASE", PASS)
+        .env("MYCELLIUM_QUEUE", "")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bob serve relay");
+    let bob_out = tail(bob_serve.stdout.take().unwrap());
+
+    // Bounded wait until Bob has reserved on the real relay + re-published his
+    // circuit address — only then does Alice know a (relay) route to Bob.
+    let published = wait_directory_addr(&alice, "bob", "/p2p-circuit", &dir, 30);
+    if !published {
+        let _ = bob_serve.kill();
+        let _ = bob_serve.wait();
+        let _ = relay.kill();
+        let _ = relay.wait();
+        panic!(
+            "bob never published a circuit address through the real relay:\n{}",
+            bob_out.lock().unwrap()
+        );
+    }
+
+    // Alice sends; Bob advertises only a circuit address, so the message is dialed
+    // live THROUGH the real relay binary into his serve and decrypted there.
+    let sent = cli(
+        &alice,
+        &[
+            "send",
+            "bob",
+            "--as",
+            "alice",
+            "--message",
+            "live over the real relay",
+            "--directory",
+            &dir,
+        ],
+    );
+    ok(&sent, "send");
+    let so = String::from_utf8_lossy(&sent.stdout);
+    assert!(
+        so.contains("[1 relay]"),
+        "send should report a live relayed delivery through the real relay: {so}"
+    );
+    assert!(
+        !so.contains("queued for retry"),
+        "relayed live delivery must not be parked in the outbox: {so}"
+    );
+    assert!(
+        !so.contains("direct"),
+        "delivery was through the relay, not a direct dial: {so}"
+    );
+
+    let got = wait_contains(&bob_out, "from alice: live over the real relay", 20);
+
+    let _ = bob_serve.kill();
+    let _ = bob_serve.wait();
+    let _ = relay.kill();
+    let _ = relay.wait();
+    assert!(
+        got,
+        "bob's serve did not receive the live message through the real relay:\n{}",
+        bob_out.lock().unwrap()
+    );
+}
+
+/// The relay binary's identity is persistent (#59): with a fixed `MYCELLIUM_DATA`
+/// its PeerId — and therefore the whole `--relay` multiaddr clients advertise —
+/// is identical across restarts, so a redeploy never breaks existing addresses.
+#[test]
+fn real_relay_peerid_is_stable_across_restarts() {
+    let _throttle = throttle();
+    let bin = relay_bin();
+    let data = home("relay-stable-data");
+    std::fs::create_dir_all(&data).unwrap();
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+
+    let spawn_and_read = || -> String {
+        let mut child = Command::new(&bin)
+            .args(["--addr", &bind])
+            .env("MYCELLIUM_DATA", &data)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn mycellium-relay");
+        let addr = read_relay_multiaddr(&mut child).expect("relay printed a multiaddr");
+        let _ = child.kill();
+        let _ = child.wait();
+        addr
+    };
+
+    let first = spawn_and_read();
+    let second = spawn_and_read();
+    assert_eq!(
+        first, second,
+        "the relay's advertised multiaddr (incl. PeerId) must be stable across restarts \
+         with a fixed MYCELLIUM_DATA: {first} != {second}"
+    );
+    // Sanity: it really is a dialable circuit-relay address on the fixed port.
+    assert!(
+        first.contains(&format!("/tcp/{port}/p2p/")),
+        "unexpected relay multiaddr: {first}"
+    );
+}
+
 /// Read the offer token the new device's `pair` prints, from its live stdout,
 /// then keep draining stdout so the still-running child never hits a broken pipe.
 fn read_pair_offer(child: &mut std::process::Child) -> String {
