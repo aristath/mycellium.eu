@@ -157,5 +157,3 @@ it and re-renders.
   the sync itself can be slow behind a slow peer.
 - **A group invite can briefly give asymmetric read access** if invites arrive out of
   order — it self-heals on the next `sync`.
-
-These are tracked in [`IMPROVEMENTS.md`](IMPROVEMENTS.md).

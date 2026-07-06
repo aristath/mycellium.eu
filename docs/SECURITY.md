@@ -2,7 +2,7 @@
 
 What Mycellium protects, what it assumes, and what it deliberately does *not* claim.
 This describes the system as built; see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the
-mechanisms and [`IMPROVEMENTS.md`](IMPROVEMENTS.md) for known rough edges.
+mechanisms and [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md) for launch status.
 
 > **Status:** not independently audited. The cryptography is assembled from vetted
 > primitives (below), never invented, but a public launch should be gated on an

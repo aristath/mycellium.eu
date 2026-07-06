@@ -62,9 +62,9 @@ where needed.
 
 ## Good first areas
 
-The rough edges in [`IMPROVEMENTS.md`](IMPROVEMENTS.md) are sized and scoped — e.g.
-routing group control messages through the outbox, merging the device list on browser
-`register`, or GC'ing deleted attachments. The open frontier
+Good entry points are small docs/API contracts, platform-boundary cleanups,
+focused tests around protocol or delivery behavior, and narrow refactors that
+match an existing local pattern. The open frontier
 ([`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md)) is larger: native-client
 completion, NAT traversal beyond Circuit Relay v2, a non-US push relay, and the
 security audit.

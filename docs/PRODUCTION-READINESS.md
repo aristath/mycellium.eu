@@ -26,8 +26,7 @@ they are what the native clients build on.
 | **T3** | Launch (security audit, moderation, large-group scaling) | ⛔ open |
 
 The one hard blocker to a public launch is the **independent security audit** (T3.1);
-see [`GO-LIVE.md`](GO-LIVE.md) for the full checklist and [`IMPROVEMENTS.md`](IMPROVEMENTS.md)
-for smaller refinements found in the doc audit.
+see [`GO-LIVE.md`](GO-LIVE.md) for the full launch checklist.
 
 ---
 
