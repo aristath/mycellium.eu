@@ -10,10 +10,7 @@ const KEY: &[u8] = b"blocklist";
 
 /// Load the set of blocked handles.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(store
-        .get(KEY)?
-        .and_then(|b| wire::decode(&b).ok())
-        .unwrap_or_default())
+    Ok(crate::decode_or_warn(store.get(KEY)?, "blocklist"))
 }
 
 /// Block a handle (idempotent).
@@ -72,5 +69,19 @@ mod tests {
 
         unblock(&mut store, "spammer").unwrap();
         assert!(!is_blocked(&load(&store).unwrap(), "spammer"));
+    }
+
+    #[test]
+    fn corrupt_blocklist_loads_empty_not_silently_dropped() {
+        // A present-but-undecodable blocklist is surfaced loudly (via
+        // decode_or_warn) and read as empty, rather than a silent drop that
+        // would quietly unblock everyone. The raw bytes stay put for recovery.
+        let mut store = MemStore::default();
+        store.put(KEY, b"not valid wire bytes").unwrap();
+        assert!(load(&store).unwrap().is_empty());
+        assert_eq!(
+            store.get(KEY).unwrap().as_deref(),
+            Some(&b"not valid wire bytes"[..])
+        );
     }
 }

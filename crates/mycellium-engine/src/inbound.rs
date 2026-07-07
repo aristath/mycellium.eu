@@ -42,10 +42,10 @@ impl PendingItem {
 
 /// Load the whole inbound-retry store.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<PendingItem>, S::Error> {
-    Ok(store
-        .get(KEY)?
-        .and_then(|b| wire::decode(&b).ok())
-        .unwrap_or_default())
+    Ok(crate::decode_or_warn(
+        store.get(KEY)?,
+        "inbound retry store",
+    ))
 }
 
 /// Persist the whole inbound-retry store.

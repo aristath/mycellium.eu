@@ -557,7 +557,7 @@ async fn pair_approve(
 #[tauri::command]
 async fn export_backup(state: State<'_, AppState>) -> Result<Vec<u8>, String> {
     let client = state.client()?;
-    blocking(move || Ok(client.export_backup())).await
+    blocking(move || client.export_backup()).await
 }
 
 /// Restore a store snapshot produced by `export_backup` into this account.

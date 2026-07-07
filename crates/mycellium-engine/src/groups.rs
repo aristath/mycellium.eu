@@ -154,17 +154,11 @@ pub fn save<S: Storage>(store: &mut S, group: &StoredGroup) -> Result<(), S::Err
 
 /// Load a group by id.
 pub fn load<S: Storage>(store: &S, id: &str) -> Result<Option<StoredGroup>, S::Error> {
-    match store.get(&group_key(id))? {
-        None => Ok(None),
-        Some(b) => match wire::decode(&b) {
-            Ok(g) => Ok(Some(g)),
-            Err(_) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                eprintln!("(warning: corrupt group '{id}' in local storage — treated as missing)");
-                Ok(None)
-            }
-        },
-    }
+    // A corrupt group blob is surfaced loudly, not silently treated as absent.
+    Ok(crate::load_opt(
+        store.get(&group_key(id))?,
+        &format!("group '{id}'"),
+    ))
 }
 
 /// List all known group ids.

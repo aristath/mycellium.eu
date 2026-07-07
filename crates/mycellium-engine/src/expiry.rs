@@ -18,7 +18,7 @@ pub fn set<S: Storage>(store: &mut S, peer: &str, ttl_secs: u64) -> Result<(), S
 
 /// The default TTL (seconds) for `peer`, if any.
 pub fn get<S: Storage>(store: &S, peer: &str) -> Result<Option<u64>, S::Error> {
-    Ok(store.get(&key(peer))?.and_then(|b| wire::decode(&b).ok()))
+    Ok(crate::load_opt(store.get(&key(peer))?, "expiry default"))
 }
 
 /// Clear the default for `peer`.

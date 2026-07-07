@@ -367,13 +367,17 @@ impl MyceliumClient {
             let my_hex = wallet_hex(&inner.identity.wallet_public());
             let my_slot = wireops::device_slot(&inner.identity.device_public());
 
+            // Login already succeeded, so a failing collect here is a real
+            // (transient) network/server error — surface it rather than mapping
+            // it to "no mail", which would look like a successful empty sync and
+            // hide the failure. An genuinely-empty mailbox returns `Ok(vec![])`.
             let mut blobs = queue
                 .collect(&qtoken, &my_hex, &my_slot)
-                .unwrap_or_default();
+                .map_err(SdkError::network)?;
             blobs.extend(
                 queue
                     .collect(&qtoken, &my_hex, ACCOUNT_SLOT)
-                    .unwrap_or_default(),
+                    .map_err(SdkError::network)?,
             );
 
             // Durability (issue #64/#43): collecting drains the mailbox
@@ -383,7 +387,7 @@ impl MyceliumClient {
             // a transient error is then retried on the next sync instead of being
             // silently lost — bounded by attempts/TTL so a bad item dead-letters.
             let now = OsPlatform.now_unix_secs();
-            let mut pending = inbound::load(&inner.store).unwrap_or_default();
+            let mut pending = inbound::load(&inner.store).map_err(SdkError::storage)?;
             for blob in blobs {
                 pending.push(inbound::PendingItem {
                     blob,
@@ -522,9 +526,12 @@ impl MyceliumClient {
     }
 
     /// Store a free-form setting value.
-    pub fn set_setting(&self, key: String, value: String) {
+    pub fn set_setting(&self, key: String, value: String) -> Result<(), SdkError> {
         let mut inner = self.lock();
-        let _ = inner.store.put(&setting_key(&key), value.as_bytes());
+        inner
+            .store
+            .put(&setting_key(&key), value.as_bytes())
+            .map_err(SdkError::storage)
     }
 
     // ---- contacts (address book, TOFU-pinned) -------------------------------
@@ -1006,23 +1013,27 @@ impl MyceliumClient {
     /// A portable snapshot of the encrypted store (every entry, still encrypted at
     /// rest under this account's storage key). Restore it into a client opened on
     /// the **same** account with [`import_backup`](Self::import_backup).
-    pub fn export_backup(&self) -> Vec<u8> {
+    pub fn export_backup(&self) -> Result<Vec<u8>, SdkError> {
         let inner = self.lock();
         let dir = inner.root.join("store");
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        if let Ok(read) = std::fs::read_dir(&dir) {
-            for entry in read.flatten() {
-                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    if let (Some(name), Ok(bytes)) = (
-                        entry.file_name().to_str().map(str::to_string),
-                        std::fs::read(entry.path()),
-                    ) {
-                        entries.push((name, bytes));
-                    }
-                }
+        // Surface IO errors instead of swallowing them: a read_dir/read failure
+        // here would otherwise yield a partial or empty backup that looks like a
+        // successful export, silently losing state the user believed was saved.
+        for entry in std::fs::read_dir(&dir).map_err(SdkError::storage)? {
+            let entry = entry.map_err(SdkError::storage)?;
+            if !entry.file_type().map_err(SdkError::storage)?.is_file() {
+                continue;
             }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                // A non-UTF-8 filename in the store dir isn't something we wrote;
+                // skip it rather than fail the whole backup.
+                continue;
+            };
+            let bytes = std::fs::read(entry.path()).map_err(SdkError::storage)?;
+            entries.push((name, bytes));
         }
-        wire::encode(&entries)
+        Ok(wire::encode(&entries))
     }
 
     /// Restore a store snapshot produced by [`export_backup`](Self::export_backup)

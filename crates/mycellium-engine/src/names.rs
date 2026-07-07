@@ -12,10 +12,7 @@ const KEY: &[u8] = b"names";
 
 /// All learned `(id, name)` pairs.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<(String, String)>, S::Error> {
-    Ok(store
-        .get(KEY)?
-        .and_then(|b| wire::decode(&b).ok())
-        .unwrap_or_default())
+    Ok(crate::decode_or_warn(store.get(KEY)?, "learned names"))
 }
 
 /// Remember (or refresh) the display name a peer publishes for their id.

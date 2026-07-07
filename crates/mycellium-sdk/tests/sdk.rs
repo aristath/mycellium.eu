@@ -216,8 +216,40 @@ fn register_send_sync_read_core() {
 
     // Free-form settings round-trip.
     assert_eq!(bob.get_setting("theme".into()), None);
-    bob.set_setting("theme".into(), "dark".into());
+    bob.set_setting("theme".into(), "dark".into())
+        .expect("set_setting");
     assert_eq!(bob.get_setting("theme".into()), Some("dark".into()));
+
+    // export_backup now returns a Result: a healthy store exports a non-empty
+    // snapshot (rather than silently producing a partial/empty one).
+    let backup = bob.export_backup().expect("export backup");
+    assert!(
+        !backup.is_empty(),
+        "backup of a registered store must not be empty"
+    );
+}
+
+/// A backup over an unreadable store surfaces the IO error as `Err` instead of
+/// masquerading as a successful (empty) export.
+#[test]
+fn export_backup_surfaces_io_error() {
+    let dd = data_dir("backup-ioerr");
+    let client = MyceliumClient::new(dd.to_string_lossy().into_owned()).expect("open");
+    // A healthy store exports fine.
+    client.export_backup().expect("healthy export");
+
+    // Replace the store directory with a regular file so read_dir fails.
+    let store = dd.join("store");
+    std::fs::remove_dir_all(&store).expect("remove store dir");
+    std::fs::write(&store, b"not a directory").expect("write file in its place");
+
+    let err = client
+        .export_backup()
+        .expect_err("export over an unreadable store must be Err, not a silent empty backup");
+    assert!(
+        matches!(err, SdkError::Storage { .. }),
+        "expected a storage error, got {err:?}"
+    );
 }
 
 #[test]

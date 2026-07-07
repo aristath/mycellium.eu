@@ -163,6 +163,10 @@ pub fn load<S: Storage>(store: &S) -> Result<Vec<OutboxEntry>, S::Error> {
     if let Ok(old) = wire::decode::<Vec<OldOutboxEntry>>(&bytes) {
         return Ok(old.into_iter().map(OutboxEntry::from).collect());
     }
+    // Present but decodes as neither the current nor the legacy shape: genuinely
+    // corrupt. Surface it loudly rather than silently dropping parked mail — the
+    // raw bytes stay put until the next write, so an export can still recover them.
+    crate::warn_corrupt("outbox");
     Ok(Vec::new())
 }
 
@@ -444,6 +448,22 @@ mod tests {
         assert_eq!(delivered, 0);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].attempts, 1);
+    }
+
+    #[test]
+    fn corrupt_outbox_loads_empty_not_silently_dropped() {
+        // A present-but-undecodable blob (neither the current nor the legacy
+        // shape) must load as empty via the loud corruption path — not a hard
+        // error, and not a silent drop. The raw bytes stay put for recovery.
+        let mut store = MemStore::default();
+        store.put(KEY, b"not valid wire bytes").unwrap();
+        let loaded = load(&store).unwrap();
+        assert!(loaded.is_empty());
+        // Bytes are left in place until the next write so an export can recover.
+        assert_eq!(
+            store.get(KEY).unwrap().as_deref(),
+            Some(&b"not valid wire bytes"[..])
+        );
     }
 
     #[test]

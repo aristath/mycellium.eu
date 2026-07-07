@@ -17,7 +17,7 @@ pub fn set<S: Storage>(store: &mut S, peer: &str, text: &str) -> Result<(), S::E
 
 /// The saved draft for `peer`, if any.
 pub fn get<S: Storage>(store: &S, peer: &str) -> Result<Option<String>, S::Error> {
-    Ok(store.get(&key(peer))?.and_then(|b| wire::decode(&b).ok()))
+    Ok(crate::load_opt(store.get(&key(peer))?, "draft"))
 }
 
 /// Clear `peer`'s draft.

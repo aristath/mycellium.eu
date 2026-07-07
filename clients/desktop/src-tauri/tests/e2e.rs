@@ -65,7 +65,8 @@ fn start_directory() -> String {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let _ = mycellium_directory::serve(&serve, mycellium_directory::ServeConfig::dev()).await;
+            let _ =
+                mycellium_directory::serve(&serve, mycellium_directory::ServeConfig::dev()).await;
         });
     });
     wait_port(port);

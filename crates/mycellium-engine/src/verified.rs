@@ -57,7 +57,10 @@ pub fn mark<S: Storage>(
 
 /// The wallet last verified for `handle`, if any.
 pub fn get<S: Storage>(store: &S, handle: &str) -> Result<Option<WalletPublicKey>, S::Error> {
-    Ok(store.get(&key(handle))?.and_then(|b| wire::decode(&b).ok()))
+    Ok(crate::load_opt(
+        store.get(&key(handle))?,
+        "verification record",
+    ))
 }
 
 /// Classify how much `current` (the wallet just looked up for `handle`) is
