@@ -90,12 +90,14 @@ impl DirectoryClient {
         Ok(verified.token)
     }
 
-    /// Publish a signed record under `handle` using a session `token`.
-    pub fn publish(&self, token: &str, handle: &Handle, record: &SignedRecord) -> Result<()> {
+    /// Publish a signed `record` using a session `token`. The record already
+    /// carries its own directory id (`record.record.handle` is `user_id(handle)`),
+    /// so no plaintext handle is needed — the PUT targets that id directly.
+    pub fn publish(&self, token: &str, record: &SignedRecord) -> Result<()> {
         let payload = serde_json::to_vec(record)?;
         self.call(
             "PUT",
-            &format!("/records/{}", id(handle)),
+            &format!("/records/{}", record.record.handle.as_str()),
             Some(token),
             Some("application/json"),
             Some(&payload),

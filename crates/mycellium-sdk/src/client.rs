@@ -15,9 +15,8 @@ use mycellium_core::group::Group as CoreGroup;
 use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
-use mycellium_core::record::{Device, Record, SignedRecord};
+use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
-use mycellium_core::userid::user_id;
 use mycellium_core::{safety, wire};
 use mycellium_directory_client::DirectoryClient;
 use mycellium_engine::flow;
@@ -1338,6 +1337,8 @@ fn decode_identity(bytes: &[u8]) -> Result<Identity, SdkError> {
 
 /// Publish our record, merging this device into any record that already exists
 /// for the handle (so re-registering or a prior pairing never drops siblings).
+/// The merge+bump+sign+publish is the shared [`flow::publish_merged`]; this only
+/// binds the SDK's `ureq` transport (the SDK has no advertised address, so `""`).
 fn publish_merged(
     identity: &Identity,
     dir_url: &str,
@@ -1346,34 +1347,10 @@ fn publish_merged(
     queue_url: &str,
 ) -> Result<(), SdkError> {
     let me = Handle::new(handle).map_err(SdkError::invalid)?;
-    let dir = DirectoryClient::with_transport(dir_url, Box::new(UreqTransport));
-    let existing = dir.lookup(&me).ok();
-    let mut devices = existing
-        .as_ref()
-        .map(|r| r.record.devices.clone())
-        .unwrap_or_default();
-    let mine = wireops::this_device(identity, "");
-    if !devices.iter().any(|d| d.device_key == mine.device_key) {
-        devices.push(mine);
-    }
-    let now = OsPlatform.now_unix_secs();
-    let seq = existing
-        .as_ref()
-        .map(|r| r.record.seq + 1)
-        .unwrap_or(now)
-        .max(now);
-    let record = Record {
-        handle: user_id(handle),
-        name: name.to_string(),
-        wallet: identity.wallet_public(),
-        queue: queue_url.to_string(),
-        queues: vec![],
-        devices,
-        seq,
+    let net = SdkNet {
+        dir: DirectoryClient::with_transport(dir_url, Box::new(UreqTransport)),
     };
-    let signed = SignedRecord::sign(record, identity);
-    let token = dir.login(identity).map_err(SdkError::network)?;
-    dir.publish(&token, &me, &signed)
+    flow::publish_merged(identity, &mut OsPlatform, &net, &me, name, queue_url, "")
         .map_err(SdkError::network)?;
     Ok(())
 }
@@ -1534,6 +1511,10 @@ struct SdkNet {
 impl flow::FlowNet for SdkNet {
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
         self.dir.lookup(handle)
+    }
+    fn publish(&self, identity: &Identity, record: &SignedRecord) -> anyhow::Result<()> {
+        let token = self.dir.login(identity)?;
+        self.dir.publish(&token, record)
     }
 }
 

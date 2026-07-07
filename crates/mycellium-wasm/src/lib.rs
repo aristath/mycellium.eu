@@ -20,7 +20,7 @@ use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
 use mycellium_core::platform::Platform;
-use mycellium_core::record::{Device, Record, SignedRecord};
+use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
 use mycellium_core::userid::user_id as core_user_id;
 use mycellium_core::wire;
@@ -99,6 +99,10 @@ struct WasmNet {
 impl flow::FlowNet for WasmNet {
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
         self.dir.lookup(handle)
+    }
+    fn publish(&self, identity: &Identity, record: &SignedRecord) -> anyhow::Result<()> {
+        let token = self.dir.login(identity)?;
+        self.dir.publish(&token, record)
     }
 }
 
@@ -1055,7 +1059,9 @@ impl Session {
 
     /// Publish our record, **merging** this device into any record that already
     /// exists for the handle, so re-registering or linking never drops sibling
-    /// devices. Bumps `seq` past the existing one.
+    /// devices. The merge+bump+sign+publish is the shared [`flow::publish_merged`];
+    /// this only binds the browser XHR transport (wasm has no advertised address,
+    /// so `""`).
     fn publish_merged(
         &self,
         dir_url: &str,
@@ -1064,37 +1070,19 @@ impl Session {
         queue_url: &str,
     ) -> Result<(), JsValue> {
         let me = Handle::new(handle).map_err(|_| JsValue::from_str("invalid handle"))?;
-        let dir = DirectoryClient::with_transport(dir_url, Box::new(XhrTransport));
-        let existing = dir.lookup(&me).ok();
-        let mut devices = existing
-            .as_ref()
-            .map(|r| r.record.devices.clone())
-            .unwrap_or_default();
-        let mine = wireops::this_device(&self.identity, "");
-        if !devices.iter().any(|d| d.device_key == mine.device_key) {
-            devices.push(mine);
-        }
-        let now = BrowserPlatform.now_unix_secs();
-        let seq = existing
-            .as_ref()
-            .map(|r| r.record.seq + 1)
-            .unwrap_or(now)
-            .max(now);
-        let record = Record {
-            handle: core_user_id(handle),
-            name: name.to_string(),
-            wallet: self.identity.wallet_public(),
-            queue: queue_url.to_string(),
-            queues: vec![],
-            devices,
-            seq,
+        let net = WasmNet {
+            dir: DirectoryClient::with_transport(dir_url, Box::new(XhrTransport)),
         };
-        let signed = SignedRecord::sign(record, &self.identity);
-        let token = dir
-            .login(&self.identity)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        dir.publish(&token, &me, &signed)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        flow::publish_merged(
+            &self.identity,
+            &mut BrowserPlatform,
+            &net,
+            &me,
+            name,
+            queue_url,
+            "",
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(())
     }
 

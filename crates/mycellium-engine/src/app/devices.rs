@@ -37,16 +37,26 @@ pub fn register(handle: &str, addr: &str, libp2p: bool, directory: &str) -> Resu
 
     // The record's location is a raw `host:port` for TCP, or a full multiaddr
     // (with the PeerId) for libp2p. `chat` auto-detects which by its leading `/`.
+    // (The libp2p resolution stays here — out of the wasm-clean `flow` layer.)
     let location = if libp2p {
         libp2p_net::advertised_multiaddr(addr, identity.device_secret())?
     } else {
         addr.to_string()
     };
-    let record = build_record(&identity, &handle, &location);
 
+    // The shared merge+bump+sign+publish ([`flow::publish_merged`]) folds this
+    // device into the account's record so re-registering never drops a sibling.
     let client = DirectoryClient::new(directory);
-    let token = client.login(&identity)?;
-    client.publish(&token, &handle, &record)?;
+    let net = EngineNet { dir: &client };
+    crate::flow::publish_merged(
+        &identity,
+        &mut OsPlatform,
+        &net,
+        &handle,
+        &display_name_for(&handle),
+        &own_queue(),
+        &location,
+    )?;
     println!("registered '{}' reachable at {}", handle.as_str(), location);
     Ok(())
 }
@@ -61,6 +71,8 @@ pub fn short_device_id(key: &DevicePublicKey) -> String {
 pub use crate::wireops::device_slot;
 
 /// Re-sign and publish a record with a new device set (seq bumped past `prev`).
+/// Used by device **revocation**, which removes a device rather than merging this
+/// one in (the merge path is [`crate::flow::publish_merged`]).
 pub fn update_devices(
     client: &DirectoryClient,
     token: &str,
@@ -81,33 +93,31 @@ pub fn update_devices(
         seq,
     };
     let signed = SignedRecord::sign(record, identity);
-    client.publish(token, handle, &signed)
+    client.publish(token, &signed)
 }
 
 /// Re-publish this account's record with THIS device's advertised address set to
 /// `addr`, leaving the rest of the cluster untouched. Used by `serve --relay` to
 /// swap in a Circuit Relay v2 circuit address once a reservation is granted (#59),
-/// so senders dial the relay to reach this device. The record `seq` is bumped, so
-/// directories accept the update; the account wallet re-signs it.
+/// so senders dial the relay to reach this device. Delegates to the shared
+/// merge+bump+sign+publish ([`crate::flow::publish_merged`]).
 pub fn republish_this_device(
     client: &DirectoryClient,
-    token: &str,
     identity: &Identity,
     handle: &Handle,
     addr: &str,
 ) -> Result<()> {
-    let current = client.lookup(handle)?;
-    current
-        .verify()
-        .map_err(|_| anyhow!("record failed verification"))?;
-    let my_key = identity.device_public();
-    let mut devices = current.record.devices.clone();
-    let updated = this_device(identity, addr);
-    match devices.iter_mut().find(|d| d.device_key == my_key) {
-        Some(slot) => *slot = updated,
-        None => devices.push(updated),
-    }
-    update_devices(client, token, identity, handle, devices, current.record.seq)
+    let net = EngineNet { dir: client };
+    crate::flow::publish_merged(
+        identity,
+        &mut OsPlatform,
+        &net,
+        handle,
+        &display_name_for(handle),
+        &own_queue(),
+        addr,
+    )?;
+    Ok(())
 }
 
 pub fn list_devices(handle: &str, directory: &str) -> Result<()> {

@@ -63,12 +63,6 @@ impl Server {
         }
     }
 
-    /// The shared metrics handle, so a service can also record events that don't
-    /// flow through an HTTP handler if it ever needs to.
-    pub fn metrics(&self) -> Arc<Metrics> {
-        Arc::clone(&self.metrics)
-    }
-
     /// Serve `app` (the service's routes, with its state already applied) on
     /// `addr` until a shutdown signal arrives, wrapping it in the shared
     /// middleware stack + `/health` + `/metrics` and terminating TLS when

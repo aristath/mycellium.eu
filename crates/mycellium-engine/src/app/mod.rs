@@ -53,6 +53,10 @@ impl crate::flow::FlowNet for EngineNet<'_> {
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
         self.dir.lookup(handle)
     }
+    fn publish(&self, identity: &Identity, record: &SignedRecord) -> anyhow::Result<()> {
+        let token = self.dir.login(identity)?;
+        self.dir.publish(&token, record)
+    }
 }
 
 mod backup;

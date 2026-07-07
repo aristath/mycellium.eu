@@ -501,31 +501,6 @@ pub fn deliver_scored(
     )
 }
 
-/// Deliver the *same* item to every device in a handle's cluster (Layer 11),
-/// via their queue for the offline devices.
-pub fn deliver_to_cluster(
-    dir: &DirectoryClient,
-    identity: &Identity,
-    handle: &Handle,
-    item: &MailItem,
-) {
-    if let Ok(rec) = dir.lookup(handle) {
-        if rec.verify().is_ok() {
-            let queue = QueueTarget::open(identity, &rec.record);
-            for device in &rec.record.devices {
-                let _ = deliver(
-                    identity.device_secret(),
-                    dir,
-                    handle,
-                    queue.as_ref(),
-                    device,
-                    item,
-                );
-            }
-        }
-    }
-}
-
 /// Retry every parked outbox item once: re-resolve the recipient, re-attempt
 /// live/queue delivery, drop the delivered and the expired, bump the rest.
 /// Returns `(delivered, still_waiting)`.
@@ -685,7 +660,7 @@ pub fn serve(
             let circuit = node
                 .reserve_str(relay_addr)
                 .context("could not reserve a slot on the relay")?;
-            republish_this_device(&client, &token, &identity, &me, &circuit)
+            republish_this_device(&client, &identity, &me, &circuit)
                 .context("could not publish our relay (circuit) address")?;
             println!(
                 "serving (libp2p via relay) as {} ({}) at {circuit} — receiving live messages",

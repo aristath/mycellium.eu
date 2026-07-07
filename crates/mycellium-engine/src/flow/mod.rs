@@ -15,8 +15,9 @@ use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
-use mycellium_core::record::{Device, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::storage::Storage;
+use mycellium_core::userid::user_id;
 
 use crate::blocklist;
 use crate::groups::{
@@ -35,6 +36,11 @@ use crate::{antirollback, verified::TrustLevel};
 pub trait FlowNet {
     /// Look up a peer's signed directory record.
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord>;
+
+    /// Log in as `identity` and publish its signed directory `record` (a PUT to
+    /// the record's own id). The clients own login + transport; `flow` only needs
+    /// to hand the account its freshly signed record to store.
+    fn publish(&self, identity: &Identity, record: &SignedRecord) -> anyhow::Result<()>;
 }
 
 /// Why the shared trust chokepoint ([`lookup_verified`]) refused a record.
@@ -235,6 +241,67 @@ where
         return Err(TrustError::StaleRecord);
     }
     Ok((handle, record))
+}
+
+/// The **shared device-merge + record-publish**: fold THIS device into the
+/// account's signed directory record and re-publish it, so re-registering, a
+/// prior pairing, or a relay-address swap never drops a sibling device. This is
+/// the one copy of what used to be triplicated across the engine's
+/// `register`/`republish_this_device`, the SDK's `publish_merged`, and the wasm
+/// `publish_merged`.
+///
+/// It looks up the account's current record through the injected [`FlowNet`],
+/// **replaces** this device's slot (matched by `device_key`) with a fresh entry
+/// carrying `addr` (or appends it if absent), bumps `seq` past the existing one
+/// (`max(existing+1, now)`, so directories accept the update), re-signs under the
+/// account wallet, and publishes via [`FlowNet::publish`] (login + PUT). The host
+/// resolves the transport address string first (the native build turns a relay
+/// circuit / libp2p multiaddr into `addr`; the SDK/wasm pass `""`), keeping the
+/// libp2p resolution out of this wasm-clean layer. Returns the published record.
+pub fn publish_merged<P, N>(
+    identity: &Identity,
+    platform: &mut P,
+    net: &N,
+    me: &Handle,
+    name: &str,
+    queue: &str,
+    addr: &str,
+) -> anyhow::Result<SignedRecord>
+where
+    P: Platform,
+    N: FlowNet,
+{
+    // The account's current record (if any) — its devices are the ones we merge
+    // into, and its seq is what we bump past.
+    let existing = net.lookup(me).ok();
+    let mut devices = existing
+        .as_ref()
+        .map(|r| r.record.devices.clone())
+        .unwrap_or_default();
+    let mine = wireops::this_device(identity, addr);
+    match devices.iter_mut().find(|d| d.device_key == mine.device_key) {
+        Some(slot) => *slot = mine, // refresh this device's advertised address/keys
+        None => devices.push(mine), // first publish from this device — add it
+    }
+    let now = platform.now_unix_secs();
+    let seq = existing
+        .as_ref()
+        .map(|r| r.record.seq.saturating_add(1))
+        .unwrap_or(now)
+        .max(now);
+    let record = Record {
+        // The record binds the *id*, never the plaintext handle (Layer 6).
+        handle: user_id(me.as_str()),
+        name: name.to_string(),
+        wallet: identity.wallet_public(),
+        queue: queue.to_string(),
+        queues: vec![],
+        devices,
+        seq,
+    };
+    let signed = SignedRecord::sign(record, identity);
+    net.publish(identity, &signed)?;
+    Ok(signed)
 }
 
 /// The per-path tally of one 1:1 send (Layer 11 device fan-out), returned by
@@ -1317,6 +1384,9 @@ mod recv_tests {
     struct NoNet;
     impl FlowNet for NoNet {
         fn lookup(&self, _handle: &Handle) -> anyhow::Result<SignedRecord> {
+            anyhow::bail!("no network in this test")
+        }
+        fn publish(&self, _identity: &Identity, _record: &SignedRecord) -> anyhow::Result<()> {
             anyhow::bail!("no network in this test")
         }
     }

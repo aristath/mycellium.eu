@@ -15,8 +15,6 @@ pub enum Error {
     BadSignature,
     /// Bytes could not be decoded into the expected structure.
     Malformed,
-    /// A record was older than one already known (anti-rollback, `seq`).
-    StaleRecord,
     /// AEAD decryption or authentication failed.
     DecryptFailed,
     /// A message would require skipping more keys than allowed.
@@ -32,7 +30,6 @@ impl fmt::Display for Error {
             Error::InvalidHandle => "invalid handle",
             Error::BadSignature => "signature verification failed",
             Error::Malformed => "malformed encoding",
-            Error::StaleRecord => "record is older than the known one",
             Error::DecryptFailed => "decryption failed",
             Error::TooManySkipped => "too many skipped messages",
             Error::WeakKey => "low-order key rejected",

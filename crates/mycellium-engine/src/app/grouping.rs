@@ -49,7 +49,15 @@ pub fn group_create(name: &str, members: &[String], whoami: &str, directory: &st
     Ok(())
 }
 
-/// Send our sender-key distribution to every other member (over pairwise E2E).
+/// Send our sender-key distribution to every member (over pairwise E2E). Every
+/// member, including our own handle — the shared seal loop skips only this exact
+/// device, so our sibling devices still get our key (Layer 11). Any device we
+/// can't reach live or via its queue is parked in the outbox for retry — so key
+/// distribution (like group text) isn't silently lost on a transient failure.
+///
+/// The shared lookup/verify/pin-check/seal loop lives in [`flow::distribute_key`];
+/// this only supplies the engine's per-device delivery (the reachability-scored
+/// live ladder, with the outbox as the guaranteed fallback).
 pub fn distribute_key(
     identity: &Identity,
     me: &Handle,
@@ -59,51 +67,7 @@ pub fn distribute_key(
     fs: &mut FileStore,
     now: u64,
 ) {
-    // Every member, including our own handle — `distribute_key_to` skips only
-    // this exact device, so our sibling devices still get our key (Layer 11).
-    distribute_key_to(
-        identity,
-        me,
-        client,
-        stored,
-        group,
-        &stored.members,
-        fs,
-        now,
-    );
-}
-
-/// The engine's [`flow::FlowNet`]: directory lookups over the native blocking
-/// `DirectoryClient`.
-struct EngineNet<'a> {
-    client: &'a DirectoryClient,
-}
-
-impl crate::flow::FlowNet for EngineNet<'_> {
-    fn lookup(&self, handle: &Handle) -> Result<SignedRecord> {
-        self.client.lookup(handle)
-    }
-}
-
-/// Send our sender-key distribution to a specific set of members. Any device we
-/// can't reach live or via its queue is parked in the outbox for retry — so key
-/// distribution (like group text) isn't silently lost on a transient failure.
-///
-/// The shared lookup/verify/pin-check/seal loop lives in [`crate::flow::distribute_key`];
-/// this only supplies the engine's per-device delivery (the reachability-scored
-/// live ladder, with the outbox as the guaranteed fallback).
-#[allow(clippy::too_many_arguments)]
-pub fn distribute_key_to(
-    identity: &Identity,
-    me: &Handle,
-    client: &DirectoryClient,
-    stored: &StoredGroup,
-    group: &Group,
-    targets: &[String],
-    fs: &mut FileStore,
-    now: u64,
-) {
-    let net = EngineNet { client };
+    let net = EngineNet { dir: client };
     let my_name = display_name_for(me);
     let my_queue = own_queue();
     // The recipient's queue endpoints are per-member, but `deliver` is called
@@ -150,7 +114,7 @@ pub fn distribute_key_to(
         &stored.name,
         &group.distribution(),
         &stored.members,
-        targets,
+        &stored.members,
         &mut deliver,
     );
 }
@@ -216,7 +180,7 @@ pub fn group_send(
     // delivery policy — the reachability-scored live ladder with the outbox as the
     // retry floor. Each member's queue is opened from the record `deliver` is
     // handed (records arrive grouped by member), cached across their devices.
-    let net = EngineNet { client: &client };
+    let net = EngineNet { dir: &client };
     let device_secret = identity.device_secret();
     let mut queue_cache: Option<(WalletPublicKey, Option<QueueTarget>)> = None;
     let mut deliver = |store: &mut FileStore,
@@ -370,7 +334,7 @@ pub fn group_leave(group: &str, whoami: &str, directory: &str) -> Result<()> {
     // to every other member's cluster (so they drop us + re-key) and removes our
     // local state; the closure below binds the engine's live ladder + outbox floor,
     // opening each member's queue from the record it is handed.
-    let net = EngineNet { client: &client };
+    let net = EngineNet { dir: &client };
     let device_secret = identity.device_secret();
     let my_name = display_name_for(&me);
     let my_queue = own_queue();

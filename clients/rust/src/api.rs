@@ -179,7 +179,7 @@ fn finalize(client: &DirectoryClient, uid: &str) -> anyhow::Result<()> {
     // Empty addr: a polling client isn't reachable for live push, so mail flows
     // through its configured queue.
     let record = app::build_record(&identity, &handle, "");
-    client.publish(&token, &handle, &record)?;
+    client.publish(&token, &record)?;
     write_handle(uid)?;
     Ok(())
 }
