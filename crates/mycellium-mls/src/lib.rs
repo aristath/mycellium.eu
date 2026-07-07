@@ -48,6 +48,7 @@
 
 use mdk_core::prelude::*;
 use nostr::{Event, EventId, PublicKey, UnsignedEvent};
+use openmls::prelude::{ExportSecretError, MlsGroupStateError};
 
 pub use mdk_memory_storage::MdkMemoryStorage;
 
@@ -106,10 +107,22 @@ impl Error {
     /// A device that subscribes to every group message inevitably sees traffic for
     /// groups it is not a member of (a commit that adds it arrives before it has
     /// joined via the Welcome; groups it will never be in), its own messages
-    /// echoed back by the relay, and stale/duplicate re-deliveries. MDK surfaces
-    /// these as distinct process-message variants; none is a bug on our side.
+    /// echoed back by the relay, and stale/duplicate re-deliveries. A device that
+    /// has been **removed** from a group (Post-Compromise Security) keeps seeing
+    /// that group's post-eviction traffic it can no longer decrypt. MDK surfaces
+    /// all of these as distinct variants; none is a bug on our side.
     #[must_use]
     pub fn is_unactionable_incoming(&self) -> bool {
+        // A removed leaf processing post-eviction group traffic fails to export the
+        // epoch secret it never held — surfaced as ExportSecret(UseAfterEviction),
+        // distinct from the ProcessMessageUseAfterEviction path. Both mean the same
+        // thing: this device was evicted and must simply drop the event.
+        if let Error::Mdk(mdk_core::Error::ExportSecret(ExportSecretError::GroupStateError(
+            MlsGroupStateError::UseAfterEviction,
+        ))) = self
+        {
+            return true;
+        }
         matches!(
             self,
             Error::Mdk(
@@ -286,6 +299,13 @@ where
     /// All groups this engine is a member of.
     pub fn groups(&self) -> Result<Vec<Group>> {
         Ok(self.mdk.get_groups()?)
+    }
+
+    /// The live member identities (Nostr device pubkeys) of `group` — every leaf
+    /// currently in the group. Used to decide which groups a device to be removed
+    /// actually belongs to before authoring its eviction commit.
+    pub fn members(&self, group: &GroupId) -> Result<std::collections::BTreeSet<PublicKey>> {
+        Ok(self.mdk.get_members(group)?)
     }
 
     /// The current MLS epoch of `group`, or `None` if this engine isn't in it.

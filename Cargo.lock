@@ -1763,6 +1763,7 @@ dependencies = [
  "mdk-core",
  "mdk-memory-storage",
  "nostr",
+ "openmls",
  "thiserror 2.0.18",
  "tokio",
 ]

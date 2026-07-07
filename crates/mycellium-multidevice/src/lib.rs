@@ -132,6 +132,11 @@ pub enum Error {
     /// A device-list event's stated `account` did not match its signer.
     #[error("device-list account does not match the event signer")]
     AccountSignerMismatch,
+    /// A device cannot author the commit that removes its **own** leaf — MLS
+    /// forbids committing your own removal, so another (admin) device of the
+    /// account must author the eviction.
+    #[error("a device cannot remove its own leaf; another device of the account must author it")]
+    CannotRemoveSelf,
 }
 
 /// Convenience result alias for this crate.
@@ -509,6 +514,48 @@ where
                     self.transport.publish(&gift).await?;
                 }
             }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    // -- Fan-out (device removal with Post-Compromise Security) --------------
+
+    /// Evict `device` from **every group this device is currently in that still
+    /// contains it**: for each such group author a `remove_members` commit and
+    /// publish the evolution (kind:445) so the remaining members advance to an
+    /// epoch whose keys the removed device never held. That epoch advance is
+    /// exactly MLS Post-Compromise Security — the removed leaf can decrypt nothing
+    /// sent after its eviction. Returns the number of groups it was removed from.
+    ///
+    /// This must be called on a device that is **already a member and an admin**
+    /// of those groups, and it **cannot remove itself** ([`Error::CannotRemoveSelf`]):
+    /// MLS forbids committing your own removal, so another (admin) device of the
+    /// account authors the eviction. Groups this device is not in are simply never
+    /// visited; groups it is in that do not contain `device` are skipped.
+    pub async fn remove_device_from_all_groups(&self, device: PublicKey) -> Result<usize> {
+        if device == self.device_keys.public_key() {
+            return Err(Error::CannotRemoveSelf);
+        }
+
+        let groups = self.mls.groups()?;
+        let mut count = 0;
+        for group in groups {
+            let gid = group.mls_group_id.clone();
+
+            // Only groups that still list `device` need (or allow) a removal.
+            if !self.mls.members(&gid)?.contains(&device) {
+                continue;
+            }
+
+            // Author the eviction; the two-phase commit merges locally so THIS
+            // device is already at the post-removal epoch on return.
+            let evolution = self
+                .mls
+                .remove_members(&gid, std::slice::from_ref(&device))?;
+
+            // Remaining members apply this commit to advance to the new epoch.
+            self.transport.publish(&evolution).await?;
             count += 1;
         }
         Ok(count)

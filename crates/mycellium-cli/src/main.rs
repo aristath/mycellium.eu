@@ -93,8 +93,28 @@ enum Command {
         yes: bool,
     },
 
+    /// List the devices in this account's device list.
+    Devices,
+
+    /// Manage this account's devices (manager only).
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
+
     /// Show the configured relay URLs.
     Relays,
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// Remove a lost/compromised device from the account: drop it from the device
+    /// list and evict it from every group (Post-Compromise Security — it can
+    /// decrypt nothing sent after removal).
+    Remove {
+        /// The device pubkey to remove (npub or hex).
+        pubkey: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -166,6 +186,10 @@ async fn main() -> Result<()> {
         Command::Inbox { seconds } => inbox(&data_dir, seconds).await,
         Command::Pair { seconds } => pair(&data_dir, seconds).await,
         Command::PairApprove { offer, yes } => pair_approve(&data_dir, &offer, yes).await,
+        Command::Devices => devices_list(&data_dir).await,
+        Command::Device {
+            cmd: DeviceCmd::Remove { pubkey },
+        } => device_remove(&data_dir, &pubkey).await,
         Command::Relays => relays(&data_dir),
     }
 }
@@ -516,7 +540,68 @@ async fn pair_approve(data_dir: &Path, offer_str: &str, yes: bool) -> Result<()>
     Ok(())
 }
 
+/// List the account's devices from its published device list, flagging the device
+/// this config represents.
+async fn devices_list(data_dir: &Path) -> Result<()> {
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    let devices = app.devices().await.context("fetching the device list")?;
+    let me = app.device_pubkey();
+    app.shutdown().await;
+
+    if devices.is_empty() {
+        println!("(no device list published yet — run `mycellium publish`)");
+        return Ok(());
+    }
+    for d in devices {
+        let npub = d.pubkey.to_bech32().unwrap_or_else(|_| d.pubkey.to_hex());
+        let here = if d.pubkey == me {
+            "  (this device)"
+        } else {
+            ""
+        };
+        match &d.name {
+            Some(n) => println!("{npub}  {n}{here}"),
+            None => println!("{npub}{here}"),
+        }
+    }
+    Ok(())
+}
+
+/// **Manager**: remove a device from the account. Drops it from the signed device
+/// list and evicts its leaf from every conversation, advancing each group to an
+/// epoch the removed device never had (Post-Compromise Security).
+async fn device_remove(data_dir: &Path, pubkey: &str) -> Result<()> {
+    let device = parse_pubkey(pubkey)?;
+
+    let (mut app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.subscribe().await.context("subscribing to the relays")?;
+    // Settle existing joins/commits so this device's group state is current before
+    // it authors the eviction commits.
+    app.pump(Duration::from_millis(600)).await?;
+
+    app.remove_device(device)
+        .await
+        .context("removing the device")?;
+
+    app.shutdown().await;
+    println!(
+        "removed device {} — dropped from the device list and evicted from every group.",
+        device.to_bech32().unwrap_or_else(|_| device.to_hex())
+    );
+    Ok(())
+}
+
 // -- helpers ----------------------------------------------------------------
+
+/// Parse a device pubkey argument: an `npub1…` bech32 key or a raw hex key.
+fn parse_pubkey(s: &str) -> Result<PublicKey> {
+    if s.starts_with("npub1") {
+        return PublicKey::from_bech32(s).context("parsing npub");
+    }
+    PublicKey::from_hex(s).context("parsing hex pubkey")
+}
 
 /// Find the existing 1:1 conversation for a contact, or start one.
 async fn resolve_conversation(app: &App, contact: &str) -> Result<mycellium_app::ConversationId> {

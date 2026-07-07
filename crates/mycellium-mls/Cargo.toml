@@ -14,6 +14,10 @@ repository.workspace = true
 # breaks against these re-exports. See the module docs for the alpha note.
 mdk-core = { version = "0.8.0", features = ["mip04"] }
 mdk-memory-storage = "0.8.0"
+# openmls is already in the tree via mdk-core (0.8.1, feature-unified); named
+# directly only so we can structurally match its post-eviction error variant
+# (UseAfterEviction) when classifying an evicted device's incoming traffic.
+openmls = "0.8.1"
 nostr = { version = "0.44.4", features = ["std", "nip44", "nip59"] }
 thiserror = "2"
 

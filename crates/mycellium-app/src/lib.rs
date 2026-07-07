@@ -102,6 +102,18 @@ pub enum Error {
     /// new device to. Publish this device's identity first.
     #[error("no device list published for this account yet; publish before pairing")]
     NoDeviceList,
+    /// A manager tried to remove the very device it is operating from. A device
+    /// cannot evict its own leaf (MLS forbids committing your own removal) — do it
+    /// from another device of the account.
+    #[error("cannot remove the current device from its own account; do it from another device")]
+    CannotRemoveCurrentDevice,
+    /// Removing this device would leave the account with no devices at all.
+    #[error("cannot remove the account's last remaining device")]
+    LastDevice,
+    /// The named device is not in the account's device list, so there is nothing
+    /// to remove.
+    #[error("device {0} is not in the account's device list")]
+    UnknownDevice(PublicKey),
 }
 
 /// Convenience result alias for this crate.
@@ -409,6 +421,67 @@ impl App {
         // Fan the new device into every group this device is already in, so it
         // joins each existing conversation over the relay.
         self.device.add_device_to_all_groups(new_device).await?;
+        Ok(())
+    }
+
+    // -- Device removal (Post-Compromise Security) --------------------------
+
+    /// The account's current devices, as named in its published device list (or an
+    /// empty list if none has been published). Lets the user see what to remove.
+    pub async fn devices(&self) -> Result<Vec<DeviceEntry>> {
+        match self.device.fetch_device_list(self.account).await? {
+            Some(list) => Ok(list.devices),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// **Remove a lost / compromised device from the account** (manager only — the
+    /// counterpart to [`App::approve_device`]). Two steps, in this order:
+    ///
+    /// 1. **Drop it from the account's signed device list and republish** — the
+    ///    authorization revocation, so no future group ever re-enrolls it.
+    /// 2. **Evict its leaf from every group** ([`DeviceAccount::remove_device_from_all_groups`]):
+    ///    each `remove_members` commit advances the group to a new MLS epoch whose
+    ///    keys the removed device never had. This is the Post-Compromise Security
+    ///    property — the removed device **cannot decrypt any message sent after
+    ///    removal**.
+    ///
+    /// Guards: [`Error::NotManager`] if this device does not hold the account key;
+    /// [`Error::CannotRemoveCurrentDevice`] if you try to remove the device you are
+    /// operating from (MLS forbids committing your own removal — do it from another
+    /// device); [`Error::LastDevice`] if it would empty the account; and
+    /// [`Error::UnknownDevice`] if the target is not in the list. Requires the
+    /// account to have a published device list ([`Error::NoDeviceList`]).
+    pub async fn remove_device(&self, device_pubkey: PublicKey) -> Result<()> {
+        // Only the account-key holder can sign a device out of the list.
+        if !self.device.is_manager() {
+            return Err(Error::NotManager);
+        }
+        // A device cannot author the commit that evicts its own leaf.
+        if device_pubkey == self.device_pubkey() {
+            return Err(Error::CannotRemoveCurrentDevice);
+        }
+
+        let mut list = self
+            .device
+            .fetch_device_list(self.account)
+            .await?
+            .ok_or(Error::NoDeviceList)?;
+        if !list.contains(&device_pubkey) {
+            return Err(Error::UnknownDevice(device_pubkey));
+        }
+        if list.devices.len() <= 1 {
+            return Err(Error::LastDevice);
+        }
+
+        // 1. Revoke authorization: drop from the signed list and republish.
+        list.devices.retain(|d| d.pubkey != device_pubkey);
+        self.publish_device_list(list.devices).await?;
+
+        // 2. Evict the leaf from every group (PCS epoch advance).
+        self.device
+            .remove_device_from_all_groups(device_pubkey)
+            .await?;
         Ok(())
     }
 
