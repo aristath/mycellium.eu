@@ -3311,6 +3311,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycellium-multidevice"
+version = "0.0.0"
+dependencies = [
+ "mycellium-mls",
+ "mycellium-nostr",
+ "nostr",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "mycellium-nostr"
 version = "0.0.0"
 dependencies = [
