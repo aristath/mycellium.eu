@@ -36,3 +36,17 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The server binaries are throughput-bound (ECDSA verify, AEAD, postcard in hot
+# request loops) and run on real hardware where binary size is irrelevant — build
+# them speed-optimized instead of inheriting the core's size-first default.
+[profile.release.package.mycellium-server]
+opt-level = 3
+[profile.release.package.mycellium-queue]
+opt-level = 3
+[profile.release.package.mycellium-directory]
+opt-level = 3
+[profile.release.package.mycellium-serve]
+opt-level = 3
+[profile.release.package.mycellium-relay]
+opt-level = 3
