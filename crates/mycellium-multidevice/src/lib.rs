@@ -319,6 +319,21 @@ where
         self.account_keys.is_some()
     }
 
+    /// The account signing keypair, if this device holds it (manager/solo). A
+    /// member device returns `None`. Used by the app layer to authenticate
+    /// account-level requests (e.g. NIP-98-signed name registration) *as* the
+    /// account, not the device.
+    #[must_use]
+    pub fn account_keys(&self) -> Option<&Keys> {
+        self.account_keys.as_ref()
+    }
+
+    /// The relays this device publishes to and advertises.
+    #[must_use]
+    pub fn relays(&self) -> &[RelayUrl] {
+        &self.relays
+    }
+
     /// The underlying relay transport (for `notifications` / `next_event` in
     /// tests and advanced callers).
     #[must_use]

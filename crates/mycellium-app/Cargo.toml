@@ -26,7 +26,7 @@ rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 
 # The `nostr` primitives (keys, pubkeys) the API speaks. PINNED to the 0.44 line
 # to match MDK 0.8's re-exports — see mycellium-mls's alpha note.
-nostr = { version = "0.44.4", features = ["std", "nip44", "nip59"] }
+nostr = { version = "0.44.4", features = ["std", "nip44", "nip59", "nip98"] }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip44", "nip59"] }
 
 # Deterministic key-derivation for the two at-rest DB keys from the device seed.
@@ -46,8 +46,12 @@ serde_json = "1"
 # rust-nostr's in-process relay: the acceptance test traverses a genuine relay
 # socket rather than handing events between devices directly.
 nostr-relay-builder = "0.44"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 tempfile = "3"
+# The real name service + a server to host it, so the names client is proven to
+# register against the genuine `mycellium-names` HTTP surface, not a mock.
+mycellium-names = { path = "../mycellium-names" }
+axum = "0.8"
 
 [lints.rust]
 unsafe_code = "forbid"

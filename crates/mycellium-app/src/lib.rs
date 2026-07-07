@@ -59,11 +59,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 pub mod contacts;
+pub mod names;
 pub mod nip05;
 pub mod pairing;
 pub mod store;
 
 pub use contacts::{safety_number, Contact, TrustStatus};
+pub use names::NameError;
 pub use nip05::{
     HttpsResolver, Nip05Address, Nip05Record, Nip05Resolver, ParseAddressError, ResolveError,
 };
@@ -143,6 +145,9 @@ pub enum Error {
     /// A contact has no recorded NIP-05 address to re-verify.
     #[error("contact '{0}' has no recorded nip05 address")]
     NoNip05(String),
+    /// Registering/releasing a NIP-05 name at its domain's name service failed.
+    #[error(transparent)]
+    Name(#[from] names::NameError),
 }
 
 /// Convenience result alias for this crate.
@@ -610,6 +615,35 @@ impl App {
     /// advertises the claim on Nostr.
     pub async fn set_nip05(&self, address: &Nip05Address) -> Result<()> {
         self.device.publish_nip05(&address.to_string()).await?;
+        Ok(())
+    }
+
+    /// **Register this account's NIP-05 name** at its domain's name service (the
+    /// server side of the binding): NIP-98-sign a `POST /register` as the account
+    /// and, on success, reflect the address in the kind:0 profile so contacts can
+    /// verify it. This is the one command that actually *claims* `name@domain`.
+    ///
+    /// Only a device holding the account key (manager/solo) can register — the
+    /// name binds to the account identity. Errors [`Error::NotManager`] otherwise,
+    /// or [`Error::Name`] if the service rejects it (taken/reserved/…).
+    pub async fn register_name(&self, address: &Nip05Address) -> Result<()> {
+        let keys = self.device.account_keys().ok_or(Error::NotManager)?;
+        let relays: Vec<String> = self
+            .device
+            .relays()
+            .iter()
+            .map(RelayUrl::to_string)
+            .collect();
+        names::register(keys, address, &relays).await?;
+        // Reflect the now-registered binding in the profile so the two sides agree.
+        self.set_nip05(address).await
+    }
+
+    /// **Release this account's NIP-05 name** at its domain's name service, freeing
+    /// it for reuse. NIP-98-authed as the account; manager/solo only.
+    pub async fn release_name(&self, address: &Nip05Address) -> Result<()> {
+        let keys = self.device.account_keys().ok_or(Error::NotManager)?;
+        names::release(keys, address).await?;
         Ok(())
     }
 

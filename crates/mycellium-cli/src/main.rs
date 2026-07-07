@@ -93,6 +93,12 @@ enum Command {
         yes: bool,
     },
 
+    /// Claim or release this account's NIP-05 name at its domain's name service.
+    Name {
+        #[command(subcommand)]
+        cmd: NameCmd,
+    },
+
     /// List the devices in this account's device list.
     Devices,
 
@@ -104,6 +110,21 @@ enum Command {
 
     /// Show the configured relay URLs.
     Relays,
+}
+
+#[derive(Subcommand)]
+enum NameCmd {
+    /// Register `name@domain` at the domain's name service (proving control of
+    /// this account's key via NIP-98) and set it in your profile.
+    Register {
+        /// The address to claim, e.g. `alice@mycellium.eu`.
+        address: String,
+    },
+    /// Release a `name@domain` you previously registered, freeing it for reuse.
+    Release {
+        /// The address to release, e.g. `alice@mycellium.eu`.
+        address: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -269,6 +290,12 @@ async fn main() -> Result<()> {
         Command::Inbox { seconds } => inbox(&data_dir, seconds).await,
         Command::Pair { seconds } => pair(&data_dir, seconds).await,
         Command::PairApprove { offer, yes } => pair_approve(&data_dir, &offer, yes).await,
+        Command::Name {
+            cmd: NameCmd::Register { address },
+        } => name_register(&data_dir, &address).await,
+        Command::Name {
+            cmd: NameCmd::Release { address },
+        } => name_release(&data_dir, &address).await,
         Command::Devices => devices_list(&data_dir).await,
         Command::Device {
             cmd: DeviceCmd::Remove { pubkey },
@@ -444,6 +471,44 @@ async fn account_set_nip05(data_dir: &Path, address: &str) -> Result<()> {
         address.name(),
         app.account().to_hex()
     );
+    Ok(())
+}
+
+/// **Register this account's NIP-05 name** at its domain's name service: NIP-98-sign
+/// a registration, POST it, and set the address in the profile. Unlike `set-nip05`
+/// (which only advertises the claim on Nostr), this actually *claims* the name at
+/// the domain — the domain must run a compatible name service (e.g. `mycellium-names`).
+async fn name_register(data_dir: &Path, address: &str) -> Result<()> {
+    let address = mycellium_app::Nip05Address::parse(address)
+        .with_context(|| format!("parsing nip05 address '{address}'"))?;
+
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    let result = app.register_name(&address).await;
+    app.shutdown().await;
+    result.with_context(|| format!("registering '{address}' at {}", address.domain()))?;
+
+    println!("registered {address} — it now resolves to your account and is set in your profile.");
+    println!(
+        "  verify: https://{}/.well-known/nostr.json?name={}",
+        address.domain(),
+        address.name()
+    );
+    Ok(())
+}
+
+/// **Release a NIP-05 name** you registered at its domain's name service.
+async fn name_release(data_dir: &Path, address: &str) -> Result<()> {
+    let address = mycellium_app::Nip05Address::parse(address)
+        .with_context(|| format!("parsing nip05 address '{address}'"))?;
+
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    let result = app.release_name(&address).await;
+    app.shutdown().await;
+    result.with_context(|| format!("releasing '{address}' at {}", address.domain()))?;
+
+    println!("released {address} — it is free to register again.");
     Ok(())
 }
 

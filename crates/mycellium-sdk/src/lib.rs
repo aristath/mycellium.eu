@@ -122,7 +122,9 @@ impl From<mycellium_app::Error> for SdkError {
             E::NoMigration(_) | E::BadMigration(_) | E::MigrationMismatch => {
                 SdkError::Migration { msg }
             }
-            E::Nip05Parse(_) | E::Nip05Resolve(_) | E::NoNip05(_) => SdkError::Nip05 { msg },
+            E::Nip05Parse(_) | E::Nip05Resolve(_) | E::NoNip05(_) | E::Name(_) => {
+                SdkError::Nip05 { msg }
+            }
             E::Account(_) | E::Transport(_) | E::Store(_) | E::MlsStorage(_) | E::Io(_) => {
                 SdkError::Engine { msg }
             }
