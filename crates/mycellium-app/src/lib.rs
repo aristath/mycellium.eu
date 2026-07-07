@@ -170,6 +170,17 @@ impl ConversationId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Reconstruct a conversation id from its string form — the hex a caller
+    /// round-trips over an FFI boundary, persists, or reads back from
+    /// [`App::conversations`]. Validated: it must be well-formed group-id hex, so a
+    /// malformed id is rejected here rather than at first use.
+    pub fn parse(s: &str) -> Result<Self> {
+        let id = Self(s.to_string());
+        // Validate that it decodes to a group id (rejects non-hex / odd length).
+        id.group_id()?;
+        Ok(id)
+    }
 }
 
 impl std::fmt::Display for ConversationId {

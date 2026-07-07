@@ -1,0 +1,52 @@
+[package]
+name = "mycellium-sdk"
+version = "0.0.0"
+description = "UniFFI SDK over mycellium-app: a stable, foreign-language-bindable (Kotlin/Swift) surface for building mobile/desktop Mycellium messenger UIs on the MLS-over-Nostr engine"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Both a `cdylib` (the native library foreign runtimes load) and a `lib` (so the
+# Rust integration test can drive the client in-process). `name` uses underscores
+# because that becomes the UniFFI namespace / loaded library base name.
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mycellium_sdk"
+
+# The bindings generator. `cargo run --bin uniffi-bindgen -- generate --library
+# <cdylib> --language {kotlin,swift}` emits the foreign bindings from the built
+# library, proving the exported surface is valid UniFFI.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# The headless messenger engine this SDK is a thin, FFI-shaped shell over.
+mycellium-app = { path = "../mycellium-app" }
+
+# The `nostr` primitives the SDK parses at its boundary (npub/nsec/hex). PINNED to
+# the 0.44 line to match the rest of the workspace / MDK 0.8 re-exports.
+nostr = { version = "0.44.4", features = ["std", "nip44", "nip59"] }
+
+# A shared multi-thread runtime the blocking-facing FFI drives the async engine
+# on (`block_on`), plus the spawned receive-loop task. Multi-thread so a spawned
+# receive loop and a foreign `block_on` call interleave.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# UniFFI: proc-macro scaffolding (`#[uniffi::export]` + `setup_scaffolding!`), no
+# hand-written .udl. The `cli` feature provides `uniffi_bindgen_main` for the
+# `uniffi-bindgen` bin above.
+uniffi = { version = "0.28", features = ["cli"] }
+
+thiserror = "2"
+
+[dev-dependencies]
+# rust-nostr's in-process relay: the round-trip test traverses a genuine relay
+# socket, like the app-engine acceptance tests.
+nostr-relay-builder = "0.44"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
