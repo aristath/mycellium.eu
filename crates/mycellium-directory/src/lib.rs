@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use mycellium_core::identity::{Handle, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
+use mycellium_core::wire;
 use sha2::{Digest, Sha256};
 
 mod http;
@@ -122,12 +123,13 @@ pub struct Directory {
     /// Per-server secret mixed into email hashes. A leaked directory reveals no
     /// testable emails without this too. Persisted with the durable store.
     pepper: [u8; 32],
-    /// Durable backing store for bindings/records/emails/pepper. `None` = purely
-    /// in-memory (tests); `Some` = write-through to disk (deployment).
-    store: Option<persist::Store>,
     /// Fixed-window rate counters: `(bucket, action) → (window_start, count)`.
     /// Ephemeral; guards abuse-prone endpoints — above all email sends.
     rate: HashMap<(String, &'static str), (u64, u32)>,
+    /// Monotonic write counter, bumped under the state lock on every mutation that
+    /// produces a durable [`persist::Write`]. It stamps each captured snapshot so
+    /// the store can drop a stale off-lock commit (see [`persist::Write`]).
+    write_seq: u64,
 }
 
 /// A username claim awaiting one-tap email verification (Layer 6 auth).
@@ -211,9 +213,12 @@ impl Directory {
         }
     }
 
-    /// Open a **durable** directory backed by the store at `path`, loading any
-    /// existing bindings/records/emails and re-using the persisted pepper.
-    pub fn open(path: &str) -> Result<Self, String> {
+    /// Open a **durable** directory: the redb [`Store`](persist::Store) lives
+    /// **outside** the state (it is `Send + Sync` and serializes its own writes),
+    /// so a handler can commit off the state lock. Loads existing
+    /// bindings/records/emails and re-uses the persisted pepper (minting + storing
+    /// one on first open). Returns the in-memory directory plus the store.
+    pub fn open(path: &str) -> Result<(Self, persist::Store), String> {
         let store = persist::Store::open(path)?;
         let loaded = store.load()?;
         let pepper = match loaded.pepper {
@@ -224,14 +229,20 @@ impl Directory {
                 p
             }
         };
-        Ok(Directory {
+        let directory = Directory {
             bindings: loaded.bindings,
             records: loaded.records,
             emails: loaded.emails,
             pepper,
-            store: Some(store),
             ..Default::default()
-        })
+        };
+        Ok((directory, store))
+    }
+
+    /// Bump and return the write counter (called under the state lock).
+    fn next_seq(&mut self) -> u64 {
+        self.write_seq += 1;
+        self.write_seq
     }
 
     /// A keyed, non-reversible hash of an email — the only email data we keep.
@@ -395,7 +406,7 @@ impl Directory {
         pending_token: &str,
         code: &str,
         now: u64,
-    ) -> Result<Handle, ApiError> {
+    ) -> Result<(Handle, persist::Write), ApiError> {
         let p = self
             .pending
             .get_mut(pending_token)
@@ -436,14 +447,16 @@ impl Directory {
                 // else: legitimate recovery — fall through and re-bind below.
             }
         }
-        if let Some(store) = &self.store {
-            store
-                .put_binding_and_email(&username, &wallet, &hash)
-                .map_err(|_| ApiError::Storage)?;
-        }
+        let seq = self.next_seq();
+        let write = persist::Write::Email {
+            handle: username.as_str().to_string(),
+            wallet: wallet.0,
+            hash: hash.clone(),
+            seq,
+        };
         self.bindings.insert(username.clone(), wallet);
         self.emails.insert(username.clone(), hash);
-        Ok(username)
+        Ok((username, write))
     }
 
     /// Poll a pending claim: `(verified, username)`.
@@ -463,7 +476,7 @@ impl Directory {
         handle: &Handle,
         record: SignedRecord,
         now: u64,
-    ) -> Result<(), ApiError> {
+    ) -> Result<persist::Write, ApiError> {
         let wallet = self.authed(token, now)?;
         if !self.allow(hex(&wallet.0), "publish", PUBLISH_PER_WALLET, now) {
             return Err(ApiError::RateLimited);
@@ -488,15 +501,19 @@ impl Directory {
             }
         }
 
-        // Persist first, so a storage failure aborts before we mutate memory.
-        if let Some(store) = &self.store {
-            store
-                .put_binding_and_record(handle, &wallet, &record)
-                .map_err(|_| ApiError::Storage)?;
-        }
+        // Mutate memory + capture the snapshot to persist; the handler commits it
+        // off the state lock and only reports success once the commit lands (a
+        // failed commit fails the request closed — see the HTTP `put_record`).
+        let seq = self.next_seq();
+        let write = persist::Write::Record {
+            handle: handle.as_str().to_string(),
+            wallet: wallet.0,
+            record: wire::encode(&record),
+            seq,
+        };
         self.bindings.insert(handle.clone(), wallet);
         self.records.insert(handle.clone(), record);
-        Ok(())
+        Ok(write)
     }
 
     /// Look up the record for `handle`. Open to everyone; no auth.
@@ -612,16 +629,20 @@ mod tests {
 
         let pepper1;
         {
-            let mut dir = Directory::open(path_str).unwrap();
+            // The store lives outside the directory now, so each write mirrors the
+            // handler: mutate memory, capture the snapshot, then commit it.
+            let (mut dir, store) = Directory::open(path_str).unwrap();
             pepper1 = dir.email_hash("x@y.z"); // captures the pepper indirectly
             let token = login(&mut dir, &ari);
-            dir.publish(&token, &handle, record_for(&ari, "ari", 1), 0)
+            let write = dir
+                .publish(&token, &handle, record_for(&ari, "ari", 1), 0)
                 .unwrap();
+            store.apply(write).unwrap();
         } // drop → store flushed/closed
 
         // A fresh process re-opening the same file sees the record, the binding,
         // and the SAME pepper (so email hashes still match).
-        let dir2 = Directory::open(path_str).unwrap();
+        let (mut dir2, _store2) = Directory::open(path_str).unwrap();
         let got = dir2.lookup(&handle).expect("record survived restart");
         assert_eq!(got.record.wallet, ari.wallet_public());
         assert_eq!(
@@ -630,7 +651,6 @@ mod tests {
             "pepper must be stable across restarts"
         );
         // Binding is enforced after reopen: a different wallet can't take the name.
-        let mut dir2 = dir2;
         let mallory = Identity::generate(&mut OsPlatform).unwrap();
         let mtoken = login(&mut dir2, &mallory);
         assert_eq!(
@@ -758,16 +778,17 @@ mod tests {
         let a = Identity::generate(&mut OsPlatform).unwrap();
         let username = Handle::new("alice").unwrap();
         {
-            let mut dir = Directory::open(path_str).unwrap();
+            let (mut dir, store) = Directory::open(path_str).unwrap();
             let tok = login(&mut dir, &a);
             let (pending, code) = dir
                 .auth_start(&tok, &username, "alice@example.com", 0)
                 .unwrap();
-            dir.auth_confirm(&pending, &code, 0).unwrap();
+            let (_username, write) = dir.auth_confirm(&pending, &code, 0).unwrap();
+            store.apply(write).unwrap();
         } // drop → flushed
 
         // Reopen: binding AND email hash both came back (written in one transaction).
-        let dir2 = Directory::open(path_str).unwrap();
+        let (dir2, _store2) = Directory::open(path_str).unwrap();
         assert_eq!(dir2.bindings.get(&username), Some(&a.wallet_public()));
         assert_eq!(
             dir2.emails.get(&username),
@@ -1026,5 +1047,155 @@ mod tests {
             dir.publish(&token, &handle, record_for(&ari, "ari", 6), 0),
             Err(ApiError::Stale)
         );
+    }
+
+    // The concurrency gate (perf review P1-3 / testing review P2-2): fire N
+    // concurrent publishes of distinct handles, each through the real path (lock →
+    // validate + mutate + capture → DROP lock → `spawn_blocking(store.apply)` →
+    // await). Assert none was lost in memory and that re-opening the durable store
+    // recovers the exact same state. Deterministic: every task is joined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishes_stay_consistent_and_durable() {
+        use std::sync::{Arc, Mutex};
+
+        let path = std::env::temp_dir().join(format!("myc-dir-concur-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let (dir, store) = Directory::open(&path_str).unwrap();
+        let dir = Arc::new(Mutex::new(dir));
+        let store = Arc::new(store);
+
+        const N: usize = 50;
+        // One distinct publisher (wallet) per handle — publishes are rate-limited
+        // per wallet, so a distinct wallet per handle stays under the limit.
+        let mut jobs = Vec::with_capacity(N);
+        for i in 0..N {
+            let id = Identity::generate(&mut OsPlatform).unwrap();
+            let handle = Handle::new(format!("user{i}")).unwrap();
+            let token = {
+                let mut d = dir.lock().unwrap_or_else(|e| e.into_inner());
+                login(&mut d, &id)
+            };
+            let record = record_for(&id, handle.as_str(), 1);
+            jobs.push((handle, token, record));
+        }
+
+        let mut tasks = Vec::with_capacity(N);
+        for (handle, token, record) in jobs {
+            let dir = Arc::clone(&dir);
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                let write = {
+                    let mut d = dir.lock().unwrap_or_else(|e| e.into_inner());
+                    d.publish(&token, &handle, record, 0)
+                }
+                .expect("publish should succeed");
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || store.apply(write))
+                    .await
+                    .expect("blocking commit task should not panic")
+                    .expect("commit should succeed");
+            }));
+        }
+        for t in tasks {
+            t.await.expect("publish task should not panic");
+        }
+
+        // In memory: every publish landed, none lost across the race.
+        {
+            let d = dir.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(d.records.len(), N, "no publish may be lost in memory");
+            assert_eq!(d.bindings.len(), N);
+        }
+
+        // Durable: a fresh open of the same store recovers the identical state.
+        drop(dir);
+        drop(store);
+        let (d2, _store2) = Directory::open(&path_str).unwrap();
+        assert_eq!(
+            d2.records.len(),
+            N,
+            "durable store must recover every publish"
+        );
+        assert_eq!(d2.bindings.len(), N);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Many concurrent publishes to the SAME handle (increasing seq): the durable
+    // record must equal the LATEST in-memory record, never a stale earlier
+    // snapshot — the version guard in the store is what prevents an off-lock
+    // commit reorder from rolling the durable seq back below memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_handle_publishes_never_roll_back_on_disk() {
+        use std::sync::{Arc, Mutex};
+
+        let path = std::env::temp_dir().join(format!("myc-dir-seq-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let (dir, store) = Directory::open(&path_str).unwrap();
+        let dir = Arc::new(Mutex::new(dir));
+        let store = Arc::new(store);
+
+        let id = Identity::generate(&mut OsPlatform).unwrap();
+        let handle = Handle::new("shared").unwrap();
+        let token = {
+            let mut d = dir.lock().unwrap_or_else(|e| e.into_inner());
+            login(&mut d, &id)
+        };
+
+        // K stays under PUBLISH_PER_WALLET. seq == K is always the global max, so
+        // whenever its publish runs under the lock it is accepted — hence the final
+        // in-memory (and required durable) seq is deterministically K.
+        const K: u64 = 25;
+        let mut tasks = Vec::with_capacity(K as usize);
+        for seq in 1..=K {
+            let dir = Arc::clone(&dir);
+            let store = Arc::clone(&store);
+            let token = token.clone();
+            let handle = handle.clone();
+            let record = record_for(&id, "shared", seq);
+            tasks.push(tokio::spawn(async move {
+                // A publish that lost the race is rejected as Stale — expected.
+                let write = {
+                    let mut d = dir.lock().unwrap_or_else(|e| e.into_inner());
+                    d.publish(&token, &handle, record, 0)
+                };
+                if let Ok(write) = write {
+                    let store = Arc::clone(&store);
+                    let _ = tokio::task::spawn_blocking(move || store.apply(write))
+                        .await
+                        .expect("blocking commit task should not panic");
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("publish task should not panic");
+        }
+
+        let mem_seq = {
+            let d = dir.lock().unwrap_or_else(|e| e.into_inner());
+            d.records
+                .get(&handle)
+                .expect("a record was published")
+                .record
+                .seq
+        };
+        assert_eq!(mem_seq, K, "the max seq always wins under the lock");
+
+        drop(dir);
+        drop(store);
+        let (d2, _store2) = Directory::open(&path_str).unwrap();
+        assert_eq!(
+            d2.records
+                .get(&handle)
+                .expect("record survived restart")
+                .record
+                .seq,
+            mem_seq,
+            "durable record must equal the latest in-memory record (no disk rollback)"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

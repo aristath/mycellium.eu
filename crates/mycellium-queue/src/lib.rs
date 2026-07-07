@@ -190,8 +190,10 @@ pub struct Queue {
     /// end-to-end sealed (see `mycellium_core::pairing`), and everything is pruned
     /// past `PAIR_TTL`, so the queue only briefly relays opaque bytes.
     pairing: HashMap<String, (Vec<String>, u64)>,
-    /// Durable backing store. `None` = in-memory (tests); `Some` = write-through.
-    store: Option<persist::Store>,
+    /// Monotonic write counter, bumped under the state lock on every mutation that
+    /// produces a durable [`persist::Write`]. It stamps each captured snapshot so
+    /// the store can drop a stale off-lock commit (see [`persist::Write`]).
+    write_seq: u64,
 }
 
 impl Queue {
@@ -200,17 +202,25 @@ impl Queue {
         Self::default()
     }
 
-    /// Open a **durable** queue backed by the store at `path`, loading any
-    /// queued mail and push subscriptions.
-    pub fn open(path: &str) -> Result<Self, String> {
+    /// Open a **durable** queue: the redb [`Store`](persist::Store) lives
+    /// **outside** the state (it is `Send + Sync` and serializes its own writes),
+    /// so a handler can commit off the state lock. Returns the in-memory queue
+    /// seeded from disk plus the store to persist through.
+    pub fn open(path: &str) -> Result<(Self, persist::Store), String> {
         let store = persist::Store::open(path)?;
         let loaded = store.load()?;
-        Ok(Queue {
+        let queue = Queue {
             mailboxes: loaded.mailboxes,
             subs: loaded.subs,
-            store: Some(store),
             ..Default::default()
-        })
+        };
+        Ok((queue, store))
+    }
+
+    /// Bump and return the write counter (called under the state lock).
+    fn next_seq(&mut self) -> u64 {
+        self.write_seq += 1;
+        self.write_seq
     }
 
     /// Step 1 of login: issue a challenge nonce for `wallet`.
@@ -284,27 +294,34 @@ impl Queue {
     /// Register a push subscription for the logged-in wallet (idempotent). The
     /// subscription is validated per variant (§2.2); a duplicate is a no-op, so a
     /// device re-registering a rotated token stays a single entry.
-    pub fn subscribe(&mut self, token: &str, sub: Subscription, now: u64) -> Result<(), ApiError> {
+    pub fn subscribe(
+        &mut self,
+        token: &str,
+        sub: Subscription,
+        now: u64,
+    ) -> Result<Option<persist::Write>, ApiError> {
         let wallet = self.authed(token, now)?;
         if !is_valid_subscription(&sub) {
             return Err(ApiError::BadRequest);
         }
         let wallet_hex = hex33(&wallet.0);
         let list = self.subs.entry(wallet_hex.clone()).or_default();
-        if !list.contains(&sub) {
-            list.push(sub);
-            // Cap per wallet by evicting the oldest, so a device rotating its
-            // token doesn't wedge the list and a client can't grow it forever.
-            while list.len() > MAX_SUBS_PER_WALLET {
-                list.remove(0);
-            }
-            if let Some(store) = &self.store {
-                store
-                    .put_subs(&wallet_hex, list)
-                    .map_err(|_| ApiError::Storage)?;
-            }
+        if list.contains(&sub) {
+            return Ok(None);
         }
-        Ok(())
+        list.push(sub);
+        // Cap per wallet by evicting the oldest, so a device rotating its token
+        // doesn't wedge the list and a client can't grow it forever.
+        while list.len() > MAX_SUBS_PER_WALLET {
+            list.remove(0);
+        }
+        let subs = list.clone();
+        let seq = self.next_seq();
+        Ok(Some(persist::Write::Subs {
+            wallet: wallet_hex,
+            subs,
+            seq,
+        }))
     }
 
     /// Remove a push subscription for the logged-in wallet (explicit unsubscribe).
@@ -313,37 +330,47 @@ impl Queue {
         token: &str,
         sub: &Subscription,
         now: u64,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Option<persist::Write>, ApiError> {
         let wallet = self.authed(token, now)?;
         let wallet_hex = hex33(&wallet.0);
         if let Some(list) = self.subs.get_mut(&wallet_hex) {
             let before = list.len();
             list.retain(|s| s != sub);
             if list.len() != before {
-                if let Some(store) = &self.store {
-                    store
-                        .put_subs(&wallet_hex, list)
-                        .map_err(|_| ApiError::Storage)?;
-                }
+                let subs = list.clone();
+                let seq = self.next_seq();
+                return Ok(Some(persist::Write::Subs {
+                    wallet: wallet_hex,
+                    subs,
+                    seq,
+                }));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Drop subscriptions a transport reported as gone (Web Push 404/410, APNs
     /// `Unregistered`, FCM `UNREGISTERED`). Called off the request path after a
     /// deposit's fan-out, so dead subscriptions don't linger and waste a send on
-    /// every future deposit.
-    pub fn remove_subs(&mut self, wallet_hex: &str, gone: &[Subscription]) {
-        if let Some(list) = self.subs.get_mut(wallet_hex) {
-            let before = list.len();
-            list.retain(|s| !gone.contains(s));
-            if list.len() != before {
-                if let Some(store) = &self.store {
-                    let _ = store.put_subs(wallet_hex, list);
-                }
-            }
+    /// every future deposit. Returns the durable write to persist (off the lock).
+    pub fn remove_subs(
+        &mut self,
+        wallet_hex: &str,
+        gone: &[Subscription],
+    ) -> Option<persist::Write> {
+        let list = self.subs.get_mut(wallet_hex)?;
+        let before = list.len();
+        list.retain(|s| !gone.contains(s));
+        if list.len() == before {
+            return None;
         }
+        let subs = list.clone();
+        let seq = self.next_seq();
+        Some(persist::Write::Subs {
+            wallet: wallet_hex.to_string(),
+            subs,
+            seq,
+        })
     }
 
     /// The push subscriptions registered for a recipient wallet.
@@ -360,7 +387,7 @@ impl Queue {
         slot: &str,
         blob: String,
         now: u64,
-    ) -> Result<(), ApiError> {
+    ) -> Result<persist::Write, ApiError> {
         // Reject malformed/oversized keys before they can mint a sparse mailbox
         // (a valid wallet is 66 hex chars; a valid slot is `account` or 64 hex).
         if !is_wallet_hex(recipient_wallet_hex) || !is_slot(slot) {
@@ -383,23 +410,27 @@ impl Queue {
             return Err(ApiError::MailboxFull);
         }
         mailbox.push(blob);
-        if let Some(store) = &self.store {
-            store
-                .put_mailbox(recipient_wallet_hex, slot, mailbox)
-                .map_err(|_| ApiError::Storage)?;
-        }
-        Ok(())
+        let blobs = mailbox.clone();
+        let seq = self.next_seq();
+        Ok(persist::Write::Mailbox {
+            wallet: recipient_wallet_hex.to_string(),
+            slot: slot.to_string(),
+            blobs,
+            seq,
+        })
     }
 
     /// Drain one mailbox slot. The `token` proves the caller controls a wallet;
-    /// they may only collect *their own* wallet (`wallet_hex`).
+    /// they may only collect *their own* wallet (`wallet_hex`). Returns the
+    /// drained blobs and, on a hit, the durable delete to persist off the lock (a
+    /// miss returns `None` — nothing to persist).
     pub fn collect(
         &mut self,
         token: &str,
         wallet_hex: &str,
         slot: &str,
         now: u64,
-    ) -> Result<Vec<String>, ApiError> {
+    ) -> Result<(Vec<String>, Option<persist::Write>), ApiError> {
         if !is_slot(slot) {
             return Err(ApiError::BadRequest);
         }
@@ -407,16 +438,21 @@ impl Queue {
         if hex33(&caller.0) != wallet_hex {
             return Err(ApiError::Forbidden);
         }
-        let drained = self
+        match self
             .mailboxes
             .remove(&(wallet_hex.to_string(), slot.to_string()))
-            .unwrap_or_default();
-        if let Some(store) = &self.store {
-            store
-                .del_mailbox(wallet_hex, slot)
-                .map_err(|_| ApiError::Storage)?;
+        {
+            Some(drained) => {
+                let seq = self.next_seq();
+                let write = persist::Write::DelMailbox {
+                    wallet: wallet_hex.to_string(),
+                    slot: slot.to_string(),
+                    seq,
+                };
+                Ok((drained, Some(write)))
+            }
+            None => Ok((Vec::new(), None)),
         }
-        Ok(drained)
     }
 
     /// Relay one opaque, end-to-end-sealed pairing message into rendezvous `rid`.
@@ -481,6 +517,10 @@ impl Queue {
 #[derive(Clone)]
 pub struct QueueState {
     queue: Arc<Mutex<Queue>>,
+    /// The durable store, held **outside** the queue `Mutex` so a write handler
+    /// commits (an fsync) off the state lock and off the async worker (on
+    /// `spawn_blocking`). `None` = in-memory development mode.
+    store: Option<Arc<persist::Store>>,
     vapid: Arc<push::Vapid>,
     native: Arc<native_push::NativePush>,
     push_allow_hosts: Arc<HashSet<String>>,
@@ -508,19 +548,27 @@ impl ServeConfig {
 
 /// Bind `addr` and serve the queue until a shutdown signal arrives.
 pub async fn serve(addr: &str, config: ServeConfig) -> std::io::Result<()> {
-    serve_with(
-        addr,
-        Arc::new(Mutex::new(open_queue(config.data_dir.as_deref())?)),
-        config,
-    )
-    .await
+    let (queue, store) = open_queue(config.data_dir.as_deref())?;
+    run(addr, Arc::new(Mutex::new(queue)), store, config).await
 }
 
-/// Serve the queue over an **externally-owned** queue handle, so an embedder or
-/// test can seed/observe the same [`Queue`] the routes mutate.
+/// Serve the queue over an **externally-owned**, in-memory queue handle, so an
+/// embedder or test can seed/observe the same [`Queue`] the routes mutate. (An
+/// externally-owned handle has no durable store; use [`serve`] for durability.)
 pub async fn serve_with(
     addr: &str,
     queue: Arc<Mutex<Queue>>,
+    config: ServeConfig,
+) -> std::io::Result<()> {
+    run(addr, queue, None, config).await
+}
+
+/// Build the shared state and serve. The durable `store` (if any) rides in the
+/// state **outside** the queue `Mutex`, so write handlers commit off the lock.
+async fn run(
+    addr: &str,
+    queue: Arc<Mutex<Queue>>,
+    store: Option<Arc<persist::Store>>,
     config: ServeConfig,
 ) -> std::io::Result<()> {
     let push_allow_hosts = Arc::new(normalize_allow_hosts(config.push_allow_hosts));
@@ -532,6 +580,7 @@ pub async fn serve_with(
     println!("  push: VAPID enabled");
     let state = QueueState {
         queue,
+        store,
         vapid,
         native,
         push_allow_hosts,
@@ -541,12 +590,32 @@ pub async fn serve_with(
         .await
 }
 
+/// Persist one durable [`persist::Write`] **off the state lock and off the async
+/// worker**: the commit (an fsync) runs on `spawn_blocking`, and the handler
+/// awaits it so durability precedes the response. A join failure (a panicked
+/// blocking task) or a commit error both fail the request closed via
+/// [`ApiError::Storage`]. In-memory mode (`None`) is a no-op.
+async fn persist(
+    store: &Option<Arc<persist::Store>>,
+    write: persist::Write,
+) -> Result<(), ApiError> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || store.apply(write))
+        .await
+        .map_err(|_| ApiError::Storage)?
+        .map_err(|_| ApiError::Storage)
+}
+
 /// Build the queue's [`Router`] over an externally-owned queue handle, with an
 /// ephemeral VAPID key. For in-process embedding and tests that want a handle to
 /// the same [`Queue`] the routes mutate.
 pub fn router_for(queue: Arc<Mutex<Queue>>) -> Router {
     router(QueueState {
         queue,
+        store: None,
         vapid: Arc::new(push::Vapid::generate()),
         native: Arc::new(native_push::NativePush::default()),
         push_allow_hosts: Arc::new(HashSet::new()),
@@ -632,22 +701,22 @@ pub fn router(state: QueueState) -> Router {
 
 /// Open the queue durably from an explicit data directory. `None` is explicit
 /// in-memory development mode.
-fn open_queue(data: Option<&str>) -> std::io::Result<Queue> {
+fn open_queue(data: Option<&str>) -> std::io::Result<(Queue, Option<Arc<persist::Store>>)> {
     match data {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             let path = format!("{}/queue.redb", dir.trim_end_matches('/'));
-            let queue = Queue::open(&path).map_err(|e| {
+            let (queue, store) = Queue::open(&path).map_err(|e| {
                 std::io::Error::other(format!(
                     "the durable queue store at {path} could not be opened: {e}"
                 ))
             })?;
             println!("  persistence: {path}");
-            Ok(queue)
+            Ok((queue, Some(Arc::new(store))))
         }
         None => {
             println!("  storage: in-memory development mode");
-            Ok(Queue::new())
+            Ok((Queue::new(), None))
         }
     }
 }
@@ -739,10 +808,14 @@ async fn push_subscribe(
 ) -> Result<Response, ApiError> {
     let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
     let req: SubscribeReq = parse(&body)?;
-    st.queue
+    let write = st
+        .queue
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .subscribe(token, req.into_subscription(), now_secs())?;
+    if let Some(write) = write {
+        persist(&st.store, write).await?;
+    }
     Ok(ok())
 }
 
@@ -753,10 +826,14 @@ async fn push_unsubscribe(
 ) -> Result<Response, ApiError> {
     let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
     let req: SubscribeReq = parse(&body)?;
-    st.queue
+    let write = st
+        .queue
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .unsubscribe(token, &req.into_subscription(), now_secs())?;
+    if let Some(write) = write {
+        persist(&st.store, write).await?;
+    }
     Ok(ok())
 }
 
@@ -768,10 +845,15 @@ async fn mailbox_post(
 ) -> Result<Response, ApiError> {
     let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
     let now = now_secs();
-    st.queue
+    // Lock → mutate memory + capture the snapshot → DROP the lock, then commit
+    // (fsync) off the lock and off the async worker, awaiting it so the deposit is
+    // durable before we respond (a commit error fails the request closed).
+    let write = st
+        .queue
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .deposit(token, &wallet, &slot, body, now)?;
+    persist(&st.store, write).await?;
     // Wake the recipient's devices — contentless, and off the lock/thread so a
     // slow push transport never stalls the queue. Each subscription dispatches
     // to its transport (Web Push over VAPID, UnifiedPush over a bare POST, APNs /
@@ -789,6 +871,7 @@ async fn mailbox_post(
             push_allow_hosts: Arc::clone(&st.push_allow_hosts),
         };
         let queue = Arc::clone(&st.queue);
+        let store = st.store.clone();
         std::thread::spawn(move || {
             // Prune the subscriptions a transport says are gone, so we don't
             // wake them on every future deposit.
@@ -803,10 +886,15 @@ async fn mailbox_post(
                 );
             }
             if !outcome.gone.is_empty() {
-                queue
+                let write = queue
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove_subs(&wallet, &outcome.gone);
+                // Best-effort persist of the pruned list (already off the request
+                // path, on this dedicated thread — a blocking commit is fine here).
+                if let (Some(write), Some(store)) = (write, &store) {
+                    let _ = store.apply(write);
+                }
             }
         });
     }
@@ -819,11 +907,17 @@ async fn mailbox_get(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
-    let messages = st
-        .queue
-        .lock()
-        .unwrap()
-        .collect(token, &wallet, &slot, now_secs())?;
+    let (messages, write) = st.queue.lock().unwrap_or_else(|e| e.into_inner()).collect(
+        token,
+        &wallet,
+        &slot,
+        now_secs(),
+    )?;
+    // On a hit, persist the drain (delete) off the lock before responding, so a
+    // reopen can't resurrect just-collected mail; a miss has nothing to persist.
+    if let Some(write) = write {
+        persist(&st.store, write).await?;
+    }
     Ok(Json(Messages { messages }).into_response())
 }
 
@@ -1071,23 +1165,30 @@ mod tests {
         let alice = Identity::generate(&mut P(1)).unwrap();
 
         {
-            let mut q = Queue::open(path_str).unwrap();
+            // The store lives outside the queue now, so each write mirrors the
+            // handler: mutate memory, capture the snapshot, then commit it.
+            let (mut q, store) = Queue::open(path_str).unwrap();
             let atoken = login(&mut q, &alice);
-            q.deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0)
+            let write = q
+                .deposit(&atoken, &bob_hex, ACCOUNT_SLOT, "sealed".into(), 0)
                 .unwrap();
+            store.apply(write).unwrap();
             let btoken = login(&mut q, &bob);
-            q.subscribe(
-                &btoken,
-                Subscription::WebPush {
-                    endpoint: "https://push.example/abc".into(),
-                },
-                0,
-            )
-            .unwrap();
+            let write = q
+                .subscribe(
+                    &btoken,
+                    Subscription::WebPush {
+                        endpoint: "https://push.example/abc".into(),
+                    },
+                    0,
+                )
+                .unwrap()
+                .expect("a fresh subscription persists");
+            store.apply(write).unwrap();
         } // drop → flushed
 
         // Reopen: the queued blob and the push subscription are both still there.
-        let mut q2 = Queue::open(path_str).unwrap();
+        let (mut q2, store2) = Queue::open(path_str).unwrap();
         assert_eq!(
             q2.subscriptions(&bob_hex),
             vec![Subscription::WebPush {
@@ -1095,18 +1196,17 @@ mod tests {
             }]
         );
         let btoken = login(&mut q2, &bob);
-        assert_eq!(
-            q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT, 0).unwrap(),
-            vec!["sealed".to_string()]
-        );
+        let (drained, write) = q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT, 0).unwrap();
+        assert_eq!(drained, vec!["sealed".to_string()]);
+        store2
+            .apply(write.expect("a hit persists the drain"))
+            .unwrap();
         // ...and after collecting, the drain is persisted (empty on next reopen).
-        drop(q2);
-        let mut q3 = Queue::open(path_str).unwrap();
+        drop((q2, store2));
+        let (mut q3, _store3) = Queue::open(path_str).unwrap();
         let btoken2 = login(&mut q3, &bob);
-        assert!(q3
-            .collect(&btoken2, &bob_hex, ACCOUNT_SLOT, 0)
-            .unwrap()
-            .is_empty());
+        let (drained3, _) = q3.collect(&btoken2, &bob_hex, ACCOUNT_SLOT, 0).unwrap();
+        assert!(drained3.is_empty());
 
         let _ = std::fs::remove_file(path);
     }
@@ -1507,18 +1607,19 @@ mod tests {
         let alice_hex = hex33(&alice.wallet_public().0);
         assert_eq!(
             q.collect(&alice_token, &alice_hex, ACCOUNT_SLOT, 0)
-                .unwrap(),
+                .unwrap()
+                .0,
             Vec::<String>::new()
         );
 
         // Bob collects his own, then it's drained.
         let bob_token = login(&mut q, &bob);
         assert_eq!(
-            q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(),
+            q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap().0,
             vec!["sealed".to_string()]
         );
         assert_eq!(
-            q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap(),
+            q.collect(&bob_token, &bob_hex, ACCOUNT_SLOT, 0).unwrap().0,
             Vec::<String>::new()
         );
     }
@@ -1864,5 +1965,91 @@ mod tests {
             ),
             "the healthy UnifiedPush sub must remain after pruning the gone one"
         );
+    }
+
+    // The concurrency gate (perf review P1-3 / testing review P2-2): fire N
+    // concurrent deposits — half at one SHARED mailbox (so whole-`Vec` commits
+    // contend on the same key and must not reorder-lose a write), half at
+    // distinct mailboxes — each through the real path (lock → mutate + capture →
+    // DROP lock → `spawn_blocking(store.apply)` → await). Then assert no write was
+    // lost in memory, and that re-opening the durable store recovers the exact
+    // same state. Deterministic: every task is joined, no sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deposits_stay_consistent_and_durable() {
+        use std::sync::{Arc, Mutex};
+
+        let path = std::env::temp_dir().join(format!("myc-q-concur-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let (queue, store) = Queue::open(&path_str).unwrap();
+        let queue = Arc::new(Mutex::new(queue));
+        let store = Arc::new(store);
+
+        // The shared recipient every even-indexed sender targets.
+        let shared = Identity::generate(&mut P(200)).unwrap();
+        let shared_hex = hex33(&shared.wallet_public().0);
+
+        const N: usize = 50;
+        // One distinct sender per write (deposits are rate-limited per sender, so
+        // distinct senders each depositing once stay well under the limit) with a
+        // pre-issued token (login is a lock-only, non-persisting op).
+        let mut senders = Vec::with_capacity(N);
+        for i in 0..N {
+            let id = Identity::generate(&mut P(i as u8)).unwrap();
+            let token = {
+                let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                login(&mut q, &id)
+            };
+            let own_hex = hex33(&id.wallet_public().0);
+            senders.push((token, own_hex));
+        }
+
+        let mut tasks = Vec::with_capacity(N);
+        for (i, (token, own_hex)) in senders.into_iter().enumerate() {
+            let queue = Arc::clone(&queue);
+            let store = Arc::clone(&store);
+            let shared_hex = shared_hex.clone();
+            tasks.push(tokio::spawn(async move {
+                // Even → the shared mailbox; odd → the sender's own mailbox.
+                let recipient = if i % 2 == 0 { shared_hex } else { own_hex };
+                let write = {
+                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                    q.deposit(&token, &recipient, ACCOUNT_SLOT, format!("blob-{i}"), 0)
+                }
+                .expect("deposit should succeed");
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || store.apply(write))
+                    .await
+                    .expect("blocking commit task should not panic")
+                    .expect("commit should succeed");
+            }));
+        }
+        for t in tasks {
+            t.await.expect("deposit task should not panic");
+        }
+
+        // In memory: the shared mailbox holds every even write, each distinct
+        // mailbox exactly one, and no blob was lost across the race.
+        let shared_key = (shared_hex.clone(), ACCOUNT_SLOT.to_string());
+        {
+            let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let total: usize = q.mailboxes.values().map(Vec::len).sum();
+            assert_eq!(total, N, "no deposit may be lost in memory");
+            assert_eq!(q.mailboxes.get(&shared_key).map(Vec::len), Some(N / 2));
+            assert_eq!(q.mailboxes.len(), 1 + N / 2, "1 shared + N/2 distinct");
+        }
+
+        // Durable: a fresh open of the same store recovers the identical state —
+        // the version guard kept the latest whole-`Vec` snapshot for the shared
+        // key even though its commits raced. Release the redb file lock first.
+        drop(queue);
+        drop(store);
+        let (q2, _store2) = Queue::open(&path_str).unwrap();
+        let total: usize = q2.mailboxes.values().map(Vec::len).sum();
+        assert_eq!(total, N, "durable store must recover every deposit");
+        assert_eq!(q2.mailboxes.get(&shared_key).map(Vec::len), Some(N / 2));
+        assert_eq!(q2.mailboxes.len(), 1 + N / 2);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

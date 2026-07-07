@@ -10,6 +10,7 @@
 //! is unchanged.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use mycellium_core::identity::{Handle, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
@@ -30,9 +31,37 @@ pub struct Loaded {
     pub pepper: Option<[u8; 32]>,
 }
 
+/// One durable mutation, captured under the [`Directory`](crate::Directory) lock
+/// and committed **off** it (on `spawn_blocking`). Each carries a monotonic `seq`
+/// from the directory's write counter so [`Store::apply`] can drop a stale
+/// off-lock commit whose handle a newer commit already advanced — keeping the
+/// durable record equal to the latest in-memory one even when a `publish`'s
+/// commit reaches redb out of the order the memory was mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Write {
+    /// A published record: its binding **and** record, written atomically.
+    Record {
+        handle: String,
+        wallet: [u8; 33],
+        record: Vec<u8>,
+        seq: u64,
+    },
+    /// An email-verified claim: its binding **and** recovery-email hash, atomic.
+    Email {
+        handle: String,
+        wallet: [u8; 33],
+        hash: String,
+        seq: u64,
+    },
+}
+
 /// A durable directory store.
 pub struct Store {
     db: Database,
+    /// Highest committed `seq` per handle-scoped key — the guard that makes
+    /// concurrent off-lock commits order-independent (see [`Write`]). Touched only
+    /// on the write path (inside `spawn_blocking`), never by a read handler.
+    versions: Mutex<HashMap<String, u64>>,
 }
 
 impl Store {
@@ -48,7 +77,10 @@ impl Store {
             txn.open_table(META).map_err(|e| e.to_string())?;
         }
         txn.commit().map_err(|e| e.to_string())?;
-        Ok(Store { db })
+        Ok(Store {
+            db,
+            versions: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Read everything back into memory.
@@ -92,66 +124,76 @@ impl Store {
         Ok(out)
     }
 
-    /// Atomically write a handle's binding **and** record in one transaction, so
-    /// a crash can never leave a binding without its record (or vice versa).
-    pub fn put_binding_and_record(
-        &self,
-        handle: &Handle,
-        wallet: &WalletPublicKey,
-        record: &SignedRecord,
-    ) -> Result<(), String> {
-        let encoded = wire::encode(record);
-        self.write(|txn| {
-            txn.open_table(BINDINGS)
-                .map_err(err)?
-                .insert(handle.as_str(), &wallet.0[..])
-                .map_err(err)?;
-            txn.open_table(RECORDS)
-                .map_err(err)?
-                .insert(handle.as_str(), &encoded[..])
-                .map_err(err)?;
-            Ok(())
-        })
-    }
-
-    /// Atomically write a handle's binding **and** recovery-email hash in one
-    /// transaction (for email-verified claim + recovery).
-    pub fn put_binding_and_email(
-        &self,
-        handle: &Handle,
-        wallet: &WalletPublicKey,
-        hash: &str,
-    ) -> Result<(), String> {
-        self.write(|txn| {
-            txn.open_table(BINDINGS)
-                .map_err(err)?
-                .insert(handle.as_str(), &wallet.0[..])
-                .map_err(err)?;
-            txn.open_table(EMAILS)
-                .map_err(err)?
-                .insert(handle.as_str(), hash)
-                .map_err(err)?;
-            Ok(())
-        })
+    /// Durably apply one [`Write`], guarding against stale off-lock commits by its
+    /// `seq` (see [`Write`]). Each variant is one atomic multi-table transaction,
+    /// so a crash can never leave a binding without its record/email. Returns
+    /// `Ok(())` for both a fresh commit and a deliberately-skipped stale one.
+    pub fn apply(&self, write: Write) -> Result<(), String> {
+        match write {
+            Write::Record {
+                handle,
+                wallet,
+                record,
+                seq,
+            } => self.versioned(&format!("r:{handle}"), seq, |txn| {
+                txn.open_table(BINDINGS)
+                    .map_err(err)?
+                    .insert(handle.as_str(), &wallet[..])
+                    .map_err(err)?;
+                txn.open_table(RECORDS)
+                    .map_err(err)?
+                    .insert(handle.as_str(), &record[..])
+                    .map_err(err)?;
+                Ok(())
+            }),
+            Write::Email {
+                handle,
+                wallet,
+                hash,
+                seq,
+            } => self.versioned(&format!("e:{handle}"), seq, |txn| {
+                txn.open_table(BINDINGS)
+                    .map_err(err)?
+                    .insert(handle.as_str(), &wallet[..])
+                    .map_err(err)?;
+                txn.open_table(EMAILS)
+                    .map_err(err)?
+                    .insert(handle.as_str(), hash.as_str())
+                    .map_err(err)?;
+                Ok(())
+            }),
+        }
     }
 
     pub fn set_pepper(&self, pepper: &[u8; 32]) -> Result<(), String> {
-        self.write(|txn| {
-            txn.open_table(META)
-                .map_err(err)?
-                .insert("pepper", &pepper[..])
-                .map_err(err)?;
-            Ok(())
-        })
+        let txn = self.db.begin_write().map_err(err)?;
+        txn.open_table(META)
+            .map_err(err)?
+            .insert("pepper", &pepper[..])
+            .map_err(err)?;
+        txn.commit().map_err(err)
     }
 
-    fn write(
+    /// Commit `f` iff `seq` is newer than the last committed `seq` for `vkey`,
+    /// else skip it as stale. The `versions` lock spans the commit so a concurrent
+    /// apply to the same key can't interleave a stale write — redb already
+    /// serializes its single writer, and (unlike the state lock it replaced) this
+    /// lock is never held across a read.
+    fn versioned(
         &self,
+        vkey: &str,
+        seq: u64,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>,
     ) -> Result<(), String> {
+        let mut versions = self.versions.lock().unwrap_or_else(|e| e.into_inner());
+        if versions.get(vkey).is_some_and(|&last| seq <= last) {
+            return Ok(()); // a newer snapshot already committed this handle
+        }
         let txn = self.db.begin_write().map_err(err)?;
         f(&txn)?;
-        txn.commit().map_err(err)
+        txn.commit().map_err(err)?;
+        versions.insert(vkey.to_string(), seq);
+        Ok(())
     }
 }
 

@@ -5,6 +5,7 @@
 //! tokens, rate counters) stays in memory. Backed by `redb`.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use redb::{ReadableTable, TableDefinition};
 
@@ -20,8 +21,43 @@ pub struct Loaded {
     pub subs: HashMap<String, Vec<Subscription>>,
 }
 
+/// One durable mutation, captured under the state lock and committed **off** it
+/// (on `spawn_blocking`). Each carries a monotonic `seq` from the in-memory
+/// state's write counter: because commits now run off the lock they can reach
+/// redb out of the order the memory was mutated, so [`Store::apply`] uses the
+/// `seq` to drop a stale snapshot whose key a newer commit already advanced —
+/// keeping the durable state equal to the latest in-memory state (whole-list
+/// writes can otherwise reorder-lose a concurrent write to the same mailbox).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Write {
+    /// Replace the whole blob list for one `(wallet, slot)` mailbox.
+    Mailbox {
+        wallet: String,
+        slot: String,
+        blobs: Vec<String>,
+        seq: u64,
+    },
+    /// Drop one `(wallet, slot)` mailbox (a collect drained it).
+    DelMailbox {
+        wallet: String,
+        slot: String,
+        seq: u64,
+    },
+    /// Replace the push-subscription list for one wallet.
+    Subs {
+        wallet: String,
+        subs: Vec<Subscription>,
+        seq: u64,
+    },
+}
+
 pub struct Store {
     db: redb::Database,
+    /// Highest committed `seq` per durable key — the guard that makes concurrent
+    /// off-lock commits order-independent (see [`Write`]). Touched only on the
+    /// write path (inside `spawn_blocking`), never by read handlers, so it never
+    /// stalls the async runtime or the state lock.
+    versions: Mutex<HashMap<String, u64>>,
 }
 
 impl Store {
@@ -33,7 +69,10 @@ impl Store {
             txn.open_table(SUBS).map_err(err)?;
         }
         txn.commit().map_err(err)?;
-        Ok(Store { db })
+        Ok(Store {
+            db,
+            versions: Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn load(&self) -> Result<Loaded, String> {
@@ -58,41 +97,74 @@ impl Store {
         Ok(out)
     }
 
-    /// Write the whole blob list for one `(wallet, slot)` mailbox.
-    pub fn put_mailbox(&self, wallet: &str, slot: &str, blobs: &[String]) -> Result<(), String> {
-        let key = format!("{wallet}\0{slot}");
-        let json = serde_json::to_vec(blobs).map_err(err)?;
-        self.write(|txn| {
-            txn.open_table(MAILBOX)
-                .map_err(err)?
-                .insert(key.as_str(), &json[..])
-                .map_err(err)?;
-            Ok(())
-        })
+    /// Durably apply one [`Write`], guarding against stale off-lock commits by
+    /// its `seq` (see [`Write`]). Returns `Ok(())` for both a fresh commit and a
+    /// deliberately-skipped stale one — either way the key is at least as new as
+    /// this snapshot when the call returns, so the caller may report success.
+    pub fn apply(&self, write: Write) -> Result<(), String> {
+        match write {
+            Write::Mailbox {
+                wallet,
+                slot,
+                blobs,
+                seq,
+            } => {
+                let key = format!("{wallet}\0{slot}");
+                let json = serde_json::to_vec(&blobs).map_err(err)?;
+                self.versioned(&format!("m:{key}"), seq, |txn| {
+                    txn.open_table(MAILBOX)
+                        .map_err(err)?
+                        .insert(key.as_str(), &json[..])
+                        .map_err(err)?;
+                    Ok(())
+                })
+            }
+            Write::DelMailbox { wallet, slot, seq } => {
+                let key = format!("{wallet}\0{slot}");
+                self.versioned(&format!("m:{key}"), seq, |txn| {
+                    txn.open_table(MAILBOX)
+                        .map_err(err)?
+                        .remove(key.as_str())
+                        .map_err(err)?;
+                    Ok(())
+                })
+            }
+            Write::Subs { wallet, subs, seq } => {
+                let json = serde_json::to_vec(&subs).map_err(err)?;
+                self.versioned(&format!("s:{wallet}"), seq, |txn| {
+                    txn.open_table(SUBS)
+                        .map_err(err)?
+                        .insert(wallet.as_str(), &json[..])
+                        .map_err(err)?;
+                    Ok(())
+                })
+            }
+        }
     }
 
-    pub fn del_mailbox(&self, wallet: &str, slot: &str) -> Result<(), String> {
-        let key = format!("{wallet}\0{slot}");
-        self.write(|txn| {
-            txn.open_table(MAILBOX)
-                .map_err(err)?
-                .remove(key.as_str())
-                .map_err(err)?;
-            Ok(())
-        })
+    /// Commit `f` iff `seq` is newer than the last committed `seq` for `vkey`,
+    /// else skip it as stale. The `versions` lock spans the commit so a concurrent
+    /// apply to the same key can't interleave a stale write — redb already
+    /// serializes its single writer, so this adds no contention beyond that, and
+    /// (unlike the state lock it replaced) it is never held across a read.
+    fn versioned(
+        &self,
+        vkey: &str,
+        seq: u64,
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut versions = self.versions.lock().unwrap_or_else(|e| e.into_inner());
+        if versions.get(vkey).is_some_and(|&last| seq <= last) {
+            return Ok(()); // a newer snapshot already committed this key
+        }
+        let txn = self.db.begin_write().map_err(err)?;
+        f(&txn)?;
+        txn.commit().map_err(err)?;
+        versions.insert(vkey.to_string(), seq);
+        Ok(())
     }
 
-    pub fn put_subs(&self, wallet: &str, subs: &[Subscription]) -> Result<(), String> {
-        let json = serde_json::to_vec(subs).map_err(err)?;
-        self.write(|txn| {
-            txn.open_table(SUBS)
-                .map_err(err)?
-                .insert(wallet, &json[..])
-                .map_err(err)?;
-            Ok(())
-        })
-    }
-
+    #[cfg(test)]
     fn write(
         &self,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<(), String>,
@@ -203,7 +275,13 @@ mod tests {
         ];
         {
             let store = Store::open(path_str).unwrap();
-            store.put_subs("wallethex", &subs).unwrap();
+            store
+                .apply(Write::Subs {
+                    wallet: "wallethex".into(),
+                    subs: subs.clone(),
+                    seq: 1,
+                })
+                .unwrap();
         }
         let loaded = Store::open(path_str).unwrap().load().unwrap();
         assert_eq!(loaded.subs.get("wallethex").unwrap(), &subs);

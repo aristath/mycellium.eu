@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use mycellium_core::identity::{Handle, Signature, WalletPublicKey};
 use mycellium_core::record::SignedRecord;
 
-use crate::{mailer, ApiError, Directory};
+use crate::{mailer, persist, ApiError, Directory};
 
 /// Largest request body the directory will buffer (records are a few KB; this is
 /// generous headroom). Anything larger is refused with 413 by the runtime.
@@ -42,6 +42,10 @@ type DirectoryHandle = Arc<Mutex<Directory>>;
 #[derive(Clone)]
 struct AppState {
     directory: DirectoryHandle,
+    /// The durable store, held **outside** the directory `Mutex` so a write
+    /// handler commits (an fsync) off the state lock and off the async worker (on
+    /// `spawn_blocking`). `None` = in-memory development mode.
+    store: Option<Arc<persist::Store>>,
     auth: AuthConfig,
 }
 
@@ -115,10 +119,11 @@ struct AuthStatusReq {
 
 /// Bind `addr` and serve the directory until a shutdown signal arrives.
 pub async fn serve(addr: &str, config: ServeConfig) -> std::io::Result<()> {
-    let directory = Arc::new(Mutex::new(open_directory(config.data_dir.as_deref())?));
+    let (directory, store) = open_directory(config.data_dir.as_deref())?;
     let http = config.http.clone();
     let state = AppState {
-        directory,
+        directory: Arc::new(Mutex::new(directory)),
+        store,
         auth: config.auth,
     };
     mycellium_serve::Server::new("directory", MAX_BODY)
@@ -126,7 +131,9 @@ pub async fn serve(addr: &str, config: ServeConfig) -> std::io::Result<()> {
         .await
 }
 
-/// Serve a caller-owned directory state. Useful for tests and embedders.
+/// Serve a caller-owned, in-memory directory state. Useful for tests and
+/// embedders. (A caller-owned handle has no durable store; use [`serve`] for
+/// durability.)
 pub async fn serve_with(
     addr: &str,
     directory: DirectoryHandle,
@@ -134,11 +141,31 @@ pub async fn serve_with(
 ) -> std::io::Result<()> {
     let state = AppState {
         directory,
+        store: None,
         auth: config.auth,
     };
     mycellium_serve::Server::new("directory", MAX_BODY)
         .run(addr, router(state), config.http)
         .await
+}
+
+/// Persist one durable [`persist::Write`] **off the state lock and off the async
+/// worker**: the commit (an fsync) runs on `spawn_blocking`, and the handler
+/// awaits it so durability precedes the response. A join failure (a panicked
+/// blocking task) or a commit error both fail the request closed via
+/// [`ApiError::Storage`]. In-memory mode (`None`) is a no-op.
+async fn persist(
+    store: &Option<Arc<persist::Store>>,
+    write: persist::Write,
+) -> Result<(), ApiError> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || store.apply(write))
+        .await
+        .map_err(|_| ApiError::Storage)?
+        .map_err(|_| ApiError::Storage)
 }
 
 /// The directory's routes, over an already-constructed [`Directory`] state. Split
@@ -186,10 +213,15 @@ async fn put_record(
     let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
     let handle = Handle::new(&handle).map_err(|_| ApiError::HandleMismatch)?;
     let record: SignedRecord = parse(&body)?;
-    dir.directory
+    // Lock → validate + mutate memory + capture the snapshot → DROP the lock, then
+    // commit (fsync) off the lock and off the async worker, awaiting it so the
+    // publish is durable before we respond (a commit error fails it closed).
+    let write = dir
+        .directory
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .publish(token, &handle, record, now_secs())?;
+    persist(&dir.store, write).await?;
     Ok(ok())
 }
 
@@ -244,11 +276,12 @@ async fn auth_start(
 
 async fn auth_confirm(State(dir): State<AppState>, body: String) -> Result<Response, ApiError> {
     let req: AuthConfirmReq = parse(&body)?;
-    let username =
-        dir.directory
-            .lock()
-            .unwrap()
-            .auth_confirm(&req.pending, &req.code, now_secs())?;
+    let (username, write) = dir
+        .directory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .auth_confirm(&req.pending, &req.code, now_secs())?;
+    persist(&dir.store, write).await?;
     Ok(Json(serde_json::json!({ "ok": true, "username": username.as_str() })).into_response())
 }
 
@@ -336,22 +369,22 @@ fn now_secs() -> u64 {
 
 /// Open the directory durably from an explicit data directory. `None` is explicit
 /// in-memory development mode.
-fn open_directory(data: Option<&str>) -> std::io::Result<Directory> {
+fn open_directory(data: Option<&str>) -> std::io::Result<(Directory, Option<Arc<persist::Store>>)> {
     match data {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             let path = format!("{}/directory.redb", dir.trim_end_matches('/'));
-            let directory = Directory::open(&path).map_err(|e| {
+            let (directory, store) = Directory::open(&path).map_err(|e| {
                 std::io::Error::other(format!(
                     "the durable directory store at {path} could not be opened: {e}"
                 ))
             })?;
             println!("  persistence: {path}");
-            Ok(directory)
+            Ok((directory, Some(Arc::new(store))))
         }
         None => {
             println!("  storage: in-memory development mode");
-            Ok(Directory::new())
+            Ok((Directory::new(), None))
         }
     }
 }

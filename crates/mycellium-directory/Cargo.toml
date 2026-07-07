@@ -21,10 +21,11 @@ sha2 = "0.10"
 redb = "2"
 mycellium-observe = { path = "../mycellium-observe" }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints.rust]
 unsafe_code = "forbid"
