@@ -20,6 +20,7 @@ members = [
     "crates/mycellium-mls",
     "crates/mycellium-nostr",
     "crates/mycellium-multidevice",
+    "crates/mycellium-app",
 ]
 # Built only for wasm32 (browser); kept out of the native workspace so its
 # getrandom "js" feature and cdylib don't affect the server/client binaries.

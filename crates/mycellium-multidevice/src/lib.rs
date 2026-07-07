@@ -65,8 +65,8 @@
 use std::time::Duration;
 
 use mycellium_mls::{
-    wire as mls_wire, EventBuilder, GroupId, Keys, Kind, MessageProcessingResult, MlsEngine,
-    NostrGroupConfigData,
+    wire as mls_wire, EventBuilder, GroupId, Keys, Kind, MdkMemoryStorage, MdkStorageProvider,
+    MessageProcessingResult, MlsEngine, NostrGroupConfigData,
 };
 use mycellium_nostr::NostrTransport;
 use nostr::{Event, EventId, PublicKey, RelayUrl};
@@ -174,7 +174,10 @@ pub enum Incoming {
 /// can publish the account's device list. Every account-layer operation —
 /// resolving an account to its device-leaves, enrolling them, fanning a new
 /// device into every group — hangs off this type.
-pub struct DeviceAccount {
+pub struct DeviceAccount<S = MdkMemoryStorage>
+where
+    S: MdkStorageProvider,
+{
     /// The stable account identity this device belongs to.
     account: PublicKey,
     /// The account signing key — present only on a device authorized to manage
@@ -183,7 +186,7 @@ pub struct DeviceAccount {
     /// This device's own keypair (its MLS-leaf / KeyPackage identity).
     device_keys: Keys,
     /// This device's MLS engine (its leaf state across all groups).
-    mls: MlsEngine,
+    mls: MlsEngine<S>,
     /// This device's relay transport.
     transport: NostrTransport,
     /// The relays this device publishes to and advertises in KeyPackages.
@@ -192,47 +195,95 @@ pub struct DeviceAccount {
     fetch_timeout: Duration,
 }
 
-impl DeviceAccount {
+impl DeviceAccount<MdkMemoryStorage> {
     /// A device that **can manage the account's device list** (it holds
-    /// `account_keys`). Use this for the device that publishes / updates the list.
+    /// `account_keys`), backed by volatile in-memory MLS storage. Use this for
+    /// the device that publishes / updates the list.
     #[must_use]
     pub fn manager(account_keys: Keys, device_keys: Keys, relays: Vec<RelayUrl>) -> Self {
         let account = account_keys.public_key();
-        Self::build(account, Some(account_keys), device_keys, relays)
+        Self::with_engine(
+            account,
+            Some(account_keys),
+            device_keys,
+            relays,
+            MlsEngine::in_memory(),
+        )
     }
 
     /// An ordinary device that belongs to `account` but does **not** hold the
-    /// account key (it can join groups and message, but cannot alter the list).
+    /// account key, backed by volatile in-memory MLS storage (it can join groups
+    /// and message, but cannot alter the list).
     #[must_use]
     pub fn member(account: PublicKey, device_keys: Keys, relays: Vec<RelayUrl>) -> Self {
-        Self::build(account, None, device_keys, relays)
+        Self::with_engine(account, None, device_keys, relays, MlsEngine::in_memory())
     }
 
-    /// Shared constructor body: one MLS engine + one transport bound to this
+    /// A single-device account backed by volatile in-memory MLS storage: the
+    /// account key *is* the device key. The degenerate (but common) case — a
+    /// contact who has not gone multi-device.
+    #[must_use]
+    pub fn solo(keys: Keys, relays: Vec<RelayUrl>) -> Self {
+        Self::manager(keys.clone(), keys, relays)
+    }
+}
+
+impl<S> DeviceAccount<S>
+where
+    S: MdkStorageProvider,
+{
+    /// A **manager** device over a caller-supplied MLS engine (e.g. a persistent
+    /// `mdk-sqlite-storage` backend). Same role as [`DeviceAccount::manager`] but
+    /// generic over the MLS storage provider.
+    #[must_use]
+    pub fn manager_with(
+        account_keys: Keys,
+        device_keys: Keys,
+        relays: Vec<RelayUrl>,
+        mls: MlsEngine<S>,
+    ) -> Self {
+        let account = account_keys.public_key();
+        Self::with_engine(account, Some(account_keys), device_keys, relays, mls)
+    }
+
+    /// A **member** device over a caller-supplied MLS engine. Same role as
+    /// [`DeviceAccount::member`] but generic over the MLS storage provider.
+    #[must_use]
+    pub fn member_with(
+        account: PublicKey,
+        device_keys: Keys,
+        relays: Vec<RelayUrl>,
+        mls: MlsEngine<S>,
+    ) -> Self {
+        Self::with_engine(account, None, device_keys, relays, mls)
+    }
+
+    /// A **solo** account over a caller-supplied MLS engine. Same role as
+    /// [`DeviceAccount::solo`] but generic over the MLS storage provider.
+    #[must_use]
+    pub fn solo_with(keys: Keys, relays: Vec<RelayUrl>, mls: MlsEngine<S>) -> Self {
+        Self::manager_with(keys.clone(), keys, relays, mls)
+    }
+
+    /// Shared constructor body: bind an MLS engine + a fresh transport to this
     /// device's keys.
-    fn build(
+    fn with_engine(
         account: PublicKey,
         account_keys: Option<Keys>,
         device_keys: Keys,
         relays: Vec<RelayUrl>,
+        mls: MlsEngine<S>,
     ) -> Self {
         let transport = NostrTransport::new(&device_keys);
         Self {
             account,
             account_keys,
             device_keys,
-            mls: MlsEngine::in_memory(),
+            mls,
             transport,
             relays,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
         }
-    }
-
-    /// A single-device account: the account key *is* the device key. The
-    /// degenerate (but common) case — a contact who has not gone multi-device.
-    #[must_use]
-    pub fn solo(keys: Keys, relays: Vec<RelayUrl>) -> Self {
-        Self::manager(keys.clone(), keys, relays)
     }
 
     /// This device's own pubkey (its MLS-leaf identity).
