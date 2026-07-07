@@ -7,6 +7,7 @@
 //!
 //! ```text
 //!   mycellium account new                 # generate an identity + config
+//!   mycellium account import <nsec>        # adopt an existing key you already hold
 //!   mycellium publish                      # KeyPackage + device list → relays
 //!   mycellium contact add <npub|nip05> [name]
 //!   mycellium contacts                     # list known contacts + trust state
@@ -127,6 +128,20 @@ enum AccountCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Import an existing identity from its **secret** key, so a key you already
+    /// hold (from another Nostr client) becomes this device's account. Requires
+    /// the `nsec1…` — a public `npub1…` cannot be imported, since the app must
+    /// sign as you.
+    Import {
+        /// The secret key to adopt: bech32 `nsec1…` or 64-char hex.
+        secret: String,
+        /// A relay URL to use (repeatable). Defaults to a public relay.
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        /// Overwrite an existing config in this data dir.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print this account's npub, device pubkey, and relays.
     Show,
     /// **Publish this account's NIP-05 address** (`name@domain`) in its kind:0
@@ -227,6 +242,11 @@ async fn main() -> Result<()> {
         Command::Account(AccountCmd::New { relays, force }) => {
             account_new(&data_dir, relays, force)
         }
+        Command::Account(AccountCmd::Import {
+            secret,
+            relays,
+            force,
+        }) => account_import(&data_dir, &secret, relays, force),
         Command::Account(AccountCmd::Show) => account_show(&data_dir),
         Command::Account(AccountCmd::SetNip05 { address }) => {
             account_set_nip05(&data_dir, &address).await
@@ -306,6 +326,36 @@ fn open_app(data_dir: &Path) -> Result<(App, Config)> {
 // -- commands ---------------------------------------------------------------
 
 fn account_new(data_dir: &Path, relays: Vec<String>, force: bool) -> Result<()> {
+    let keys = Keys::generate();
+    let config = create_account(data_dir, &keys, relays, force)?;
+    report_account(data_dir, &keys, &config, "account created")
+}
+
+fn account_import(data_dir: &Path, secret: &str, relays: Vec<String>, force: bool) -> Result<()> {
+    // A public key can't be imported — the app has to sign as this identity, which
+    // needs the secret. Catch the common paste-the-npub mistake with a clear message
+    // instead of a cryptic parse error.
+    if secret.starts_with("npub1") {
+        bail!(
+            "'{secret}' is a public key (npub) — importing an identity needs its SECRET key \
+             (nsec1…), which only you hold. A public key cannot sign, so it can't be imported."
+        );
+    }
+    let keys = Keys::parse(secret).context(
+        "parsing the secret key to import (expected an `nsec1…` bech32 or 64-char hex secret)",
+    )?;
+    let config = create_account(data_dir, &keys, relays, force)?;
+    report_account(data_dir, &keys, &config, "account imported")
+}
+
+/// Write a fresh solo-account config built from `keys`, guarding an existing
+/// config unless `force`. Shared by `account new` and `account import`.
+fn create_account(
+    data_dir: &Path,
+    keys: &Keys,
+    relays: Vec<String>,
+    force: bool,
+) -> Result<Config> {
     let path = config_path(data_dir);
     if path.exists() && !force {
         bail!(
@@ -326,15 +376,17 @@ fn account_new(data_dir: &Path, relays: Vec<String>, force: bool) -> Result<()> 
         RelayUrl::parse(r).with_context(|| format!("invalid relay url '{r}'"))?;
     }
 
-    let keys = Keys::generate();
     let config = Config {
         secret_key: keys.secret_key().to_bech32().context("encoding nsec")?,
         account_key: None,
         relays,
     };
     write_config(&path, &config)?;
+    Ok(config)
+}
 
-    println!("account created");
+fn report_account(data_dir: &Path, keys: &Keys, config: &Config, headline: &str) -> Result<()> {
+    println!("{headline}");
     println!("  npub:     {}", keys.public_key().to_bech32()?);
     println!("  data dir: {}", data_dir.display());
     println!("  relays:   {}", config.relays.join(", "));

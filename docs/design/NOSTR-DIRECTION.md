@@ -1,13 +1,15 @@
 # Direction: Mycellium on Nostr
 
 **Status:** DECIDED + IMPLEMENTED. This document records the original reasoning; the rebuild
-landed it as the `mycellium-{mls,nostr,multidevice,app,cli}` workspace. Delivered so far:
+landed it as the `mycellium-{mls,nostr,multidevice,app,cli,sdk}` workspace. Delivered:
 MLS-over-Nostr via MDK (FS+PCS); relay transport; **multi-device** (the differentiator);
-the headless app engine (contacts, conversations, SQLCipher-persisted history); a CLI; and
+the headless app engine (contacts, conversations, SQLCipher-persisted history); a CLI;
 the full key-lifecycle security — SAS device pairing, PCS device removal, account-key
-rotation/migration (mutual attestation, no auto-accept), and live trust subscriptions.
-Remaining: NIP-05, running general relays + upstream Marmot/MDK contribution, a client
-SDK/UIs. The open decision below is resolved (we adopted MLS-over-Nostr via MDK).
+rotation/migration (mutual attestation, no auto-accept), and live trust subscriptions;
+**hardened NIP-05 verification** (rebinding/mismatch detection, not a badge); and a UniFFI
+SDK (Kotlin/Swift bindings) as the bridge to native clients. Remaining: running general
+relays + upstream Marmot/MDK contribution, and the native client UIs. The open decision
+below is resolved (we adopted MLS-over-Nostr via MDK).
 
 ## TL;DR
 
@@ -125,9 +127,18 @@ event looks normal); a feature only interops with *other* clients once its NIP i
 ## Naming (Zooko's triangle)
 
 Nostr's answer: self-certifying **npub** + DNS-anchored human names via **NIP-05**
-(`alice@mycellium.eu`). We adopt it. The npub is the canonical, portable, secure identity;
-the NIP-05 alias under our own domain is the human-readable, membership/rules layer we
-legitimately control. This replaces today's globally-unique-`alice` model.
+(`alice@mycellium.eu`). The name↔key binding is **Nostr's, not ours** — we adopt NIP-05 as-is,
+we do not invent it. The npub is the canonical, portable, secure identity; the NIP-05 alias
+under our own domain is the human-readable, membership/rules layer we legitimately control.
+This replaces today's globally-unique-`alice` model.
+
+What we *add* is **hardened verification of that binding**, which mainstream clients skip:
+they resolve NIP-05 once and render a "verified" badge. We treat it as an *untrusted claim* —
+resolve it, check the returned npub against the key we already pinned (TOFU), and detect
+**rebinding** (`alice@mycellium.eu` now resolving to a different npub) or an unreachable/removed
+record. A mismatch raises a trust event on the same pipeline as key rotation and device-list
+changes ("this identity claim changed — re-verify out of band"). So: Nostr owns the binding;
+we own detecting when it is lying or has changed.
 
 ## The moat: stewardship, not secret crypto
 
