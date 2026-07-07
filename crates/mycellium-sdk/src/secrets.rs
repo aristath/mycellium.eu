@@ -28,10 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use argon2::Argon2;
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
-use serde::{Deserialize, Serialize};
+use mycellium_storage::seal::{self, SealError};
 
 use crate::types::SdkError;
 
@@ -105,15 +102,6 @@ pub struct PassphraseFileSecretStore {
     passphrase: String,
 }
 
-/// One sealed secret on disk: a random per-secret salt + nonce and the AEAD
-/// ciphertext. Same shape as [`mycellium_storage::store`]'s `Sealed`.
-#[derive(Serialize, Deserialize)]
-struct Sealed {
-    salt: Vec<u8>,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-}
-
 impl PassphraseFileSecretStore {
     /// Seal secrets under `passphrase`, in files under `dir` (created on first
     /// write).
@@ -123,16 +111,6 @@ impl PassphraseFileSecretStore {
             passphrase: passphrase.into(),
         }
     }
-
-    /// Derive a 32-byte key from the passphrase and a per-secret `salt` with
-    /// Argon2id (default params, matching the CLI).
-    fn derive_key(&self, salt: &[u8]) -> Result<[u8; 32], SdkError> {
-        let mut key = [0u8; 32];
-        Argon2::default()
-            .hash_password_into(self.passphrase.as_bytes(), salt, &mut key)
-            .map_err(|e| SdkError::crypto(format!("key derivation failed: {e}")))?;
-        Ok(key)
-    }
 }
 
 impl SecretStore for PassphraseFileSecretStore {
@@ -141,24 +119,9 @@ impl SecretStore for PassphraseFileSecretStore {
         std::fs::create_dir_all(&self.dir).map_err(SdkError::storage)?;
         restrict_dir(&self.dir);
 
-        let mut salt = [0u8; 16];
-        let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut salt).map_err(SdkError::crypto)?;
-        getrandom::getrandom(&mut nonce).map_err(SdkError::crypto)?;
-
-        let key_ga: Key = self.derive_key(&salt)?.into();
-        let nonce_ga: Nonce = nonce.into();
-        let ciphertext = ChaCha20Poly1305::new(&key_ga)
-            .encrypt(&nonce_ga, secret.as_ref())
-            .map_err(|_| SdkError::crypto("failed to seal secret"))?;
-
-        let sealed = Sealed {
-            salt: salt.to_vec(),
-            nonce: nonce.to_vec(),
-            ciphertext,
-        };
-        let json = serde_json::to_vec(&sealed).map_err(SdkError::storage)?;
-        std::fs::write(&path, json).map_err(SdkError::storage)?;
+        let sealed = seal::seal(&self.passphrase, &secret)
+            .map_err(|e| SdkError::crypto(format!("failed to seal secret: {e}")))?;
+        std::fs::write(&path, sealed).map_err(SdkError::storage)?;
         restrict_file(&path);
         Ok(())
     }
@@ -170,19 +133,12 @@ impl SecretStore for PassphraseFileSecretStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(SdkError::storage(e)),
         };
-        let sealed: Sealed = serde_json::from_slice(&bytes)
-            .map_err(|_| SdkError::crypto("secret file is corrupt"))?;
-        let key_ga: Key = self.derive_key(&sealed.salt)?.into();
-        let nonce_arr: [u8; 12] = sealed
-            .nonce
-            .as_slice()
-            .try_into()
-            .map_err(|_| SdkError::crypto("secret file is corrupt"))?;
-        let nonce_ga: Nonce = nonce_arr.into();
         // Wrong passphrase (or tampering) fails the AEAD tag — fail closed.
-        let plaintext = ChaCha20Poly1305::new(&key_ga)
-            .decrypt(&nonce_ga, sealed.ciphertext.as_ref())
-            .map_err(|_| SdkError::crypto("wrong passphrase or corrupt secret"))?;
+        let plaintext = seal::open(&self.passphrase, &bytes).map_err(|e| match e {
+            SealError::Corrupt => SdkError::crypto("secret file is corrupt"),
+            SealError::WrongKeyOrCorrupt => SdkError::crypto("wrong passphrase or corrupt secret"),
+            other => SdkError::crypto(other.to_string()),
+        })?;
         Ok(Some(plaintext))
     }
 

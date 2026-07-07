@@ -664,6 +664,35 @@ fn passphrase_store_round_trips_and_fails_closed() {
     store.delete("identity".into()).unwrap();
 }
 
+/// The SDK passphrase store and the CLI identity store share ONE seal format
+/// ([`mycellium_storage::seal`]). A blob produced by the primitive directly must
+/// open through the SDK store — proving the two at-rest paths stay bit-compatible
+/// because they run the same code, not two hand-copied ones.
+#[test]
+fn passphrase_store_opens_blob_sealed_by_shared_primitive() {
+    let dir = data_dir("shared-seal-compat");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let passphrase = "correct horse battery staple";
+    let secret = b"account root key material".to_vec();
+
+    // Seal with the shared primitive directly and drop it where the store reads.
+    let blob = mycellium_storage::seal::seal(passphrase, &secret).unwrap();
+    std::fs::write(dir.join("identity"), &blob).unwrap();
+
+    // The store must decrypt it (same Argon2id + ChaCha20-Poly1305 + wire layout).
+    let store = PassphraseFileSecretStore::new(dir.clone(), passphrase);
+    assert_eq!(store.load("identity".into()).unwrap(), Some(secret.clone()));
+
+    // And the reverse: what the store writes opens with the primitive.
+    store.store("identity".into(), secret.clone()).unwrap();
+    let written = std::fs::read(dir.join("identity")).unwrap();
+    assert_eq!(
+        mycellium_storage::seal::open(passphrase, &written).unwrap(),
+        secret
+    );
+}
+
 #[test]
 fn legacy_sidecar_migrates_into_store_then_is_removed() {
     // Produce a *real* identity secret by opening a client over a mock store, then

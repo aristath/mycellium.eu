@@ -12,8 +12,7 @@ use std::time::Duration;
 use mycellium_core::identity::PeerId;
 use mycellium_core::transport::{Connection, Transport};
 
-/// Maximum accepted frame size (guards against absurd length prefixes).
-const MAX_FRAME: usize = 1 << 20; // 1 MiB
+use crate::link::{frame_header, frame_len};
 
 /// How long a dial may take before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,21 +59,15 @@ impl Connection for TcpConnection {
     type Error = io::Error;
 
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.0.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        self.0.write_all(&frame_header(bytes.len()))?;
         self.0.write_all(bytes)?;
         self.0.flush()
     }
 
     fn recv(&mut self) -> io::Result<Vec<u8>> {
-        let mut len = [0u8; 4];
-        self.0.read_exact(&mut len)?;
-        let n = u32::from_be_bytes(len) as usize;
-        if n > MAX_FRAME {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame too large",
-            ));
-        }
+        let mut header = [0u8; 4];
+        self.0.read_exact(&mut header)?;
+        let n = frame_len(header)?;
         let mut buf = vec![0u8; n];
         self.0.read_exact(&mut buf)?;
         Ok(buf)

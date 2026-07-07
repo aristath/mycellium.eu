@@ -30,13 +30,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The `engine::flow` seam (`FlowNet`) returns `anyhow::Result`.
 anyhow = "1"
-# At-rest sealing for the passphrase default SecretStore (#65): passphrase ->
-# Argon2id -> ChaCha20-Poly1305, matching the CLI's identity-at-rest crypto.
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
-getrandom = "0.2"
 
 [dev-dependencies]
+# Prove the passphrase SecretStore and the CLI identity store share one seal
+# format: a blob sealed by the primitive directly must open through the store.
+mycellium-storage = { path = "../mycellium-storage" }
 mycellium-directory = { path = "../mycellium-directory" }
 mycellium-queue = { path = "../mycellium-queue" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

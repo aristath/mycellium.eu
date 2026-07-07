@@ -10,6 +10,7 @@
 //! adapter; the engine depends only on the core `Storage` port.
 
 pub mod filestore;
+pub mod seal;
 pub mod store;
 
 /// Best-effort restrictive permissions for local storage. On Unix, directories

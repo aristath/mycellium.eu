@@ -27,7 +27,6 @@ use tokio::sync::mpsc;
 use mycellium_core::transport::Connection;
 
 const PROTOCOL: StreamProtocol = StreamProtocol::new("/mycellium/1.0");
-const MAX_FRAME: usize = 1 << 20;
 
 /// How long `reserve`/`listen_addr` wait for the swarm to make progress.
 const RESERVE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -323,15 +322,9 @@ impl crate::link::FrameReader for Libp2pReadHalf {
     fn recv_frame(&mut self) -> anyhow::Result<Vec<u8>> {
         let read = &mut self.read;
         let bytes = self.handle.block_on(async move {
-            let mut len = [0u8; 4];
-            read.read_exact(&mut len).await?;
-            let n = u32::from_be_bytes(len) as usize;
-            if n > MAX_FRAME {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame too large",
-                ));
-            }
+            let mut header = [0u8; 4];
+            read.read_exact(&mut header).await?;
+            let n = crate::link::frame_len(header)?;
             let mut buf = vec![0u8; n];
             read.read_exact(&mut buf).await?;
             Ok::<_, io::Error>(buf)
@@ -344,7 +337,9 @@ impl crate::link::FrameWriter for Libp2pWriteHalf {
     fn send_frame(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         let write = &mut self.write;
         self.handle.block_on(async move {
-            write.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+            write
+                .write_all(&crate::link::frame_header(bytes.len()))
+                .await?;
             write.write_all(bytes).await?;
             write.flush().await
         })?;
@@ -359,7 +354,7 @@ impl Connection for Libp2pConnection {
         let stream = &mut self.stream;
         self.handle.block_on(async move {
             stream
-                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .write_all(&crate::link::frame_header(bytes.len()))
                 .await?;
             stream.write_all(bytes).await?;
             stream.flush().await
@@ -369,15 +364,9 @@ impl Connection for Libp2pConnection {
     fn recv(&mut self) -> io::Result<Vec<u8>> {
         let stream = &mut self.stream;
         self.handle.block_on(async move {
-            let mut len = [0u8; 4];
-            stream.read_exact(&mut len).await?;
-            let n = u32::from_be_bytes(len) as usize;
-            if n > MAX_FRAME {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame too large",
-                ));
-            }
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await?;
+            let n = crate::link::frame_len(header)?;
             let mut buf = vec![0u8; n];
             stream.read_exact(&mut buf).await?;
             Ok(buf)

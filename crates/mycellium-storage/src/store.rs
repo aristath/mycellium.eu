@@ -16,12 +16,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
-use argon2::Argon2;
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
 
 use mycellium_core::identity::Identity;
+
+use crate::seal::{self, SealError};
 
 /// Process-local client configuration.
 #[derive(Clone, Debug)]
@@ -83,15 +82,7 @@ pub fn display_name() -> String {
     config().display_name
 }
 
-/// On-disk encrypted identity.
-#[derive(Serialize, Deserialize)]
-struct Sealed {
-    salt: Vec<u8>,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-}
-
-/// The secret material sealed inside [`Sealed`]: the account wallet secret plus
+/// The secret material sealed on disk: the account wallet secret plus
 /// this device's own seed (Layer 11), so reloading reproduces the *same* device.
 #[derive(Serialize, Deserialize)]
 struct Secret {
@@ -130,57 +121,32 @@ pub fn save_identity(identity: &Identity) -> Result<()> {
         bail!("passphrase must be at least {MIN_PASSPHRASE_LEN} characters");
     }
 
-    let mut salt = [0u8; 16];
-    let mut nonce = [0u8; 12];
-    getrandom::getrandom(&mut salt)?;
-    getrandom::getrandom(&mut nonce)?;
-
-    let key = derive_key(&passphrase, &salt)?;
-    let key_ga: Key = key.into();
-    let nonce_ga: Nonce = nonce.into();
     let secret = Secret {
         wallet_secret: identity.wallet_secret().to_vec(),
         device_seed: identity.device_seed().to_vec(),
     };
     let plaintext = serde_json::to_vec(&secret)?;
-    let ciphertext = ChaCha20Poly1305::new(&key_ga)
-        .encrypt(&nonce_ga, plaintext.as_ref())
-        .map_err(|_| anyhow!("failed to encrypt identity"))?;
-
-    let sealed = Sealed {
-        salt: salt.to_vec(),
-        nonce: nonce.to_vec(),
-        ciphertext,
-    };
+    let sealed = seal::seal(&passphrase, &plaintext)
+        .map_err(|e| anyhow!("failed to encrypt identity: {e}"))?;
 
     fs::create_dir_all(home())?;
     crate::perms::restrict_dir(&home());
-    let json = serde_json::to_string(&sealed)?;
-    fs::write(path(), json)?;
+    fs::write(path(), sealed)?;
     crate::perms::restrict_file(&path());
     Ok(())
 }
 
 /// Load and decrypt the stored identity.
 pub fn load_identity() -> Result<Identity> {
-    let json = fs::read_to_string(path())
-        .context("no identity found — run `mycellium identity-new` first")?;
-    let sealed: Sealed = serde_json::from_str(&json).context("identity file is corrupt")?;
+    let bytes =
+        fs::read(path()).context("no identity found — run `mycellium identity-new` first")?;
 
     let passphrase = passphrase("Passphrase to unlock your identity")?;
-    let key = derive_key(&passphrase, &sealed.salt)?;
-    let key_ga: Key = key.into();
-
-    let nonce_arr: [u8; 12] = sealed
-        .nonce
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("identity file is corrupt"))?;
-    let nonce_ga: Nonce = nonce_arr.into();
-
-    let plaintext = ChaCha20Poly1305::new(&key_ga)
-        .decrypt(&nonce_ga, sealed.ciphertext.as_ref())
-        .map_err(|_| anyhow!("wrong passphrase or corrupt identity"))?;
+    let plaintext = seal::open(&passphrase, &bytes).map_err(|e| match e {
+        SealError::Corrupt => anyhow!("identity file is corrupt"),
+        SealError::WrongKeyOrCorrupt => anyhow!("wrong passphrase or corrupt identity"),
+        other => anyhow!("{other}"),
+    })?;
     let secret: Secret =
         serde_json::from_slice(&plaintext).context("decrypted identity is corrupt")?;
     let device_seed: [u8; 32] = secret
@@ -196,15 +162,6 @@ pub fn load_identity() -> Result<Identity> {
 
     Identity::from_wallet_secret(wallet_secret, device_seed)
         .map_err(|_| anyhow!("stored account key is invalid"))
-}
-
-/// Derive a 32-byte key from a passphrase and salt with Argon2id.
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    let mut key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
-        .map_err(|e| anyhow!("key derivation failed: {e}"))?;
-    Ok(key)
 }
 
 /// Obtain the configured passphrase or, failing that, a **no-echo** terminal
