@@ -104,7 +104,7 @@ function healthBanner(s) {
   if (!down.length) return '';
   return `<div class="banner-warn">
     ⚠ Can't reach the <b>${down.map((d) => d[0]).join('</b> & <b>')}</b>. Registration and messaging need ${down.length > 1 ? 'them' : 'it'} running:
-    ${down.map((d) => `<div><code>cargo run -p ${d[2]} -- --addr ${hostOf(d[1]) || '127.0.0.1:' + d[3]}</code></div>`).join('')}
+    ${down.map((d) => `<div><code>cargo run -p ${d[2]} -- --dev --addr ${hostOf(d[1]) || '127.0.0.1:' + d[3]}</code></div>`).join('')}
   </div>`;
 }
 const hostOf = (url) => (url || '').replace(/^https?:\/\//, '');

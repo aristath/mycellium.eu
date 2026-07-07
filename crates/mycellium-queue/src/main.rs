@@ -24,7 +24,7 @@ async fn main() {
             exit(2);
         }
     };
-    let (addr, config) = match args.config {
+    let (mut addr, config) = match args.config {
         Some(path) => match load_config(&path) {
             Ok(v) => v,
             Err(err) => {
@@ -42,6 +42,13 @@ async fn main() {
             exit(2);
         }
     };
+
+    // An explicit `--addr` overrides the default/config bind address —
+    // handy for local dev + CI where writing a config file just to pick a
+    // port would be clumsy. (A CLI flag, not the removed env-var config.)
+    if let Some(a) = args.addr {
+        addr = a;
+    }
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -71,6 +78,7 @@ fn init_tracing() {
 struct Args {
     config: Option<String>,
     dev: bool,
+    addr: Option<String>,
 }
 
 impl Args {
@@ -78,6 +86,7 @@ impl Args {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut config = None;
         let mut dev = false;
+        let mut addr = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -87,6 +96,14 @@ impl Args {
                         args.get(i)
                             .cloned()
                             .ok_or_else(|| "--config requires a path".to_string())?,
+                    );
+                }
+                "--addr" => {
+                    i += 1;
+                    addr = Some(
+                        args.get(i)
+                            .cloned()
+                            .ok_or_else(|| "--addr requires HOST:PORT".to_string())?,
                     );
                 }
                 "--dev" => {
@@ -109,7 +126,7 @@ impl Args {
         if dev && config.is_some() {
             return Err("--dev and --config are mutually exclusive".into());
         }
-        Ok(Self { config, dev })
+        Ok(Self { config, dev, addr })
     }
 }
 
@@ -152,7 +169,7 @@ fn load_config(path: &str) -> Result<(String, mycellium_queue::ServeConfig), Str
 fn print_help() {
     println!("mycellium-queue — the Mycellium message queue\n");
     println!("USAGE:");
-    println!("    mycellium-queue --dev");
+    println!("    mycellium-queue --dev [--addr HOST:PORT]");
     println!("    mycellium-queue --config PATH\n");
     println!("Config is JSON. Example:");
     println!(

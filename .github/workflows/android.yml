@@ -80,8 +80,8 @@ jobs:
       - name: Start directory + queue (dev auth) on the host
         run: |
           # The emulator reaches these at 10.0.2.2:<port> (host loopback).
-          MYCELLIUM_DEV_AUTH=1 ./target/release/mycellium-server --addr 127.0.0.1:18080 &
-          ./target/release/mycellium-queue --addr 127.0.0.1:18090 &
+          ./target/release/mycellium-server --dev --addr 127.0.0.1:18080 &
+          ./target/release/mycellium-queue --dev --addr 127.0.0.1:18090 &
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:18080/health >/dev/null && curl -sf http://127.0.0.1:18090/health >/dev/null && break
             sleep 1

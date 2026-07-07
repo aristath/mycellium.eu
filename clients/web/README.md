@@ -47,8 +47,8 @@ See `docs/BROWSER.md` for the full walk-through.
 ./clients/web/build.sh
 
 # 2. run a directory + queue (see docs/QUICKSTART.md)
-cargo run -p mycellium-server -- --addr 127.0.0.1:8080 &
-cargo run -p mycellium-queue  -- --addr 127.0.0.1:8090 &
+cargo run -p mycellium-server -- --dev &
+cargo run -p mycellium-queue  -- --dev &
 
 # 3. serve this folder statically and open it with the two URLs
 python3 -m http.server 8000 --directory clients/web

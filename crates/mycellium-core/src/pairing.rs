@@ -34,7 +34,7 @@ use crate::platform::Platform;
 const PAIRING_AAD: &[u8] = b"mycellium-pairing-v1";
 
 /// The one-time **pairing offer** the new device shows (as text or a QR) for an
-/// existing device to scan/paste into [`pair_approve`]. It carries no secret —
+/// existing device to scan/paste into `pair_approve`. It carries no secret —
 /// only the rendezvous coordinates and the ephemeral public key that
 /// authenticates the exchange. On the wire it travels as hex-of-JSON; this type
 /// is the single source of truth for its field contract, shared by every client.

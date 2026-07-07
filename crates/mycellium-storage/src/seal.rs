@@ -1,5 +1,5 @@
 //! The one passphrase-sealing primitive: **Argon2id** key derivation +
-//! **ChaCha20-Poly1305** AEAD, with a small JSON [`Sealed`] wire struct
+//! **ChaCha20-Poly1305** AEAD, with a small JSON `Sealed` wire struct
 //! (salt + nonce + ciphertext).
 //!
 //! Both at-rest secret stores ride on this exact code so their on-disk format
@@ -67,7 +67,7 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], SealError> {
     Ok(key)
 }
 
-/// Seal `plaintext` under `passphrase`, returning the serialized [`Sealed`] blob
+/// Seal `plaintext` under `passphrase`, returning the serialized `Sealed` blob
 /// (a fresh random salt + nonce embedded). This is the exact byte format both
 /// stores read back with [`open`].
 pub fn seal(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
