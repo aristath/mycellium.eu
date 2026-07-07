@@ -1,0 +1,29 @@
+[package]
+name = "mycellium-nostr"
+version = "0.0.0"
+description = "Nostr relay transport for Mycellium's MLS-over-Nostr (Marmot) stack: a thin async wrapper over nostr-sdk that connects, publishes, subscribes, and fetches"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The MLS crypto + Nostr event *building* layer (phase 1). This crate is the
+# transport underneath it. PINNED to the 0.44 nostr line to match MDK 0.8's
+# re-exports — see the module docs and mycellium-mls's alpha note.
+mycellium-mls = { path = "../mycellium-mls" }
+# nostr-sdk is the async relay client (connect / publish / subscribe / fetch).
+# It re-exports the same `nostr` 0.44 types mycellium-mls builds events with.
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip44", "nip59"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+thiserror = "2"
+
+[dev-dependencies]
+# rust-nostr's in-process relay: lets the round-trip test traverse a genuine
+# relay socket without spawning an external binary.
+nostr-relay-builder = "0.44"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
