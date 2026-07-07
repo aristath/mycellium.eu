@@ -1,7 +1,8 @@
 //! An encrypted, file-backed implementation of the core [`Storage`] trait.
 //!
 //! Each key maps to one file whose contents are `nonce || ChaCha20-Poly1305(value)`
-//! under a key derived from the identity ([`Identity::storage_key`]). So local
+//! under a key derived from the identity
+//! ([`Identity::storage_key`](mycellium_core::identity::Identity::storage_key)). So local
 //! data (message history) is encrypted at rest, consistent with the seed.
 //!
 //! The logical storage key is bound into the AEAD as **associated data**, so a

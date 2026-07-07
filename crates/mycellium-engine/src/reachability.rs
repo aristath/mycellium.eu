@@ -1,7 +1,7 @@
 //! Local-only, per-device **reachability scoring** (#60) and the shared
 //! [`DeliveryPath`] outcome (#59/#60).
 //!
-//! The delivery ladder ([`crate::app::messaging`]) remembers, per recipient
+//! The delivery ladder (`app::messaging`) remembers, per recipient
 //! *device* and per *path*, whether that path recently worked — so it can try
 //! the most-likely-successful rung first instead of paying a full direct-dial
 //! timeout for a device it already knows is unreachable that way. The queue and

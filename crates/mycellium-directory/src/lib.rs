@@ -213,7 +213,7 @@ impl Directory {
         }
     }
 
-    /// Open a **durable** directory: the redb [`Store`](persist::Store) lives
+    /// Open a **durable** directory: the redb `persist::Store` lives
     /// **outside** the state (it is `Send + Sync` and serializes its own writes),
     /// so a handler can commit off the state lock. Loads existing
     /// bindings/records/emails and re-uses the persisted pepper (minting + storing

@@ -78,3 +78,60 @@ jobs:
       # permission is needed.)
       - name: Audit
         run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+
+  msrv:
+    name: msrv (1.96.0 builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Enforce the `rust-version = "1.96"` promise in the root Cargo.toml: the
+      # whole workspace must build on exactly that toolchain, not just on stable.
+      - name: Install Rust 1.96.0
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the workspace on the declared MSRV
+        run: cargo +1.96.0 build --workspace --all-targets
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Supply-chain gate: licenses, advisories, banned/duplicate crates, and
+      # source registries — configured in deny.toml. Complements `cargo audit`.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check advisories, licenses, bans, sources
+        run: cargo deny check
+
+  doc:
+    name: cargo doc (warnings are errors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # Fail on any rustdoc warning — broken intra-doc links, private-item links,
+      # etc. — so doc-rot cannot land silently.
+      - name: Build docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  no-std-embedded:
+    name: no_std bare-metal (thumbv7em-none-eabi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Prove the "runs on microcontrollers" claim (docs/CONCEPT.md Layer 10,
+      # ESP32 / Cortex-M4/M7): cross-compile the portable core, no_std + alloc, to
+      # a bare-metal Cortex-M target with default (std) features off.
+      - name: Install Rust + thumbv7em-none-eabi target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add thumbv7em-none-eabi
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross-compile the core for bare metal
+        run: cargo build -p mycellium-core --no-default-features --target thumbv7em-none-eabi

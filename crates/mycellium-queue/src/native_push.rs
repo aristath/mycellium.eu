@@ -1,7 +1,7 @@
 //! Contentless **native** push: APNs (Apple) and FCM (Google) wake payloads and
 //! provider-auth construction — the in-repo slice of #71.
 //!
-//! Mirrors the contentless discipline of [`crate::push`]: a wake tells the
+//! Mirrors the contentless discipline of the internal `push` module: a wake tells the
 //! device *"go check your mailbox"* and carries **no** sender, text, peer,
 //! group, thread, or preview. The two payload constructors here are pure and
 //! unit-tested (see this module's tests) to guarantee that invariant — nothing
@@ -14,7 +14,7 @@
 //! devices: APNs is HTTP/2 to `api.push.apple.com` with a `.p8` provider key, and
 //! FCM needs a service-account OAuth2 bearer. So an **unconfigured** transport is
 //! skipped at fan-out (mail stays queued — the reliability invariant), and a
-//! configured one constructs the payload/auth but reports [`SendResult::Failed`]
+//! configured one constructs the payload/auth but reports `SendResult::Failed`
 //! rather than fake a send. No credentials are invented here.
 //! See `docs/research/NATIVE-PUSH.md` §8.
 
@@ -41,7 +41,7 @@ pub fn fcm_wake_payload() -> String {
 }
 
 /// Build an APNs provider **JWT** (ES256) — the same P-256 / ES256 signing the
-/// VAPID path in [`crate::push`] already uses. Header
+/// VAPID path in the internal `push` module already uses. Header
 /// `{"alg":"ES256","kid":<key_id>}`, claims `{"iss":<team_id>,"iat":<now>}`. The
 /// real sender reuses one token for up to ~1h. Pure and testable: no network.
 pub fn apns_provider_jwt(signing: &SigningKey, key_id: &str, team_id: &str, now: u64) -> String {

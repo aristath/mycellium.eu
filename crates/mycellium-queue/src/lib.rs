@@ -28,7 +28,7 @@ mod push;
 /// This replaces the bare endpoint `String` the queue used to store per wallet,
 /// so a single per-wallet list can hold browser Web Push, native APNs/FCM, and
 /// de-Googled UnifiedPush registrations side by side. The wake to every variant
-/// is **contentless** (see [`native_push`] and [`push`]); only the transport
+/// is **contentless** (see [`native_push`] and the internal `push` module); only the transport
 /// differs. Serialized with an internal `kind` tag; existing bare-string
 /// web-push records are upgraded to [`Subscription::WebPush`] on load
 /// (`persist::load_subs`).
@@ -204,7 +204,7 @@ impl Queue {
         Self::default()
     }
 
-    /// Open a **durable** queue: the redb [`Store`](persist::Store) lives
+    /// Open a **durable** queue: the redb `persist::Store` lives
     /// **outside** the state (it is `Send + Sync` and serializes its own writes),
     /// so a handler can commit off the state lock. Returns the in-memory queue
     /// seeded from disk plus the store to persist through.
