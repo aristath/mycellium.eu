@@ -1,0 +1,26 @@
+[package]
+name = "mycellium-mls"
+version = "0.0.0"
+description = "MLS-over-Nostr (Marmot) engine for Mycellium: a thin, honest wrapper over MDK (Marmot Development Kit)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Marmot Development Kit — the MLS-over-Nostr crypto engine.
+# PINNED: MDK 0.8 re-exports nostr 0.44; do NOT bump nostr to 0.45-alpha, it
+# breaks against these re-exports. See the module docs for the alpha note.
+mdk-core = { version = "0.8.0", features = ["mip04"] }
+mdk-memory-storage = "0.8.0"
+nostr = { version = "0.44.4", features = ["std", "nip44", "nip59"] }
+thiserror = "2"
+
+[dev-dependencies]
+# The Nostr wire helpers (sign / gift-wrap) are async; the round-trip test
+# drives them on a minimal current-thread runtime.
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints.rust]
+unsafe_code = "forbid"

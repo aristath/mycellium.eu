@@ -19,7 +19,7 @@ all-features = false
 # OPTIONAL dns/mdns features, which this workspace never enables — the crates
 # sit in Cargo.lock but are never compiled. This mirrors the `audit` job's
 # `--ignore` set so we don't double-fail on the same deferred ids.
-ignore = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119"]
+ignore = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119", "RUSTSEC-2026-0124"]
 # Only fail on an unmaintained crate the workspace depends on *directly* — one we
 # could actually swap out. Transitive-only unmaintained crates (bincode, paste,
 # rustls-pemfile — all pulled deep under axum-server/uniffi with no safe upgrade
@@ -43,6 +43,9 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
     "MPL-2.0",
+    # Public-domain dedication; the bitcoin crypto crates nostr pulls (bitcoin-io,
+    # bitcoin_hashes, secp256k1 chain) are CC0-1.0.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.9
 

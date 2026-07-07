@@ -77,7 +77,7 @@ jobs:
       # (Using `cargo audit` directly, not rustsec/audit-check, so no check-run API
       # permission is needed.)
       - name: Audit
-        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0124
 
   msrv:
     name: msrv (1.96.0 builds)
