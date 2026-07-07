@@ -101,9 +101,20 @@ impl Storage for FileStore {
         let mut blob = Vec::with_capacity(12 + ciphertext.len());
         blob.extend_from_slice(&nonce);
         blob.extend_from_slice(&ciphertext);
+        // Write atomically: a crash mid-`fs::write` would leave a truncated file,
+        // silently corrupting/dropping the entry (e.g. undelivered outbox mail).
+        // Write a temp in the same dir, fsync it, then rename — a rename is atomic,
+        // so a reader only ever sees the whole old or the whole new blob.
+        use std::io::Write;
         let p = self.path(key);
-        fs::write(&p, blob)?;
-        crate::perms::restrict_file(&p);
+        let tmp = p.with_extension("tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&blob)?;
+            f.sync_all()?;
+        }
+        crate::perms::restrict_file(&tmp);
+        fs::rename(&tmp, &p)?;
         Ok(())
     }
 
