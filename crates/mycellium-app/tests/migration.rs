@@ -118,7 +118,8 @@ async fn account_key_rotation_migrates_trust_without_auto_accept() {
     let bob_new_keys = bob
         .rotate_account_key()
         .await
-        .expect("bob rotates account key");
+        .expect("bob rotates account key")
+        .new_keys;
     assert_ne!(
         bob_new_keys.public_key(),
         bob_account.public_key(),

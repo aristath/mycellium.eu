@@ -503,6 +503,31 @@ impl MycelliumClient {
         )
     }
 
+    /// **Register this account's NIP-05 name** at its domain's name service: prove
+    /// control of the account key (NIP-98) to claim `name@domain`, then set it in
+    /// the profile. Unlike [`Self::set_nip05`] (which only advertises the claim on
+    /// Nostr), this actually *claims* the name — the domain must run a compatible
+    /// name service. A later [`Self::rotate_account_key`] carries the name along.
+    pub fn register_name(&self, address: String) -> Result<(), SdkError> {
+        let addr = parse_nip05(&address)?;
+        on_app!(
+            self,
+            app,
+            app.register_name(&addr).await.map_err(SdkError::from)
+        )
+    }
+
+    /// **Release a NIP-05 name** previously registered at its domain's name service,
+    /// freeing it for reuse.
+    pub fn release_name(&self, address: String) -> Result<(), SdkError> {
+        let addr = parse_nip05(&address)?;
+        on_app!(
+            self,
+            app,
+            app.release_name(&addr).await.map_err(SdkError::from)
+        )
+    }
+
     /// Disconnect from relays and stop any running receive loop.
     pub fn shutdown(&self) {
         self.stop_receiving();
@@ -714,8 +739,8 @@ impl MycelliumClient {
     /// Existing conversations keep working (device keys are untouched).
     pub fn rotate_account_key(&self) -> Result<String, SdkError> {
         on_app!(self, app,
-            let new_keys = app.rotate_account_key().await?;
-            nsec_of(&new_keys)
+            let outcome = app.rotate_account_key().await?;
+            nsec_of(&outcome.new_keys)
         )
     }
 

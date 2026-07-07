@@ -541,7 +541,7 @@ async fn account_rotate(data_dir: &Path, yes: bool) -> Result<()> {
     app.pump(Duration::from_millis(600)).await?;
 
     let old_npub = app.account().to_bech32().unwrap_or_default();
-    let new_keys = app
+    let outcome = app
         .rotate_account_key()
         .await
         .context("rotating the account key")?;
@@ -549,7 +549,8 @@ async fn account_rotate(data_dir: &Path, yes: bool) -> Result<()> {
 
     // Persist the new account identity (the device key is unchanged).
     config.account_key = Some(
-        new_keys
+        outcome
+            .new_keys
             .secret_key()
             .to_bech32()
             .context("encoding new nsec")?,
@@ -558,7 +559,16 @@ async fn account_rotate(data_dir: &Path, yes: bool) -> Result<()> {
 
     println!("account key rotated.");
     println!("  old npub: {old_npub}");
-    println!("  new npub: {}", new_keys.public_key().to_bech32()?);
+    println!("  new npub: {}", outcome.new_keys.public_key().to_bech32()?);
+    // Report whether a registered NIP-05 name followed the rotation.
+    match outcome.name_carry {
+        Some(Ok(addr)) => println!("  name:     {addr} now points at the new key"),
+        Some(Err(reason)) => {
+            println!("  name:     WARNING — could not carry your name over ({reason});");
+            println!("            re-run `mycellium name register <you@domain>` to repair it.");
+        }
+        None => {}
+    }
     println!("\nTell your contacts to run `mycellium account migration <you>` and re-verify");
     println!("the safety number out of band before they accept the new key.");
     Ok(())

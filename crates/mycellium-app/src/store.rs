@@ -90,9 +90,40 @@ impl AppStore {
                  FOREIGN KEY (conversation_id) REFERENCES conversations(id)
              );
              CREATE INDEX IF NOT EXISTS messages_by_conv
-                 ON messages(conversation_id);",
+                 ON messages(conversation_id);
+             CREATE TABLE IF NOT EXISTS settings (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
         )?;
         Ok(())
+    }
+
+    // -- Account-level settings (a small key→value store) -------------------
+
+    /// Set (or, with `None`, clear) an account-level setting.
+    pub fn set_setting(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(v) => self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                rusqlite::params![key, v],
+            )?,
+            None => self
+                .conn
+                .execute("DELETE FROM settings WHERE key = ?1", [key])?,
+        };
+        Ok(())
+    }
+
+    /// Read an account-level setting.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
     }
 
     // -- Contacts -----------------------------------------------------------

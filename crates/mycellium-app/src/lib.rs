@@ -153,6 +153,22 @@ pub enum Error {
 /// Convenience result alias for this crate.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// The store-settings key under which an account remembers its own registered
+/// NIP-05 name, so a key rotation can carry it to the new key.
+const ACCOUNT_NIP05_SETTING: &str = "account_nip05";
+
+/// The result of [`App::rotate_account_key`].
+pub struct RotationOutcome {
+    /// The new account identity keypair — **persist it**; it is now the account key.
+    pub new_keys: Keys,
+    /// The fate of the account's registered NIP-05 name, if any:
+    /// - `None` — no name was registered on this device; nothing to carry.
+    /// - `Some(Ok(addr))` — `addr` was reassigned to the new key at its name service.
+    /// - `Some(Err(reason))` — rotation succeeded but the name still points at the
+    ///   **old** key; re-run `name register` to repair the binding.
+    pub name_carry: Option<core::result::Result<Nip05Address, String>>,
+}
+
 /// A stable conversation identifier: the hex of the MLS group id (which never
 /// changes for the life of the group), so it round-trips to a [`GroupId`] and
 /// survives restart without any extra mapping.
@@ -636,7 +652,11 @@ impl App {
             .collect();
         names::register(keys, address, &relays).await?;
         // Reflect the now-registered binding in the profile so the two sides agree.
-        self.set_nip05(address).await
+        self.set_nip05(address).await?;
+        // Remember it locally so an account-key rotation can carry it to the new key.
+        self.store
+            .set_setting(ACCOUNT_NIP05_SETTING, Some(&address.to_string()))?;
+        Ok(())
     }
 
     /// **Release this account's NIP-05 name** at its domain's name service, freeing
@@ -644,7 +664,17 @@ impl App {
     pub async fn release_name(&self, address: &Nip05Address) -> Result<()> {
         let keys = self.device.account_keys().ok_or(Error::NotManager)?;
         names::release(keys, address).await?;
+        self.store.set_setting(ACCOUNT_NIP05_SETTING, None)?;
         Ok(())
+    }
+
+    /// This account's own registered NIP-05 address, if one was registered via
+    /// [`App::register_name`] on this device.
+    fn registered_name(&self) -> Result<Option<Nip05Address>> {
+        match self.store.get_setting(ACCOUNT_NIP05_SETTING)? {
+            Some(s) => Ok(Some(Nip05Address::parse(&s)?)),
+            None => Ok(None),
+        }
     }
 
     /// **Add a contact by NIP-05 address**: resolve `address`, **pin** the key it
@@ -790,16 +820,49 @@ impl App {
     /// identity and the device-list signer change. Returns the **new account
     /// keypair**, which the caller must persist (it is now this account's identity).
     ///
+    /// If this account has a NIP-05 name registered (via [`App::register_name`] on
+    /// this device), the rotation also **carries that name to the new key** at its
+    /// name service — a reassignment authorized by the outgoing key. See
+    /// [`RotationOutcome`].
+    ///
     /// Errors with [`Error::NotManager`] if this device does not hold the account
     /// key (a member device cannot rotate the account identity).
-    pub async fn rotate_account_key(&mut self) -> Result<Keys> {
+    pub async fn rotate_account_key(&mut self) -> Result<RotationOutcome> {
         if !self.device.is_manager() {
             return Err(Error::NotManager);
         }
+        // Capture the outgoing key and relays *before* rotating: carrying a name to
+        // the new key is a reassignment the name service authorizes against the
+        // **current** (old) owner, so we need the old key after the device moves on.
+        let old_keys = self.device.account_keys().cloned();
+        let relays: Vec<String> = self
+            .device
+            .relays()
+            .iter()
+            .map(RelayUrl::to_string)
+            .collect();
+
         let new_keys = Keys::generate();
         self.device.rotate_account_key(&new_keys).await?;
         self.account = new_keys.public_key();
-        Ok(new_keys)
+
+        // Best-effort name carry-over. Rotation is the security-critical operation
+        // and has already succeeded; a name-service failure here must NOT fail it —
+        // the binding just still points at the old key until `name register` re-runs.
+        let name_carry = match (old_keys, self.registered_name()?) {
+            (Some(old), Some(address)) => Some(
+                names::reassign(&old, &address, new_keys.public_key(), &relays)
+                    .await
+                    .map(|()| address)
+                    .map_err(|e| e.to_string()),
+            ),
+            _ => None,
+        };
+
+        Ok(RotationOutcome {
+            new_keys,
+            name_carry,
+        })
     }
 
     // -- Contact key-migration (the security-sensitive side) ----------------

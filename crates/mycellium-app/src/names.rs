@@ -10,7 +10,7 @@
 
 use nostr::hashes::{sha256::Hash as Sha256Hash, Hash as _};
 use nostr::nips::nip98::{HttpData, HttpMethod};
-use nostr::{Keys, Url};
+use nostr::{Keys, PublicKey, Url};
 use serde_json::json;
 
 use crate::nip05::Nip05Address;
@@ -41,6 +41,27 @@ pub async fn register(
     let url = endpoint(address, "register")?;
     let transport = url.to_string();
     let body = json!({ "name": address.name(), "relays": relays });
+    post_signed(account_keys, url, transport, body)
+        .await
+        .map(drop)
+}
+
+/// Point `address` at `new_pubkey` — a `POST /reassign {name, new_pubkey, relays}`
+/// authorized by the **current** owner (`account_keys`). Used to carry a name to a
+/// rotated account key.
+pub async fn reassign(
+    account_keys: &Keys,
+    address: &Nip05Address,
+    new_pubkey: PublicKey,
+    relays: &[String],
+) -> Result<(), NameError> {
+    let url = endpoint(address, "reassign")?;
+    let transport = url.to_string();
+    let body = json!({
+        "name": address.name(),
+        "new_pubkey": new_pubkey.to_hex(),
+        "relays": relays,
+    });
     post_signed(account_keys, url, transport, body)
         .await
         .map(drop)
@@ -145,9 +166,25 @@ mod tests {
         let rec = registry.resolve("alice").expect("alice is now registered");
         assert_eq!(rec.pubkey, keys.public_key(), "bound to the signing key");
 
-        // release: the same account frees the name.
+        // reassign: carry the name to a rotated key, authed by the *old* key.
+        let rotated = Keys::generate();
         post_signed(
             &keys,
+            endpoint(&address, "reassign").unwrap(),
+            format!("http://{addr}/reassign"),
+            json!({ "name": address.name(), "new_pubkey": rotated.public_key().to_hex() }),
+        )
+        .await
+        .expect("reassign succeeds");
+        assert_eq!(
+            registry.resolve("alice").unwrap().pubkey,
+            rotated.public_key(),
+            "name now points at the rotated key"
+        );
+
+        // release: only the new owner (the rotated key) can now free it.
+        post_signed(
+            &rotated,
             endpoint(&address, "release").unwrap(),
             format!("http://{addr}/release"),
             json!({ "name": address.name() }),

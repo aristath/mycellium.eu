@@ -133,7 +133,11 @@ async fn live_trust_subscription_emits_migration_and_device_change() {
 
     // ---- 2. Bob rotates his account key → Alice LIVE-emits pending -------
     bob.pump(SETTLE).await.expect("bob settles pre-rotation");
-    let bob_new_keys = bob.rotate_account_key().await.expect("bob rotates");
+    let bob_new_keys = bob
+        .rotate_account_key()
+        .await
+        .expect("bob rotates")
+        .new_keys;
     assert_ne!(
         bob_new_keys.public_key(),
         bob_account.public_key(),
