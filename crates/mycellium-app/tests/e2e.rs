@@ -97,6 +97,7 @@ async fn app_engine_end_to_end_over_relay() {
             Some("bob@example.com".into()),
             Some("Bob".into()),
         )
+        .await
         .expect("add contact");
     assert_eq!(status, TrustStatus::Pinned, "first add pins TOFU");
 
@@ -163,7 +164,7 @@ async fn app_engine_end_to_end_over_relay() {
     alice.shutdown().await;
     drop(alice);
 
-    let alice_reopened = App::open_solo(alice_keys.clone(), relays.clone(), alice_dir.path())
+    let mut alice_reopened = App::open_solo(alice_keys.clone(), relays.clone(), alice_dir.path())
         .expect("reopen alice from disk");
     alice_reopened.connect().await.expect("reconnect alice");
     let reopened = alice_reopened
@@ -219,6 +220,7 @@ async fn app_engine_end_to_end_over_relay() {
     // Re-adding under the same handle with the new key is also refused (no re-pin).
     let readd = alice_reopened
         .add_contact("bob", bob_imposter_account.public_key(), None, None)
+        .await
         .expect("re-add");
     assert_eq!(readd, TrustStatus::IdentityChanged, "re-pin refused");
     // The original pin is untouched.

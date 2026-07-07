@@ -132,6 +132,16 @@ impl NostrTransport {
         Ok(output.val)
     }
 
+    /// Open (or **replace**) a live subscription under a caller-chosen, stable
+    /// [`SubscriptionId`]. Re-issuing the same `id` with a new `filter` edits the
+    /// existing subscription in place rather than opening a second one — used to
+    /// keep a single, merged subscription whose filter widens as it is refreshed
+    /// (e.g. the pinned-contact trust set growing as contacts are added).
+    pub async fn subscribe_with_id(&self, id: SubscriptionId, filter: Filter) -> Result<()> {
+        self.client.subscribe_with_id(id, filter, None).await?;
+        Ok(())
+    }
+
     /// Close a subscription previously opened with [`NostrTransport::subscribe`].
     pub async fn unsubscribe(&self, id: &SubscriptionId) {
         self.client.unsubscribe(id).await;

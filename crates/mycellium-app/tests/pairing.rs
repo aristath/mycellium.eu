@@ -79,6 +79,7 @@ async fn secure_device_pairing_over_relay() {
 
     let status = carol
         .add_contact("bob", bob_account.public_key(), None, Some("Bob".into()))
+        .await
         .expect("carol pins bob");
     assert_eq!(status, TrustStatus::Pinned);
 

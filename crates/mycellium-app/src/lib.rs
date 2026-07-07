@@ -43,13 +43,15 @@
 //! the **MLS state** (`mdk-sqlite-storage`, so leaf/epoch state is durable) and
 //! the **app data** ([`store::AppStore`] — contacts, trust pins, transcripts).
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mycellium_mls::{GroupId, Keys, Kind, MlsEngine};
 use mycellium_multidevice::{
-    verify_migration, DeviceAccount, DeviceEntry, DeviceList, Incoming, KIND_GROUP_MESSAGE,
+    verify_migration, DeviceAccount, DeviceEntry, DeviceList, Incoming, KIND_DEVICE_LIST,
+    KIND_GROUP_MESSAGE, KIND_KEY_MIGRATION,
 };
 use mycellium_nostr::{NostrTransport, Notification};
 use nostr::{PublicKey, RelayUrl};
@@ -177,6 +179,67 @@ pub struct ReceivedMessage {
     pub timestamp: u64,
 }
 
+/// A **live trust event** surfaced by the receive loop for a *pinned* contact,
+/// alongside ordinary messages ([`AppEvent`]). These arrive passively over the
+/// contact-trust subscription (kinds 30444 / 30445 authored by the contact's
+/// account key) the instant they hit the relay — no explicit fetch/detect needed.
+///
+/// A trust event is a **signal**, never an action: none of these variants changes
+/// a pin. A [`Self::KeyMigrationPending`] still requires the user's out-of-band
+/// re-verification followed by [`App::accept_key_migration`] to move the pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustEvent {
+    /// A **valid** mutual account-key migration (per [`verify_migration`]) for a
+    /// pinned contact arrived live. It is **not** applied: the pin is untouched
+    /// and this is a prompt for the user to compare `new_safety_number` out of
+    /// band, then call [`App::accept_key_migration`]. A migration whose old key is
+    /// not the pinned key is dropped before it ever becomes this variant.
+    KeyMigrationPending {
+        /// The local handle of the pinned contact this migration is for.
+        contact: String,
+        /// The contact's currently pinned (old) account key.
+        old_pubkey: PublicKey,
+        /// The new account key the migration points to (not yet trusted).
+        new_pubkey: PublicKey,
+        /// The safety number for this account vs. the **new** key, to compare out
+        /// of band before accepting.
+        new_safety_number: String,
+    },
+    /// A pinned contact's device list (30444) changed vs. the last seen set. The
+    /// app's cached resolution is refreshed so a **new** conversation with the
+    /// contact enrolls their current devices. Informational: a device the contact
+    /// added to an *existing* shared group is committed by the contact's own side
+    /// (Alice just processes that 445 commit), so no action is required here.
+    ContactDevicesChanged {
+        /// The local handle of the pinned contact whose devices changed.
+        contact: String,
+        /// The contact's current device set (after the change).
+        devices: Vec<DeviceEntry>,
+    },
+    /// A migration-shaped event authored by a pinned contact's key **failed**
+    /// verification (e.g. no valid new-key attestation) — a forgery. Never a
+    /// trust decision; surfaced only for logging/debugging.
+    ForgedMigration {
+        /// The local handle of the pinned contact the event claimed to be for.
+        contact: String,
+        /// Why verification failed.
+        reason: String,
+    },
+}
+
+/// One item drained from the unified receive loop ([`App::next_event`]): either a
+/// decrypted application message or a passive [`TrustEvent`] for a pinned contact.
+/// The loop distinguishes the two by Nostr `kind` — group traffic (gift-wrapped
+/// Welcomes + kind:445) becomes a [`Self::Message`]; a contact's kind:30444 /
+/// 30445 becomes a [`Self::Trust`] — so a single poll yields whichever arrives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppEvent {
+    /// A newly received, decrypted, persisted application message.
+    Message(ReceivedMessage),
+    /// A passive trust signal for a pinned contact (no pin is changed).
+    Trust(TrustEvent),
+}
+
 /// The result of probing a pinned contact for a published **account-key
 /// migration** — the deliberately non-automatic signal at the heart of the trust
 /// model.
@@ -222,6 +285,15 @@ pub struct App {
     store: AppStore,
     account: PublicKey,
     incoming: Option<broadcast::Receiver<Notification>>,
+    /// Last-seen device-pubkey set per pinned contact account (sorted), the
+    /// baseline the live 30444 stream is diffed against to emit
+    /// [`TrustEvent::ContactDevicesChanged`] only on a real change. Also the
+    /// app's cached resolution of a contact's current devices.
+    trust_devices: HashMap<PublicKey, Vec<PublicKey>>,
+    /// Migrations already surfaced as [`TrustEvent::KeyMigrationPending`], keyed
+    /// `(old, new)`, so a relay re-delivery of the same attestation is not
+    /// re-emitted.
+    seen_migrations: HashSet<(PublicKey, PublicKey)>,
 }
 
 impl App {
@@ -296,6 +368,8 @@ impl App {
             store,
             account,
             incoming: None,
+            trust_devices: HashMap::new(),
+            seen_migrations: HashSet::new(),
         }
     }
 
@@ -337,6 +411,37 @@ impl App {
         // Grab the receiver first so nothing published after subscribe is missed.
         self.incoming = Some(self.device.transport().notifications());
         self.device.subscribe_incoming().await?;
+        // Also watch every already-pinned contact's trust events (30444/30445),
+        // so a live key migration or device-list change surfaces passively.
+        self.refresh_trust_subscription().await?;
+        Ok(())
+    }
+
+    /// (Re)build the single merged **contact-trust** subscription from the current
+    /// pinned-contact set, and seed a device-list baseline for any newly-tracked
+    /// contact so the relay's initial (unchanged) re-delivery is not mistaken for
+    /// a change. Called whenever the pinned set changes (subscribe / add_contact /
+    /// accept_key_migration). A no-op before [`App::subscribe`] has run.
+    async fn refresh_trust_subscription(&mut self) -> Result<()> {
+        if self.incoming.is_none() {
+            return Ok(());
+        }
+        let accounts: Vec<PublicKey> = self
+            .store
+            .list_contacts()?
+            .iter()
+            .map(|c| c.account)
+            .collect();
+        for account in &accounts {
+            if !self.trust_devices.contains_key(account) {
+                let baseline = match self.device.fetch_device_list(*account).await? {
+                    Some(list) => sorted_pubkeys(&list),
+                    None => Vec::new(),
+                };
+                self.trust_devices.insert(*account, baseline);
+            }
+        }
+        self.device.subscribe_contact_trust(&accounts).await?;
         Ok(())
     }
 
@@ -361,8 +466,8 @@ impl App {
     /// - Same handle, **different** key → returns [`TrustStatus::IdentityChanged`]
     ///   and **does not** overwrite the pin: the engine refuses to silently accept
     ///   a changed identity.
-    pub fn add_contact(
-        &self,
+    pub async fn add_contact(
+        &mut self,
         id: &str,
         account: PublicKey,
         nip05: Option<String>,
@@ -379,6 +484,9 @@ impl App {
                 verified: false,
                 added_at: now(),
             })?;
+            // Widen the live trust subscription to watch this new contact's
+            // account key (30444/30445). No-op if not yet subscribed.
+            self.refresh_trust_subscription().await?;
             return Ok(TrustStatus::Pinned);
         }
         // Known handle: never silently re-pin. Return the classification as-is
@@ -528,7 +636,7 @@ impl App {
     /// and [`Error::MigrationMismatch`] if it does not link the pinned old key to
     /// the confirmed `new_pubkey`.
     pub async fn accept_key_migration(
-        &self,
+        &mut self,
         contact_id: &str,
         new_pubkey: PublicKey,
     ) -> Result<()> {
@@ -545,6 +653,7 @@ impl App {
         if verified.old_pubkey != contact.account || verified.new_pubkey != new_pubkey {
             return Err(Error::MigrationMismatch);
         }
+        let old_account = contact.account;
         // Move the pin to the new identity. The caller only reaches here after an
         // out-of-band re-verification, so the new pin is recorded as verified.
         self.store.put_contact(&Contact {
@@ -555,6 +664,10 @@ impl App {
             verified: true,
             added_at: contact.added_at,
         })?;
+        // Follow the identity on the live trust stream: stop watching the old key
+        // and start watching the new one (with a fresh device-list baseline).
+        self.trust_devices.remove(&old_account);
+        self.refresh_trust_subscription().await?;
         Ok(())
     }
 
@@ -786,14 +899,72 @@ impl App {
         Ok(out)
     }
 
+    /// Wait up to `timeout` for the **next receive-loop item** — either a decrypted
+    /// application message *or* a live [`TrustEvent`] for a pinned contact — as an
+    /// [`AppEvent`]. This is the unified poll: group traffic (Welcomes + kind:445)
+    /// yields [`AppEvent::Message`]; a pinned contact's kind:30444 / 30445 yields
+    /// [`AppEvent::Trust`]. Returns `Ok(None)` on timeout (or stream close).
+    ///
+    /// Trust events are **passive**: a surfaced [`TrustEvent::KeyMigrationPending`]
+    /// does not move any pin — the user must re-verify out of band and call
+    /// [`App::accept_key_migration`].
+    pub async fn next_event(&mut self, timeout: Duration) -> Result<Option<AppEvent>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let event = {
+                let recv = self.incoming.as_mut().ok_or(Error::NotSubscribed)?;
+                NostrTransport::next_event(recv, remaining, |e| {
+                    e.kind == Kind::GiftWrap
+                        || e.kind == Kind::Custom(KIND_GROUP_MESSAGE)
+                        || e.kind == Kind::Custom(KIND_DEVICE_LIST)
+                        || e.kind == Kind::Custom(KIND_KEY_MIGRATION)
+                })
+                .await
+            };
+            let Some(event) = event else {
+                return Ok(None);
+            };
+            if let Some(item) = self.ingest_event(&event).await? {
+                return Ok(Some(item));
+            }
+        }
+    }
+
+    /// Drain every receive-loop item available within a short idle window, applying
+    /// each (persisting messages, refreshing trust caches). Returns messages *and*
+    /// trust events, in arrival order — the [`AppEvent`] counterpart of [`App::pump`].
+    pub async fn drain_events(&mut self, idle: Duration) -> Result<Vec<AppEvent>> {
+        let mut out = Vec::new();
+        while let Some(e) = self.next_event(idle).await? {
+            out.push(e);
+        }
+        Ok(out)
+    }
+
     /// Route one relay event through the engine and persist any message.
     async fn ingest(&mut self, event: &nostr::Event) -> Result<Option<ReceivedMessage>> {
+        // The message-only path: a trust event (30444/30445) never reaches here via
+        // `next_message`'s matcher, so discarding one is unreachable in practice.
+        Ok(match self.ingest_event(event).await? {
+            Some(AppEvent::Message(m)) => Some(m),
+            _ => None,
+        })
+    }
+
+    /// The single receive-loop dispatcher: route one relay event to either a
+    /// persisted message or a pinned-contact trust event, distinguished by `kind`.
+    async fn ingest_event(&mut self, event: &nostr::Event) -> Result<Option<AppEvent>> {
+        // Account-key migration (kind:30445): a live trust signal, handled here
+        // rather than routed through the MLS engine.
+        if event.kind == Kind::Custom(KIND_KEY_MIGRATION) {
+            return Ok(self.observe_migration(event)?.map(AppEvent::Trust));
+        }
         match self.device.process_incoming(event).await? {
-            Incoming::Joined { group } => {
-                self.record_conversation(&group)?;
-                Ok(None)
-            }
-            Incoming::CommitApplied { group } => {
+            Incoming::Joined { group } | Incoming::CommitApplied { group } => {
                 self.record_conversation(&group)?;
                 Ok(None)
             }
@@ -816,19 +987,89 @@ impl App {
                     &event.id.to_hex(),
                 )?;
                 if inserted {
-                    Ok(Some(ReceivedMessage {
+                    Ok(Some(AppEvent::Message(ReceivedMessage {
                         conversation: conv,
                         author,
                         text: content,
                         timestamp: ts,
-                    }))
+                    })))
                 } else {
                     // A duplicate re-delivery — already in the transcript.
                     Ok(None)
                 }
             }
-            Incoming::DeviceListUpdate(_) | Incoming::Ignored => Ok(None),
+            // A pinned contact's device list revision arrived live (30444).
+            Incoming::DeviceListUpdate(list) => {
+                Ok(self.observe_device_list(&list).map(AppEvent::Trust))
+            }
+            Incoming::Ignored => Ok(None),
         }
+    }
+
+    /// Classify a live kind:30445 migration for a pinned contact **without** ever
+    /// re-pinning. A migration whose verified old key is a pinned contact surfaces
+    /// as [`TrustEvent::KeyMigrationPending`] (deduped against re-delivery); one
+    /// authored by a pinned key but failing verification is a
+    /// [`TrustEvent::ForgedMigration`] debug signal; anything not tied to a pinned
+    /// key is dropped (a forgery the user never sees as acceptable).
+    fn observe_migration(&mut self, event: &nostr::Event) -> Result<Option<TrustEvent>> {
+        let verified = match verify_migration(event) {
+            Ok(v) => v,
+            Err(e) => {
+                // Malformed, but authored by a key we pinned → forged debug signal.
+                return Ok(self.contact_by_account(event.pubkey)?.map(|c| {
+                    TrustEvent::ForgedMigration {
+                        contact: c.id,
+                        reason: e.to_string(),
+                    }
+                }));
+            }
+        };
+        // The outer signer (the claimed old key) must be a contact we pinned; a
+        // migration not tied to a pinned identity is not surfaced as acceptable.
+        let Some(contact) = self.contact_by_account(verified.old_pubkey)? else {
+            return Ok(None);
+        };
+        // Only surface a given (old→new) attestation once, despite relay re-delivery.
+        if !self
+            .seen_migrations
+            .insert((verified.old_pubkey, verified.new_pubkey))
+        {
+            return Ok(None);
+        }
+        Ok(Some(TrustEvent::KeyMigrationPending {
+            contact: contact.id,
+            old_pubkey: verified.old_pubkey,
+            new_pubkey: verified.new_pubkey,
+            new_safety_number: safety_number(&self.account, &verified.new_pubkey),
+        }))
+    }
+
+    /// Diff a live kind:30444 device list for a pinned contact against the cached
+    /// baseline, updating the cache and emitting [`TrustEvent::ContactDevicesChanged`]
+    /// only on a real change. Lists for non-pinned accounts are ignored.
+    fn observe_device_list(&mut self, list: &DeviceList) -> Option<TrustEvent> {
+        let contact = self.contact_by_account(list.account).ok().flatten()?;
+        let pubkeys = sorted_pubkeys(list);
+        match self.trust_devices.get(&list.account) {
+            Some(prev) if *prev == pubkeys => None,
+            _ => {
+                self.trust_devices.insert(list.account, pubkeys);
+                Some(TrustEvent::ContactDevicesChanged {
+                    contact: contact.id,
+                    devices: list.devices.clone(),
+                })
+            }
+        }
+    }
+
+    /// The pinned contact whose account key is `account`, if any.
+    fn contact_by_account(&self, account: PublicKey) -> Result<Option<Contact>> {
+        Ok(self
+            .store
+            .list_contacts()?
+            .into_iter()
+            .find(|c| c.account == account))
     }
 
     /// Ensure a conversation record exists for `group`, titling it from the MLS
@@ -860,6 +1101,14 @@ fn derive_db_key(seed: &[u8], domain: &[u8]) -> [u8; 32] {
     hasher.update(b":");
     hasher.update(seed);
     hasher.finalize().into()
+}
+
+/// A device list's pubkeys as a stable, order-independent set (sorted by hex), so
+/// two revisions listing the same devices in any order compare equal.
+fn sorted_pubkeys(list: &DeviceList) -> Vec<PublicKey> {
+    let mut pubkeys = list.pubkeys();
+    pubkeys.sort_by_key(nostr::PublicKey::to_hex);
+    pubkeys
 }
 
 /// Current unix time in whole seconds.

@@ -88,6 +88,7 @@ async fn account_key_rotation_migrates_trust_without_auto_accept() {
 
     let status = alice
         .add_contact("bob", bob_account.public_key(), None, Some("Bob".into()))
+        .await
         .expect("alice pins bob");
     assert_eq!(
         status,

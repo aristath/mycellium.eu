@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
         }) => account_accept_migration(&data_dir, &contact, &new_key, yes).await,
         Command::Contact {
             cmd: ContactCmd::Add { handle, name },
-        } => contact_add(&data_dir, &handle, name),
+        } => contact_add(&data_dir, &handle, name).await,
         Command::Contacts => contacts_list(&data_dir),
         Command::Publish => publish(&data_dir).await,
         Command::Chat { contact } => chat(&data_dir, &contact).await,
@@ -488,7 +488,7 @@ async fn account_accept_migration(
         }
     }
 
-    let (app, _config) = open_app(data_dir)?;
+    let (mut app, _config) = open_app(data_dir)?;
     app.connect().await.context("connecting to relays")?;
     app.accept_key_migration(contact, new_pubkey)
         .await
@@ -504,9 +504,9 @@ async fn account_accept_migration(
     Ok(())
 }
 
-fn contact_add(data_dir: &Path, handle: &str, name: Option<String>) -> Result<()> {
+async fn contact_add(data_dir: &Path, handle: &str, name: Option<String>) -> Result<()> {
     let (account, nip05) = resolve_identity(handle)?;
-    let (app, _config) = open_app(data_dir)?;
+    let (mut app, _config) = open_app(data_dir)?;
 
     // The local handle used to reference the contact later: the given name, else
     // its npub.
@@ -516,6 +516,7 @@ fn contact_add(data_dir: &Path, handle: &str, name: Option<String>) -> Result<()
 
     let status = app
         .add_contact(&local_id, account, nip05, name)
+        .await
         .context("adding the contact")?;
     println!("contact '{local_id}' — {}", status.label());
     println!("  npub: {}", account.to_bech32()?);
@@ -622,12 +623,19 @@ async fn chat(data_dir: &Path, contact: &str) -> Result<()> {
             }
             // Only this future borrows `app` while the select waits, so sending
             // in the branch above stays a distinct, non-overlapping borrow.
-            received = app.next_message(Duration::from_millis(500)) => {
-                if let Some(msg) = received? {
-                    if msg.conversation == conversation {
+            received = app.next_event(Duration::from_millis(500)) => {
+                match received? {
+                    Some(mycellium_app::AppEvent::Message(msg)) if msg.conversation == conversation => {
                         print!("  [them] {}\n> ", msg.text);
                         let _ = std::io::stdout().flush();
                     }
+                    Some(mycellium_app::AppEvent::Trust(trust)) => {
+                        println!();
+                        print_trust_event(&trust);
+                        print!("> ");
+                        let _ = std::io::stdout().flush();
+                    }
+                    _ => {}
                 }
             }
             _ = tokio::signal::ctrl_c() => break,
@@ -648,18 +656,23 @@ async fn inbox(data_dir: &Path, seconds: u64) -> Result<()> {
     let mut count = 0usize;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if let Some(msg) = app
-            .next_message(remaining.min(Duration::from_millis(500)))
+        if let Some(event) = app
+            .next_event(remaining.min(Duration::from_millis(500)))
             .await?
         {
-            count += 1;
-            let convs = app.conversations()?;
-            let title = convs
-                .iter()
-                .find(|(id, _)| *id == msg.conversation)
-                .map(|(_, t)| t.as_str())
-                .unwrap_or("conversation");
-            println!("[{title}] {}", msg.text);
+            match event {
+                mycellium_app::AppEvent::Message(msg) => {
+                    count += 1;
+                    let convs = app.conversations()?;
+                    let title = convs
+                        .iter()
+                        .find(|(id, _)| *id == msg.conversation)
+                        .map(|(_, t)| t.as_str())
+                        .unwrap_or("conversation");
+                    println!("[{title}] {}", msg.text);
+                }
+                mycellium_app::AppEvent::Trust(trust) => print_trust_event(&trust),
+            }
         }
     }
     app.shutdown().await;
@@ -667,6 +680,32 @@ async fn inbox(data_dir: &Path, seconds: u64) -> Result<()> {
         println!("(no messages in {seconds}s)");
     }
     Ok(())
+}
+
+/// Print a live trust event surfaced by the receive loop. None of these change a
+/// pin: a migration prompts the user to re-verify out of band, then explicitly
+/// accept; a device-list change is informational + refreshes the cached resolution.
+fn print_trust_event(trust: &mycellium_app::TrustEvent) {
+    match trust {
+        mycellium_app::TrustEvent::KeyMigrationPending {
+            contact,
+            new_safety_number,
+            ..
+        } => {
+            println!(
+                "⚠ IDENTITY MIGRATION for {contact} — verify safety number {new_safety_number} then `account accept-migration`"
+            );
+        }
+        mycellium_app::TrustEvent::ContactDevicesChanged { contact, devices } => {
+            println!(
+                "contact {contact} devices changed ({} now listed)",
+                devices.len()
+            );
+        }
+        mycellium_app::TrustEvent::ForgedMigration { contact, reason } => {
+            println!("⚠ dropped a FORGED migration for {contact}: {reason} (pin unchanged)");
+        }
+    }
 }
 
 /// **New device**: print a pairing offer + its SAS, publish this device's

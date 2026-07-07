@@ -100,6 +100,7 @@ async fn device_removal_locks_out_post_compromise_traffic() {
 
     let status = carol
         .add_contact("bob", bob_account.public_key(), None, Some("Bob".into()))
+        .await
         .expect("carol pins bob");
     assert_eq!(status, TrustStatus::Pinned);
 

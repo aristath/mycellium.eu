@@ -1,7 +1,13 @@
 # Direction: Mycellium on Nostr
 
-**Status:** direction / brainstorm captured for decision — not yet decided or implemented.
-Records the reasoning from the design discussion so we can act on it deliberately.
+**Status:** DECIDED + IMPLEMENTED. This document records the original reasoning; the rebuild
+landed it as the `mycellium-{mls,nostr,multidevice,app,cli}` workspace. Delivered so far:
+MLS-over-Nostr via MDK (FS+PCS); relay transport; **multi-device** (the differentiator);
+the headless app engine (contacts, conversations, SQLCipher-persisted history); a CLI; and
+the full key-lifecycle security — SAS device pairing, PCS device removal, account-key
+rotation/migration (mutual attestation, no auto-accept), and live trust subscriptions.
+Remaining: NIP-05, running general relays + upstream Marmot/MDK contribution, a client
+SDK/UIs. The open decision below is resolved (we adopted MLS-over-Nostr via MDK).
 
 ## TL;DR
 

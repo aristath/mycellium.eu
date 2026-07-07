@@ -357,6 +357,39 @@ where
         Ok(())
     }
 
+    /// The stable subscription id for the merged **contact-trust** stream, so
+    /// refreshing the pinned set edits the one subscription in place.
+    #[must_use]
+    fn contact_trust_sub_id() -> mycellium_nostr::SubId {
+        mycellium_nostr::SubId::new("mycellium-contact-trust")
+    }
+
+    /// Subscribe to the **trust events** of a set of pinned contact accounts —
+    /// their device list (kind:30444) and account-key migration (kind:30445),
+    /// both authored by the contact's *account* key — so a live revision arrives
+    /// on the [`DeviceAccount::transport`] notifications stream instead of only on
+    /// an explicit fetch.
+    ///
+    /// This is a single, author-scoped subscription held under one stable id: each
+    /// call **replaces** it with the current `accounts` set, so the merged filter
+    /// widens as contacts are pinned and narrows as they follow a migration. An
+    /// empty `accounts` closes the trust stream. Author-scoping is itself a trust
+    /// boundary: the relay only forwards trust events actually signed by a pinned
+    /// account, so an unrelated key's forged migration is never even delivered.
+    pub async fn subscribe_contact_trust(&self, accounts: &[PublicKey]) -> Result<()> {
+        let id = Self::contact_trust_sub_id();
+        if accounts.is_empty() {
+            self.transport.unsubscribe(&id).await;
+            return Ok(());
+        }
+        let filter = Filter::new().authors(accounts.iter().copied()).kinds([
+            Kind::Custom(KIND_DEVICE_LIST),
+            Kind::Custom(migration::KIND_KEY_MIGRATION),
+        ]);
+        self.transport.subscribe_with_id(id, filter).await?;
+        Ok(())
+    }
+
     // -- KeyPackages & device list -----------------------------------------
 
     /// Publish this device's KeyPackage (kind:30443) so it can be enrolled as a
