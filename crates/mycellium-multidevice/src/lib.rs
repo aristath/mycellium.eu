@@ -69,7 +69,7 @@ use mycellium_mls::{
     MessageProcessingResult, MlsEngine, NostrGroupConfigData,
 };
 use mycellium_nostr::NostrTransport;
-use nostr::{Event, EventId, PublicKey, RelayUrl};
+use nostr::{Event, EventId, JsonUtil, PublicKey, RelayUrl};
 use nostr_sdk::prelude::Filter;
 
 mod device_list;
@@ -409,6 +409,41 @@ where
         let list = DeviceList::new(self.account, devices);
         let event = wire::device_list_event(account_keys, &list).await?;
         Ok(self.transport.publish(&event).await?)
+    }
+
+    /// Publish this account's **profile metadata** (kind:0) advertising `nip05`,
+    /// signed by the account key — so contacts can verify the name→key binding
+    /// against the key they pinned. Requires the account signing key (a
+    /// [`DeviceAccount::manager`]/solo device); a member device errors with
+    /// [`Error::NoAccountKey`].
+    ///
+    /// Publishing the corresponding server-side `.well-known/nostr.json` is out of
+    /// scope — that is the domain operator's job; this only advertises the claim.
+    pub async fn publish_nip05(&self, nip05: &str) -> Result<EventId> {
+        let account_keys = self.account_keys.as_ref().ok_or(Error::NoAccountKey)?;
+        let metadata = nostr::Metadata::new().nip05(nip05);
+        let event = EventBuilder::metadata(&metadata)
+            .build(account_keys.public_key())
+            .sign(account_keys)
+            .await?;
+        Ok(self.transport.publish(&event).await?)
+    }
+
+    /// Fetch the NIP-05 address an `account` **claims** in its published kind:0
+    /// profile, or `None` if it has no profile / no `nip05` field. The claim is
+    /// unverified: the app layer resolves it and checks it maps to the pinned key.
+    pub async fn fetch_profile_nip05(&self, account: PublicKey) -> Result<Option<String>> {
+        match self
+            .transport
+            .fetch_metadata(account, self.fetch_timeout)
+            .await?
+        {
+            Some(event) => {
+                let metadata = nostr::Metadata::from_json(&event.content)?;
+                Ok(metadata.nip05)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Fetch the latest device list published under `account`, or `None` if the

@@ -59,10 +59,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 pub mod contacts;
+pub mod nip05;
 pub mod pairing;
 pub mod store;
 
 pub use contacts::{safety_number, Contact, TrustStatus};
+pub use nip05::{
+    HttpsResolver, Nip05Address, Nip05Record, Nip05Resolver, ParseAddressError, ResolveError,
+};
 pub use pairing::{sas_for, PairingOffer, ParseOfferError};
 pub use store::{AppStore, StoredMessage};
 
@@ -130,6 +134,15 @@ pub enum Error {
     /// old key actually signed a migration to).
     #[error("migration does not match the expected old and new identity")]
     MigrationMismatch,
+    /// A NIP-05 address string could not be parsed.
+    #[error(transparent)]
+    Nip05Parse(#[from] nip05::ParseAddressError),
+    /// Resolving a NIP-05 address failed (network, malformed JSON, name absent).
+    #[error(transparent)]
+    Nip05Resolve(#[from] nip05::ResolveError),
+    /// A contact has no recorded NIP-05 address to re-verify.
+    #[error("contact '{0}' has no recorded nip05 address")]
+    NoNip05(String),
 }
 
 /// Convenience result alias for this crate.
@@ -225,6 +238,20 @@ pub enum TrustEvent {
         /// Why verification failed.
         reason: String,
     },
+    /// A pinned contact's recorded NIP-05 address now resolves to a **different**
+    /// key than the one we pinned — a name→key **rebinding**. Same spirit as a
+    /// key change: a red flag, **advisory only**. The pin is untouched; following
+    /// the new key requires the same out-of-band re-confirmation. A domain
+    /// operator (or a DNS/TLS compromise) can rebind a name, so this is never an
+    /// override of the pin.
+    Nip05Mismatch {
+        /// The local handle of the pinned contact whose NIP-05 rebinding was seen.
+        contact: String,
+        /// The recorded NIP-05 address that rebound (`name@domain`).
+        address: String,
+        /// The **different** key the name now resolves to (not trusted; not pinned).
+        resolved_pubkey: PublicKey,
+    },
 }
 
 /// One item drained from the unified receive loop ([`App::next_event`]): either a
@@ -271,6 +298,35 @@ pub enum MigrationSignal {
         /// Why verification failed (for logging/UX; not a trust decision input).
         reason: String,
     },
+}
+
+/// The outcome of checking a contact's NIP-05 address against the key we
+/// **pinned** for them — a name→key binding check, never an identity source.
+///
+/// Verification means the name still resolves to the *pinned* key. A
+/// [`Self::Mismatch`] (the name now points elsewhere) is a rebinding red flag,
+/// surfaced as [`TrustEvent::Nip05Mismatch`]; it does **not** move the pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Nip05Status {
+    /// The NIP-05 address still resolves to the pinned key — the binding holds.
+    Verified,
+    /// The address now resolves to a **different** key than the pinned one: a
+    /// rebinding (operator change, migration, or impersonation). Advisory only.
+    Mismatch {
+        /// The key the name resolves to now (not the pinned key; not trusted).
+        resolved_pubkey: PublicKey,
+    },
+    /// The address could not be resolved (network error, malformed response, or
+    /// the name is no longer present) — the binding could not be confirmed.
+    Unreachable,
+}
+
+impl Nip05Status {
+    /// Whether the binding was confirmed against the pinned key.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Nip05Status::Verified)
+    }
 }
 
 /// A headless messenger account bound to **one device**.
@@ -480,6 +536,7 @@ impl App {
                 id: id.to_string(),
                 account,
                 nip05,
+                nip05_verified: false,
                 name,
                 verified: false,
                 added_at: now(),
@@ -529,6 +586,151 @@ impl App {
         }
         self.store.set_verified(id, true)?;
         Ok(())
+    }
+
+    // -- NIP-05 (verifiable name↔key binding) -------------------------------
+
+    /// **Publish this account's own NIP-05 address** in its kind:0 profile
+    /// metadata, so contacts can verify the `name@domain` → this-key binding. Only
+    /// a device holding the account key (manager/solo) can do this.
+    ///
+    /// Note: hosting the domain's `.well-known/nostr.json` (the server side of the
+    /// binding) is out of scope — the domain operator must serve it. This only
+    /// advertises the claim on Nostr.
+    pub async fn set_nip05(&self, address: &Nip05Address) -> Result<()> {
+        self.device.publish_nip05(&address.to_string()).await?;
+        Ok(())
+    }
+
+    /// **Add a contact by NIP-05 address**: resolve `address`, **pin** the key it
+    /// maps to (TOFU, via [`App::add_contact`]), and record the address as a
+    /// *verified* NIP-05 binding. Returns the resulting [`TrustStatus`].
+    ///
+    /// NIP-05 is not an identity override: if the local handle was already pinned
+    /// to a **different** key, this returns [`TrustStatus::IdentityChanged`] and
+    /// does **not** re-pin or mark the binding verified. The binding is only
+    /// recorded verified when the pinned key equals the resolved key.
+    pub async fn add_contact_by_nip05<R: Nip05Resolver>(
+        &mut self,
+        resolver: &R,
+        address: &Nip05Address,
+        name: Option<String>,
+    ) -> Result<TrustStatus> {
+        let record = resolver.resolve(address).await?;
+        let local_id = name.clone().unwrap_or_else(|| address.to_string());
+        let status = self
+            .add_contact(&local_id, record.pubkey, Some(address.to_string()), name)
+            .await?;
+        // Mark the NIP-05 binding verified only when the pin actually matches the
+        // resolved key (Pinned/Verified). On IdentityChanged the pin was left on a
+        // different key, so the binding is NOT verified.
+        if status.is_trusted() {
+            self.store
+                .set_nip05(&local_id, Some(&address.to_string()), true)?;
+        }
+        Ok(status)
+    }
+
+    /// **Re-verify a contact's recorded NIP-05 binding** against the **pinned**
+    /// key. Re-resolves the contact's recorded `name@domain` and checks it still
+    /// maps to the key we pinned:
+    ///
+    /// - resolves to the pinned key → [`Nip05Status::Verified`];
+    /// - resolves to a **different** key → [`Nip05Status::Mismatch`] (a rebinding —
+    ///   the pin is left untouched, **never** auto-re-pinned);
+    /// - could not be resolved → [`Nip05Status::Unreachable`].
+    ///
+    /// Errors with [`Error::NoNip05`] if the contact has no recorded address.
+    pub async fn verify_nip05<R: Nip05Resolver>(
+        &self,
+        resolver: &R,
+        contact_id: &str,
+    ) -> Result<Nip05Status> {
+        let contact = self
+            .store
+            .get_contact(contact_id)?
+            .ok_or_else(|| Error::UnknownContact(contact_id.to_string()))?;
+        let recorded = contact
+            .nip05
+            .clone()
+            .ok_or_else(|| Error::NoNip05(contact_id.to_string()))?;
+        let address = Nip05Address::parse(&recorded)?;
+        Ok(Self::resolve_against_pin(resolver, &address, contact.account).await)
+    }
+
+    /// Like [`App::verify_nip05`], but returns the **trust signal** to surface on a
+    /// rebinding: `Some(`[`TrustEvent::Nip05Mismatch`]`)` when the recorded address
+    /// now resolves to a different key than the pin, else `None`. The pin is never
+    /// changed — this is advisory, requiring the same out-of-band re-confirmation
+    /// as any identity change.
+    pub async fn verify_nip05_signal<R: Nip05Resolver>(
+        &self,
+        resolver: &R,
+        contact_id: &str,
+    ) -> Result<Option<TrustEvent>> {
+        let contact = self
+            .store
+            .get_contact(contact_id)?
+            .ok_or_else(|| Error::UnknownContact(contact_id.to_string()))?;
+        let recorded = contact
+            .nip05
+            .clone()
+            .ok_or_else(|| Error::NoNip05(contact_id.to_string()))?;
+        let address = Nip05Address::parse(&recorded)?;
+        Ok(
+            match Self::resolve_against_pin(resolver, &address, contact.account).await {
+                Nip05Status::Mismatch { resolved_pubkey } => Some(TrustEvent::Nip05Mismatch {
+                    contact: contact.id,
+                    address: recorded,
+                    resolved_pubkey,
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    /// **Check a contact's *claimed* NIP-05** — the `nip05` field they advertise in
+    /// their own kind:0 profile — and verify it resolves to the **pinned** key.
+    /// Unlike [`App::verify_nip05`] (which re-checks the address *you recorded*),
+    /// this reads whatever the contact currently *claims* and confirms it is not a
+    /// claim pointing at some other key.
+    ///
+    /// Returns `None` if the contact publishes no NIP-05 claim; otherwise a
+    /// [`Nip05Status`] (`Verified` only when the claim resolves to the pinned key —
+    /// a claim resolving elsewhere is a [`Nip05Status::Mismatch`], not verified).
+    pub async fn check_claimed_nip05<R: Nip05Resolver>(
+        &self,
+        resolver: &R,
+        contact_id: &str,
+    ) -> Result<Option<Nip05Status>> {
+        let contact = self
+            .store
+            .get_contact(contact_id)?
+            .ok_or_else(|| Error::UnknownContact(contact_id.to_string()))?;
+        let Some(claim) = self.device.fetch_profile_nip05(contact.account).await? else {
+            return Ok(None);
+        };
+        let address = Nip05Address::parse(&claim)?;
+        Ok(Some(
+            Self::resolve_against_pin(resolver, &address, contact.account).await,
+        ))
+    }
+
+    /// Resolve `address` and classify it against a `pinned` key: matching key →
+    /// `Verified`, a different key → `Mismatch`, any resolve error → `Unreachable`.
+    /// Shared by the recorded-address and claimed-address checks. **Never re-pins.**
+    async fn resolve_against_pin<R: Nip05Resolver>(
+        resolver: &R,
+        address: &Nip05Address,
+        pinned: PublicKey,
+    ) -> Nip05Status {
+        match resolver.resolve(address).await {
+            Ok(record) if record.pubkey == pinned => Nip05Status::Verified,
+            Ok(record) => Nip05Status::Mismatch {
+                resolved_pubkey: record.pubkey,
+            },
+            Err(_) => Nip05Status::Unreachable,
+        }
     }
 
     // -- Account-key rotation (self) ----------------------------------------
@@ -660,6 +862,9 @@ impl App {
             id: contact.id,
             account: new_pubkey,
             nip05: contact.nip05,
+            // The recorded NIP-05 was verified against the OLD key; it no longer
+            // provably binds the new one until re-resolved, so drop the flag.
+            nip05_verified: false,
             name: contact.name,
             verified: true,
             added_at: contact.added_at,

@@ -16,19 +16,15 @@ path = "src/main.rs"
 # The headless messenger engine this CLI is a thin shell over. It re-exports the
 # nostr identity types (Keys / PublicKey / RelayUrl) the CLI speaks.
 mycellium-app = { path = "../mycellium-app" }
-# The `nostr` primitives for parsing npub/nsec (nip19 bech32) and resolving a
-# nip05 handle to a pubkey (nip05). PINNED to the 0.44 line to match MDK 0.8's
-# re-exports — see mycellium-mls's alpha note.
+# The `nostr` primitives for parsing npub/nsec (nip19 bech32). NIP-05 resolution
+# now lives in mycellium-app's `nip05` module. PINNED to the 0.44 line to match
+# MDK 0.8's re-exports — see mycellium-mls's alpha note.
 nostr = { version = "0.44.4", features = ["std", "nip44", "nip59"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-# One blocking HTTPS GET to resolve a nip05 handle to a pubkey (the
-# `.well-known/nostr.json` fetch). rustls-backed, so no OpenSSL/native-tls and no
-# extra DNS resolver — it reuses the ring/rustls already in the nostr-sdk tree.
-ureq = "2"
 
 [lints.rust]
 unsafe_code = "forbid"

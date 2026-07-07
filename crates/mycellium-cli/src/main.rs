@@ -25,7 +25,6 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use mycellium_app::{App, Device};
-use nostr::nips::nip05::{Nip05Address, Nip05Profile};
 use nostr::nips::nip19::{FromBech32, ToBech32};
 use nostr::{Keys, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
@@ -130,6 +129,13 @@ enum AccountCmd {
     },
     /// Print this account's npub, device pubkey, and relays.
     Show,
+    /// **Publish this account's NIP-05 address** (`name@domain`) in its kind:0
+    /// profile so contacts can verify the name→key binding. Hosting the domain's
+    /// `.well-known/nostr.json` is the operator's job (server-side, out of scope).
+    SetNip05 {
+        /// The NIP-05 address to advertise (`name@domain`, or `_@domain` for root).
+        address: String,
+    },
     /// **Rotate this account's identity key** (hygiene, or recovery after the key
     /// is believed compromised). Publishes a mutual old→new migration attestation
     /// and re-signs the device list under the new key; the device key and every
@@ -222,6 +228,9 @@ async fn main() -> Result<()> {
             account_new(&data_dir, relays, force)
         }
         Command::Account(AccountCmd::Show) => account_show(&data_dir),
+        Command::Account(AccountCmd::SetNip05 { address }) => {
+            account_set_nip05(&data_dir, &address).await
+        }
         Command::Account(AccountCmd::Rotate { yes }) => account_rotate(&data_dir, yes).await,
         Command::Account(AccountCmd::Migration { contact }) => {
             account_migration(&data_dir, &contact).await
@@ -357,6 +366,32 @@ fn account_show(data_dir: &Path) -> Result<()> {
     println!("device pubkey:{}", device.public_key().to_hex());
     println!("data dir:     {}", data_dir.display());
     println!("relays:       {}", config.relays.join(", "));
+    Ok(())
+}
+
+/// **Publish this account's NIP-05 address** in its kind:0 profile metadata, so
+/// contacts can verify the `name@domain` → this-key binding. Hosting the domain's
+/// `.well-known/nostr.json` file is server-side and out of scope.
+async fn account_set_nip05(data_dir: &Path, address: &str) -> Result<()> {
+    let address = mycellium_app::Nip05Address::parse(address)
+        .with_context(|| format!("parsing nip05 address '{address}'"))?;
+
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.set_nip05(&address)
+        .await
+        .context("publishing the nip05 profile")?;
+    app.shutdown().await;
+
+    println!("published NIP-05 '{address}' in this account's profile (kind:0).");
+    println!("Ensure your domain serves it too:");
+    println!(
+        "  https://{}/.well-known/nostr.json?name={}  →  {{\"names\":{{\"{}\":\"{}\"}}}}",
+        address.domain(),
+        address.name(),
+        address.name(),
+        app.account().to_hex()
+    );
     Ok(())
 }
 
@@ -505,21 +540,42 @@ async fn account_accept_migration(
 }
 
 async fn contact_add(data_dir: &Path, handle: &str, name: Option<String>) -> Result<()> {
-    let (account, nip05) = resolve_identity(handle)?;
     let (mut app, _config) = open_app(data_dir)?;
 
-    // The local handle used to reference the contact later: the given name, else
-    // its npub.
-    let local_id = name
-        .clone()
-        .unwrap_or_else(|| account.to_bech32().unwrap_or_else(|_| account.to_hex()));
+    // A `name@domain` handle is resolved + verified via the NIP-05 module (the
+    // resolved key is pinned TOFU and the binding recorded verified); an npub/hex
+    // is pinned directly. Either way the pin is authoritative — NIP-05 is a
+    // binding to verify, never an identity override.
+    let (local_id, status) = if handle.contains('@') {
+        let address = mycellium_app::Nip05Address::parse(handle)
+            .with_context(|| format!("parsing nip05 handle '{handle}'"))?;
+        let local_id = name.clone().unwrap_or_else(|| address.to_string());
+        app.connect().await.context("connecting to relays")?;
+        let status = app
+            .add_contact_by_nip05(&mycellium_app::HttpsResolver, &address, name)
+            .await
+            .context("adding the contact by nip05")?;
+        app.shutdown().await;
+        println!("  nip05: {address} (verified → pinned key)");
+        (local_id, status)
+    } else {
+        let account = parse_pubkey(handle).with_context(|| {
+            format!("'{handle}' is not a valid npub, hex pubkey, or nip05 handle")
+        })?;
+        let local_id = name
+            .clone()
+            .unwrap_or_else(|| account.to_bech32().unwrap_or_else(|_| account.to_hex()));
+        let status = app
+            .add_contact(&local_id, account, None, name)
+            .await
+            .context("adding the contact")?;
+        (local_id, status)
+    };
 
-    let status = app
-        .add_contact(&local_id, account, nip05, name)
-        .await
-        .context("adding the contact")?;
     println!("contact '{local_id}' — {}", status.label());
-    println!("  npub: {}", account.to_bech32()?);
+    if let Some(c) = app.contact(&local_id)? {
+        println!("  npub: {}", c.account.to_bech32()?);
+    }
     if status.label().contains("changed") {
         println!("  WARNING: this handle was already pinned to a DIFFERENT key.");
     }
@@ -537,7 +593,14 @@ fn contacts_list(data_dir: &Path) -> Result<()> {
         let verified = if c.verified { "verified" } else { "pinned" };
         let npub = c.account.to_bech32().unwrap_or_else(|_| c.account.to_hex());
         match &c.nip05 {
-            Some(n) => println!("{}  [{verified}]  {npub}  ({n})", c.id),
+            Some(n) => {
+                let nip05 = if c.nip05_verified {
+                    format!("{n} ✓nip05")
+                } else {
+                    format!("{n} (nip05 unverified)")
+                };
+                println!("{}  [{verified}]  {npub}  ({nip05})", c.id);
+            }
             None => println!("{}  [{verified}]  {npub}", c.id),
         }
     }
@@ -652,6 +715,21 @@ async fn inbox(data_dir: &Path, seconds: u64) -> Result<()> {
     app.connect().await.context("connecting to relays")?;
     app.subscribe().await.context("subscribing to the relays")?;
 
+    // Actively re-verify each contact's recorded NIP-05 binding against its pin and
+    // surface any rebinding (a name now pointing at a different key) as a trust
+    // warning. This is a pull (an HTTPS resolve), unlike the passive relay events,
+    // so it runs once at inbox open. The pin is never changed here.
+    for c in app.contacts()?.into_iter().filter(|c| c.nip05.is_some()) {
+        match app
+            .verify_nip05_signal(&mycellium_app::HttpsResolver, &c.id)
+            .await
+        {
+            Ok(Some(event)) => print_trust_event(&event),
+            Ok(None) => {}
+            Err(e) => eprintln!("nip05 check for '{}' failed: {e}", c.id),
+        }
+    }
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     let mut count = 0usize;
     while tokio::time::Instant::now() < deadline {
@@ -704,6 +782,19 @@ fn print_trust_event(trust: &mycellium_app::TrustEvent) {
         }
         mycellium_app::TrustEvent::ForgedMigration { contact, reason } => {
             println!("⚠ dropped a FORGED migration for {contact}: {reason} (pin unchanged)");
+        }
+        mycellium_app::TrustEvent::Nip05Mismatch {
+            contact,
+            address,
+            resolved_pubkey,
+        } => {
+            let resolved = resolved_pubkey
+                .to_bech32()
+                .unwrap_or_else(|_| resolved_pubkey.to_hex());
+            println!(
+                "⚠ NIP-05 REBINDING for {contact}: '{address}' now resolves to {resolved} \
+                 (NOT the pinned key). The pin is unchanged — re-verify out of band."
+            );
         }
     }
 }
@@ -871,35 +962,4 @@ async fn resolve_conversation(app: &App, contact: &str) -> Result<mycellium_app:
         .await
         .context("starting the conversation")?;
     Ok(conv)
-}
-
-/// Resolve a contact handle (`npub…`, hex, or `name@domain` nip05) to a pubkey,
-/// returning the pubkey and the nip05 string if that was the input form.
-fn resolve_identity(handle: &str) -> Result<(PublicKey, Option<String>)> {
-    if handle.starts_with("npub1") {
-        let pk = PublicKey::from_bech32(handle).context("parsing npub")?;
-        return Ok((pk, None));
-    }
-    if handle.contains('@') {
-        let pk = resolve_nip05(handle)?;
-        return Ok((pk, Some(handle.to_string())));
-    }
-    if let Ok(pk) = PublicKey::from_hex(handle) {
-        return Ok((pk, None));
-    }
-    bail!("'{handle}' is not a valid npub, hex pubkey, or nip05 handle")
-}
-
-/// Resolve a nip05 handle by fetching its `.well-known/nostr.json` (one blocking
-/// HTTPS GET) and extracting the pubkey.
-fn resolve_nip05(handle: &str) -> Result<PublicKey> {
-    let address = Nip05Address::parse(handle).context("parsing the nip05 handle")?;
-    let body = ureq::get(address.url().as_str())
-        .call()
-        .with_context(|| format!("fetching {}", address.url()))?
-        .into_string()
-        .context("reading the nip05 response")?;
-    let profile = Nip05Profile::from_raw_json(&address, &body)
-        .with_context(|| format!("no pubkey for '{handle}' in the nostr.json"))?;
-    Ok(profile.public_key)
 }

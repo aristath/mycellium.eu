@@ -124,6 +124,22 @@ impl NostrTransport {
         Ok(events.first_owned())
     }
 
+    /// Fetch the latest kind:0 profile metadata event published by `author`.
+    ///
+    /// Runs a bounded (`timeout`) filter query and returns the newest matching
+    /// event, or `None` if the author has published no profile on the queried
+    /// relays. Used to read a contact's *claimed* NIP-05 (the `nip05` field of
+    /// their profile) so it can be checked against the pinned key.
+    pub async fn fetch_metadata(
+        &self,
+        author: PublicKey,
+        timeout: Duration,
+    ) -> Result<Option<Event>> {
+        let filter = Filter::new().author(author).kind(Kind::Metadata).limit(1);
+        let events = self.client.fetch_events(filter, timeout).await?;
+        Ok(events.first_owned())
+    }
+
     /// Open a live subscription for `filter`. New matching events arrive on the
     /// [`NostrTransport::notifications`] stream. Returns the subscription id so
     /// the caller can later [`NostrTransport::unsubscribe`].

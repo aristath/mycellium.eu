@@ -31,8 +31,15 @@ pub struct Contact {
     pub id: String,
     /// The account public key pinned when the contact was added.
     pub account: PublicKey,
-    /// Optional NIP-05 identifier (`name@domain`) the contact advertises.
+    /// Optional NIP-05 identifier (`name@domain`) recorded for the contact — the
+    /// address to re-resolve when checking the name→key binding still holds.
     pub nip05: Option<String>,
+    /// Whether the recorded [`Self::nip05`] address was **verified** to resolve to
+    /// the pinned [`Self::account`] key (a NIP-05 binding check — distinct from the
+    /// out-of-band [`Self::verified`] safety-number confirmation). A later
+    /// rebinding to a different key does **not** clear this silently; it surfaces
+    /// as a mismatch signal instead.
+    pub nip05_verified: bool,
     /// Optional display name.
     pub name: Option<String>,
     /// Whether this identity was confirmed out of band (safety-number compare).
@@ -135,6 +142,7 @@ mod tests {
             id: "bob".into(),
             account,
             nip05: None,
+            nip05_verified: false,
             name: None,
             verified,
             added_at: 0,

@@ -67,12 +67,13 @@ impl AppStore {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS contacts (
-                 id        TEXT PRIMARY KEY,
-                 account   TEXT NOT NULL,
-                 nip05     TEXT,
-                 name      TEXT,
-                 verified  INTEGER NOT NULL DEFAULT 0,
-                 added_at  INTEGER NOT NULL
+                 id             TEXT PRIMARY KEY,
+                 account        TEXT NOT NULL,
+                 nip05          TEXT,
+                 nip05_verified INTEGER NOT NULL DEFAULT 0,
+                 name           TEXT,
+                 verified       INTEGER NOT NULL DEFAULT 0,
+                 added_at       INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS conversations (
                  id         TEXT PRIMARY KEY,
@@ -99,14 +100,17 @@ impl AppStore {
     /// Insert or replace a contact (pinning its account key).
     pub fn put_contact(&self, c: &Contact) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO contacts (id, account, nip05, name, verified, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO contacts
+                 (id, account, nip05, nip05_verified, name, verified, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
-                 account=?2, nip05=?3, name=?4, verified=?5, added_at=?6",
+                 account=?2, nip05=?3, nip05_verified=?4, name=?5,
+                 verified=?6, added_at=?7",
             rusqlite::params![
                 c.id,
                 c.account.to_hex(),
                 c.nip05,
+                c.nip05_verified as i64,
                 c.name,
                 c.verified as i64,
                 c.added_at as i64,
@@ -119,7 +123,7 @@ impl AppStore {
     pub fn get_contact(&self, id: &str) -> Result<Option<Contact>> {
         self.conn
             .query_row(
-                "SELECT id, account, nip05, name, verified, added_at
+                "SELECT id, account, nip05, nip05_verified, name, verified, added_at
                  FROM contacts WHERE id = ?1",
                 [id],
                 row_to_contact,
@@ -131,7 +135,7 @@ impl AppStore {
     /// Every contact, in insertion order.
     pub fn list_contacts(&self) -> Result<Vec<Contact>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, account, nip05, name, verified, added_at
+            "SELECT id, account, nip05, nip05_verified, name, verified, added_at
              FROM contacts ORDER BY added_at, id",
         )?;
         let rows = stmt.query_map([], row_to_contact)?;
@@ -147,6 +151,17 @@ impl AppStore {
         self.conn.execute(
             "UPDATE contacts SET verified = ?2 WHERE id = ?1",
             rusqlite::params![id, verified as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Record (or clear) a contact's NIP-05 address and whether it was verified to
+    /// resolve to the pinned key. Distinct from [`Self::set_verified`] (the
+    /// out-of-band safety-number confirmation): this is the name→key binding check.
+    pub fn set_nip05(&self, id: &str, nip05: Option<&str>, nip05_verified: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE contacts SET nip05 = ?2, nip05_verified = ?3 WHERE id = ?1",
+            rusqlite::params![id, nip05, nip05_verified as i64],
         )?;
         Ok(())
     }
@@ -251,14 +266,16 @@ impl AppStore {
 /// Map a `contacts` row to a [`Contact`] (pubkey parse is fallible → inner Result).
 fn row_to_contact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Contact>> {
     let account_hex: String = row.get(1)?;
-    let verified: i64 = row.get(4)?;
-    let added_at: i64 = row.get(5)?;
+    let nip05_verified: i64 = row.get(3)?;
+    let verified: i64 = row.get(5)?;
+    let added_at: i64 = row.get(6)?;
     Ok((|| {
         Ok(Contact {
             id: row.get(0)?,
             account: PublicKey::from_hex(&account_hex).map_err(|_| Error::BadKey(account_hex))?,
             nip05: row.get(2)?,
-            name: row.get(3)?,
+            nip05_verified: nip05_verified != 0,
+            name: row.get(4)?,
             verified: verified != 0,
             added_at: added_at as u64,
         })
