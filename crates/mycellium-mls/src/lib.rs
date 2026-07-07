@@ -97,6 +97,32 @@ pub enum Error {
     NostrGiftWrap(#[from] nostr::nips::nip59::Error),
 }
 
+impl Error {
+    /// Whether this error, raised while processing an incoming kind:445 event,
+    /// means the event is simply **not actionable for this device** rather than a
+    /// real fault — so a receive loop on a shared kind:445 subscription should
+    /// drop it, not fail.
+    ///
+    /// A device that subscribes to every group message inevitably sees traffic for
+    /// groups it is not a member of (a commit that adds it arrives before it has
+    /// joined via the Welcome; groups it will never be in), its own messages
+    /// echoed back by the relay, and stale/duplicate re-deliveries. MDK surfaces
+    /// these as distinct process-message variants; none is a bug on our side.
+    #[must_use]
+    pub fn is_unactionable_incoming(&self) -> bool {
+        matches!(
+            self,
+            Error::Mdk(
+                mdk_core::Error::GroupNotFound
+                    | mdk_core::Error::CannotDecryptOwnMessage
+                    | mdk_core::Error::ProcessMessageWrongGroupId
+                    | mdk_core::Error::ProcessMessageWrongEpoch(_, _)
+                    | mdk_core::Error::ProcessMessageUseAfterEviction
+            )
+        )
+    }
+}
+
 /// Convenience result alias for this crate.
 pub type Result<T> = core::result::Result<T, Error>;
 

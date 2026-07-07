@@ -55,9 +55,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 pub mod contacts;
+pub mod pairing;
 pub mod store;
 
 pub use contacts::{safety_number, Contact, TrustStatus};
+pub use pairing::{sas_for, PairingOffer, ParseOfferError};
 pub use store::{AppStore, StoredMessage};
 
 // Re-export the identity types a caller touches so downstream code depends on
@@ -92,6 +94,14 @@ pub enum Error {
     /// A conversation id was not valid hex.
     #[error("invalid conversation id '{0}'")]
     BadConversationId(String),
+    /// Device pairing was attempted on a device that does not hold the account
+    /// key, so it cannot authorize (sign into the device list) a new device.
+    #[error("this device is not the account manager; it cannot approve a new device")]
+    NotManager,
+    /// No device list exists yet for this account, so there is nothing to add the
+    /// new device to. Publish this device's identity first.
+    #[error("no device list published for this account yet; publish before pairing")]
+    NoDeviceList,
 }
 
 /// Convenience result alias for this crate.
@@ -351,6 +361,54 @@ impl App {
             return Err(Error::UnknownContact(id.to_string()));
         }
         self.store.set_verified(id, true)?;
+        Ok(())
+    }
+
+    // -- Secure device pairing ----------------------------------------------
+
+    /// Mint this device's [`PairingOffer`] (used by a **new device**): the offer
+    /// carries this device's own pubkey and, via [`PairingOffer::sas`], a short
+    /// code the user compares against the manager's screen. The new device shows
+    /// the offer string / SAS, publishes its KeyPackage, subscribes, and waits to
+    /// be approved (after which it receives the fan-out Welcomes over the relay).
+    #[must_use]
+    pub fn pairing_offer(&self) -> PairingOffer {
+        PairingOffer::new(self.device_pubkey())
+    }
+
+    /// **Manager side of pairing.** After the user has confirmed out of band that
+    /// this offer's [`PairingOffer::sas`] matches the new device's screen, pin the
+    /// new device into the account: add it to the signed device list (the
+    /// authorization) and fan it into **every existing group** (an `add_members`
+    /// commit + a gift-wrapped Welcome per group), so the new device securely joins
+    /// every conversation.
+    ///
+    /// The SAS confirmation is the caller's responsibility — this method assumes it
+    /// has happened. Errors with [`Error::NotManager`] if this device does not hold
+    /// the account key, and [`Error::NoDeviceList`] if the account has never
+    /// published a device list to add to.
+    pub async fn approve_device(&self, offer: &PairingOffer) -> Result<()> {
+        // Only the account-key holder can sign a device into the list.
+        if !self.device.is_manager() {
+            return Err(Error::NotManager);
+        }
+        let new_device = offer.device_pubkey;
+
+        // Add the device to the account's signed list (idempotent: a re-approval
+        // of an already-listed device just republishes the same set).
+        let mut list = self
+            .device
+            .fetch_device_list(self.account)
+            .await?
+            .ok_or(Error::NoDeviceList)?;
+        if !list.contains(&new_device) {
+            list.devices.push(DeviceEntry::new(new_device));
+        }
+        self.publish_device_list(list.devices).await?;
+
+        // Fan the new device into every group this device is already in, so it
+        // joins each existing conversation over the relay.
+        self.device.add_device_to_all_groups(new_device).await?;
         Ok(())
     }
 

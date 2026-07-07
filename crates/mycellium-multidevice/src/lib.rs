@@ -298,6 +298,14 @@ where
         self.account
     }
 
+    /// Whether this device holds the account signing key — i.e. it can publish /
+    /// update the account's device list (a manager or solo device). An ordinary
+    /// member device returns `false`.
+    #[must_use]
+    pub fn is_manager(&self) -> bool {
+        self.account_keys.is_some()
+    }
+
     /// The underlying relay transport (for `notifications` / `next_event` in
     /// tests and advanced callers).
     #[must_use]
@@ -533,7 +541,16 @@ where
         }
 
         if event.kind == Kind::Custom(KIND_GROUP_MESSAGE) {
-            return Ok(match self.mls.process_incoming(event)? {
+            // A device on the shared kind:445 subscription sees traffic for groups
+            // it is not (yet) in — most importantly the fan-out commit that adds a
+            // freshly paired device arrives before that device joins via its
+            // Welcome. Such an event is not actionable, not a fault: drop it.
+            let processed = match self.mls.process_incoming(event) {
+                Ok(processed) => processed,
+                Err(e) if e.is_unactionable_incoming() => return Ok(Incoming::Ignored),
+                Err(e) => return Err(e.into()),
+            };
+            return Ok(match processed {
                 MessageProcessingResult::ApplicationMessage(message) => Incoming::Message {
                     group: message.mls_group_id,
                     content: message.content,

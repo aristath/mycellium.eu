@@ -75,6 +75,24 @@ enum Command {
         seconds: u64,
     },
 
+    /// Pair THIS (new) device to an existing account: print an offer + SAS, then
+    /// wait to be approved by the manager and join every conversation.
+    Pair {
+        /// How long to wait for approval (fan-out Welcomes) before exiting.
+        #[arg(long, default_value_t = 120)]
+        seconds: u64,
+    },
+
+    /// Manager: approve a new device from its offer string, after confirming the
+    /// SAS matches the new device's screen.
+    PairApprove {
+        /// The offer string printed by `mycellium pair` on the new device.
+        offer: String,
+        /// Skip the interactive SAS confirmation (assume already verified).
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Show the configured relay URLs.
     Relays,
 }
@@ -146,6 +164,8 @@ async fn main() -> Result<()> {
         Command::Publish => publish(&data_dir).await,
         Command::Chat { contact } => chat(&data_dir, &contact).await,
         Command::Inbox { seconds } => inbox(&data_dir, seconds).await,
+        Command::Pair { seconds } => pair(&data_dir, seconds).await,
+        Command::PairApprove { offer, yes } => pair_approve(&data_dir, &offer, yes).await,
         Command::Relays => relays(&data_dir),
     }
 }
@@ -411,6 +431,88 @@ async fn inbox(data_dir: &Path, seconds: u64) -> Result<()> {
     if count == 0 {
         println!("(no messages in {seconds}s)");
     }
+    Ok(())
+}
+
+/// **New device**: print a pairing offer + its SAS, publish this device's
+/// KeyPackage, then wait to be approved — receiving the fan-out Welcomes and any
+/// messages that arrive once the manager pins this device into the account.
+async fn pair(data_dir: &Path, seconds: u64) -> Result<()> {
+    let (mut app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.subscribe().await.context("subscribing to the relays")?;
+    // Advertise this device's KeyPackage so the manager can enrol it.
+    app.publish_key_package()
+        .await
+        .context("publishing KeyPackage")?;
+
+    let offer = app.pairing_offer();
+    println!("New device pairing. Give the manager this offer:\n");
+    println!("  {offer}\n");
+    println!("Then confirm the SAS below MATCHES the manager's screen:\n");
+    println!("      SAS:  {}\n", offer.sas());
+    println!("Waiting up to {seconds}s to be approved and join conversations...");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let mut joined = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Some(msg) = app
+            .next_message(remaining.min(Duration::from_millis(500)))
+            .await?
+        {
+            println!("  [received] {}", msg.text);
+        }
+        let convos = app.conversations()?.len();
+        if convos > joined {
+            joined = convos;
+            println!("  joined {joined} conversation(s)");
+        }
+    }
+    app.shutdown().await;
+    if joined == 0 {
+        println!("(not approved within {seconds}s — no conversations joined)");
+    } else {
+        println!("paired: joined {joined} conversation(s).");
+    }
+    Ok(())
+}
+
+/// **Manager**: approve a new device from its offer string. Prints the SAS the
+/// manager must confirm matches the new device's screen (the out-of-band check),
+/// then pins the device into the account and fans it into every conversation.
+async fn pair_approve(data_dir: &Path, offer_str: &str, yes: bool) -> Result<()> {
+    let offer: mycellium_app::PairingOffer = offer_str
+        .parse()
+        .context("parsing the pairing offer string")?;
+
+    println!("Pairing a new device: {}", offer.device_pubkey.to_hex());
+    println!("\n      SAS:  {}\n", offer.sas());
+    println!("Confirm this SAS is IDENTICAL to the one shown on the new device.");
+    if !yes {
+        print!("Type 'yes' to approve (anything else aborts): ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading confirmation")?;
+        if line.trim() != "yes" {
+            bail!("aborted: SAS not confirmed — the new device was NOT approved");
+        }
+    }
+
+    let (mut app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.subscribe().await.context("subscribing to the relays")?;
+    // Settle existing joins/commits so every current conversation is enrolled.
+    app.pump(Duration::from_millis(600)).await?;
+
+    app.approve_device(&offer)
+        .await
+        .context("approving the new device")?;
+
+    app.shutdown().await;
+    println!("approved: the device was added to the account and fanned into every conversation.");
     Ok(())
 }
 
