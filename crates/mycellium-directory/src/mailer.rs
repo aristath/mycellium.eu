@@ -32,11 +32,11 @@ pub struct SmtpConfig {
 pub fn send_verification(config: &AuthConfig, to: &str, code: &str) {
     match config {
         AuthConfig::Dev => {
-            eprintln!("[mycellium-directory] DEV verification code for {to}: {code}");
+            tracing::info!(%to, %code, "dev verification code (dev auth mode)");
         }
         AuthConfig::Smtp(smtp) => {
             if let Err(e) = smtp_send(smtp, to, code) {
-                eprintln!("[mycellium-directory] email to {to} failed: {e}");
+                tracing::warn!(%to, error = %e, "verification email delivery failed");
             }
         }
     }

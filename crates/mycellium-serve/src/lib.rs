@@ -28,6 +28,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::info;
 
 pub use mycellium_observe::Metrics;
 
@@ -56,9 +57,16 @@ impl Server {
     /// Create a runtime for `service` (the metrics/log label, e.g. `"directory"`),
     /// capping request bodies at `max_body` bytes.
     pub fn new(service: &'static str, max_body: usize) -> Self {
+        Self::with_metrics(service, max_body, Arc::new(Metrics::default()))
+    }
+
+    /// Like [`Server::new`], but over a caller-owned [`Metrics`] so a service can
+    /// keep its own `Arc<Metrics>` handle (e.g. the queue records push-fan-out
+    /// failures on the *same* counters the `/metrics` endpoint renders).
+    pub fn with_metrics(service: &'static str, max_body: usize, metrics: Arc<Metrics>) -> Self {
         Server {
             service,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
             max_body,
         }
     }
@@ -113,6 +121,9 @@ impl Server {
         let handle = axum_server::Handle::new();
         tokio::spawn(shutdown_signal(handle.clone()));
 
+        let tls_enabled = config.tls.is_some();
+        info!(service, addr = %sockaddr, tls = tls_enabled, "listening");
+
         match config.tls {
             Some(tls) => {
                 // rustls 0.23 requires a process-wide crypto provider; install the
@@ -129,14 +140,14 @@ impl Server {
                         tls.cert_path, tls.key_path
                     ))
                 })?;
-                println!("  tls: enabled ({}) — rustls", tls.cert_path);
+                info!(cert = %tls.cert_path, "tls enabled — rustls");
                 axum_server::bind_rustls(sockaddr, rustls_config)
                     .handle(handle)
                     .serve(app.into_make_service())
                     .await
             }
             None => {
-                println!("  tls: disabled (terminate at a proxy or configure TLS)");
+                info!("tls disabled — terminate at a proxy or configure TLS");
                 axum_server::bind(sockaddr)
                     .handle(handle)
                     .serve(app.into_make_service())
@@ -227,7 +238,7 @@ async fn shutdown_signal(handle: axum_server::Handle) {
         _ = terminate => {}
     }
 
-    println!("shutting down — draining in-flight requests");
+    info!("shutting down — draining in-flight requests");
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }
 

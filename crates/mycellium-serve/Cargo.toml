@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 # pin the audited `ring` backend explicitly so TLS is deterministic.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 mycellium-observe = { path = "../mycellium-observe" }
+tracing = "0.1"
 
 [lints.rust]
 unsafe_code = "forbid"

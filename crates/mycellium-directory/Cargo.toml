@@ -22,6 +22,7 @@ redb = "2"
 mycellium-observe = { path = "../mycellium-observe" }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }

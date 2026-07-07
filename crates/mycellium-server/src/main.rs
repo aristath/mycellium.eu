@@ -11,11 +11,14 @@
 use std::process::exit;
 
 use serde::Deserialize;
+use tracing::{error, info};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
+
     let args = match Args::parse() {
         Ok(args) => args,
         Err(err) => {
@@ -29,7 +32,7 @@ async fn main() {
         Some(path) => match load_config(&path) {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("mycellium-server: {err}");
+                error!(%err, "invalid directory configuration");
                 exit(2);
             }
         },
@@ -44,16 +47,29 @@ async fn main() {
         }
     };
 
-    println!(
-        "mycellium-server {} — hosting the directory on http://{addr}",
-        env!("CARGO_PKG_VERSION")
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        %addr,
+        "mycellium-server — hosting the untrusted directory (stores signed records + presence; holds no keys, reads no content)"
     );
-    println!("  routes: /health · /login/{{challenge,verify}} · /auth/{{start,confirm,status}} · /records/{{handle}} · /presence/{{handle}} · /metrics");
-    println!("  untrusted: stores signed records + presence; holds no keys, reads no content");
     if let Err(err) = mycellium_directory::serve(&addr, config).await {
-        eprintln!("mycellium-server failed: {err}");
+        error!(%err, "mycellium-server failed");
         exit(1);
     }
+}
+
+/// Install the process-wide structured-logging sink once at startup: a
+/// `tracing_subscriber` fmt subscriber filtered by `RUST_LOG` (default `info`).
+/// All operational logs (this service's + the shared runtime's) flow through it.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
+        .init();
 }
 
 struct Args {

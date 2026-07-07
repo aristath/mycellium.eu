@@ -53,7 +53,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mycellium_core::identity::{Signature, WalletPublicKey};
+use mycellium_observe::Metrics;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 /// A request the queue rejected, with the HTTP status it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +536,9 @@ pub struct QueueState {
     vapid: Arc<push::Vapid>,
     native: Arc<native_push::NativePush>,
     push_allow_hosts: Arc<HashSet<String>>,
+    /// Shared with the HTTP runtime's `/metrics` renderer, so the deposit push
+    /// fan-out can record a `push_send_failures_total` when a provider is down.
+    metrics: Arc<Metrics>,
 }
 
 /// Queue HTTP serving config.
@@ -587,15 +592,19 @@ async fn run(
         (*push_allow_hosts).clone(),
     ));
     let native = Arc::new(native_push::NativePush::default());
-    println!("  push: VAPID enabled");
+    info!("push: VAPID enabled");
+    // One `Arc<Metrics>` shared by the `/metrics` renderer and the push fan-out,
+    // so a down provider shows up as `push_send_failures_total` on the dashboard.
+    let metrics = Arc::new(Metrics::default());
     let state = QueueState {
         queue,
         store,
         vapid,
         native,
         push_allow_hosts,
+        metrics: Arc::clone(&metrics),
     };
-    mycellium_serve::Server::new("queue", MAX_BODY)
+    mycellium_serve::Server::with_metrics("queue", MAX_BODY, metrics)
         .run(addr, router(state), config.http)
         .await
 }
@@ -629,6 +638,7 @@ pub fn router_for(queue: Arc<Mutex<Queue>>) -> Router {
         vapid: Arc::new(push::Vapid::generate()),
         native: Arc::new(native_push::NativePush::default()),
         push_allow_hosts: Arc::new(HashSet::new()),
+        metrics: Arc::new(Metrics::default()),
     })
 }
 
@@ -721,11 +731,11 @@ fn open_queue(data: Option<&str>) -> std::io::Result<(Queue, Option<Arc<persist:
                     "the durable queue store at {path} could not be opened: {e}"
                 ))
             })?;
-            println!("  persistence: {path}");
+            info!(%path, "persistence enabled");
             Ok((queue, Some(Arc::new(store))))
         }
         None => {
-            println!("  storage: in-memory development mode");
+            info!("storage: in-memory development mode");
             Ok((Queue::new(), None))
         }
     }
@@ -748,19 +758,21 @@ fn load_or_generate_vapid(
         if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
             if let Some(v) = push::Vapid::from_seed_with_allowlist(&seed, push_allow_hosts.clone())
             {
-                println!("  push: VAPID key loaded ({path})");
+                info!(%path, "push: VAPID key loaded");
                 return v;
             }
         }
-        eprintln!("  push: {path} is unreadable; regenerating");
+        warn!(%path, "push: VAPID key unreadable; regenerating");
     }
     let v = push::Vapid::generate_with_allowlist(push_allow_hosts);
     match std::fs::write(&path, v.seed()) {
         Ok(()) => {
             restrict_perms(&path);
-            println!("  push: VAPID key generated + persisted ({path})");
+            info!(%path, "push: VAPID key generated + persisted");
         }
-        Err(e) => eprintln!("  push: could not persist VAPID key ({e}); it will change on restart"),
+        Err(e) => {
+            warn!(error = %e, "push: could not persist VAPID key; it will change on restart")
+        }
     }
     v
 }
@@ -882,17 +894,20 @@ async fn mailbox_post(
         };
         let queue = Arc::clone(&st.queue);
         let store = st.store.clone();
+        let metrics = Arc::clone(&st.metrics);
         std::thread::spawn(move || {
             // Prune the subscriptions a transport says are gone, so we don't
             // wake them on every future deposit.
             let outcome = wake_all(subs, &waker, now);
-            // A transport error means a push provider is unhealthy — surface it.
+            // A transport error means a push provider is unhealthy — surface it,
+            // both in the logs and on the dashboard (push_send_failures_total).
             // Previously the result was discarded, so a down APNs/FCM/Web Push
             // endpoint stopped waking recipients silently. (No wallet is logged.)
             if outcome.failed > 0 {
-                eprintln!(
-                    "queue: {} push wake(s) failed for a recipient — a push provider may be down",
-                    outcome.failed
+                metrics.inc_push_failure();
+                warn!(
+                    failed = outcome.failed,
+                    "push wake(s) failed for a recipient — a push provider may be down"
                 );
             }
             if !outcome.gone.is_empty() {

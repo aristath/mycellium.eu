@@ -22,10 +22,13 @@ use std::process::exit;
 
 use mycellium_transport::libp2p_net::{listen_multiaddr, Libp2pNode};
 use serde::Deserialize;
+use tracing::{error, info, warn};
 
 const DEFAULT_ADDR: &str = "0.0.0.0:8700";
 
 fn main() {
+    init_tracing();
+
     let args = match Args::parse() {
         Ok(args) => args,
         Err(err) => {
@@ -38,7 +41,7 @@ fn main() {
         Some(path) => match load_config(&path) {
             Ok(config) => config,
             Err(err) => {
-                eprintln!("mycellium-relay: {err}");
+                error!(%err, "invalid relay configuration");
                 exit(2);
             }
         },
@@ -55,14 +58,14 @@ fn main() {
     let listen = match listen_multiaddr(&config.addr) {
         Ok(a) => a,
         Err(err) => {
-            eprintln!("mycellium-relay: invalid addr {}: {err}", config.addr);
+            error!(addr = %config.addr, %err, "invalid relay bind address");
             exit(2);
         }
     };
 
-    println!(
-        "mycellium-relay {} — Circuit Relay v2 server",
-        env!("CARGO_PKG_VERSION")
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "mycellium-relay — Circuit Relay v2 server"
     );
 
     // Start the node. Its background swarm task (spawned inside `new`) grants
@@ -71,30 +74,29 @@ fn main() {
     let mut node = match Libp2pNode::new(secret, Some(listen)) {
         Ok(n) => n,
         Err(err) => {
-            eprintln!("mycellium-relay: could not start the relay node: {err}");
+            error!(%err, "could not start the relay node");
             exit(1);
         }
     };
 
     // `listen_addr()` blocks until the swarm reports the concrete bound address
-    // (resolving a `tcp/0` bind to the OS-assigned port), so what we print is the
-    // real, dialable address.
+    // (resolving a `tcp/0` bind to the OS-assigned port), so what we log is the
+    // real, dialable address. It is interpolated into the message (not a field)
+    // so it stays a bare, whitespace-delimited token an operator (or tooling)
+    // can copy straight out of the log line.
     let bound = match node.listen_addr() {
         Ok(a) => a,
         Err(err) => {
-            eprintln!("mycellium-relay: never bound a listen address: {err}");
+            error!(%err, "never bound a listen address");
             exit(1);
         }
     };
     let dialable = format!("{bound}/p2p/{}", node.peer_id());
 
-    println!("  relay listening — advertise this multiaddr to peers:");
-    println!("    {dialable}");
-    println!("  recipients:  serve --libp2p --relay {dialable}");
-    println!(
-        "  forwards opaque Noise-encrypted circuit traffic only; holds no keys, reads nothing"
-    );
-    println!("  press Ctrl-C to stop");
+    info!("relay listening — advertise this dialable multiaddr to peers: {dialable}");
+    info!("recipients run:  serve --libp2p --relay {dialable}");
+    info!("forwards opaque Noise-encrypted circuit traffic only; holds no keys, reads nothing");
+    info!("press Ctrl-C to stop");
 
     // Stay alive for the process lifetime, holding `node` (and its background
     // swarm task + runtime) so the relay keeps granting reservations and
@@ -204,10 +206,10 @@ fn load_or_generate_secret(data_dir: Option<&str>) -> [u8; 32] {
     let dir = match data_dir {
         Some(d) if !d.trim().is_empty() => d,
         _ => {
-            eprintln!(
-                "  identity: dev mode uses an EPHEMERAL key; the relay's PeerId will CHANGE \
-                 on restart and break clients' --relay addresses. Use --config with data_dir \
-                 to persist a stable identity."
+            warn!(
+                "identity: dev mode uses an EPHEMERAL key; the relay's PeerId will CHANGE on \
+                 restart and break clients' --relay addresses. Use --config with data_dir to \
+                 persist a stable identity."
             );
             return random_secret();
         }
@@ -216,22 +218,36 @@ fn load_or_generate_secret(data_dir: Option<&str>) -> [u8; 32] {
     let path = format!("{}/relay.key", dir.trim_end_matches('/'));
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(secret) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            println!("  identity: relay key loaded ({path}) — PeerId is stable");
+            info!(%path, "identity: relay key loaded — PeerId is stable");
             return secret;
         }
-        eprintln!("  identity: {path} is unreadable; regenerating");
+        warn!(%path, "identity: relay key unreadable; regenerating");
     }
     let secret = random_secret();
     match std::fs::write(&path, secret) {
         Ok(()) => {
             restrict_perms(&path);
-            println!("  identity: relay key generated + persisted ({path}) — PeerId is stable");
+            info!(%path, "identity: relay key generated + persisted — PeerId is stable");
         }
-        Err(err) => eprintln!(
-            "  identity: could not persist relay key ({err}); the PeerId will change on restart"
-        ),
+        Err(err) => {
+            warn!(%err, "identity: could not persist relay key; the PeerId will change on restart")
+        }
     }
     secret
+}
+
+/// Install the process-wide structured-logging sink once at startup: a
+/// `tracing_subscriber` fmt subscriber filtered by `RUST_LOG` (default `info`).
+/// Writes to stdout so the dialable multiaddr stays copy-pastable from the log.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
+        .init();
 }
 
 fn random_secret() -> [u8; 32] {

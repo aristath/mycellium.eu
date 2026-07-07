@@ -379,11 +379,11 @@ fn open_directory(data: Option<&str>) -> std::io::Result<(Directory, Option<Arc<
                     "the durable directory store at {path} could not be opened: {e}"
                 ))
             })?;
-            println!("  persistence: {path}");
+            tracing::info!(%path, "persistence enabled");
             Ok((directory, Some(Arc::new(store))))
         }
         None => {
-            println!("  storage: in-memory development mode");
+            tracing::info!("storage: in-memory development mode");
             Ok((Directory::new(), None))
         }
     }
