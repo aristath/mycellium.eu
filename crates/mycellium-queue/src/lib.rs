@@ -212,6 +212,10 @@ impl Queue {
         let queue = Queue {
             mailboxes: loaded.mailboxes,
             subs: loaded.subs,
+            // Continue the write counter above every persisted blob seq so keys
+            // stay unique and monotonic across the reopen (a fresh 0 would collide
+            // with existing keys and under-cover a later collect's drain bound).
+            write_seq: loaded.max_seq,
             ..Default::default()
         };
         Ok((queue, store))
@@ -409,14 +413,16 @@ impl Queue {
         if mailbox.len() >= MAX_MAILBOX {
             return Err(ApiError::MailboxFull);
         }
-        mailbox.push(blob);
-        let blobs = mailbox.clone();
+        mailbox.push(blob.clone());
+        // O(1) durable write: one per-blob key, no whole-mailbox re-serialize.
+        // The `seq` (unique, monotonic) both zero-pads into the key to preserve
+        // FIFO range order and stamps the blob for the drain-floor guard.
         let seq = self.next_seq();
-        Ok(persist::Write::Mailbox {
+        Ok(persist::Write::Blob {
             wallet: recipient_wallet_hex.to_string(),
             slot: slot.to_string(),
-            blobs,
             seq,
+            blob,
         })
     }
 
@@ -443,8 +449,12 @@ impl Queue {
             .remove(&(wallet_hex.to_string(), slot.to_string()))
         {
             Some(drained) => {
+                // A bounded range-delete of this mailbox's blob keys. The `seq`
+                // is the delete's upper bound (exclusive): every blob currently
+                // in the mailbox was deposited earlier with a smaller seq, so
+                // it's swept, while any post-collect deposit (larger seq) is not.
                 let seq = self.next_seq();
-                let write = persist::Write::DelMailbox {
+                let write = persist::Write::DrainMailbox {
                     wallet: wallet_hex.to_string(),
                     slot: slot.to_string(),
                     seq,
@@ -1212,6 +1222,59 @@ mod tests {
     }
 
     #[test]
+    fn per_blob_schema_persists_fifo_order_and_deletes_on_collect() {
+        // The per-blob durable schema must (1) survive a reopen with blobs in
+        // FIFO deposit order — each under its own `{wallet}\0{slot}\0{seq}` key,
+        // range-scanned back in order — and (2) actually delete those keys on
+        // collect, so a reopen after collecting yields an empty mailbox.
+        let path = std::env::temp_dir().join(format!("myc-q-fifo-{}.redb", random_hex::<8>()));
+        let path_str = path.to_str().unwrap();
+        let bob = Identity::generate(&mut P(90)).unwrap();
+        let bob_hex = hex33(&bob.wallet_public().0);
+        let alice = Identity::generate(&mut P(1)).unwrap();
+
+        // Deposit several blobs into one mailbox, committing each like the handler.
+        {
+            let (mut q, store) = Queue::open(path_str).unwrap();
+            let atoken = login(&mut q, &alice);
+            for i in 0..5 {
+                let write = q
+                    .deposit(&atoken, &bob_hex, ACCOUNT_SLOT, format!("blob-{i}"), 0)
+                    .unwrap();
+                store.apply(write).unwrap();
+            }
+        } // drop → flushed
+
+        // Reopen: the load range-scans the per-blob keys back in FIFO order.
+        let expected: Vec<String> = (0..5).map(|i| format!("blob-{i}")).collect();
+        let (mut q2, store2) = Queue::open(path_str).unwrap();
+        assert_eq!(
+            q2.mailboxes
+                .get(&(bob_hex.clone(), ACCOUNT_SLOT.to_string())),
+            Some(&expected),
+            "blobs must reload in FIFO deposit order"
+        );
+
+        // Collect drains memory and persists the bounded range-delete of the keys.
+        let btoken = login(&mut q2, &bob);
+        let (drained, write) = q2.collect(&btoken, &bob_hex, ACCOUNT_SLOT, 0).unwrap();
+        assert_eq!(drained, expected, "collect returns the blobs in FIFO order");
+        store2
+            .apply(write.expect("a hit persists the drain"))
+            .unwrap();
+        drop((q2, store2));
+
+        // Reopen after collect: the blob keys are gone — the mailbox is empty.
+        let (q3, _store3) = Queue::open(path_str).unwrap();
+        assert!(
+            q3.mailboxes.is_empty(),
+            "collect must delete the blob keys on disk"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn token_expires_after_ttl() {
         let mut q = Queue::new();
         let alice = Identity::generate(&mut P(3)).unwrap();
@@ -1968,12 +2031,13 @@ mod tests {
     }
 
     // The concurrency gate (perf review P1-3 / testing review P2-2): fire N
-    // concurrent deposits — half at one SHARED mailbox (so whole-`Vec` commits
-    // contend on the same key and must not reorder-lose a write), half at
-    // distinct mailboxes — each through the real path (lock → mutate + capture →
-    // DROP lock → `spawn_blocking(store.apply)` → await). Then assert no write was
-    // lost in memory, and that re-opening the durable store recovers the exact
-    // same state. Deterministic: every task is joined, no sleeps.
+    // concurrent deposits — half at one SHARED mailbox (each deposit is its own
+    // per-blob key, so racing commits to the shared mailbox must all persist and
+    // none may be lost), half at distinct mailboxes — each through the real path
+    // (lock → mutate + capture → DROP lock → `spawn_blocking(store.apply)` →
+    // await). Then assert no write was lost in memory, and that re-opening the
+    // durable store recovers the exact same state. Deterministic: every task is
+    // joined, no sleeps.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_deposits_stay_consistent_and_durable() {
         use std::sync::{Arc, Mutex};
@@ -2040,8 +2104,9 @@ mod tests {
         }
 
         // Durable: a fresh open of the same store recovers the identical state —
-        // the version guard kept the latest whole-`Vec` snapshot for the shared
-        // key even though its commits raced. Release the redb file lock first.
+        // every racing per-blob commit landed under its own key, so none was
+        // lost even for the contended shared mailbox. Release the redb file lock
+        // first.
         drop(queue);
         drop(store);
         let (q2, _store2) = Queue::open(&path_str).unwrap();
