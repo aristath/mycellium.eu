@@ -1,30 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mycellium-core",
-    "crates/mycellium-directory",
-    "crates/mycellium-server",
-    "crates/mycellium-queue",
-    "crates/mycellium-queue-client",
-    "crates/mycellium-relay",
-    "clients/rust",
-    "crates/mycellium-transport",
-    "crates/mycellium-storage",
-    "crates/mycellium-directory-client",
-    "crates/mycellium-http",
-    "crates/mycellium-observe",
-    "crates/mycellium-serve",
-    "crates/mycellium-engine",
-    "crates/mycellium-cli",
-    "crates/mycellium-sdk",
     "crates/mycellium-mls",
     "crates/mycellium-nostr",
     "crates/mycellium-multidevice",
     "crates/mycellium-app",
+    "crates/mycellium-cli",
 ]
-# Built only for wasm32 (browser); kept out of the native workspace so its
-# getrandom "js" feature and cdylib don't affect the server/client binaries.
-exclude = ["crates/mycellium-wasm"]
 
 [workspace.package]
 edition = "2021"
@@ -33,24 +15,10 @@ authors = ["Mycellium Team"]
 rust-version = "1.96"
 repository = "https://github.com/aristath/mycellium.eu"
 
-# The core is compiled for everything from microcontrollers to desktops, so we
-# keep release builds small and predictable. See docs/CONCEPT.md Layer 10.
+# The workspace is a messenger stack over MLS-over-Nostr (Marmot): the mls /
+# nostr / multidevice / app engine crates plus the CLI. These are I/O- and
+# crypto-bound native binaries, so optimise release builds for speed.
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
-
-# The server binaries are throughput-bound (ECDSA verify, AEAD, postcard in hot
-# request loops) and run on real hardware where binary size is irrelevant — build
-# them speed-optimized instead of inheriting the core's size-first default.
-[profile.release.package.mycellium-server]
-opt-level = 3
-[profile.release.package.mycellium-queue]
-opt-level = 3
-[profile.release.package.mycellium-directory]
-opt-level = 3
-[profile.release.package.mycellium-serve]
-opt-level = 3
-[profile.release.package.mycellium-relay]
-opt-level = 3

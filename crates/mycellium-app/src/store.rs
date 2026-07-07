@@ -4,9 +4,8 @@
 //! Backed by a single **SQLCipher-encrypted** SQLite database (via `rusqlite`'s
 //! bundled SQLCipher, so no system SQLite is required), separate from the MLS
 //! state database that `mdk-sqlite-storage` owns. The encryption key is derived
-//! from this device's seed (see [`crate::derive_db_key`]), so the transcript and
-//! address book are encrypted with the identity — consistent with the old
-//! engine's `FileStore` model, reimplemented cleanly here.
+//! from this device's seed (via the app engine's `derive_db_key`), so the
+//! transcript and address book are encrypted with the identity.
 //!
 //! Transcripts survive restart: reopening the same file against the same key
 //! yields the same messages. This is what makes the engine a real messenger core

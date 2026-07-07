@@ -7,8 +7,7 @@
 //! once you know who you are talking to, but says nothing about whether the key
 //! you are talking to is still the person you pinned.
 //!
-//! This module is that hardening, carried over from the old engine's
-//! `contacts` + `verified` concepts and reimplemented on the new stack:
+//! This module is that hardening:
 //!
 //! - A [`Contact`] pins the account public key you first saw for a local handle
 //!   (trust-on-first-use).
@@ -43,8 +42,7 @@ pub struct Contact {
 }
 
 /// How much the engine trusts that an observed account key really belongs to a
-/// known contact. Mirrors the old engine's `TrustLevel`, reframed for the
-/// account-key (npub) identity model.
+/// known contact, in the account-key (npub) identity model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrustStatus {
     /// Confirmed out of band **and** the observed key matches — safe.

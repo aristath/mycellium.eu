@@ -1,48 +1,44 @@
 # mycellium-cli
 
-The terminal shell over `mycellium-engine`.
+`mycellium` — a thin, runnable messenger CLI over
+[`mycellium-app`](../mycellium-app), the headless MLS-over-Nostr (Marmot)
+engine. The CLI only parses arguments, holds the on-disk config (this device's
+key + relay URLs), and drives the engine.
 
-## Config
+## Data & config
 
-Pass a JSON config with `--config`:
+State lives under `--data-dir` (default `$HOME/.mycellium`, or
+`$MYCELLIUM_DATA_DIR`): a `config.json` (this device's `nsec` + relay URLs)
+alongside the two SQLCipher-encrypted databases `mycellium-app` maintains (MLS
+state + app data).
 
-```json
-{
-  "data_dir": "./data/alice",
-  "passphrase": "a local dev passphrase",
-  "queue": "http://127.0.0.1:8090",
-  "name": "Alice"
-}
-```
-
-`data_dir` selects the local profile. `passphrase` is optional; without it the
-CLI prompts. `queue` is recorded in your signed directory record so other peers
-can leave offline messages. `name` is the display name published in your record.
-
-## Quick Start
+## Quick start
 
 ```sh
-mycellium --config alice.client.json identity-new
-mycellium --config alice.client.json register alice \
-  --addr 127.0.0.1:9001 --directory http://127.0.0.1:8080
-mycellium --config alice.client.json send bob --as alice \
-  --message "hi" --directory http://127.0.0.1:8080
-mycellium --config alice.client.json inbox --as alice \
-  --directory http://127.0.0.1:8080
+# Create an identity + config (defaults to a public relay; --relay is repeatable).
+mycellium account new --relay wss://relay.damus.io
+
+# Announce this device to the relays (KeyPackage + device list).
+mycellium publish
+
+# Add a contact by npub, hex pubkey, or nip05 handle, then list contacts.
+mycellium contact add npub1... alice
+mycellium contacts
+
+# Open an interactive 1:1 conversation: type a line to send, Ctrl-D to quit.
+mycellium chat alice
+
+# Drain incoming messages non-interactively for a few seconds.
+mycellium inbox --seconds 10
 ```
 
 ## Commands
 
-- `identity-new`, `identity-show`
-- `register`, `pair`, `pair-approve`, `devices`, `revoke-device`
-- `send`, `chat`, `listen`, `serve`, `inbox`, `outbox`, `broadcast`, `forward`
-- `announce`, `presence`, `verify`, `card`, `verify-card`
-- `group create/send/add/history/info/leave/sync/list`
-- `contact add/list/remove`
-- `history`, `clear-history`, `conversations`, `search`
-- `draft set/show/clear`, `expire set/clear/show`
-- `block`, `unblock`, `blocked`
-- `export`, `import`, `wipe`
+- `account new [--relay <url>]... [--force]`, `account show`
+- `publish` — publish this device's KeyPackage + account device list
+- `contact add <npub|hex|nip05> [name]`, `contacts`
+- `chat <contact>` — interactive 1:1 conversation
+- `inbox [--seconds N]` — connect, drain, and print incoming messages
+- `relays` — show the configured relay URLs
 
-Every command that talks to the directory accepts `--directory`, defaulting to
-`http://127.0.0.1:8080`.
+A global `--data-dir`/`-d` selects the profile directory for any command.

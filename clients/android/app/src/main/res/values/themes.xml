@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- Base theme. The actual colors come from Compose Material3 (Theme.kt);
-         this XML theme only needs to be a valid Material 3 parent so the
-         Activity has a sane window background before Compose takes over. -->
-    <style name="Theme.Mycellium" parent="android:Theme.Material.NoActionBar" />
-</resources>

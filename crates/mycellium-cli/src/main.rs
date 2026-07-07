@@ -1,992 +1,468 @@
-//! `mycellium` — the Full-tier client shell.
+//! **`mycellium`** — a thin, runnable messenger CLI over [`mycellium_app`].
 //!
-//! Wires the portable core to real host capabilities (OS entropy/clock, TCP
-//! transport, a directory HTTP client) and drives the whole flow end to end:
-//! create/restore an identity, register a handle, look a peer up, open a direct
-//! line, run X3DH + Double Ratchet, and exchange end-to-end-encrypted messages.
+//! This binary is a shell: every real operation (accounts, contacts + trust,
+//! conversations, the relay send/receive loop, persisted history) lives in
+//! `mycellium-app`; the CLI only parses arguments, holds the on-disk config
+//! (this device's key + relay URLs), and drives the engine.
+//!
+//! ```text
+//!   mycellium account new                 # generate an identity + config
+//!   mycellium publish                      # KeyPackage + device list → relays
+//!   mycellium contact add <npub|nip05> [name]
+//!   mycellium contacts                     # list known contacts + trust state
+//!   mycellium chat <contact>               # interactive 1:1 conversation
+//!   mycellium inbox [--seconds N]          # drain + print incoming messages
+//!   mycellium relays                       # configured relay URLs
+//! ```
+//!
+//! Data lives under `--data-dir` (default `$HOME/.mycellium`): `config.json`
+//! next to the two SQLCipher databases `mycellium-app` maintains.
 
-mod tui;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use std::io::BufRead;
-use std::sync::{Arc, Mutex};
-
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use mycellium_app::{App, Device};
+use nostr::nips::nip05::{Nip05Address, Nip05Profile};
+use nostr::nips::nip19::{FromBech32, ToBech32};
+use nostr::{Keys, PublicKey, RelayUrl};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
-use mycellium_core::identity::Handle;
-use mycellium_core::message::AppMessage;
-use mycellium_core::platform::Platform;
-use mycellium_core::ratchet::RatchetMessage;
-use mycellium_core::transport::Transport;
-use mycellium_core::wire;
-
-use mycellium_directory_client::DirectoryClient;
-use mycellium_engine::blocklist;
-use mycellium_engine::history::{self, StoredMessage};
-use mycellium_engine::platform::OsPlatform;
-use mycellium_storage::filestore::FileStore;
-use mycellium_storage::store;
-use mycellium_transport::libp2p_net::{self, Libp2pNode};
-use mycellium_transport::link::{FrameReader, FrameWriter};
-use mycellium_transport::net::TcpTransport;
-
-// The engine owns the orchestration; the shell drives it.
-use mycellium_engine::app::*;
-
-const DEFAULT_DIRECTORY: &str = "http://127.0.0.1:8080";
-
+/// A thin messenger client over MLS-over-Nostr (Marmot).
 #[derive(Parser)]
-#[command(
-    name = "mycellium",
-    about = "Mycellium peer-to-peer messenger (POC client)"
-)]
+#[command(name = "mycellium", version, about, long_about = None)]
 struct Cli {
-    /// JSON client config. If omitted, the CLI uses `.mycellium` plus
-    /// interactive passphrase prompts and no advertised queue.
-    #[arg(long, global = true)]
-    config: Option<String>,
+    /// Directory holding config.json and the encrypted databases.
+    #[arg(long, short = 'd', global = true)]
+    data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new identity and store it locally (no seed phrase — recovery is
-    /// via email verification; add devices with `pair`).
-    IdentityNew,
-    /// Show this device's public identity.
-    IdentityShow,
-    /// Register a handle with the directory and publish your record.
-    Register {
-        /// The handle to claim, e.g. `ari`.
-        handle: String,
-        /// Address other peers dial to reach you, e.g. `127.0.0.1:9001`.
-        #[arg(long)]
-        addr: String,
-        /// Advertise a libp2p multiaddr instead of a raw TCP address.
-        #[arg(long)]
-        libp2p: bool,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Pair this (fresh) device with an existing account — seedless linking.
-    ///
-    /// Prints a one-time offer to run on an existing device (`pair-approve`),
-    /// then adopts the account over an authenticated pairing channel. No seed
-    /// phrase ever leaves the other device.
-    Pair {
-        /// The account handle you're joining.
-        handle: String,
-        /// Address other peers dial to reach this device.
-        #[arg(long)]
-        addr: String,
-        /// Advertise a libp2p multiaddr instead of a raw TCP address.
-        #[arg(long)]
-        libp2p: bool,
-        /// The queue URL both devices use as the pairing rendezvous.
-        #[arg(long)]
-        queue: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Approve a new device's pairing offer (run on an existing device).
-    PairApprove {
-        /// The offer string printed by `pair` on the new device.
-        offer: String,
-        /// Your account handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// List the devices in an account's cluster.
-    Devices {
-        /// The handle to inspect.
-        handle: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Remove a device from your cluster (by short id).
-    RevokeDevice {
-        /// Your handle.
-        handle: String,
-        /// The short device id (from `devices`).
-        device_id: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Wait for a peer to connect and chat with them.
-    Listen {
-        /// Address to bind, matching the one you registered.
-        #[arg(long)]
-        addr: String,
-        /// Listen with the libp2p transport instead of raw TCP.
-        #[arg(long)]
-        libp2p: bool,
-        /// Use the full-screen terminal UI instead of line mode.
-        #[arg(long)]
-        tui: bool,
-    },
-    /// Look up a peer, open a direct line, and chat.
-    Chat {
-        /// The peer's handle.
-        peer: String,
-        /// Your own handle (used to authenticate you to the peer).
-        #[arg(long = "as")]
-        whoami: String,
-        /// Use the full-screen terminal UI instead of line mode.
-        #[arg(long)]
-        tui: bool,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Queue an offline message in a peer's mailbox (no live connection).
-    Send {
-        /// The recipient's handle.
-        peer: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        /// The message text.
-        #[arg(long)]
-        message: Option<String>,
-        /// Reply to an earlier message id (with --message).
-        #[arg(long)]
-        reply_to: Option<String>,
-        /// React with an emoji (needs --to).
-        #[arg(long)]
-        react: Option<String>,
-        /// The message id to react to.
-        #[arg(long)]
-        to: Option<String>,
-        /// Attach a file at this path.
-        #[arg(long)]
-        file: Option<String>,
-        /// Edit an earlier message id (with --message).
-        #[arg(long)]
-        edit: Option<String>,
-        /// Delete (unsend) an earlier message id.
-        #[arg(long)]
-        delete: Option<String>,
-        /// Make the message disappear after this long (e.g. 30s, 10m, 1h, 7d).
-        #[arg(long)]
-        expire: Option<String>,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Send the same message to several peers at once.
-    Broadcast {
-        /// Comma-separated recipient handles/nicknames.
-        #[arg(long, value_delimiter = ',')]
-        to: Vec<String>,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        /// The message text.
-        #[arg(long)]
-        message: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Fetch and decrypt queued offline messages.
-    Inbox {
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Retry undelivered messages and show what's still waiting to send.
-    Outbox {
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Stay online and receive live-pushed messages (announces presence).
-    Serve {
-        /// Address to bind (matching the one you registered).
-        #[arg(long)]
-        addr: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        /// Receive over the libp2p transport instead of raw TCP (match how you
-        /// registered — a `--libp2p` account must serve with `--libp2p`).
-        #[arg(long)]
-        libp2p: bool,
-        /// Be reachable only through a Circuit Relay v2 relay: reserve a slot on
-        /// this relay multiaddr and advertise the resulting circuit address, so
-        /// senders reach this (NATed/relay-only) device through it. Requires
-        /// `--libp2p`.
-        #[arg(long)]
-        relay: Option<String>,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Show the stored message history with a peer.
-    History {
-        /// The peer's handle.
-        peer: String,
-    },
-    /// Delete the stored history with a peer.
-    ClearHistory {
-        /// The peer's handle or nickname.
-        peer: String,
-    },
-    /// List all conversations (peers and groups) with a last-message preview.
-    Conversations,
-    /// Search all local transcripts (1:1 and groups) for text.
-    Search {
-        /// The text to search for (case-insensitive).
-        query: String,
-    },
-    /// Forward a stored message to another peer.
-    Forward {
-        /// The message id to forward.
-        message_id: String,
-        /// The peer you received it from (handle or nickname).
-        #[arg(long)]
-        from: String,
-        /// The recipient (handle or nickname).
-        #[arg(long)]
-        to: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Group messaging (async, via the offline mailbox).
-    Group {
-        #[command(subcommand)]
-        action: GroupAction,
-    },
-    /// Manage your local address book of nicknames.
+    /// Account identity: create one or show the current one.
+    #[command(subcommand)]
+    Account(AccountCmd),
+
+    /// Add a contact by npub / hex pubkey / nip05 handle.
     Contact {
         #[command(subcommand)]
-        action: ContactAction,
+        cmd: ContactCmd,
     },
-    /// Announce that you're online (heartbeat the directory).
-    Announce {
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
+
+    /// List known contacts and their trust state.
+    Contacts,
+
+    /// Publish this device's KeyPackage and account device list to the relays.
+    Publish,
+
+    /// Open an interactive 1:1 conversation with a contact.
+    Chat {
+        /// The contact handle (its name, or npub if unnamed).
+        contact: String,
     },
-    /// Check whether a handle is currently online.
-    Presence {
-        /// The handle (or a contact nickname) to check.
-        peer: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
+
+    /// Connect, drain, and print incoming messages for a few seconds.
+    Inbox {
+        /// How long to listen before exiting.
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
     },
-    /// Show the safety number to verify a peer's identity out of band.
-    Verify {
-        /// The peer (handle or nickname).
-        peer: String,
-        /// After comparing the safety number out of band, mark the peer verified.
+
+    /// Show the configured relay URLs.
+    Relays,
+}
+
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// Generate a new identity and write config.json.
+    New {
+        /// A relay URL to use (repeatable). Defaults to a public relay.
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        /// Overwrite an existing config in this data dir.
         #[arg(long)]
-        confirm: bool,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
+        force: bool,
     },
-    /// Show your own contact card (QR + code) for a peer to scan and verify you.
-    Card {
-        /// Your handle.
-        handle: String,
-    },
-    /// Verify a peer from their contact card (compares it to the directory record).
-    VerifyCard {
-        /// The card string a peer showed you (from their `card`).
-        card: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Block a handle (its messages are dropped).
-    Block {
-        /// The handle to block.
-        handle: String,
-    },
-    /// Unblock a handle.
-    Unblock {
-        /// The handle to unblock.
-        handle: String,
-    },
-    /// List blocked handles.
-    Blocked,
-    /// Set a per-conversation default disappearing-message timer.
-    Expire {
-        #[command(subcommand)]
-        action: ExpireAction,
-    },
-    /// Export identity + local data to a single backup file.
-    Export {
-        /// Destination path.
-        path: String,
-    },
-    /// Import a backup into a fresh configured data directory.
-    Import {
-        /// Backup file path.
-        path: String,
-    },
-    /// Save/show/clear a draft message for a peer.
-    Draft {
-        #[command(subcommand)]
-        action: DraftAction,
-    },
-    /// Erase ALL local data (identity + messages). Irreversible.
-    Wipe {
-        /// Confirm the wipe.
-        #[arg(long)]
-        yes: bool,
-    },
+    /// Print this account's npub, device pubkey, and relays.
+    Show,
 }
 
 #[derive(Subcommand)]
-enum DraftAction {
-    /// Save a draft for a peer.
-    Set {
-        /// Peer handle or nickname.
-        peer: String,
-        /// The draft text.
-        text: String,
-    },
-    /// Show a peer's draft.
-    Show {
-        /// Peer handle or nickname.
-        peer: String,
-    },
-    /// Clear a peer's draft.
-    Clear {
-        /// Peer handle or nickname.
-        peer: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ExpireAction {
-    /// Set the default TTL for a peer or group id (e.g. 1h).
-    Set {
-        /// Peer handle/nickname, or group id.
-        target: String,
-        /// Duration, e.g. 30s, 10m, 1h, 7d.
-        duration: String,
-    },
-    /// Clear a target's default TTL.
-    Clear {
-        /// Peer handle/nickname, or group id.
-        target: String,
-    },
-    /// Show a target's default TTL.
-    Show {
-        /// Peer handle/nickname, or group id.
-        target: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ContactAction {
-    /// Add a contact, pinning their current identity (trust-on-first-use).
+enum ContactCmd {
+    /// Add a contact, pinning its key (trust-on-first-use).
     Add {
-        /// Local nickname.
-        nickname: String,
-        /// The peer's handle.
+        /// npub, hex pubkey, or a nip05 handle (`name@domain`).
         handle: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// List your contacts.
-    List,
-    /// Remove a contact.
-    Remove {
-        /// Local nickname.
-        nickname: String,
+        /// A local name to reference the contact by.
+        name: Option<String>,
     },
 }
 
-#[derive(Subcommand)]
-enum GroupAction {
-    /// Create a group and invite members (sends each your sender key).
-    Create {
-        /// Group name.
-        name: String,
-        /// Comma-separated member handles.
-        #[arg(long, value_delimiter = ',')]
-        members: Vec<String>,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Send a message to a group (fans out to every member).
-    Send {
-        /// Group id or name.
-        group: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        /// The message text.
-        #[arg(long)]
-        message: Option<String>,
-        /// Reply to an earlier message id (with --message).
-        #[arg(long)]
-        reply_to: Option<String>,
-        /// React with an emoji (needs --to).
-        #[arg(long)]
-        react: Option<String>,
-        /// The message id to react to.
-        #[arg(long)]
-        to: Option<String>,
-        /// Attach a file at this path.
-        #[arg(long)]
-        file: Option<String>,
-        /// Edit an earlier message id (with --message).
-        #[arg(long)]
-        edit: Option<String>,
-        /// Delete (unsend) an earlier message id.
-        #[arg(long)]
-        delete: Option<String>,
-        /// Make the message disappear after this long (e.g. 30s, 10m, 1h, 7d).
-        #[arg(long)]
-        expire: Option<String>,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Invite another member to an existing group.
-    Add {
-        /// Group id or name.
-        group: String,
-        /// The handle to invite.
-        #[arg(long)]
-        member: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Show the stored transcript of a group.
-    History {
-        /// Group id or name.
-        group: String,
-    },
-    /// Show a group's name, id, and members.
-    Info {
-        /// Group id or name.
-        group: String,
-    },
-    /// Leave a group (notifies the others to re-key).
-    Leave {
-        /// Group id or name.
-        group: String,
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// Bootstrap your other devices into your groups (Layer 11, receive-only).
-    Sync {
-        /// Your own handle.
-        #[arg(long = "as")]
-        whoami: String,
-        #[arg(long, default_value = DEFAULT_DIRECTORY)]
-        directory: String,
-    },
-    /// List the groups this device knows about.
-    List,
+/// On-disk client config: this device's secret key plus its relay URLs.
+#[derive(Serialize, Deserialize)]
+struct Config {
+    /// The device/account secret key, bech32 (`nsec1…`).
+    secret_key: String,
+    /// Relay URLs this device connects to.
+    relays: Vec<String>,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    init_client_config(cli.config.as_deref())?;
-    match cli.command {
-        Command::IdentityNew => identity_new(),
-        Command::Pair {
-            handle,
-            addr,
-            libp2p,
-            queue,
-            directory,
-        } => pair_new(&handle, &addr, libp2p, &queue, &directory),
-        Command::PairApprove {
-            offer,
-            whoami,
-            directory,
-        } => pair_approve(&offer, &whoami, &directory),
-        Command::Devices { handle, directory } => list_devices(&handle, &directory),
-        Command::RevokeDevice {
-            handle,
-            device_id,
-            directory,
-        } => revoke_device(&handle, &device_id, &directory),
-        Command::IdentityShow => identity_show(),
-        Command::Register {
-            handle,
-            addr,
-            libp2p,
-            directory,
-        } => register(&handle, &addr, libp2p, &directory),
-        Command::Listen { addr, libp2p, tui } => listen(&addr, libp2p, tui),
-        Command::Chat {
-            peer,
-            whoami,
-            tui,
-            directory,
-        } => chat(&peer, &whoami, tui, &directory),
-        Command::Send {
-            peer,
-            whoami,
-            message,
-            reply_to,
-            react,
-            to,
-            file,
-            edit,
-            delete,
-            expire,
-            directory,
-        } => send(
-            &peer,
-            &whoami,
-            message.as_deref(),
-            reply_to.as_deref(),
-            react.as_deref(),
-            to.as_deref(),
-            file.as_deref(),
-            edit.as_deref(),
-            delete.as_deref(),
-            expire.as_deref(),
-            &directory,
-        ),
-        Command::Broadcast {
-            to,
-            whoami,
-            message,
-            directory,
-        } => broadcast(&to, &whoami, &message, &directory),
-        Command::Inbox { whoami, directory } => inbox(&whoami, &directory),
-        Command::Outbox { directory } => outbox_show(&directory),
-        Command::Serve {
-            addr,
-            whoami,
-            libp2p,
-            relay,
-            directory,
-        } => serve(&addr, &whoami, libp2p, relay.as_deref(), &directory),
-        Command::History { peer } => show_history(&peer),
-        Command::ClearHistory { peer } => clear_history(&peer),
-        Command::Conversations => conversations(),
-        Command::Search { query } => search(&query),
-        Command::Forward {
-            message_id,
-            from,
-            to,
-            whoami,
-            directory,
-        } => forward(&message_id, &from, &to, &whoami, &directory),
-        Command::Group { action } => match action {
-            GroupAction::Create {
-                name,
-                members,
-                whoami,
-                directory,
-            } => group_create(&name, &members, &whoami, &directory),
-            GroupAction::Send {
-                group,
-                whoami,
-                message,
-                reply_to,
-                react,
-                to,
-                file,
-                edit,
-                delete,
-                expire,
-                directory,
-            } => group_send(
-                &group,
-                &whoami,
-                message.as_deref(),
-                reply_to.as_deref(),
-                react.as_deref(),
-                to.as_deref(),
-                file.as_deref(),
-                edit.as_deref(),
-                delete.as_deref(),
-                expire.as_deref(),
-                &directory,
-            ),
-            GroupAction::Add {
-                group,
-                member,
-                whoami,
-                directory,
-            } => group_add(&group, &member, &whoami, &directory),
-            GroupAction::History { group } => group_history(&group),
-            GroupAction::Info { group } => group_info(&group),
-            GroupAction::Leave {
-                group,
-                whoami,
-                directory,
-            } => group_leave(&group, &whoami, &directory),
-            GroupAction::Sync { whoami, directory } => group_sync(&whoami, &directory),
-            GroupAction::List => group_list(),
-        },
-        Command::Contact { action } => match action {
-            ContactAction::Add {
-                nickname,
-                handle,
-                directory,
-            } => contact_add(&nickname, &handle, &directory),
-            ContactAction::List => contact_list(),
-            ContactAction::Remove { nickname } => contact_remove(&nickname),
-        },
-        Command::Block { handle } => set_blocked(&handle, true),
-        Command::Unblock { handle } => set_blocked(&handle, false),
-        Command::Blocked => list_blocked(),
-        Command::Announce { whoami, directory } => announce(&whoami, &directory),
-        Command::Presence { peer, directory } => presence(&peer, &directory),
-        Command::Verify {
-            peer,
-            confirm,
-            directory,
-        } => verify(&peer, &directory, confirm),
-        Command::Card { handle } => {
-            let card = contact_card(&handle)?;
-            println!("Contact card for '{handle}' — show this to a peer to verify you:\n");
-            print_qr(&card);
-            println!("\n{card}\n");
-            println!("They run:  mycellium verify-card {card}");
-            Ok(())
-        }
-        Command::VerifyCard { card, directory } => verify_card(&card, &directory),
-        Command::Expire { action } => match action {
-            ExpireAction::Set { target, duration } => expire_set(&target, &duration),
-            ExpireAction::Clear { target } => expire_clear(&target),
-            ExpireAction::Show { target } => expire_show(&target),
-        },
-        Command::Export { path } => export_backup(&path),
-        Command::Import { path } => import_backup(&path),
-        Command::Draft { action } => match action {
-            DraftAction::Set { peer, text } => draft_cmd(&peer, Some(&text)),
-            DraftAction::Show { peer } => draft_cmd(&peer, None),
-            DraftAction::Clear { peer } => draft_clear(&peer),
-        },
-        Command::Wipe { yes } => wipe(yes),
+impl Config {
+    fn keys(&self) -> Result<Keys> {
+        Keys::parse(&self.secret_key).context("parsing the stored secret key")
+    }
+
+    fn relay_urls(&self) -> Result<Vec<RelayUrl>> {
+        self.relays
+            .iter()
+            .map(|r| RelayUrl::parse(r).with_context(|| format!("parsing relay url '{r}'")))
+            .collect()
     }
 }
 
-#[derive(Default, Deserialize)]
-struct ClientConfigFile {
-    data_dir: Option<String>,
-    passphrase: Option<String>,
-    queue: Option<String>,
-    name: Option<String>,
+const DEFAULT_RELAY: &str = "wss://relay.damus.io";
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let data_dir = resolve_data_dir(cli.data_dir.as_deref())?;
+
+    match cli.command {
+        Command::Account(AccountCmd::New { relays, force }) => {
+            account_new(&data_dir, relays, force)
+        }
+        Command::Account(AccountCmd::Show) => account_show(&data_dir),
+        Command::Contact {
+            cmd: ContactCmd::Add { handle, name },
+        } => contact_add(&data_dir, &handle, name),
+        Command::Contacts => contacts_list(&data_dir),
+        Command::Publish => publish(&data_dir).await,
+        Command::Chat { contact } => chat(&data_dir, &contact).await,
+        Command::Inbox { seconds } => inbox(&data_dir, seconds).await,
+        Command::Relays => relays(&data_dir),
+    }
 }
 
-fn init_client_config(path: Option<&str>) -> Result<()> {
-    let file = match path {
-        Some(path) => {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("could not read client config '{path}'"))?;
-            serde_json::from_str::<ClientConfigFile>(&raw)
-                .with_context(|| format!("could not parse client config '{path}'"))?
-        }
-        None => ClientConfigFile::default(),
+// -- config plumbing --------------------------------------------------------
+
+fn resolve_data_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    if let Ok(env) = std::env::var("MYCELLIUM_DATA_DIR") {
+        return Ok(PathBuf::from(env));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("$HOME is not set; pass --data-dir"))?;
+    Ok(home.join(".mycellium"))
+}
+
+fn config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("config.json")
+}
+
+fn load_config(data_dir: &Path) -> Result<Config> {
+    let path = config_path(data_dir);
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow!(
+            "no config at {} ({e}); run `mycellium account new` first",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&raw).context("parsing config.json")
+}
+
+/// Open the engine from the on-disk config as a solo (single-device) account.
+fn open_app(data_dir: &Path) -> Result<(App, Config)> {
+    let config = load_config(data_dir)?;
+    let keys = config.keys()?;
+    let relays = config.relay_urls()?;
+    let app = App::open_solo(keys, relays, data_dir).context("opening the app engine")?;
+    Ok((app, config))
+}
+
+// -- commands ---------------------------------------------------------------
+
+fn account_new(data_dir: &Path, relays: Vec<String>, force: bool) -> Result<()> {
+    let path = config_path(data_dir);
+    if path.exists() && !force {
+        bail!(
+            "config already exists at {}; pass --force to overwrite",
+            path.display()
+        );
+    }
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+
+    let relays = if relays.is_empty() {
+        vec![DEFAULT_RELAY.to_string()]
+    } else {
+        relays
     };
-    store::configure(store::ClientConfig {
-        data_dir: file
-            .data_dir
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(".mycellium")),
-        passphrase: file.passphrase,
-        queue_url: file.queue.unwrap_or_default(),
-        display_name: file.name.unwrap_or_default(),
-    });
+    // Validate the relay URLs up front so a bad one fails now, not at connect.
+    for r in &relays {
+        RelayUrl::parse(r).with_context(|| format!("invalid relay url '{r}'"))?;
+    }
+
+    let keys = Keys::generate();
+    let config = Config {
+        secret_key: keys.secret_key().to_bech32().context("encoding nsec")?,
+        relays,
+    };
+    write_config(&path, &config)?;
+
+    println!("account created");
+    println!("  npub:     {}", keys.public_key().to_bech32()?);
+    println!("  data dir: {}", data_dir.display());
+    println!("  relays:   {}", config.relays.join(", "));
+    println!("\nnext: `mycellium publish` to announce this device to the relays.");
     Ok(())
 }
 
-fn listen(addr: &str, libp2p: bool, tui: bool) -> Result<()> {
-    let identity = store::load_identity()?;
-    let history = Arc::new(Mutex::new(open_history(&identity)?));
-    let blocked = blocklist::load(&*history.lock().unwrap())?;
-
-    // Accept connections until one completes a handshake; failed handshakes
-    // (health probes, scanners) and blocked peers are skipped. The accepted
-    // peer runs full-duplex.
-    if libp2p {
-        let listen_addr = libp2p_net::listen_multiaddr(addr)?;
-        let mut node = Libp2pNode::new(identity.device_secret(), Some(listen_addr))?;
-        println!("listening (libp2p) on {addr} as {}", node.peer_id());
-        loop {
-            let mut conn = node.accept()?;
-            match handshake_responder(&mut conn, &identity) {
-                Ok(session) if blocklist::is_blocked(&blocked, &session.peer_name) => {
-                    eprintln!("(refused blocked peer '{}')", session.peer_name);
-                }
-                Ok(session) => {
-                    let (reader, writer) = conn.split();
-                    run_session(
-                        Box::new(reader),
-                        Box::new(writer),
-                        session,
-                        tui,
-                        Arc::clone(&history),
-                    );
-                    node.drain(300);
-                    std::process::exit(0);
-                }
-                Err(err) => eprintln!("(ignoring connection: {err})"),
-            }
-        }
-    } else {
-        let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
-        println!("listening on {addr}; waiting for a peer to connect...");
-        loop {
-            let mut conn = transport.accept()?;
-            match handshake_responder(&mut conn, &identity) {
-                Ok(session) if blocklist::is_blocked(&blocked, &session.peer_name) => {
-                    eprintln!("(refused blocked peer '{}')", session.peer_name);
-                }
-                Ok(session) => {
-                    let (reader, writer) = conn.split()?;
-                    run_session(
-                        Box::new(reader),
-                        Box::new(writer),
-                        session,
-                        tui,
-                        Arc::clone(&history),
-                    );
-                    std::process::exit(0);
-                }
-                Err(err) => eprintln!("(ignoring connection: {err})"),
-            }
-        }
+fn write_config(path: &Path, config: &Config) -> Result<()> {
+    let json = serde_json::to_string_pretty(config)?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    // The config holds a secret key — make it owner-only where the OS supports it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+    Ok(())
 }
 
-fn chat(peer: &str, whoami: &str, tui: bool, directory: &str) -> Result<()> {
-    let identity = store::load_identity()?;
-    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
-    let history = Arc::new(Mutex::new(open_history(&identity)?));
-
-    let client = DirectoryClient::new(directory);
-    let (peer_handle, peer_record) = {
-        let mut fs = history.lock().unwrap();
-        lookup_verified(&client, &mut fs, peer)?
-    };
-
-    let location = String::from_utf8(peer_record.record.primary().peer_id.0.clone())
-        .context("peer record has no dialable address")?;
-
-    // A leading '/' marks a libp2p multiaddr; anything else is a TCP host:port.
-    if location.starts_with('/') {
-        let mut node = Libp2pNode::new(identity.device_secret(), None)?;
-        let mut conn = node
-            .dial_str(&location)
-            .with_context(|| format!("could not connect to {location}"))?;
-        let session = handshake_initiator(
-            &mut conn,
-            &identity,
-            &me,
-            &peer_handle,
-            &peer_record,
-            &location,
-        )?;
-        let (reader, writer) = conn.split();
-        run_session(
-            Box::new(reader),
-            Box::new(writer),
-            session,
-            tui,
-            Arc::clone(&history),
-        );
-        node.drain(300);
-        std::process::exit(0);
-    } else {
-        let mut transport = TcpTransport::dialer();
-        let mut conn = transport
-            .dial(&peer_record.record.primary().peer_id)
-            .with_context(|| format!("could not connect to {location}"))?;
-        let session = handshake_initiator(
-            &mut conn,
-            &identity,
-            &me,
-            &peer_handle,
-            &peer_record,
-            &location,
-        )?;
-        let (reader, writer) = conn.split()?;
-        run_session(
-            Box::new(reader),
-            Box::new(writer),
-            session,
-            tui,
-            Arc::clone(&history),
-        );
-        std::process::exit(0);
-    }
+fn account_show(data_dir: &Path) -> Result<()> {
+    let config = load_config(data_dir)?;
+    let keys = config.keys()?;
+    println!("npub:     {}", keys.public_key().to_bech32()?);
+    println!("pubkey:   {}", keys.public_key().to_hex());
+    println!("data dir: {}", data_dir.display());
+    println!("relays:   {}", config.relays.join(", "));
+    Ok(())
 }
 
-/// Run a session in either the terminal UI or line mode.
-fn run_session(
-    reader: Box<dyn FrameReader>,
-    writer: Box<dyn FrameWriter>,
-    session: Session,
-    tui: bool,
-    history: Arc<Mutex<FileStore>>,
-) {
-    if tui {
-        if let Err(err) = tui::run(reader, writer, session, history) {
-            eprintln!("tui error: {err}");
-        }
-    } else {
-        run_duplex(reader, writer, session, history);
+fn contact_add(data_dir: &Path, handle: &str, name: Option<String>) -> Result<()> {
+    let (account, nip05) = resolve_identity(handle)?;
+    let (app, _config) = open_app(data_dir)?;
+
+    // The local handle used to reference the contact later: the given name, else
+    // its npub.
+    let local_id = name
+        .clone()
+        .unwrap_or_else(|| account.to_bech32().unwrap_or_else(|_| account.to_hex()));
+
+    let status = app
+        .add_contact(&local_id, account, nip05, name)
+        .context("adding the contact")?;
+    println!("contact '{local_id}' — {}", status.label());
+    println!("  npub: {}", account.to_bech32()?);
+    if status.label().contains("changed") {
+        println!("  WARNING: this handle was already pinned to a DIFFERENT key.");
     }
+    Ok(())
 }
 
-/// Run a full-duplex chat: a reader thread decrypts and prints incoming
-/// messages while the main thread encrypts stdin lines and sends them. The
-/// ratchet is shared under a mutex since both directions advance it. Every
-/// message (both directions) is persisted to the encrypted history store.
-fn run_duplex(
-    mut reader: Box<dyn FrameReader>,
-    mut writer: Box<dyn FrameWriter>,
-    session: Session,
-    history: Arc<Mutex<FileStore>>,
-) {
-    let Session {
-        ratchet,
-        ad,
-        peer_name,
-    } = session;
-    let ratchet = Arc::new(Mutex::new(ratchet));
-    let ad = Arc::new(ad);
-    let peer_name = Arc::new(peer_name);
-
-    // Replay any earlier conversation (pruning expired).
-    let now = OsPlatform.now_unix_secs();
-    if let Ok(past) = history::load_active(&mut *history.lock().unwrap(), &peer_name, now) {
-        if !past.is_empty() {
-            println!("--- earlier messages with {peer_name} ---");
-            for m in &past {
-                let who = if m.from_me { "you" } else { peer_name.as_str() };
-                println!("{who}: {}", m.text);
-            }
-            println!("---");
+fn contacts_list(data_dir: &Path) -> Result<()> {
+    let (app, _config) = open_app(data_dir)?;
+    let contacts = app.contacts()?;
+    if contacts.is_empty() {
+        println!("(no contacts yet — add one with `mycellium contact add <npub|nip05>`)");
+        return Ok(());
+    }
+    for c in contacts {
+        let verified = if c.verified { "verified" } else { "pinned" };
+        let npub = c.account.to_bech32().unwrap_or_else(|_| c.account.to_hex());
+        match &c.nip05 {
+            Some(n) => println!("{}  [{verified}]  {npub}  ({n})", c.id),
+            None => println!("{}  [{verified}]  {npub}", c.id),
         }
     }
+    Ok(())
+}
 
-    // Reader thread: incoming frames -> decrypt -> print + persist.
-    let reader_ratchet = Arc::clone(&ratchet);
-    let reader_ad = Arc::clone(&ad);
-    let reader_history = Arc::clone(&history);
-    let reader_peer = Arc::clone(&peer_name);
-    std::thread::spawn(move || {
-        let mut platform = OsPlatform;
-        loop {
-            let frame = match reader.recv_frame() {
-                Ok(frame) => frame,
-                Err(_) => break, // peer disconnected
-            };
-            let msg: RatchetMessage = match wire::decode(&frame) {
-                Ok(msg) => msg,
-                Err(_) => continue,
-            };
-            let decrypted = reader_ratchet
-                .lock()
-                .unwrap()
-                .decrypt(&mut platform, &msg, &reader_ad);
-            match decrypted {
-                Ok(plaintext) => {
-                    let (id, expires_at, display) = render_incoming(&plaintext);
-                    println!("{reader_peer}: {display}  (#{id})");
-                    record(
-                        &reader_history,
-                        &reader_peer,
-                        false,
-                        id,
-                        display,
-                        expires_at,
-                    );
-                }
-                Err(_) => eprintln!("(received an undecryptable message)"),
+fn relays(data_dir: &Path) -> Result<()> {
+    let config = load_config(data_dir)?;
+    for r in &config.relays {
+        println!("{r}");
+    }
+    Ok(())
+}
+
+async fn publish(data_dir: &Path) -> Result<()> {
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+
+    app.publish_key_package()
+        .await
+        .context("publishing KeyPackage")?;
+    // Announce this single device as the account's device list.
+    let device = Device::new(app.device_pubkey());
+    app.publish_device_list(vec![device])
+        .await
+        .context("publishing device list")?;
+
+    app.shutdown().await;
+    println!(
+        "published KeyPackage + device list for {}",
+        app.account().to_bech32()?
+    );
+    Ok(())
+}
+
+async fn chat(data_dir: &Path, contact: &str) -> Result<()> {
+    let (mut app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.subscribe().await.context("subscribing to the relays")?;
+
+    // Settle any pending joins/commits so an existing conversation is discovered.
+    app.pump(Duration::from_millis(600)).await?;
+
+    let conversation = resolve_conversation(&app, contact).await?;
+    println!("conversation {conversation} with '{contact}' — type a line to send, Ctrl-D to quit.");
+
+    // Replay the recent transcript so the session has context on open.
+    for m in app
+        .transcript(&conversation)?
+        .into_iter()
+        .rev()
+        .take(20)
+        .rev()
+    {
+        let who = if m.from_me { "me" } else { "them" };
+        println!("  [{who}] {}", m.text);
+    }
+
+    // Read stdin lines off-thread and feed them in over a channel, so the main
+    // loop can both send and drain incoming messages without blocking on I/O.
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line_tx.send(line).await.is_err() {
+                break;
             }
         }
     });
 
-    // Main thread: stdin lines -> encrypt -> send + persist. Ends on Ctrl-D.
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        // A responder cannot send until it has received the peer's first
-        // message; wait for the reader thread to establish the sending chain.
-        while !ratchet.lock().unwrap().can_send() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    loop {
+        tokio::select! {
+            maybe_line = line_rx.recv() => {
+                match maybe_line {
+                    Some(line) if !line.trim().is_empty() => {
+                        if let Err(e) = app.send_text(&conversation, &line).await {
+                            eprintln!("send failed: {e}");
+                        }
+                    }
+                    Some(_) => {} // blank line: ignore
+                    None => break, // stdin closed (Ctrl-D)
+                }
+            }
+            // Only this future borrows `app` while the select waits, so sending
+            // in the branch above stays a distinct, non-overlapping borrow.
+            received = app.next_message(Duration::from_millis(500)) => {
+                if let Some(msg) = received? {
+                    if msg.conversation == conversation {
+                        print!("  [them] {}\n> ", msg.text);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
         }
-        let app = text_message(&line);
-        let msg = ratchet.lock().unwrap().encrypt(&app.encode(), &ad);
-        if writer.send_frame(&wire::encode(&msg)).is_err() {
-            break;
-        }
-        record(
-            &history,
-            &peer_name,
-            true,
-            app.id.clone(),
-            line,
-            app.expires_at,
-        );
     }
+
+    app.shutdown().await;
+    println!("\nbye.");
+    Ok(())
 }
 
-/// Persist one message to the encrypted history store (best-effort), keeping its
-/// real id + expiry so reply/edit/delete/expiry work the same as offline mail.
-fn record(
-    history: &Arc<Mutex<FileStore>>,
-    peer: &str,
-    from_me: bool,
-    id: String,
-    text: String,
-    expires_at: Option<u64>,
-) {
-    let message = StoredMessage {
-        id,
-        from_me,
-        text,
-        timestamp: OsPlatform.now_unix_secs(),
-        expires_at,
-    };
-    let _ = history::append(&mut *history.lock().unwrap(), peer, message);
-}
+async fn inbox(data_dir: &Path, seconds: u64) -> Result<()> {
+    let (mut app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.subscribe().await.context("subscribing to the relays")?;
 
-/// Decode a decrypted payload into `(id, expires_at, display)`, tolerating older
-/// raw text (which has no metadata → empty id, no expiry).
-fn render_incoming(bytes: &[u8]) -> (String, Option<u64>, String) {
-    match AppMessage::decode(bytes) {
-        Ok(msg) => {
-            let summary = msg.summary();
-            (msg.id, msg.expires_at, summary)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let mut count = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Some(msg) = app
+            .next_message(remaining.min(Duration::from_millis(500)))
+            .await?
+        {
+            count += 1;
+            let convs = app.conversations()?;
+            let title = convs
+                .iter()
+                .find(|(id, _)| *id == msg.conversation)
+                .map(|(_, t)| t.as_str())
+                .unwrap_or("conversation");
+            println!("[{title}] {}", msg.text);
         }
-        Err(_) => (
-            String::new(),
-            None,
-            String::from_utf8_lossy(bytes).into_owned(),
-        ),
     }
+    app.shutdown().await;
+    if count == 0 {
+        println!("(no messages in {seconds}s)");
+    }
+    Ok(())
 }
 
-/// Render `text` as a scannable QR in the terminal (dense half-block unicode).
-/// Best-effort — if the payload is too large for a QR, the printed code still works.
-fn print_qr(text: &str) {
-    if let Ok(code) = qrcode::QrCode::new(text) {
-        let img = code
-            .render::<qrcode::render::unicode::Dense1x2>()
-            .quiet_zone(true)
-            .build();
-        println!("{img}");
+// -- helpers ----------------------------------------------------------------
+
+/// Find the existing 1:1 conversation for a contact, or start one.
+async fn resolve_conversation(app: &App, contact: &str) -> Result<mycellium_app::ConversationId> {
+    let c = app
+        .contact(contact)?
+        .ok_or_else(|| anyhow!("no contact known under handle '{contact}'"))?;
+    // `start_conversation` titles a 1:1 by the contact's name, else its handle —
+    // match on that to reopen rather than create a second group.
+    let title = c.name.clone().unwrap_or_else(|| c.id.clone());
+    for (id, t) in app.conversations()? {
+        if t == title {
+            return Ok(id);
+        }
     }
+    let conv = app
+        .start_conversation(contact)
+        .await
+        .context("starting the conversation")?;
+    Ok(conv)
+}
+
+/// Resolve a contact handle (`npub…`, hex, or `name@domain` nip05) to a pubkey,
+/// returning the pubkey and the nip05 string if that was the input form.
+fn resolve_identity(handle: &str) -> Result<(PublicKey, Option<String>)> {
+    if handle.starts_with("npub1") {
+        let pk = PublicKey::from_bech32(handle).context("parsing npub")?;
+        return Ok((pk, None));
+    }
+    if handle.contains('@') {
+        let pk = resolve_nip05(handle)?;
+        return Ok((pk, Some(handle.to_string())));
+    }
+    if let Ok(pk) = PublicKey::from_hex(handle) {
+        return Ok((pk, None));
+    }
+    bail!("'{handle}' is not a valid npub, hex pubkey, or nip05 handle")
+}
+
+/// Resolve a nip05 handle by fetching its `.well-known/nostr.json` (one blocking
+/// HTTPS GET) and extracting the pubkey.
+fn resolve_nip05(handle: &str) -> Result<PublicKey> {
+    let address = Nip05Address::parse(handle).context("parsing the nip05 handle")?;
+    let body = ureq::get(address.url().as_str())
+        .call()
+        .with_context(|| format!("fetching {}", address.url()))?
+        .into_string()
+        .context("reading the nip05 response")?;
+    let profile = Nip05Profile::from_raw_json(&address, &body)
+        .with_context(|| format!("no pubkey for '{handle}' in the nostr.json"))?;
+    Ok(profile.public_key)
 }

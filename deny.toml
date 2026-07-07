@@ -7,31 +7,33 @@
 # actually carries — the list is derived from the real tree, not a blanket allow.
 
 [graph]
-# Evaluate every target we ship to (native servers/clients, wasm, and the
-# thumbv7em bare-metal core). `all-features = false` keeps optional, unbuilt
-# libp2p transports (dns/mdns) out of the graph, matching what CI compiles.
+# The workspace is the MLS-over-Nostr (Marmot) messenger stack — the mls / nostr
+# / multidevice / app engine crates plus the CLI. `all-features = false` keeps
+# optional, unbuilt cargo features out of the graph, matching what CI compiles.
 all-features = false
 
 [advisories]
 # RUSTSEC advisory DB. `cargo audit` is the primary advisory gate (see the
-# `audit` CI job); deny re-checks the same DB as a complementary net. The two
-# hickory-proto DoS advisories below are reachable only through libp2p's
-# OPTIONAL dns/mdns features, which this workspace never enables — the crates
-# sit in Cargo.lock but are never compiled. This mirrors the `audit` job's
-# `--ignore` set so we don't double-fail on the same deferred ids.
-ignore = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119", "RUSTSEC-2026-0124"]
+# `audit` CI job); deny re-checks the same DB as a complementary net. The single
+# ignore below is RUSTSEC-2026-0124 (a potential panic in
+# libcrux-chacha20poly1305 on an overlong ciphertext buffer): the fixed 0.0.8 is
+# unreachable because MDK's crypto chain (mdk-core → openmls_rust_crypto →
+# hpke-rs-libcrux → libcrux-aead) pins `libcrux-chacha20poly1305 ^0.0.7`, so it
+# cannot be bumped without a new MDK release. This mirrors the `audit` job's
+# `--ignore` set so we don't double-fail on the same deferred id.
+ignore = ["RUSTSEC-2026-0124"]
 # Only fail on an unmaintained crate the workspace depends on *directly* — one we
-# could actually swap out. Transitive-only unmaintained crates (bincode, paste,
-# rustls-pemfile — all pulled deep under axum-server/uniffi with no safe upgrade
+# could actually swap out. Transitive-only unmaintained crates (instant,
+# proc-macro-error2 — pulled deep under the nostr-sdk stack with no safe upgrade
 # reachable) are informational, matching how the `audit` job treats them. Real
 # vulnerabilities and yanked crates still fail regardless of depth.
 unmaintained = "workspace"
 
 [licenses]
-# Permissive-only allowlist, plus MPL-2.0 (file-scoped weak copyleft, used by
-# uniffi/attohttpc). Every entry is present in the current tree; SPDX `OR`
-# expressions resolve against these, so we do not need to list the copyleft
-# alternatives (e.g. LGPL) that only appear as one branch of an `OR`.
+# Permissive-only allowlist, plus MPL-2.0 (file-scoped weak copyleft). Every
+# entry is present in the current tree; SPDX `OR` expressions resolve against
+# these, so we do not need to list the copyleft alternatives (e.g. LGPL) that
+# only appear as one branch of an `OR`.
 allow = [
     "MIT",
     "Apache-2.0",

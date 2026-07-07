@@ -27,7 +27,7 @@
 //!   account key that differs from the pin surfaces as
 //!   [`TrustStatus::IdentityChanged`] and is never silently trusted (Nostr has no
 //!   built-in key-change protection — this is our hardening). Plus an
-//!   out-of-band [`safety_number`](contacts::safety_number) verification helper.
+//!   out-of-band [`safety_number`] verification helper.
 //! - **Conversations** — a 1:1 conversation is an MLS group containing exactly
 //!   the two accounts' devices; groups are >2 accounts. [`App::start_conversation`],
 //!   [`App::send_text`].

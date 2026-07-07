@@ -23,42 +23,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: no_std core builds without std
-        run: cargo build -p mycellium-core --no-default-features
-      - name: SDK bindings smoke test (Kotlin + Swift generate)
-        run: ./crates/mycellium-sdk/bindings/generate.sh
-
-  wasm:
-    name: wasm build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust + wasm target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-bindgen-cli (pinned to the crate's version)
-        run: cargo install wasm-bindgen-cli --version 0.2.100 --locked
-      - name: Build the WASM engine
-        run: ./clients/web/build.sh
-      - name: Verify generated web assets exist
-        run: |
-          test -f clients/web/pkg/mycellium_wasm.js || { echo "missing pkg/mycellium_wasm.js"; exit 1; }
-          test -f clients/web/pkg/mycellium_wasm_bg.wasm || { echo "missing pkg/mycellium_wasm_bg.wasm"; exit 1; }
-          echo "web assets present"
-      - name: Upload deployable web bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: mycellium-web
-          path: |
-            clients/web/index.html
-            clients/web/worker.js
-            clients/web/sw.js
-            clients/web/manifest.json
-            clients/web/icon.svg
-            clients/web/pkg/
-          if-no-files-found: error
 
   audit:
     name: cargo audit
@@ -68,16 +32,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # RUSTSEC-2026-0118/-0119 are hickory-proto DoS advisories reachable only
-      # through libp2p's OPTIONAL dns/mdns features, which this workspace does not
-      # enable — the crates sit in Cargo.lock but are never compiled (`cargo tree
-      # -i hickory-proto` is empty). No current libp2p release avoids listing them,
-      # so we ignore the advisories for those uncompiled deps rather than mask a
-      # real one. Any other advisory still fails the job.
+      # RUSTSEC-2026-0124 is a potential panic in libcrux-chacha20poly1305 on an
+      # overlong ciphertext buffer. The fixed 0.0.8 is unreachable: MDK's crypto
+      # chain (mdk-core → openmls_rust_crypto → hpke-rs-libcrux → libcrux-aead)
+      # pins `libcrux-chacha20poly1305 ^0.0.7`, so it cannot be bumped without a
+      # new MDK release. Any other advisory still fails the job.
       # (Using `cargo audit` directly, not rustsec/audit-check, so no check-run API
       # permission is needed.)
       - name: Audit
-        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0124
+        run: cargo audit --ignore RUSTSEC-2026-0124
 
   msrv:
     name: msrv (1.96.0 builds)
@@ -119,19 +82,3 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps
-
-  no-std-embedded:
-    name: no_std bare-metal (thumbv7em-none-eabi)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Prove the "runs on microcontrollers" claim (docs/CONCEPT.md Layer 10,
-      # ESP32 / Cortex-M4/M7): cross-compile the portable core, no_std + alloc, to
-      # a bare-metal Cortex-M target with default (std) features off.
-      - name: Install Rust + thumbv7em-none-eabi target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add thumbv7em-none-eabi
-      - uses: Swatinem/rust-cache@v2
-      - name: Cross-compile the core for bare metal
-        run: cargo build -p mycellium-core --no-default-features --target thumbv7em-none-eabi
