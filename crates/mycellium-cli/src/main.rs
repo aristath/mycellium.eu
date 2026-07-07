@@ -130,6 +130,34 @@ enum AccountCmd {
     },
     /// Print this account's npub, device pubkey, and relays.
     Show,
+    /// **Rotate this account's identity key** (hygiene, or recovery after the key
+    /// is believed compromised). Publishes a mutual old→new migration attestation
+    /// and re-signs the device list under the new key; the device key and every
+    /// MLS conversation are untouched. Contacts must re-verify out of band.
+    Rotate {
+        /// Rotate without the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show any pending account-key migration a contact has published (fetched from
+    /// the relays and verified), including the new safety number to compare out of
+    /// band before accepting it.
+    Migration {
+        /// The contact handle to probe.
+        contact: String,
+    },
+    /// **Accept a contact's key migration** and re-pin to their new key — only
+    /// after you have compared the new safety number out of band. Re-verifies the
+    /// published mutual attestation before moving the pin.
+    AcceptMigration {
+        /// The contact handle whose migration to accept.
+        contact: String,
+        /// The new npub/hex pubkey you confirmed out of band.
+        new_key: String,
+        /// Accept without the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -146,15 +174,32 @@ enum ContactCmd {
 /// On-disk client config: this device's secret key plus its relay URLs.
 #[derive(Serialize, Deserialize)]
 struct Config {
-    /// The device/account secret key, bech32 (`nsec1…`).
+    /// This **device's** secret key, bech32 (`nsec1…`). It is *also* the account
+    /// key when `account_key` is absent (a solo account); it never changes on an
+    /// account-key rotation, so MLS/history stay intact.
     secret_key: String,
+    /// The separate **account** identity key, bech32 (`nsec1…`), present once the
+    /// account key has been rotated away from the device key (making this a manager
+    /// account). Absent for a solo account, where `secret_key` serves both roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_key: Option<String>,
     /// Relay URLs this device connects to.
     relays: Vec<String>,
 }
 
 impl Config {
+    /// This device's keypair.
     fn keys(&self) -> Result<Keys> {
-        Keys::parse(&self.secret_key).context("parsing the stored secret key")
+        Keys::parse(&self.secret_key).context("parsing the stored device secret key")
+    }
+
+    /// The account identity keypair — the rotated account key if one is stored,
+    /// else the device key (solo account).
+    fn account_keys(&self) -> Result<Keys> {
+        match &self.account_key {
+            Some(ak) => Keys::parse(ak).context("parsing the stored account secret key"),
+            None => self.keys(),
+        }
     }
 
     fn relay_urls(&self) -> Result<Vec<RelayUrl>> {
@@ -177,6 +222,15 @@ async fn main() -> Result<()> {
             account_new(&data_dir, relays, force)
         }
         Command::Account(AccountCmd::Show) => account_show(&data_dir),
+        Command::Account(AccountCmd::Rotate { yes }) => account_rotate(&data_dir, yes).await,
+        Command::Account(AccountCmd::Migration { contact }) => {
+            account_migration(&data_dir, &contact).await
+        }
+        Command::Account(AccountCmd::AcceptMigration {
+            contact,
+            new_key,
+            yes,
+        }) => account_accept_migration(&data_dir, &contact, &new_key, yes).await,
         Command::Contact {
             cmd: ContactCmd::Add { handle, name },
         } => contact_add(&data_dir, &handle, name),
@@ -224,12 +278,19 @@ fn load_config(data_dir: &Path) -> Result<Config> {
     serde_json::from_str(&raw).context("parsing config.json")
 }
 
-/// Open the engine from the on-disk config as a solo (single-device) account.
+/// Open the engine from the on-disk config: a solo account when the account key
+/// equals the device key, or a manager account once the account key has been
+/// rotated to a separate key.
 fn open_app(data_dir: &Path) -> Result<(App, Config)> {
     let config = load_config(data_dir)?;
-    let keys = config.keys()?;
+    let device_keys = config.keys()?;
     let relays = config.relay_urls()?;
-    let app = App::open_solo(keys, relays, data_dir).context("opening the app engine")?;
+    let app = if config.account_key.is_some() {
+        App::open_manager(config.account_keys()?, device_keys, relays, data_dir)
+            .context("opening the app engine (manager)")?
+    } else {
+        App::open_solo(device_keys, relays, data_dir).context("opening the app engine")?
+    };
     Ok((app, config))
 }
 
@@ -259,6 +320,7 @@ fn account_new(data_dir: &Path, relays: Vec<String>, force: bool) -> Result<()> 
     let keys = Keys::generate();
     let config = Config {
         secret_key: keys.secret_key().to_bech32().context("encoding nsec")?,
+        account_key: None,
         relays,
     };
     write_config(&path, &config)?;
@@ -285,11 +347,160 @@ fn write_config(path: &Path, config: &Config) -> Result<()> {
 
 fn account_show(data_dir: &Path) -> Result<()> {
     let config = load_config(data_dir)?;
-    let keys = config.keys()?;
-    println!("npub:     {}", keys.public_key().to_bech32()?);
-    println!("pubkey:   {}", keys.public_key().to_hex());
-    println!("data dir: {}", data_dir.display());
-    println!("relays:   {}", config.relays.join(", "));
+    let device = config.keys()?;
+    let account = config.account_keys()?;
+    println!("account npub: {}", account.public_key().to_bech32()?);
+    if config.account_key.is_some() {
+        println!("  (account key rotated — separate from the device key)");
+    }
+    println!("device npub:  {}", device.public_key().to_bech32()?);
+    println!("device pubkey:{}", device.public_key().to_hex());
+    println!("data dir:     {}", data_dir.display());
+    println!("relays:       {}", config.relays.join(", "));
+    Ok(())
+}
+
+/// **Rotate this account's identity key.** Publishes the mutual old→new migration
+/// attestation and re-signs the device list under the new key, then persists the
+/// new account key into config.json. The device key and all MLS conversations are
+/// untouched; contacts must re-verify out of band before they follow the new key.
+async fn account_rotate(data_dir: &Path, yes: bool) -> Result<()> {
+    if !yes {
+        println!("Rotating this account's identity key will:");
+        println!("  - publish a signed old→new migration (both keys consent),");
+        println!("  - re-sign the device list under the new key,");
+        println!("  - keep the device key and every conversation intact.");
+        println!("Contacts will NOT auto-trust the new key — they must re-verify out of band.");
+        print!("Type 'yes' to rotate (anything else aborts): ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading confirmation")?;
+        if line.trim() != "yes" {
+            bail!("aborted: the account key was NOT rotated");
+        }
+    }
+
+    let (mut app, mut config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.subscribe().await.context("subscribing to the relays")?;
+    // Settle any pending joins/commits so the current device list is in view.
+    app.pump(Duration::from_millis(600)).await?;
+
+    let old_npub = app.account().to_bech32().unwrap_or_default();
+    let new_keys = app
+        .rotate_account_key()
+        .await
+        .context("rotating the account key")?;
+    app.shutdown().await;
+
+    // Persist the new account identity (the device key is unchanged).
+    config.account_key = Some(
+        new_keys
+            .secret_key()
+            .to_bech32()
+            .context("encoding new nsec")?,
+    );
+    write_config(&config_path(data_dir), &config)?;
+
+    println!("account key rotated.");
+    println!("  old npub: {old_npub}");
+    println!("  new npub: {}", new_keys.public_key().to_bech32()?);
+    println!("\nTell your contacts to run `mycellium account migration <you>` and re-verify");
+    println!("the safety number out of band before they accept the new key.");
+    Ok(())
+}
+
+/// Show any pending account-key migration a contact has published — fetched from
+/// the relays and mutual-signature verified. Never re-pins: it prints the new key
+/// and the safety number to compare out of band first.
+async fn account_migration(data_dir: &Path, contact: &str) -> Result<()> {
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    let signal = app
+        .detect_migration(contact)
+        .await
+        .context("probing for a migration")?;
+    app.shutdown().await;
+
+    match signal {
+        mycellium_app::MigrationSignal::None => {
+            println!("no key migration published for '{contact}'.");
+        }
+        mycellium_app::MigrationSignal::Forged { reason } => {
+            println!("REJECTED an invalid/forged migration for '{contact}': {reason}");
+            println!("The pin is unchanged. Do NOT trust this — it is not signed by '{contact}''s pinned key.");
+        }
+        mycellium_app::MigrationSignal::PendingReverification {
+            old_pubkey,
+            new_pubkey,
+            new_safety_number,
+        } => {
+            let new_npub = new_pubkey
+                .to_bech32()
+                .unwrap_or_else(|_| new_pubkey.to_hex());
+            println!("PENDING key migration for '{contact}' (NOT yet trusted):");
+            println!(
+                "  old key: {}",
+                old_pubkey
+                    .to_bech32()
+                    .unwrap_or_else(|_| old_pubkey.to_hex())
+            );
+            println!("  new key: {new_npub}");
+            println!("\nCompare this safety number for the NEW key out of band with '{contact}':");
+            println!("    {new_safety_number}");
+            println!(
+                "\nIf — and only if — it matches, accept it:\n  mycellium account accept-migration {contact} {new_npub}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// **Accept a contact's key migration** and re-pin to their new key. Only run this
+/// after comparing the new safety number out of band (see `account migration`). The
+/// engine re-verifies the published mutual attestation before moving the pin.
+async fn account_accept_migration(
+    data_dir: &Path,
+    contact: &str,
+    new_key: &str,
+    yes: bool,
+) -> Result<()> {
+    let new_pubkey = parse_pubkey(new_key)?;
+
+    if !yes {
+        println!(
+            "Accepting re-pins '{contact}' to {} and marks it verified.",
+            new_pubkey
+                .to_bech32()
+                .unwrap_or_else(|_| new_pubkey.to_hex())
+        );
+        println!("Only do this if you compared the NEW safety number OUT OF BAND and it matched.");
+        print!("Type 'yes' to accept (anything else aborts): ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading confirmation")?;
+        if line.trim() != "yes" {
+            bail!("aborted: the migration was NOT accepted; the pin is unchanged");
+        }
+    }
+
+    let (app, _config) = open_app(data_dir)?;
+    app.connect().await.context("connecting to relays")?;
+    app.accept_key_migration(contact, new_pubkey)
+        .await
+        .context("accepting the key migration")?;
+    app.shutdown().await;
+
+    println!(
+        "accepted: '{contact}' is now pinned (verified) to {}.",
+        new_pubkey
+            .to_bech32()
+            .unwrap_or_else(|_| new_pubkey.to_hex())
+    );
     Ok(())
 }
 

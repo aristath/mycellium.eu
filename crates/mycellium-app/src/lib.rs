@@ -48,7 +48,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mycellium_mls::{GroupId, Keys, Kind, MlsEngine};
-use mycellium_multidevice::{DeviceAccount, DeviceEntry, DeviceList, Incoming, KIND_GROUP_MESSAGE};
+use mycellium_multidevice::{
+    verify_migration, DeviceAccount, DeviceEntry, DeviceList, Incoming, KIND_GROUP_MESSAGE,
+};
 use mycellium_nostr::{NostrTransport, Notification};
 use nostr::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
@@ -114,6 +116,18 @@ pub enum Error {
     /// to remove.
     #[error("device {0} is not in the account's device list")]
     UnknownDevice(PublicKey),
+    /// No account-key migration attestation was found on the relays for a contact
+    /// whose migration was expected (e.g. during [`App::accept_key_migration`]).
+    #[error("no key-migration published for account {0}")]
+    NoMigration(PublicKey),
+    /// A purported migration attestation failed mutual-signature verification.
+    #[error("migration attestation is invalid: {0}")]
+    BadMigration(String),
+    /// A migration attestation is well-formed but does not link the expected
+    /// old→new identities (e.g. the confirmed new key does not match the one the
+    /// old key actually signed a migration to).
+    #[error("migration does not match the expected old and new identity")]
+    MigrationMismatch,
 }
 
 /// Convenience result alias for this crate.
@@ -161,6 +175,39 @@ pub struct ReceivedMessage {
     pub text: String,
     /// Unix seconds when it was received.
     pub timestamp: u64,
+}
+
+/// The result of probing a pinned contact for a published **account-key
+/// migration** — the deliberately non-automatic signal at the heart of the trust
+/// model.
+///
+/// A migration is **never** auto-accepted: even the [`Self::PendingReverification`]
+/// case (a fully, mutually valid attestation) requires the user to compare the new
+/// safety number out of band before [`App::accept_key_migration`] re-pins, because
+/// a compromised old key can sign a valid-but-fraudulent migration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MigrationSignal {
+    /// No migration attestation is published under the contact's pinned key.
+    None,
+    /// A migration signed by **both** the pinned old key and the claimed new key
+    /// exists. It is *not* trusted yet: surface it to the user, who must compare
+    /// `new_safety_number` out of band with the contact before accepting.
+    PendingReverification {
+        /// The contact's currently pinned (old) account key.
+        old_pubkey: PublicKey,
+        /// The new account key the migration points to.
+        new_pubkey: PublicKey,
+        /// The safety number for *this* account vs. the **new** key, to compare
+        /// out of band before accepting.
+        new_safety_number: String,
+    },
+    /// A migration-shaped event exists but failed verification — it is not signed
+    /// by the contact's pinned old key, or the new-key attestation is missing or
+    /// invalid. A forgery: never acceptable, never surfaced as trustworthy.
+    Forged {
+        /// Why verification failed (for logging/UX; not a trust decision input).
+        reason: String,
+    },
 }
 
 /// A headless messenger account bound to **one device**.
@@ -373,6 +420,141 @@ impl App {
             return Err(Error::UnknownContact(id.to_string()));
         }
         self.store.set_verified(id, true)?;
+        Ok(())
+    }
+
+    // -- Account-key rotation (self) ----------------------------------------
+
+    /// **Rotate this account's identity key** (manager/solo only).
+    ///
+    /// Generates a fresh account keypair, publishes a mutual old→new migration
+    /// attestation (signed by the old key and embedding the new key's continuation
+    /// attestation), and re-signs + republishes the device list under the new key.
+    /// Because MLS leaves bind to **device** keys — untouched here — every existing
+    /// group and conversation keeps working with no re-keying: only the Nostr
+    /// identity and the device-list signer change. Returns the **new account
+    /// keypair**, which the caller must persist (it is now this account's identity).
+    ///
+    /// Errors with [`Error::NotManager`] if this device does not hold the account
+    /// key (a member device cannot rotate the account identity).
+    pub async fn rotate_account_key(&mut self) -> Result<Keys> {
+        if !self.device.is_manager() {
+            return Err(Error::NotManager);
+        }
+        let new_keys = Keys::generate();
+        self.device.rotate_account_key(&new_keys).await?;
+        self.account = new_keys.public_key();
+        Ok(new_keys)
+    }
+
+    // -- Contact key-migration (the security-sensitive side) ----------------
+
+    /// Fetch the raw (unverified) migration attestation a `account` key has
+    /// published, if any. Prefer [`App::detect_migration`], which verifies it.
+    pub async fn fetch_migration(&self, account: PublicKey) -> Result<Option<nostr::Event>> {
+        Ok(self.device.fetch_migration(account).await?)
+    }
+
+    /// **Detect a published account-key migration for a pinned contact** — the
+    /// safe, non-automatic transition signal. Fetches the migration attestation
+    /// authored by the contact's **pinned** key off the relays and classifies it
+    /// with [`App::classify_migration`].
+    ///
+    /// The result is *never* an automatic re-pin: a [`MigrationSignal::Forged`]
+    /// event is rejected, and even a valid [`MigrationSignal::PendingReverification`]
+    /// must be confirmed out of band (compare the new safety number) before
+    /// [`App::accept_key_migration`].
+    pub async fn detect_migration(&self, contact_id: &str) -> Result<MigrationSignal> {
+        let contact = self
+            .store
+            .get_contact(contact_id)?
+            .ok_or_else(|| Error::UnknownContact(contact_id.to_string()))?;
+        match self.device.fetch_migration(contact.account).await? {
+            None => Ok(MigrationSignal::None),
+            Some(event) => self.classify_migration(contact_id, &event),
+        }
+    }
+
+    /// Classify an already-fetched migration `event` against a pinned contact,
+    /// **without** re-pinning anything. The two trust checks that matter:
+    ///
+    /// - The event must pass full mutual-signature verification (signed by the key
+    ///   it names as the old identity *and* carrying a valid new-key attestation).
+    ///   Any failure → [`MigrationSignal::Forged`].
+    /// - That old identity must equal the key we actually **pinned** for this
+    ///   contact. A migration signed by some other key — however well-formed — does
+    ///   not speak for this contact → [`MigrationSignal::Forged`].
+    ///
+    /// A migration that clears both is surfaced as
+    /// [`MigrationSignal::PendingReverification`] carrying the new safety number to
+    /// compare out of band. It is deliberately **not** trusted here.
+    pub fn classify_migration(
+        &self,
+        contact_id: &str,
+        event: &nostr::Event,
+    ) -> Result<MigrationSignal> {
+        let contact = self
+            .store
+            .get_contact(contact_id)?
+            .ok_or_else(|| Error::UnknownContact(contact_id.to_string()))?;
+        match verify_migration(event) {
+            Err(e) => Ok(MigrationSignal::Forged {
+                reason: e.to_string(),
+            }),
+            Ok(v) if v.old_pubkey != contact.account => Ok(MigrationSignal::Forged {
+                reason: "migration is not signed by this contact's pinned key".to_string(),
+            }),
+            Ok(v) => Ok(MigrationSignal::PendingReverification {
+                old_pubkey: v.old_pubkey,
+                new_pubkey: v.new_pubkey,
+                new_safety_number: safety_number(&self.account, &v.new_pubkey),
+            }),
+        }
+    }
+
+    /// **Accept a contact's key migration** and re-pin to the new key — the final,
+    /// user-driven step, called only **after** the user has compared the new safety
+    /// number out of band. Re-verifies that a mutually-signed migration from the
+    /// contact's pinned old key to exactly `new_pubkey` is published (so the app
+    /// never re-pins to an unattested key), then moves the pin to `new_pubkey` and
+    /// marks it verified (acceptance *is* the out-of-band confirmation).
+    ///
+    /// After this, messaging the contact continues over the **same** MLS groups
+    /// (device keys never changed); only the trust pin and future device-list
+    /// resolution follow the new identity.
+    ///
+    /// Errors: [`Error::UnknownContact`], [`Error::NoMigration`] if none is
+    /// published, [`Error::BadMigration`] if the published one fails verification,
+    /// and [`Error::MigrationMismatch`] if it does not link the pinned old key to
+    /// the confirmed `new_pubkey`.
+    pub async fn accept_key_migration(
+        &self,
+        contact_id: &str,
+        new_pubkey: PublicKey,
+    ) -> Result<()> {
+        let contact = self
+            .store
+            .get_contact(contact_id)?
+            .ok_or_else(|| Error::UnknownContact(contact_id.to_string()))?;
+        let event = self
+            .device
+            .fetch_migration(contact.account)
+            .await?
+            .ok_or(Error::NoMigration(contact.account))?;
+        let verified = verify_migration(&event).map_err(|e| Error::BadMigration(e.to_string()))?;
+        if verified.old_pubkey != contact.account || verified.new_pubkey != new_pubkey {
+            return Err(Error::MigrationMismatch);
+        }
+        // Move the pin to the new identity. The caller only reaches here after an
+        // out-of-band re-verification, so the new pin is recorded as verified.
+        self.store.put_contact(&Contact {
+            id: contact.id,
+            account: new_pubkey,
+            nip05: contact.nip05,
+            name: contact.name,
+            verified: true,
+            added_at: contact.added_at,
+        })?;
         Ok(())
     }
 

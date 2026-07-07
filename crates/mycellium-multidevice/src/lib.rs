@@ -73,7 +73,12 @@ use nostr::{Event, EventId, PublicKey, RelayUrl};
 use nostr_sdk::prelude::Filter;
 
 mod device_list;
+pub mod migration;
 pub use device_list::{DeviceEntry, DeviceList};
+pub use migration::{
+    verify_migration, MigrationError, VerifiedMigration, KEY_MIGRATION_IDENTIFIER,
+    KIND_KEY_MIGRATION,
+};
 
 // Re-export the handful of types a caller touches, so downstream code depends on
 // this crate rather than reaching into the layers below it.
@@ -137,6 +142,9 @@ pub enum Error {
     /// account must author the eviction.
     #[error("a device cannot remove its own leaf; another device of the account must author it")]
     CannotRemoveSelf,
+    /// A migration attestation failed verification (bad/absent signatures).
+    #[error(transparent)]
+    Migration(#[from] migration::MigrationError),
 }
 
 /// Convenience result alias for this crate.
@@ -398,6 +406,73 @@ where
             None if account == self.account => Ok(vec![self.device_keys.public_key()]),
             None => Err(Error::NoDeviceList(account)),
         }
+    }
+
+    // -- Account-key rotation / migration -----------------------------------
+
+    /// Fetch the latest account-key migration attestation published under
+    /// `account`, or `None` if that key has published none. The returned event is
+    /// *unverified* — pass it to [`migration::verify_migration`] (via the app
+    /// layer) before trusting it.
+    pub async fn fetch_migration(&self, account: PublicKey) -> Result<Option<Event>> {
+        let filter = Filter::new()
+            .author(account)
+            .kind(Kind::Custom(migration::KIND_KEY_MIGRATION))
+            .identifier(migration::KEY_MIGRATION_IDENTIFIER)
+            .limit(1);
+        let events = self
+            .transport
+            .client()
+            .fetch_events(filter, self.fetch_timeout)
+            .await?;
+        Ok(events.first_owned())
+    }
+
+    /// **Rotate this account's identity key** (manager/solo only). Because MLS
+    /// leaves are bound to *device* keys, this touches **no** MLS group and no
+    /// device leaf — it only changes the Nostr identity and re-signs the account's
+    /// membership under the new key. Three steps:
+    ///
+    /// 1. **Publish a mutual migration attestation** old→new
+    ///    ([`migration::build_migration`]): signed by the *old* key and embedding
+    ///    the *new* key's continuation attestation, so a contact who pinned the old
+    ///    key can discover (and deliberately decide to trust) the transition.
+    /// 2. **Re-sign and republish the device list under the new account key** —
+    ///    the same devices, now authorized by the new identity.
+    /// 3. **Switch this device's in-memory account identity** to the new key.
+    ///
+    /// The device list is fetched under the *old* key before the switch so the
+    /// device set is preserved verbatim; a solo account with no published list
+    /// falls back to its single device. Returns the published migration event.
+    ///
+    /// Errors with [`Error::NoAccountKey`] if this device does not hold the account
+    /// key (only a manager/solo can rotate).
+    pub async fn rotate_account_key(&mut self, new_account_keys: &Keys) -> Result<Event> {
+        let old_keys = self
+            .account_keys
+            .as_ref()
+            .ok_or(Error::NoAccountKey)?
+            .clone();
+
+        // 1. Publish the mutual (old+new signed) migration attestation. In a
+        //    deployment where old and new advertise different relay sets, publish
+        //    to the union; here both identities share this device's relay set.
+        let migration = migration::build_migration(&old_keys, new_account_keys).await?;
+        self.transport.publish(&migration).await?;
+
+        // 2. Preserve the device set (fetched under the OLD key, pre-switch).
+        let devices = match self.fetch_device_list(self.account).await? {
+            Some(list) => list.devices,
+            None => vec![DeviceEntry::new(self.device_keys.public_key())],
+        };
+
+        // 3. Switch identity, then republish the device list — now signed by the
+        //    new account key (`publish_device_list` uses `self.account_keys`).
+        self.account = new_account_keys.public_key();
+        self.account_keys = Some(new_account_keys.clone());
+        self.publish_device_list(devices).await?;
+
+        Ok(migration)
     }
 
     // -- Group creation (enroll every device of every account) --------------
