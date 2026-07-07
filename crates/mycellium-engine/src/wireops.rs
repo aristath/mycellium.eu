@@ -115,14 +115,21 @@ pub fn build_record<P: Platform>(
 }
 
 /// Asynchronously X3DH-seal `plaintext` for one recipient `device` (offline,
-/// one-shot session). `my_name`/`my_queue` populate the sender's self-record
-/// embedded in the envelope.
-pub fn seal_to<P: Platform>(
+/// one-shot session), embedding an already-built sender self-record.
+///
+/// This is the hot-loop entry point for the send fan-out: the sender's
+/// [`SignedRecord`] costs two secp256k1 ECDSA signs to build (record signature +
+/// signed-pre-key signature), yet it is *identical* for every recipient device of
+/// one send. Callers that fan out over many devices build it **once** (via
+/// [`build_record`]) and pass it here per device, instead of re-signing it N
+/// times. One-shot callers use [`seal_to`], which builds the record then calls
+/// this. The embedded record is byte-for-byte what [`seal_to`] would embed, so the
+/// receiver's per-message re-verification ([`open_envelope`]) is unchanged.
+pub fn seal_to_with_record<P: Platform>(
     platform: &mut P,
     identity: &Identity,
     me: &Handle,
-    my_name: &str,
-    my_queue: &str,
+    sender_record: &SignedRecord,
     device: &Device,
     plaintext: &[u8],
 ) -> Result<Envelope> {
@@ -139,11 +146,29 @@ pub fn seal_to<P: Platform>(
     let sealed = ratchet.encrypt(&pad_bucket(plaintext), &ad);
     Ok(Envelope {
         from: me.clone(),
-        sender_record: build_record(platform, identity, me, my_name, my_queue, ""),
+        sender_record: sender_record.clone(),
         init: initiated.init,
         message: sealed,
         timestamp: platform.now_unix_secs(),
     })
+}
+
+/// Asynchronously X3DH-seal `plaintext` for one recipient `device` (offline,
+/// one-shot session). `my_name`/`my_queue` populate the sender's self-record
+/// embedded in the envelope. Builds the sender record once, then delegates to
+/// [`seal_to_with_record`] — the one-shot convenience for callers that seal to a
+/// single device (`forward`, `broadcast`, wasm `seal`, the failover tests).
+pub fn seal_to<P: Platform>(
+    platform: &mut P,
+    identity: &Identity,
+    me: &Handle,
+    my_name: &str,
+    my_queue: &str,
+    device: &Device,
+    plaintext: &[u8],
+) -> Result<Envelope> {
+    let sender_record = build_record(platform, identity, me, my_name, my_queue, "");
+    seal_to_with_record(platform, identity, me, &sender_record, device, plaintext)
 }
 
 /// Decrypt an incoming envelope, verifying the sender's self-record binds their

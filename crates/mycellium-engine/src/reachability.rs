@@ -247,7 +247,16 @@ pub fn record<S: Storage>(
             stat.failures = stat.failures.saturating_add(1);
         }
     }
-    st.prune(now);
+    // Only pay for pruning (an O(n) TTL retain plus an O(n log n) sort when over
+    // cap) once the store has actually grown to the cap — not on every single
+    // attempt. Pruning only ever *removes* entries, and a stale-but-still-present
+    // entry yields the same ladder order as an absent one (`direct_deprioritized`
+    // requires a recent `last_attempt`, which a stale entry cannot have), so
+    // deferring it never changes any `best_paths` result — it only keeps the store
+    // bounded, which the cap still guarantees.
+    if st.devices.len() >= MAX_DEVICES {
+        st.prune(now);
+    }
     save(store, &st)
 }
 
@@ -454,21 +463,59 @@ mod tests {
     }
 
     #[test]
-    fn prune_bounds_stale_devices() {
-        let mut store = MemStore::default();
-        // An old device, untouched, then time moves well past the prune TTL.
-        record(&mut store, "old", DeliveryPath::Direct, true, 100).unwrap();
-        record(
-            &mut store,
-            "fresh",
-            DeliveryPath::Direct,
-            true,
-            PRUNE_TTL_SECS + 1_000,
-        )
-        .unwrap();
-        let st = load(&store).unwrap();
+    fn prune_drops_stale_devices_and_caps() {
+        // TTL: an entry untouched past PRUNE_TTL_SECS is dropped, a fresh one kept.
+        let mut st = ScoreStore::default();
+        st.entry_mut("old").last_touch = 100;
+        st.entry_mut("fresh").last_touch = PRUNE_TTL_SECS + 1_000;
+        st.prune(PRUNE_TTL_SECS + 1_000);
         assert!(st.find("old").is_none(), "stale device must be pruned");
         assert!(st.find("fresh").is_some());
+
+        // Cap: past MAX_DEVICES the oldest-touched entries are dropped so the store
+        // stays bounded, keeping the most-recently-touched.
+        let now = (MAX_DEVICES + 10) as u64;
+        let mut big = ScoreStore::default();
+        for i in 0..(MAX_DEVICES + 10) {
+            big.entry_mut(&format!("d{i}")).last_touch = i as u64;
+        }
+        big.prune(now);
+        assert_eq!(
+            big.devices.len(),
+            MAX_DEVICES,
+            "store is capped at MAX_DEVICES"
+        );
+        assert!(
+            big.find("d0").is_none(),
+            "oldest-touched dropped past the cap"
+        );
+        assert!(
+            big.find(&format!("d{}", MAX_DEVICES + 9)).is_some(),
+            "most-recently-touched kept"
+        );
+    }
+
+    #[test]
+    fn record_bounds_the_store_at_the_cap() {
+        // Through the public API: recording well past the cap must not let the
+        // store grow unbounded — pruning still fires once the cap is reached.
+        let mut store = MemStore::default();
+        for i in 0..(MAX_DEVICES + 5) {
+            record(
+                &mut store,
+                &format!("dev{i}"),
+                DeliveryPath::Direct,
+                true,
+                1_000,
+            )
+            .unwrap();
+        }
+        let st = load(&store).unwrap();
+        assert!(
+            st.devices.len() <= MAX_DEVICES,
+            "the store must stay bounded at the cap ({} devices)",
+            st.devices.len()
+        );
     }
 
     #[test]

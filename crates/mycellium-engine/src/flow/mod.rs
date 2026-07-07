@@ -366,10 +366,16 @@ where
         ..Default::default()
     };
 
+    // Sign our sender self-record ONCE (two secp256k1 signs) and reuse it across
+    // every device of this send — the peer's cluster and our own siblings all
+    // embed the identical record, so re-signing it per device is pure waste.
+    let sender_record = wireops::build_record(platform, identity, me, my_name, my_queue, "");
+
     // Fan out one sealed copy per recipient device (Layer 11) — each device has
     // its own keys. A device we can't reach is parked by the `deliver` closure.
     for device in &peer_record.record.devices {
-        let Ok(env) = wireops::seal_to(platform, identity, me, my_name, my_queue, device, &encoded)
+        let Ok(env) =
+            wireops::seal_to_with_record(platform, identity, me, &sender_record, device, &encoded)
         else {
             continue;
         };
@@ -425,9 +431,14 @@ where
             if device.device_key == my_key {
                 continue;
             }
-            let Ok(env) =
-                wireops::seal_to(platform, identity, me, my_name, my_queue, device, &encoded)
-            else {
+            let Ok(env) = wireops::seal_to_with_record(
+                platform,
+                identity,
+                me,
+                &sender_record,
+                device,
+                &encoded,
+            ) else {
                 continue;
             };
             let sync = MailItem::SelfSync {
@@ -490,6 +501,10 @@ pub fn distribute_key<S, P, N>(
         return;
     };
 
+    // Sign our sender self-record ONCE and reuse it for every device of every
+    // target — it is identical across the whole distribution fan-out.
+    let sender_record = wireops::build_record(platform, identity, me, my_name, my_queue, "");
+
     for target in targets {
         let Ok(handle) = Handle::new(target.clone()) else {
             continue;
@@ -516,8 +531,13 @@ pub fn distribute_key<S, P, N>(
             if device.device_key == identity.device_public() {
                 continue;
             }
-            let Ok(env) = wireops::seal_to(
-                platform, identity, me, my_name, my_queue, device, &plaintext,
+            let Ok(env) = wireops::seal_to_with_record(
+                platform,
+                identity,
+                me,
+                &sender_record,
+                device,
+                &plaintext,
             ) else {
                 continue;
             };
@@ -669,6 +689,8 @@ pub fn group_leave<S, P, N>(
     let Ok(plaintext) = serde_json::to_vec(&payload) else {
         return;
     };
+    // Sign our sender self-record ONCE and reuse it across every member's devices.
+    let sender_record = wireops::build_record(platform, identity, me, my_name, my_queue, "");
     for member in &group.members {
         if member == me.as_str() {
             continue; // our own departure isn't announced to ourselves
@@ -687,8 +709,13 @@ pub fn group_leave<S, P, N>(
             if device.device_key == identity.device_public() {
                 continue;
             }
-            let Ok(env) = wireops::seal_to(
-                platform, identity, me, my_name, my_queue, device, &plaintext,
+            let Ok(env) = wireops::seal_to_with_record(
+                platform,
+                identity,
+                me,
+                &sender_record,
+                device,
+                &plaintext,
             ) else {
                 continue;
             };
