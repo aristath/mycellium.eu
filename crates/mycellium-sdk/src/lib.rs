@@ -839,6 +839,19 @@ pub fn generate_identity() -> String {
     nsec_of(&Keys::generate()).unwrap_or_default()
 }
 
+/// Validate an existing secret key the user already holds (from another Nostr
+/// client) and return its **`npub`**, so a native client can confirm *which*
+/// identity is about to be imported ("Importing aristath — npub1… — correct?")
+/// before opening the app with it via [`MycelliumClient::open_solo`].
+///
+/// Errors ([`SdkError::InvalidKey`]) if `nsec` is not a valid secret — in
+/// particular a public `npub1…` is rejected with a clear message, since a
+/// public key cannot sign and so cannot back an identity.
+#[uniffi::export]
+pub fn import_identity(nsec: String) -> Result<String, SdkError> {
+    Ok(npub(&parse_keys(&nsec)?.public_key()))
+}
+
 /// Render a public key as an `npub`, falling back to hex if bech32 encoding fails.
 fn npub(pk: &PublicKey) -> String {
     pk.to_bech32().unwrap_or_else(|_| pk.to_hex())
@@ -851,8 +864,17 @@ fn nsec_of(keys: &Keys) -> Result<String, SdkError> {
         .map_err(|e| SdkError::InvalidKey { msg: e.to_string() })
 }
 
-/// Parse an `nsec1…` (or hex) secret key into a keypair.
+/// Parse an `nsec1…` (or hex) secret key into a keypair. Rejects a public
+/// `npub1…` with a clear message — an identity can only be opened/imported from
+/// its *secret*, since the app must sign as it; a public key can never sign.
 fn parse_keys(secret: &str) -> Result<Keys, SdkError> {
+    if secret.starts_with("npub1") {
+        return Err(SdkError::InvalidKey {
+            msg: "that is a public key (npub) — an identity needs its secret key (nsec1…), \
+                  which only you hold; a public key cannot sign"
+                .to_string(),
+        });
+    }
     Keys::parse(secret).map_err(|e| SdkError::InvalidKey { msg: e.to_string() })
 }
 
