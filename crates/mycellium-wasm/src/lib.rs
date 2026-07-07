@@ -18,7 +18,10 @@ use mycellium_core::http::{HttpResponse, HttpTransport};
 use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
-use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
+use mycellium_core::pairing::{
+    self, PairingMessage, PairingOffer, PairingResponder, PairingResponderPublic,
+    ProvisioningPayload,
+};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
@@ -424,11 +427,12 @@ impl Session {
         let mut rid = [0u8; 16];
         getrandom::getrandom(&mut rid).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let rid = hex(&rid);
-        let offer = hex(
-            serde_json::json!({ "r": rid, "k": hex(&responder.public().0), "q": queue })
-                .to_string()
-                .as_bytes(),
-        );
+        let offer = hex(&serde_json::to_vec(&PairingOffer {
+            rendezvous: rid.clone(),
+            ephemeral_pub: hex(&responder.public().0),
+            queue: queue.to_string(),
+        })
+        .map_err(|e| JsValue::from_str(&format!("{e}")))?);
         self.pairing = Some((responder, rid));
         Ok(offer)
     }
@@ -463,39 +467,26 @@ impl Session {
     /// user really means to add a device before calling this.
     pub fn pair_approve(&mut self, offer: &str, handle: &str, dir: &str) -> Result<(), JsValue> {
         let bytes = from_hex(offer.trim())?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes)
+        let offer: PairingOffer = serde_json::from_slice(&bytes)
             .map_err(|_| JsValue::from_str("invalid pairing offer"))?;
-        let rid = v["r"]
-            .as_str()
-            .ok_or_else(|| JsValue::from_str("bad offer"))?;
-        let k = from_hex(
-            v["k"]
-                .as_str()
-                .ok_or_else(|| JsValue::from_str("bad offer"))?,
-        )?;
+        let k = from_hex(&offer.ephemeral_pub)?;
         let k: [u8; 32] = k
             .as_slice()
             .try_into()
             .map_err(|_| JsValue::from_str("bad ephemeral key"))?;
-        let queue = v["q"]
-            .as_str()
-            .ok_or_else(|| JsValue::from_str("bad offer"))?;
-        let payload = serde_json::json!({
-            "ws": hex(&self.identity.wallet_secret()),
-            "h": handle,
-            "n": self.cfg(b"myc:name"),
-            "d": dir,
-            "q": self.cfg(b"myc:queue"),
+        let payload = serde_json::to_vec(&ProvisioningPayload {
+            wallet_secret: hex(&self.identity.wallet_secret()),
+            handle: handle.to_string(),
+            name: self.cfg(b"myc:name"),
+            directory: dir.to_string(),
+            queue: self.cfg(b"myc:queue"),
         })
-        .to_string();
-        let msg = pairing::seal_provisioning(
-            &mut BrowserPlatform,
-            &PairingResponderPublic(k),
-            payload.as_bytes(),
-        )
         .map_err(|e| JsValue::from_str(&format!("{e}")))?;
-        QueueClient::with_transport(queue, Box::new(XhrTransport))
-            .pair_post(rid, &hex(&wire::encode(&msg)))
+        let msg =
+            pairing::seal_provisioning(&mut BrowserPlatform, &PairingResponderPublic(k), &payload)
+                .map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        QueueClient::with_transport(&offer.queue, Box::new(XhrTransport))
+            .pair_post(&offer.rendezvous, &hex(&wire::encode(&msg)))
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(())
     }
@@ -1018,23 +1009,21 @@ impl Session {
     /// device's identity with the received account (fresh device keys), join its
     /// record, persist config, and return `{dir,queue,handle,name}` JSON.
     fn adopt_from_payload(&mut self, payload: &[u8]) -> Result<String, JsValue> {
-        let v: serde_json::Value =
+        let prov: ProvisioningPayload =
             serde_json::from_slice(payload).map_err(|_| JsValue::from_str("bad provisioning"))?;
-        let ws = from_hex(
-            v["ws"]
-                .as_str()
-                .ok_or_else(|| JsValue::from_str("bad provisioning"))?,
-        )?;
+        let ws = from_hex(&prov.wallet_secret)?;
         let ws: [u8; 32] = ws
             .as_slice()
             .try_into()
             .map_err(|_| JsValue::from_str("bad account key"))?;
-        let handle = v["h"]
-            .as_str()
-            .ok_or_else(|| JsValue::from_str("bad provisioning"))?;
-        let name = v["n"].as_str().filter(|s| !s.is_empty()).unwrap_or(handle);
-        let dir = v["d"].as_str().unwrap_or("");
-        let queue = v["q"].as_str().unwrap_or("");
+        let handle = prov.handle.as_str();
+        let name = if prov.name.is_empty() {
+            handle
+        } else {
+            prov.name.as_str()
+        };
+        let dir = prov.directory.as_str();
+        let queue = prov.queue.as_str();
 
         self.identity = Identity::adopt(&mut BrowserPlatform, ws)
             .map_err(|_| JsValue::from_str("invalid account key"))?;

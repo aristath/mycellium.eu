@@ -19,6 +19,7 @@
 //! the QR is worthless after pairing (unlike a seed phrase). The shared secret is
 //! rejected if it degenerates to all-zero (a low-order/contributory guard).
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use hkdf::Hkdf;
@@ -31,6 +32,41 @@ use crate::platform::Platform;
 
 /// AEAD associated data binding a provisioning ciphertext to this protocol.
 const PAIRING_AAD: &[u8] = b"mycellium-pairing-v1";
+
+/// The one-time **pairing offer** the new device shows (as text or a QR) for an
+/// existing device to scan/paste into [`pair_approve`]. It carries no secret —
+/// only the rendezvous coordinates and the ephemeral public key that
+/// authenticates the exchange. On the wire it travels as hex-of-JSON; this type
+/// is the single source of truth for its field contract, shared by every client.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairingOffer {
+    /// The rendezvous id both devices meet on.
+    pub rendezvous: String,
+    /// The new device's ephemeral X25519 public key ([`PairingResponderPublic`]),
+    /// lowercase hex — the value that authenticates the whole exchange.
+    pub ephemeral_pub: String,
+    /// The rendezvous queue URL both devices talk through.
+    pub queue: String,
+}
+
+/// The sealed **provisioning payload** the existing device sends to the new one:
+/// the account (wallet) key plus the config the new device needs to join the
+/// account (handle, display name, directory + queue URLs). It is only ever sealed
+/// under the offer's ephemeral key (see [`seal_provisioning`]), so a relay learns
+/// nothing. This type is the single source of truth for its field contract.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProvisioningPayload {
+    /// The account's wallet secret key, lowercase hex.
+    pub wallet_secret: String,
+    /// The account handle the new device should adopt.
+    pub handle: String,
+    /// The account display name (empty means "fall back to the handle").
+    pub name: String,
+    /// The directory URL the account is registered on.
+    pub directory: String,
+    /// The queue URL the account uses.
+    pub queue: String,
+}
 
 /// B's ephemeral public key, shown in the pairing QR. This is the *only* channel
 /// it travels over, and it is what authenticates the whole exchange.

@@ -14,7 +14,10 @@
 
 use super::*;
 
-use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
+use mycellium_core::pairing::{
+    self, PairingMessage, PairingOffer, PairingResponder, PairingResponderPublic,
+    ProvisioningPayload,
+};
 
 /// How long the new device waits for approval before giving up (matches the
 /// queue's rendezvous TTL).
@@ -40,11 +43,11 @@ pub fn pair_new(
     let rid = hex(&rid_bytes);
 
     // The offer the user carries to their existing device.
-    let offer = hex(
-        serde_json::json!({ "r": rid, "k": hex(&responder.public().0), "q": queue })
-            .to_string()
-            .as_bytes(),
-    );
+    let offer = hex(&serde_json::to_vec(&PairingOffer {
+        rendezvous: rid.clone(),
+        ephemeral_pub: hex(&responder.public().0),
+        queue: queue.to_string(),
+    })?);
     println!("On your EXISTING device, run:\n");
     println!("    mycellium pair-approve {offer} --as {handle} --directory {directory}\n");
     println!(
@@ -80,20 +83,25 @@ fn adopt_and_register(
     libp2p: bool,
     directory: &str,
 ) -> Result<()> {
-    let v: serde_json::Value =
+    let prov: ProvisioningPayload =
         serde_json::from_slice(payload).map_err(|_| anyhow!("malformed provisioning payload"))?;
-    let ws = from_hex(
-        v["ws"]
-            .as_str()
-            .ok_or_else(|| anyhow!("bad provisioning"))?,
-    )?;
+    let ws = from_hex(&prov.wallet_secret)?;
     let ws: [u8; 32] = ws
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("bad account key length"))?;
-    // Prefer the account's own handle/directory as sent by the approving device.
-    let acc_handle = v["h"].as_str().unwrap_or(handle);
-    let acc_dir = v["d"].as_str().unwrap_or(directory);
+    // Prefer the account's own handle/directory as sent by the approving device,
+    // falling back to the local CLI arguments if the payload left them blank.
+    let acc_handle = if prov.handle.is_empty() {
+        handle
+    } else {
+        prov.handle.as_str()
+    };
+    let acc_dir = if prov.directory.is_empty() {
+        directory
+    } else {
+        prov.directory.as_str()
+    };
 
     let identity =
         Identity::adopt(&mut OsPlatform, ws).map_err(|_| anyhow!("invalid account key"))?;
@@ -131,31 +139,26 @@ fn adopt_and_register(
 pub fn pair_approve(offer: &str, handle: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let bytes = from_hex(offer.trim()).map_err(|_| anyhow!("invalid pairing offer"))?;
-    let v: serde_json::Value =
+    let offer: PairingOffer =
         serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid pairing offer"))?;
-    let rid = v["r"].as_str().ok_or_else(|| anyhow!("bad offer"))?;
-    let k = from_hex(v["k"].as_str().ok_or_else(|| anyhow!("bad offer"))?)?;
+    let k = from_hex(&offer.ephemeral_pub)?;
     let k: [u8; 32] = k
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("bad ephemeral key"))?;
-    let queue = v["q"].as_str().ok_or_else(|| anyhow!("bad offer"))?;
 
     println!("Pairing a new device to '{handle}' — this shares your account key with it.");
-    let payload = serde_json::json!({
-        "ws": hex(&identity.wallet_secret()),
-        "h": handle,
-        "d": directory,
-        "q": own_queue(),
+    let payload = serde_json::to_vec(&ProvisioningPayload {
+        wallet_secret: hex(&identity.wallet_secret()),
+        handle: handle.to_string(),
+        name: String::new(),
+        directory: directory.to_string(),
+        queue: own_queue(),
     })
-    .to_string();
-    let msg = pairing::seal_provisioning(
-        &mut OsPlatform,
-        &PairingResponderPublic(k),
-        payload.as_bytes(),
-    )
     .map_err(|e| anyhow!("{e}"))?;
-    QueueClient::new(queue).pair_post(rid, &hex(&wire::encode(&msg)))?;
+    let msg = pairing::seal_provisioning(&mut OsPlatform, &PairingResponderPublic(k), &payload)
+        .map_err(|e| anyhow!("{e}"))?;
+    QueueClient::new(&offer.queue).pair_post(&offer.rendezvous, &hex(&wire::encode(&msg)))?;
     println!("approved — the new device will finish pairing.");
     Ok(())
 }

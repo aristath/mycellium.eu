@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+pub mod card;
 mod cipher;
 pub mod error;
 pub mod group;

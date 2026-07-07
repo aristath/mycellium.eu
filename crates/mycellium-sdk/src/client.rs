@@ -11,10 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use mycellium_core::card::ContactCard;
 use mycellium_core::group::Group as CoreGroup;
 use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
-use mycellium_core::pairing::{self, PairingMessage, PairingResponder, PairingResponderPublic};
+use mycellium_core::pairing::{
+    self, PairingMessage, PairingOffer, PairingResponder, PairingResponderPublic,
+    ProvisioningPayload,
+};
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
 use mycellium_core::{safety, wire};
@@ -624,13 +628,13 @@ impl MyceliumClient {
         if inner.config.handle.is_empty() {
             return Err(SdkError::NotRegistered);
         }
-        let card = serde_json::json!({
-            "v": 1,
-            "h": inner.config.handle,
-            "w": wireops::hex(&inner.identity.wallet_public().0),
+        let card = serde_json::to_vec(&ContactCard {
+            version: 1,
+            handle: inner.config.handle.clone(),
+            wallet: wireops::hex(&inner.identity.wallet_public().0),
         })
-        .to_string();
-        Ok(wireops::hex(card.as_bytes()))
+        .map_err(|e| SdkError::invalid(format!("{e}")))?;
+        Ok(wireops::hex(&card))
     }
 
     /// Verify a peer's contact `card`: parse it, look its handle up in the
@@ -641,14 +645,10 @@ impl MyceliumClient {
     pub fn verify_card(&self, card: String) -> Result<String, SdkError> {
         let mut inner = self.lock();
         let bytes = from_hex(card.trim())?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes)
+        let card: ContactCard = serde_json::from_slice(&bytes)
             .map_err(|_| SdkError::invalid("invalid contact card"))?;
-        let handle = v["h"]
-            .as_str()
-            .ok_or_else(|| SdkError::invalid("malformed card"))?;
-        let card_wallet = v["w"]
-            .as_str()
-            .ok_or_else(|| SdkError::invalid("malformed card"))?;
+        let handle = card.handle.as_str();
+        let card_wallet = card.wallet.as_str();
         let h = Handle::new(handle).map_err(SdkError::invalid)?;
         let dir = DirectoryClient::with_transport(&inner.config.dir_url, Box::new(UreqTransport));
         let record = dir.lookup(&h).map_err(SdkError::network)?;
@@ -679,13 +679,12 @@ impl MyceliumClient {
             OsPlatform.fill_random(&mut rid);
             let rid = wireops::hex(&rid);
             let offer = wireops::hex(
-                serde_json::json!({
-                    "r": rid,
-                    "k": wireops::hex(&responder.public().0),
-                    "q": queue_url,
+                &serde_json::to_vec(&PairingOffer {
+                    rendezvous: rid.clone(),
+                    ephemeral_pub: wireops::hex(&responder.public().0),
+                    queue: queue_url,
                 })
-                .to_string()
-                .as_bytes(),
+                .map_err(|e| SdkError::invalid(format!("{e}")))?,
             );
             inner.pairing = Some((responder, rid));
             (offer, inner.listener.clone())
@@ -740,36 +739,26 @@ impl MyceliumClient {
                 return Err(SdkError::NotRegistered);
             }
             let bytes = from_hex(offer.trim())?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes)
+            let offer: PairingOffer = serde_json::from_slice(&bytes)
                 .map_err(|_| SdkError::invalid("invalid pairing offer"))?;
-            let rid = v["r"]
-                .as_str()
-                .ok_or_else(|| SdkError::invalid("bad offer"))?;
-            let k = from_hex(
-                v["k"]
-                    .as_str()
-                    .ok_or_else(|| SdkError::invalid("bad offer"))?,
-            )?;
+            let k = from_hex(&offer.ephemeral_pub)?;
             let k: [u8; 32] = k
                 .as_slice()
                 .try_into()
                 .map_err(|_| SdkError::invalid("bad ephemeral key"))?;
-            let payload = serde_json::json!({
-                "ws": wireops::hex(&inner.identity.wallet_secret()),
-                "h": inner.config.handle,
-                "n": inner.config.name,
-                "d": inner.config.dir_url,
-                "q": inner.config.queue_url,
+            let payload = serde_json::to_vec(&ProvisioningPayload {
+                wallet_secret: wireops::hex(&inner.identity.wallet_secret()),
+                handle: inner.config.handle.clone(),
+                name: inner.config.name.clone(),
+                directory: inner.config.dir_url.clone(),
+                queue: inner.config.queue_url.clone(),
             })
-            .to_string();
-            let msg = pairing::seal_provisioning(
-                &mut OsPlatform,
-                &PairingResponderPublic(k),
-                payload.as_bytes(),
-            )
-            .map_err(|e| SdkError::crypto(format!("{e:?}")))?;
+            .map_err(|e| SdkError::crypto(format!("{e}")))?;
+            let msg =
+                pairing::seal_provisioning(&mut OsPlatform, &PairingResponderPublic(k), &payload)
+                    .map_err(|e| SdkError::crypto(format!("{e:?}")))?;
             QueueClient::with_transport(&queue_url, Box::new(UreqTransport))
-                .pair_post(rid, &wireops::hex(&wire::encode(&msg)))
+                .pair_post(&offer.rendezvous, &wireops::hex(&wire::encode(&msg)))
                 .map_err(SdkError::network)?;
             inner.listener.clone()
         };
@@ -1215,28 +1204,21 @@ impl MyceliumClient {
     /// the local store** to it, join its directory record, persist config, and
     /// return the adopted [`Account`].
     fn adopt_from_payload(&self, inner: &mut Inner, payload: &[u8]) -> Result<Account, SdkError> {
-        let v: serde_json::Value =
+        let prov: ProvisioningPayload =
             serde_json::from_slice(payload).map_err(|_| SdkError::crypto("bad provisioning"))?;
-        let ws = from_hex(
-            v["ws"]
-                .as_str()
-                .ok_or_else(|| SdkError::crypto("bad provisioning"))?,
-        )?;
+        let ws = from_hex(&prov.wallet_secret)?;
         let ws: [u8; 32] = ws
             .as_slice()
             .try_into()
             .map_err(|_| SdkError::crypto("bad account key"))?;
-        let handle = v["h"]
-            .as_str()
-            .ok_or_else(|| SdkError::crypto("bad provisioning"))?
-            .to_string();
-        let name = v["n"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&handle)
-            .to_string();
-        let dir = v["d"].as_str().unwrap_or_default().to_string();
-        let queue = v["q"].as_str().unwrap_or_default().to_string();
+        let handle = prov.handle;
+        let name = if prov.name.is_empty() {
+            handle.clone()
+        } else {
+            prov.name
+        };
+        let dir = prov.directory;
+        let queue = prov.queue;
 
         let new_identity =
             Identity::adopt(&mut OsPlatform, ws).map_err(|e| SdkError::crypto(format!("{e:?}")))?;

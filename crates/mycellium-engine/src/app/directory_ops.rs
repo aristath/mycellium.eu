@@ -1,6 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
+use mycellium_core::card::ContactCard;
+
 pub fn announce(whoami: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
@@ -49,13 +51,13 @@ pub fn verify(peer: &str, directory: &str, confirm: bool) -> Result<()> {
 pub fn contact_card(handle: &str) -> Result<String> {
     let identity = store::load_identity()?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let card = serde_json::json!({
-        "v": 1,
-        "h": handle.as_str(),
-        "w": hex(&identity.wallet_public().0),
+    let card = serde_json::to_vec(&ContactCard {
+        version: 1,
+        handle: handle.as_str().to_string(),
+        wallet: hex(&identity.wallet_public().0),
     })
-    .to_string();
-    Ok(hex(card.as_bytes()))
+    .map_err(|e| anyhow!("{e}"))?;
+    Ok(hex(&card))
 }
 
 /// Verify a peer's contact card: parse it, look up its handle in the directory,
@@ -67,10 +69,10 @@ pub fn verify_card(card: &str, directory: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let bytes = from_hex(card.trim()).map_err(|_| anyhow!("invalid contact card"))?;
-    let v: serde_json::Value =
+    let card: ContactCard =
         serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid contact card"))?;
-    let handle = v["h"].as_str().ok_or_else(|| anyhow!("malformed card"))?;
-    let card_wallet = v["w"].as_str().ok_or_else(|| anyhow!("malformed card"))?;
+    let handle = card.handle.as_str();
+    let card_wallet = card.wallet.as_str();
     let handle_h = Handle::new(handle).map_err(|_| anyhow!("invalid handle in card"))?;
 
     let client = DirectoryClient::new(directory);
