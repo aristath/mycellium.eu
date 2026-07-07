@@ -7,6 +7,7 @@ members = [
     "crates/mycellium-app",
     "crates/mycellium-cli",
     "crates/mycellium-sdk",
+    "crates/mycellium-names",
 ]
 
 [workspace.package]
