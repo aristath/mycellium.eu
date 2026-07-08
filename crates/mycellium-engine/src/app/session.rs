@@ -14,11 +14,11 @@ pub fn handshake_initiator(
     conn: &mut dyn Wire,
     identity: &Identity,
     me: &Handle,
+    my_record: &SignedRecord,
     peer_handle: &Handle,
     peer_record: &SignedRecord,
     location: &str,
 ) -> Result<Session> {
-    let my_record = build_record(identity, me, "");
     conn.send(&wire::encode(&my_record))?;
     // Our plaintext name for display — self-verifying (its id must equal the id
     // in the record we just sent), since the record only carries the id now.
@@ -55,7 +55,11 @@ pub fn handshake_initiator(
 }
 
 /// Responder handshake: read the peer's record + X3DH init, build the session.
-pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<Session> {
+pub fn handshake_responder(
+    conn: &mut dyn Wire,
+    identity: &Identity,
+    store: &mut FileStore,
+) -> Result<Session> {
     let peer_record: SignedRecord = wire::decode(&conn.recv()?)?;
     peer_record
         .verify()
@@ -65,6 +69,7 @@ pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<S
     if user_id(&who) != peer_record.record.handle {
         bail!("peer name does not match its record");
     }
+    let peer_handle = Handle::new(who.clone()).map_err(|_| anyhow!("bad peer handle"))?;
     let init: HandshakeInit = wire::decode(&conn.recv()?)?;
     // Bind the handshake to the peer's published identity — the init's identity
     // key MUST be the one in their wallet-signed record (the same check
@@ -76,6 +81,7 @@ pub fn handshake_responder(conn: &mut dyn Wire, identity: &Identity) -> Result<S
     if init.initiator_ik != peer_record.record.primary().id_key {
         bail!("handshake is not bound to the peer's identity");
     }
+    peerbook::put(store, &peer_handle, peer_record.clone())?;
 
     let shared = x3dh::respond(identity, &init).map_err(|e| anyhow!("{e}"))?;
     let ratchet = Ratchet::new_responder(&shared, identity);

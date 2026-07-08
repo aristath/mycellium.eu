@@ -1,10 +1,10 @@
-//! The Full-tier [`Platform`]: OS entropy and the system clock.
+//! Native [`Platform`]: OS entropy and the system clock.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mycellium_core::platform::Platform;
 
-/// A desktop/server platform backed by the OS CSPRNG and wall clock.
+/// A native platform backed by the OS CSPRNG and wall clock.
 pub struct OsPlatform;
 
 impl Platform for OsPlatform {

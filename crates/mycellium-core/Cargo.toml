@@ -24,16 +24,13 @@ std = [
 ]
 
 [dependencies]
-# secp256k1 wallet key — the account root, SIWE login, record signatures. The
-# account is a raw random secret (no BIP-39 seed phrase / BIP-32 derivation);
-# recovery is via the directory's email verification, and new devices adopt the
-# account over the `pairing` protocol.
+# secp256k1 wallet key: the account root and record signature key.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 # Ed25519 device key — basis of the libp2p PeerId / transport.
 ed25519-dalek = { version = "2", default-features = false }
 # X25519 messaging key — X3DH.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
-# HKDF-SHA512 domain-separated key derivation from the BIP-39 seed.
+# HKDF-SHA512 domain-separated key derivation from local secret material.
 sha2 = { version = "0.10", default-features = false }
 hkdf = { version = "0.12", default-features = false }
 hmac = { version = "0.12", default-features = false }

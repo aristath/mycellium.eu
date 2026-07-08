@@ -7,9 +7,8 @@
 # actually carries — the list is derived from the real tree, not a blanket allow.
 
 [graph]
-# Evaluate every target we ship to (native servers/clients, wasm, and the
-# thumbv7em bare-metal core). `all-features = false` keeps optional, unbuilt
-# libp2p transports (dns/mdns) out of the graph, matching what CI compiles.
+# Evaluate the dependency graph we actually compile. `all-features = false`
+# keeps optional libp2p transports (dns/mdns) out of the graph, matching CI.
 all-features = false
 
 [advisories]
@@ -20,16 +19,15 @@ all-features = false
 # sit in Cargo.lock but are never compiled. This mirrors the `audit` job's
 # `--ignore` set so we don't double-fail on the same deferred ids.
 ignore = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119"]
-# Only fail on an unmaintained crate the workspace depends on *directly* — one we
-# could actually swap out. Transitive-only unmaintained crates (bincode, paste,
-# rustls-pemfile — all pulled deep under axum-server/uniffi with no safe upgrade
-# reachable) are informational, matching how the `audit` job treats them. Real
+# Only fail on an unmaintained crate the workspace depends on directly; those are
+# the dependencies we can actually swap out. Transitive-only unmaintained crates
+# are informational, matching how the `audit` job treats them. Real
 # vulnerabilities and yanked crates still fail regardless of depth.
 unmaintained = "workspace"
 
 [licenses]
-# Permissive-only allowlist, plus MPL-2.0 (file-scoped weak copyleft, used by
-# uniffi/attohttpc). Every entry is present in the current tree; SPDX `OR`
+# Permissive-only allowlist, plus MPL-2.0 (file-scoped weak copyleft). Every
+# entry is present in the current tree; SPDX `OR`
 # expressions resolve against these, so we do not need to list the copyleft
 # alternatives (e.g. LGPL) that only appear as one branch of an `OR`.
 allow = [

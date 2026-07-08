@@ -1,15 +1,13 @@
-//! Client-side anti-rollback for directory records.
+//! Client-side anti-rollback for signed peer records.
 //!
-//! A record carries a wallet-signed, monotonic `seq`. The directory rejects a
-//! lower-`seq` update, but a **malicious or compelled** directory can still serve
-//! an older — still validly-signed, same-wallet — record to roll a peer back to a
-//! stale device set or queue/relay endpoint (e.g. re-introducing a device the
-//! victim removed after a compromise, so a sender seals to it again). The
-//! wallet-change (TOFU) guard can't catch that: the wallet is unchanged.
+//! A record carries a wallet-signed, monotonic `seq`. Any resolver, import path,
+//! or stale file can still present an older — still validly-signed, same-wallet —
+//! record to roll a peer back to a stale device set (for example re-introducing a
+//! device the victim removed after a compromise, so a sender seals to it again).
+//! The wallet-change (TOFU) guard can't catch that: the wallet is unchanged.
 //!
 //! So each client pins the highest `seq` it has seen per handle and refuses a
-//! regression — moving anti-rollback into the trust boundary that matters (the
-//! client), not the untrusted directory (core review, HIGH).
+//! regression inside the trust boundary that matters: the client.
 
 use mycellium_core::storage::Storage;
 
@@ -40,6 +38,14 @@ pub fn check_and_pin<S: Storage>(store: &mut S, handle: &str, seq: u64) -> Resul
     }
     store.put(&key(handle), &seq.to_le_bytes())?;
     Ok(true)
+}
+
+/// Clear the local high-water mark for `handle`.
+///
+/// This is only for explicit user-controlled local resets. Normal import and
+/// discovery paths must keep using [`check_and_pin`].
+pub fn clear<S: Storage>(store: &mut S, handle: &str) -> Result<(), S::Error> {
+    store.delete(&key(handle))
 }
 
 #[cfg(test)]
@@ -73,11 +79,20 @@ mod tests {
         // Equal or higher is fresh and advances the pin.
         assert!(check_and_pin(&mut s, "bob", 5).unwrap());
         assert!(check_and_pin(&mut s, "bob", 9).unwrap());
-        // A lower seq — the rollback a compelled directory would serve — is refused.
+        // A lower seq, whatever path supplied it, is refused.
         assert!(!check_and_pin(&mut s, "bob", 8).unwrap());
         // ...and the rejected attempt did not lower the pin.
         assert_eq!(highest(&s, "bob").unwrap(), Some(9));
         // A different handle is independent.
         assert!(check_and_pin(&mut s, "carol", 1).unwrap());
+    }
+
+    #[test]
+    fn explicit_clear_removes_the_pin() {
+        let mut s = Mem::default();
+        assert!(check_and_pin(&mut s, "bob", 9).unwrap());
+        clear(&mut s, "bob").unwrap();
+        assert_eq!(highest(&s, "bob").unwrap(), None);
+        assert!(check_and_pin(&mut s, "bob", 1).unwrap());
     }
 }

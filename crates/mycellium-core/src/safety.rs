@@ -1,12 +1,11 @@
 //! Out-of-band verification — the "safety number" (Layer 5 trust hardening).
 //!
-//! The directory tells you *who* a handle is; normally you trust it. To close
-//! even that gap, two peers compare a short code derived from **both their
-//! wallet identity keys**. It's the same on both devices (the inputs are sorted,
-//! so it's independent of who computes it), and it changes completely if either
-//! identity differs from what you expect. Read it aloud or scan it in person:
-//! codes match → the directory told the truth; codes differ → someone is in the
-//! middle.
+//! Signed records tell you which wallet a handle currently maps to. To verify
+//! that mapping out of band, two peers compare a short code derived from **both
+//! their wallet identity keys**. It's the same on both devices (the inputs are
+//! sorted, so it's independent of who computes it), and it changes completely if
+//! either identity differs from what you expect. Read it aloud or scan it in
+//! person.
 
 use alloc::string::String;
 

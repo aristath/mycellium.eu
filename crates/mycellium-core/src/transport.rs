@@ -1,9 +1,9 @@
 //! The **Transport** capability: opening a direct line to a peer.
 //!
 //! The core never speaks a wire protocol itself. On rich devices the host
-//! implements this with rust-libp2p (DHT, NAT traversal, relay); on constrained
-//! devices with a minimal Noise-over-TCP/UDP. Either way the core only sees
-//! "give me a byte-stream connection to this peer" (Layer 10.3).
+//! implements this with rust-libp2p or direct TCP; on constrained devices with a
+//! minimal Noise-over-TCP/UDP. Either way the core only sees "give me a
+//! byte-stream connection to this peer".
 //!
 //! These traits are deliberately synchronous and buffer-oriented so they fit a
 //! `no_std` core. A `Full`-tier host wraps its async stack behind them; that

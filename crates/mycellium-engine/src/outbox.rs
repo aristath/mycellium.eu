@@ -1,9 +1,8 @@
-//! The local, encrypted **outbox**: messages we couldn't hand off yet.
+//! The local, encrypted **outbox**: sealed messages awaiting direct retry.
 //!
-//! A message is normally delivered live (peer online) or dropped into the
-//! recipient's queue. When *neither* works — the peer is offline **and** their
-//! queue is unreachable or they publish none — the sealed item is parked here
-//! and retried later (on every `send`/`inbox`, or an explicit `outbox` run).
+//! A message is normally delivered live to a peer-published device address. If
+//! that direct handoff fails, the already-sealed item is parked here and retried
+//! later on an explicit outbox flush or the next sending action.
 //!
 //! Entries are kept per (recipient, device slot) with the already-sealed item,
 //! and pruned once they exceed [`MAX_ATTEMPTS`] or [`TTL_SECS`] so the outbox
@@ -11,19 +10,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use mycellium_core::platform::Platform;
 use mycellium_core::storage::Storage;
 use mycellium_core::wire;
 
 use crate::groups::MailItem;
-use crate::privacy::PrivacyMode;
 
 const KEY: &[u8] = b"outbox";
 
 /// Give up on an entry after this many failed retries.
 pub const MAX_ATTEMPTS: u32 = 100;
 
-/// Give up on an entry this long after it was first queued (7 days).
+/// Give up on an entry this long after it was first parked (7 days).
 pub const TTL_SECS: u64 = 7 * 86_400;
 
 /// One undelivered, already-sealed item awaiting a retry.
@@ -37,15 +34,12 @@ pub struct OutboxEntry {
     pub slot: String,
     /// The sealed item (an `Envelope`-bearing `MailItem`), ready to send as-is.
     pub item: MailItem,
-    /// When it was first queued (unix seconds).
+    /// When it was first parked (unix seconds).
     pub created_at: u64,
     /// How many delivery attempts have failed so far.
     pub attempts: u32,
-    /// Earliest unix-second at which this item may be deposited (the privacy
-    /// delay window; see [`crate::privacy`]). `0` means immediate.
-    ///
-    /// `#[serde(default)]` so entries persisted before this field existed load
-    /// as `0` = immediate — preserving the pre-delay behavior across upgrades.
+    /// Earliest unix-second at which this item may be retried. `0` means
+    /// immediate.
     #[serde(default)]
     pub send_after: u64,
 }
@@ -56,15 +50,14 @@ impl OutboxEntry {
         self.attempts >= MAX_ATTEMPTS || now.saturating_sub(self.created_at) >= TTL_SECS
     }
 
-    /// Whether this entry's scheduled delay has elapsed at `now` (i.e. it may be
-    /// deposited). A not-yet-due entry is left untouched for a later flush.
+    /// Whether this entry's scheduled delay has elapsed at `now`.
     pub fn is_due(&self, now: u64) -> bool {
         now >= self.send_after
     }
 }
 
-/// What one flush pass decided about a single *due* entry, after trying to
-/// deposit it. Returned by the `deliver` closure passed to [`flush_pass`].
+/// What one flush pass decided about a single *due* entry, after trying direct
+/// delivery. Returned by the closure passed to [`flush_pass`].
 pub enum Attempt {
     /// Deposited successfully — remove it from the outbox.
     Delivered,
@@ -75,8 +68,8 @@ pub enum Attempt {
     Retry,
 }
 
-/// Run one flush pass over `entries` at time `now`, depositing entries whose
-/// delay has elapsed via `deliver` and returning `(delivered_count, remaining)`.
+/// Run one flush pass over `entries` at time `now`, retrying entries whose delay
+/// has elapsed via `deliver` and returning `(delivered_count, remaining)`.
 ///
 /// This is the pure, network-free core of [`crate::app::flush_outbox`]:
 /// - a **not-yet-due** entry (`now < send_after`) is skipped this pass — it is
@@ -120,54 +113,12 @@ where
     (delivered, remaining)
 }
 
-/// The pre-`send_after` shape of an entry, for decoding outboxes persisted by
-/// an older build. Our wire format ([`wire`]/postcard) is compact and *not*
-/// self-describing: a trailing field that is simply absent from the bytes can't
-/// be `#[serde(default)]`-filled during decode (postcard reads fields
-/// positionally and hits end-of-input). So we decode old blobs in their exact
-/// old shape and lift them into the current one with an immediate `send_after`.
-#[derive(Deserialize)]
-struct OldOutboxEntry {
-    id: String,
-    recipient: String,
-    slot: String,
-    item: MailItem,
-    created_at: u64,
-    attempts: u32,
-}
-
-impl From<OldOutboxEntry> for OutboxEntry {
-    fn from(o: OldOutboxEntry) -> Self {
-        OutboxEntry {
-            id: o.id,
-            recipient: o.recipient,
-            slot: o.slot,
-            item: o.item,
-            created_at: o.created_at,
-            attempts: o.attempts,
-            send_after: 0, // pre-delay entries are immediate
-        }
-    }
-}
-
 /// Load the whole outbox.
 pub fn load<S: Storage>(store: &S) -> Result<Vec<OutboxEntry>, S::Error> {
     let Some(bytes) = store.get(KEY)? else {
         return Ok(Vec::new());
     };
-    // Current format first; on failure, fall back to the pre-`send_after` shape
-    // (upgrade back-compat) before giving up on genuinely-corrupt bytes.
-    if let Ok(entries) = wire::decode::<Vec<OutboxEntry>>(&bytes) {
-        return Ok(entries);
-    }
-    if let Ok(old) = wire::decode::<Vec<OldOutboxEntry>>(&bytes) {
-        return Ok(old.into_iter().map(OutboxEntry::from).collect());
-    }
-    // Present but decodes as neither the current nor the legacy shape: genuinely
-    // corrupt. Surface it loudly rather than silently dropping parked mail — the
-    // raw bytes stay put until the next write, so an export can still recover them.
-    crate::warn_corrupt("outbox");
-    Ok(Vec::new())
+    Ok(crate::decode_or_warn(Some(bytes), "outbox"))
 }
 
 /// Persist the whole outbox.
@@ -210,27 +161,6 @@ pub fn enqueue_at<S: Storage>(
         send_after,
     });
     save(store, &entries)
-}
-
-/// Schedule a queued deposit under a [`PrivacyMode`]: compute
-/// `send_after = now + mode.delivery_delay(platform)` and park the item so the
-/// next due flush deposits it. The clean entry point for SDK/clients.
-///
-/// `Normal` yields a `0` delay (immediate); `Private`/`HighRisk` draw a
-/// randomized in-window delay from the platform CSPRNG. The delayed deposit is
-/// persisted, so it survives a restart and is retried, never lost.
-pub fn schedule_deposit<S: Storage, P: Platform>(
-    store: &mut S,
-    platform: &mut P,
-    id: String,
-    recipient: &str,
-    slot: &str,
-    item: MailItem,
-    mode: PrivacyMode,
-) -> Result<(), S::Error> {
-    let now = platform.now_unix_secs();
-    let send_after = now.saturating_add(mode.delivery_delay(platform));
-    enqueue_at(store, id, recipient, slot, item, now, send_after)
 }
 
 /// Number of items currently waiting.
@@ -319,23 +249,6 @@ mod tests {
         assert!(e.is_expired(TTL_SECS + 1));
     }
 
-    /// A deterministic platform: `now` is fixed and `fill_random` yields a fixed
-    /// byte so `delivery_delay` for a mode is reproducible.
-    struct FixedPlatform {
-        now: u64,
-        byte: u8,
-    }
-    impl Platform for FixedPlatform {
-        fn fill_random(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                *b = self.byte;
-            }
-        }
-        fn now_unix_secs(&self) -> u64 {
-            self.now
-        }
-    }
-
     #[test]
     fn enqueue_is_immediate_by_default() {
         let mut store = MemStore::default();
@@ -352,32 +265,6 @@ mod tests {
         assert_eq!(e.send_after, 0);
         assert!(e.is_due(0), "immediate entry must be due even at t=0");
         assert!(e.is_due(100));
-    }
-
-    #[test]
-    fn schedule_deposit_sets_future_send_after() {
-        let mut store = MemStore::default();
-        // Private window is 0..=30; byte 0xFF gives a nonzero draw, so send_after
-        // is strictly in the future here. now = 1_000.
-        let mut p = FixedPlatform {
-            now: 1_000,
-            byte: 0xFF,
-        };
-        schedule_deposit(
-            &mut store,
-            &mut p,
-            "1".into(),
-            "mary",
-            "abcd",
-            sample("1").item,
-            PrivacyMode::Private,
-        )
-        .unwrap();
-        let e = &load(&store).unwrap()[0];
-        assert_eq!(e.created_at, 1_000);
-        assert!(e.send_after > 1_000 && e.send_after <= 1_030);
-        assert!(!e.is_due(1_000), "must not be due before the delay elapses");
-        assert!(e.is_due(e.send_after));
     }
 
     #[test]
@@ -452,9 +339,9 @@ mod tests {
 
     #[test]
     fn corrupt_outbox_loads_empty_not_silently_dropped() {
-        // A present-but-undecodable blob (neither the current nor the legacy
-        // shape) must load as empty via the loud corruption path — not a hard
-        // error, and not a silent drop. The raw bytes stay put for recovery.
+        // A present-but-undecodable blob must load as empty via the loud
+        // corruption path, not a hard error and not a silent drop. The raw bytes
+        // stay put for recovery.
         let mut store = MemStore::default();
         store.put(KEY, b"not valid wire bytes").unwrap();
         let loaded = load(&store).unwrap();
@@ -464,41 +351,5 @@ mod tests {
             store.get(KEY).unwrap().as_deref(),
             Some(&b"not valid wire bytes"[..])
         );
-    }
-
-    #[test]
-    fn old_format_entry_loads_as_immediate() {
-        // Encode an entry WITHOUT `send_after`, exactly as an older build would
-        // have persisted it, and confirm it deserializes to send_after = 0.
-        #[derive(Serialize)]
-        struct OldEntry {
-            id: String,
-            recipient: String,
-            slot: String,
-            item: MailItem,
-            created_at: u64,
-            attempts: u32,
-        }
-        let old = OldEntry {
-            id: "1".into(),
-            recipient: "mary".into(),
-            slot: "abcd".into(),
-            item: sample("1").item,
-            created_at: 42,
-            attempts: 3,
-        };
-        let bytes = wire::encode(&vec![old]);
-        let mut store = MemStore::default();
-        store.put(KEY, &bytes).unwrap();
-
-        let loaded = load(&store).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(
-            loaded[0].send_after, 0,
-            "missing field defaults to immediate"
-        );
-        assert_eq!(loaded[0].created_at, 42);
-        assert_eq!(loaded[0].attempts, 3);
-        assert!(loaded[0].is_due(0));
     }
 }

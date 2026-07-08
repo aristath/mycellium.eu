@@ -207,10 +207,10 @@ impl Ratchet {
         if let Some(pos) = self.skipped.iter().position(|s| s.dh == dh && s.n == n) {
             // Fail closed: peek → decrypt → remove-on-success only. Verify the
             // AEAD against a reference to the banked key *without* removing it
-            // first. A corrupted out-of-order copy (active attacker or queue
-            // corruption of one copy) then leaves the banked key untouched, so
-            // the legitimate copy of the same message can still decrypt. Only on
-            // a successful decrypt do we consume and zeroize the used key.
+            // first. A corrupted out-of-order copy then leaves the banked key
+            // untouched, so the legitimate copy of the same message can still
+            // decrypt. Only on a successful decrypt do we consume and zeroize
+            // the used key.
             let aad = associated_data(ad, &msg.header);
             let plaintext = aead_decrypt(&self.skipped[pos].mk, &msg.ciphertext, &aad)?;
             let mut entry = self.skipped.remove(pos);
@@ -506,9 +506,9 @@ mod tests {
         assert_eq!(bob.decrypt(&mut p, &real, AD).unwrap(), b"legit");
     }
 
-    /// Re-delivering an already-consumed in-order message (ordinary at-least-once
-    /// queue behaviour) must be rejected without consuming the live chain key, so
-    /// the next legitimate message still decrypts.
+    /// Re-delivering an already-consumed in-order message must be rejected
+    /// without consuming the live chain key, so the next legitimate message still
+    /// decrypts.
     #[test]
     fn replayed_in_order_message_is_harmless() {
         let mut p = SeededPlatform(0);
@@ -519,7 +519,7 @@ mod tests {
 
         assert_eq!(bob.decrypt(&mut p, &m0, AD).unwrap(), b"zero");
         assert_eq!(bob.decrypt(&mut p, &m1, AD).unwrap(), b"one");
-        // Queue re-delivers m1 (already consumed, not covered by a skipped key).
+        // m1 is re-delivered (already consumed, not covered by a skipped key).
         assert!(bob.decrypt(&mut p, &m1, AD).is_err());
         // The next legitimate message must still decrypt.
         assert_eq!(bob.decrypt(&mut p, &m2, AD).unwrap(), b"two");
@@ -540,8 +540,7 @@ mod tests {
         // Deliver m1 first: bob advances past n=0, banking the skipped key for m0.
         assert_eq!(bob.decrypt(&mut p, &m1, AD).unwrap(), b"one");
 
-        // (1) A corrupted copy of m0 (active attacker or queue corruption of one
-        // copy) must fail — not panic, not silently succeed.
+        // (1) A corrupted copy of m0 must fail, not panic or silently succeed.
         let mut corrupt = m0.clone();
         corrupt.ciphertext[0] ^= 0xff;
         assert!(bob.decrypt(&mut p, &corrupt, AD).is_err());

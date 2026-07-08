@@ -1,11 +1,10 @@
 //! Encrypted identity storage (Layer 9 hardening).
 //!
 //! The account is a random **wallet secret** plus this device's own seed (there is
-//! no seed phrase — recovery is via email, see #6), so those 32-byte secrets must
-//! not sit in plaintext. We derive a key from a user passphrase with **Argon2id**
-//! and seal the `wallet_secret + device_seed` with **ChaCha20-Poly1305**. Losing
-//! the passphrase means losing this on-disk copy; the account is then recovered by
-//! re-binding the handle from a fresh device via email verification.
+//! no hosted recovery authority), so those 32-byte secrets must not sit in
+//! plaintext. We derive a key from a user passphrase with **Argon2id** and seal
+//! the `wallet_secret + device_seed` with **ChaCha20-Poly1305**. Moving an account
+//! to a fresh device is an explicit wallet-secret transfer.
 //!
 //! Interactive callers can type the passphrase at a **no-echo** terminal prompt.
 //! Noninteractive callers pass an explicit [`ClientConfig`] before using the
@@ -29,10 +28,10 @@ pub struct ClientConfig {
     pub data_dir: PathBuf,
     /// Optional noninteractive passphrase for identity encryption.
     pub passphrase: Option<String>,
-    /// This account's queue URL, recorded in directory records.
-    pub queue_url: String,
-    /// This account's display name, recorded in directory records.
+    /// This account's display name, recorded in peer records.
     pub display_name: String,
+    /// Optional DHT bootstrap peer multiaddrs for non-authoritative discovery.
+    pub dht_bootstrap: Vec<String>,
 }
 
 impl Default for ClientConfig {
@@ -40,8 +39,8 @@ impl Default for ClientConfig {
         Self {
             data_dir: PathBuf::from(".mycellium"),
             passphrase: None,
-            queue_url: String::new(),
             display_name: String::new(),
+            dht_bootstrap: Vec::new(),
         }
     }
 }
@@ -62,22 +61,12 @@ pub fn config() -> ClientConfig {
     config_cell().lock().unwrap().clone()
 }
 
-/// Update just the configured queue URL.
-pub fn set_queue_url(queue_url: impl Into<String>) {
-    config_cell().lock().unwrap().queue_url = queue_url.into();
-}
-
 /// Update just the configured display name.
 pub fn set_display_name(display_name: impl Into<String>) {
     config_cell().lock().unwrap().display_name = display_name.into();
 }
 
-/// This account's queue URL, recorded in directory records.
-pub fn queue_url() -> String {
-    config().queue_url
-}
-
-/// This account's display name, recorded in directory records.
+/// This account's display name, recorded in peer records.
 pub fn display_name() -> String {
     config().display_name
 }
