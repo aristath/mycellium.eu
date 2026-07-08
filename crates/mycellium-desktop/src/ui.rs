@@ -29,11 +29,10 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
-/// A pending relay/account setup, shown when no account exists yet.
+/// A pending account setup, shown when no account exists yet.
 #[derive(Default)]
 struct SetupForm {
     import_nsec: String,
-    relay: String,
     error: Option<String>,
 }
 
@@ -64,10 +63,7 @@ impl DesktopApp {
             ctx: cc.egui_ctx.clone(),
             data_dir,
             engine: None,
-            setup: SetupForm {
-                relay: config::DEFAULT_RELAY.to_string(),
-                ..Default::default()
-            },
+            setup: SetupForm::default(),
             account_npub: String::new(),
             status: "no account".to_string(),
             contacts: Vec::new(),
@@ -167,18 +163,14 @@ impl DesktopApp {
                 ui.label("Create a new identity, or import a Nostr key you already hold.");
             });
             ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                ui.label("Relay:");
-                ui.text_edit_singleline(&mut self.setup.relay);
-            });
-            ui.add_space(8.0);
 
-            let relays = vec![self.setup.relay.trim().to_string()];
+            // New accounts get the default spread of public relays (see
+            // `config::DEFAULT_RELAYS`) — no relay wrangling needed to start.
             let mut chosen: Option<Config> = None;
 
             ui.horizontal(|ui| {
                 if ui.button("Create new account").clicked() {
-                    chosen = Some(Config::generate(relays.clone()));
+                    chosen = Some(Config::generate(Vec::new()));
                 }
             });
             ui.add_space(8.0);
@@ -186,12 +178,17 @@ impl DesktopApp {
                 ui.label("or import nsec:");
                 ui.text_edit_singleline(&mut self.setup.import_nsec);
                 if ui.button("Import").clicked() {
-                    match Config::import(self.setup.import_nsec.trim(), relays.clone()) {
+                    match Config::import(self.setup.import_nsec.trim(), Vec::new()) {
                         Ok(cfg) => chosen = Some(cfg),
                         Err(e) => self.setup.error = Some(e.to_string()),
                     }
                 }
             });
+            ui.add_space(4.0);
+            ui.small(format!(
+                "Connects to {} public relays by default.",
+                mycellium_app::config::DEFAULT_RELAYS.len()
+            ));
 
             if let Some(err) = &self.setup.error {
                 ui.add_space(8.0);

@@ -141,7 +141,7 @@ enum DeviceCmd {
 enum AccountCmd {
     /// Generate a new identity and write config.json.
     New {
-        /// A relay URL to use (repeatable). Defaults to a public relay.
+        /// A relay URL to use (repeatable). Defaults to a dozen public relays.
         #[arg(long = "relay")]
         relays: Vec<String>,
         /// Overwrite an existing config in this data dir.
@@ -155,7 +155,7 @@ enum AccountCmd {
     Import {
         /// The secret key to adopt: bech32 `nsec1…` or 64-char hex.
         secret: String,
-        /// A relay URL to use (repeatable). Defaults to a public relay.
+        /// A relay URL to use (repeatable). Defaults to a dozen public relays.
         #[arg(long = "relay")]
         relays: Vec<String>,
         /// Overwrite an existing config in this data dir.

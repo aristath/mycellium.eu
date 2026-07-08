@@ -19,8 +19,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::App;
 
-/// The relay a freshly created account uses when none is specified.
-pub const DEFAULT_RELAY: &str = "wss://relay.damus.io";
+/// The relays a freshly created account uses when none are specified — a spread of
+/// well-known, free, general-purpose public Nostr relays, so a new account has
+/// real redundancy (no single point of failure) out of the box rather than
+/// depending on one host.
+///
+/// This is a pragmatic starting set, not gospel: public-relay availability and
+/// write policies drift over time, and the durable answer is Mycellium's own
+/// always-on relays plus a relay embedded in each node. Treat this as a default
+/// the user can override, not a fixed dependency.
+pub const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://relay.snort.social",
+    "wss://nostr.mom",
+    "wss://offchain.pub",
+    "wss://relay.nostr.bg",
+    "wss://nostr.oxtr.dev",
+    "wss://relay.mostr.pub",
+    "wss://nostr-pub.wellorder.net",
+    "wss://relay.nostr.net",
+    "wss://nostr.land",
+];
 
 /// A failure loading, saving, or opening a client config.
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +104,7 @@ impl Config {
 
     fn from_device_key(keys: &Keys, relays: Vec<String>) -> Self {
         let relays = if relays.is_empty() {
-            vec![DEFAULT_RELAY.to_string()]
+            DEFAULT_RELAYS.iter().map(|r| (*r).to_string()).collect()
         } else {
             relays
         };
