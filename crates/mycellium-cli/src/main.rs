@@ -25,10 +25,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use mycellium_app::{App, Device};
+use mycellium_app::{App, Config, Device};
 use nostr::nips::nip19::{FromBech32, ToBech32};
-use nostr::{Keys, PublicKey, RelayUrl};
-use serde::{Deserialize, Serialize};
+use nostr::PublicKey;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -213,47 +212,6 @@ enum ContactCmd {
     },
 }
 
-/// On-disk client config: this device's secret key plus its relay URLs.
-#[derive(Serialize, Deserialize)]
-struct Config {
-    /// This **device's** secret key, bech32 (`nsec1…`). It is *also* the account
-    /// key when `account_key` is absent (a solo account); it never changes on an
-    /// account-key rotation, so MLS/history stay intact.
-    secret_key: String,
-    /// The separate **account** identity key, bech32 (`nsec1…`), present once the
-    /// account key has been rotated away from the device key (making this a manager
-    /// account). Absent for a solo account, where `secret_key` serves both roles.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    account_key: Option<String>,
-    /// Relay URLs this device connects to.
-    relays: Vec<String>,
-}
-
-impl Config {
-    /// This device's keypair.
-    fn keys(&self) -> Result<Keys> {
-        Keys::parse(&self.secret_key).context("parsing the stored device secret key")
-    }
-
-    /// The account identity keypair — the rotated account key if one is stored,
-    /// else the device key (solo account).
-    fn account_keys(&self) -> Result<Keys> {
-        match &self.account_key {
-            Some(ak) => Keys::parse(ak).context("parsing the stored account secret key"),
-            None => self.keys(),
-        }
-    }
-
-    fn relay_urls(&self) -> Result<Vec<RelayUrl>> {
-        self.relays
-            .iter()
-            .map(|r| RelayUrl::parse(r).with_context(|| format!("parsing relay url '{r}'")))
-            .collect()
-    }
-}
-
-const DEFAULT_RELAY: &str = "wss://relay.damus.io";
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -319,122 +277,48 @@ fn resolve_data_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(home.join(".mycellium"))
 }
 
-fn config_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("config.json")
-}
-
-fn load_config(data_dir: &Path) -> Result<Config> {
-    let path = config_path(data_dir);
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
-        anyhow!(
-            "no config at {} ({e}); run `mycellium account new` first",
-            path.display()
+/// Open the engine from the on-disk config (solo or, post-rotation, manager).
+fn open_app(data_dir: &Path) -> Result<(App, Config)> {
+    let config = Config::load(data_dir).with_context(|| {
+        format!(
+            "no account at {}; run `mycellium account new` first",
+            data_dir.display()
         )
     })?;
-    serde_json::from_str(&raw).context("parsing config.json")
-}
-
-/// Open the engine from the on-disk config: a solo account when the account key
-/// equals the device key, or a manager account once the account key has been
-/// rotated to a separate key.
-fn open_app(data_dir: &Path) -> Result<(App, Config)> {
-    let config = load_config(data_dir)?;
-    let device_keys = config.keys()?;
-    let relays = config.relay_urls()?;
-    let app = if config.account_key.is_some() {
-        App::open_manager(config.account_keys()?, device_keys, relays, data_dir)
-            .context("opening the app engine (manager)")?
-    } else {
-        App::open_solo(device_keys, relays, data_dir).context("opening the app engine")?
-    };
+    let app = config.open(data_dir).context("opening the app engine")?;
     Ok((app, config))
 }
 
 // -- commands ---------------------------------------------------------------
 
 fn account_new(data_dir: &Path, relays: Vec<String>, force: bool) -> Result<()> {
-    let keys = Keys::generate();
-    let config = create_account(data_dir, &keys, relays, force)?;
-    report_account(data_dir, &keys, &config, "account created")
+    let config = Config::generate(relays);
+    config.create(data_dir, force)?;
+    report_account(data_dir, &config, "account created")
 }
 
 fn account_import(data_dir: &Path, secret: &str, relays: Vec<String>, force: bool) -> Result<()> {
-    // A public key can't be imported — the app has to sign as this identity, which
-    // needs the secret. Catch the common paste-the-npub mistake with a clear message
-    // instead of a cryptic parse error.
-    if secret.starts_with("npub1") {
-        bail!(
-            "'{secret}' is a public key (npub) — importing an identity needs its SECRET key \
-             (nsec1…), which only you hold. A public key cannot sign, so it can't be imported."
-        );
-    }
-    let keys = Keys::parse(secret).context(
-        "parsing the secret key to import (expected an `nsec1…` bech32 or 64-char hex secret)",
-    )?;
-    let config = create_account(data_dir, &keys, relays, force)?;
-    report_account(data_dir, &keys, &config, "account imported")
+    // `Config::import` rejects a public `npub1…` with a clear message — importing an
+    // identity needs its secret, since the app must sign as it.
+    let config = Config::import(secret, relays).context("importing the secret key")?;
+    config.create(data_dir, force)?;
+    report_account(data_dir, &config, "account imported")
 }
 
-/// Write a fresh solo-account config built from `keys`, guarding an existing
-/// config unless `force`. Shared by `account new` and `account import`.
-fn create_account(
-    data_dir: &Path,
-    keys: &Keys,
-    relays: Vec<String>,
-    force: bool,
-) -> Result<Config> {
-    let path = config_path(data_dir);
-    if path.exists() && !force {
-        bail!(
-            "config already exists at {}; pass --force to overwrite",
-            path.display()
-        );
-    }
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-
-    let relays = if relays.is_empty() {
-        vec![DEFAULT_RELAY.to_string()]
-    } else {
-        relays
-    };
-    // Validate the relay URLs up front so a bad one fails now, not at connect.
-    for r in &relays {
-        RelayUrl::parse(r).with_context(|| format!("invalid relay url '{r}'"))?;
-    }
-
-    let config = Config {
-        secret_key: keys.secret_key().to_bech32().context("encoding nsec")?,
-        account_key: None,
-        relays,
-    };
-    write_config(&path, &config)?;
-    Ok(config)
-}
-
-fn report_account(data_dir: &Path, keys: &Keys, config: &Config, headline: &str) -> Result<()> {
+fn report_account(data_dir: &Path, config: &Config, headline: &str) -> Result<()> {
     println!("{headline}");
-    println!("  npub:     {}", keys.public_key().to_bech32()?);
+    println!(
+        "  npub:     {}",
+        config.account_keys()?.public_key().to_bech32()?
+    );
     println!("  data dir: {}", data_dir.display());
     println!("  relays:   {}", config.relays.join(", "));
     println!("\nnext: `mycellium publish` to announce this device to the relays.");
     Ok(())
 }
 
-fn write_config(path: &Path, config: &Config) -> Result<()> {
-    let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
-    // The config holds a secret key — make it owner-only where the OS supports it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
 fn account_show(data_dir: &Path) -> Result<()> {
-    let config = load_config(data_dir)?;
+    let config = Config::load(data_dir)?;
     let device = config.keys()?;
     let account = config.account_keys()?;
     println!("account npub: {}", account.public_key().to_bech32()?);
@@ -555,7 +439,7 @@ async fn account_rotate(data_dir: &Path, yes: bool) -> Result<()> {
             .to_bech32()
             .context("encoding new nsec")?,
     );
-    write_config(&config_path(data_dir), &config)?;
+    config.save(data_dir).context("saving rotated config")?;
 
     println!("account key rotated.");
     println!("  old npub: {old_npub}");
@@ -735,7 +619,7 @@ fn contacts_list(data_dir: &Path) -> Result<()> {
 }
 
 fn relays(data_dir: &Path) -> Result<()> {
-    let config = load_config(data_dir)?;
+    let config = Config::load(data_dir)?;
     for r in &config.relays {
         println!("{r}");
     }

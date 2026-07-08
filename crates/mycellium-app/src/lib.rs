@@ -58,12 +58,14 @@ use nostr::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
+pub mod config;
 pub mod contacts;
 pub mod names;
 pub mod nip05;
 pub mod pairing;
 pub mod store;
 
+pub use config::{Config, ConfigError};
 pub use contacts::{safety_number, Contact, TrustStatus};
 pub use names::NameError;
 pub use nip05::{
