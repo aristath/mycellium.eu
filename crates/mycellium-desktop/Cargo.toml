@@ -1,0 +1,32 @@
+[package]
+name = "mycellium-desktop"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# A native desktop client for Mycellium: an egui UI over a small async controller
+# that owns the `mycellium-app` engine on its own runtime and talks to the UI
+# thread over channels. The controller (`engine`) is GUI-agnostic and tested over
+# a real relay; the egui layer (`ui`, and the binary) sits behind the default
+# `gui` feature so the controller test links without windowing/GL system libs.
+
+[[bin]]
+name = "mycellium-desktop"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe"]
+
+[dependencies]
+mycellium-app = { path = "../mycellium-app" }
+nostr = { version = "0.44.4", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+eframe = { version = "0.29", optional = true }
+
+[dev-dependencies]
+nostr-relay-builder = "0.44"
+tempfile = "3"

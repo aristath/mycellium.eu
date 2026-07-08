@@ -21,7 +21,18 @@ all-features = false
 # hpke-rs-libcrux → libcrux-aead) pins `libcrux-chacha20poly1305 ^0.0.7`, so it
 # cannot be bumped without a new MDK release. This mirrors the `audit` job's
 # `--ignore` set so we don't double-fail on the same deferred id.
-ignore = ["RUSTSEC-2026-0124"]
+ignore = [
+    "RUSTSEC-2026-0124",
+    # quick-xml DoS advisories (quadratic attribute-dup scan; unbounded namespace
+    # allocation). Both instances are transitive, deep in the desktop-GUI stack:
+    # 0.30.0 via zbus_xml → atspi (the AT-SPI accessibility bus) and 0.39.4 via
+    # wayland-scanner. Both parse XML only from *trusted local* desktop components
+    # (the wayland compositor, the a11y bus), never network/attacker input, so the
+    # DoS is not reachable in practice. Neither can be bumped without upstream
+    # eframe/winit/accesskit widening their pins. Re-evaluate on an eframe update.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 # Only fail on an unmaintained crate the workspace depends on *directly* — one we
 # could actually swap out. Transitive-only unmaintained crates (instant,
 # proc-macro-error2 — pulled deep under the nostr-sdk stack with no safe upgrade
@@ -48,8 +59,21 @@ allow = [
     # Public-domain dedication; the bitcoin crypto crates nostr pulls (bitcoin-io,
     # bitcoin_hashes, secp256k1 chain) are CC0-1.0.
     "CC0-1.0",
+    # Boost Software License — permissive, from the desktop-GUI clipboard stack
+    # (clipboard-win, error-code) pulled by eframe.
+    "BSL-1.0",
+    # SIL Open Font License — the fonts egui bundles (epaint_default_fonts). A
+    # font-embedding license, permissive for our use.
+    "OFL-1.1",
 ]
 confidence-threshold = 0.9
+
+# egui bundles default fonts under the Ubuntu Font Licence, which has no SPDX id
+# (`LicenseRef-UFL-1.0`). It is a permissive font-embedding licence; allow it for
+# just that one crate rather than globally.
+[[licenses.exceptions]]
+crate = "epaint_default_fonts"
+allow = ["MIT", "Apache-2.0", "OFL-1.1", "LicenseRef-UFL-1.0"]
 
 [bans]
 # Duplicate versions are common and often unavoidable in a large transitive
