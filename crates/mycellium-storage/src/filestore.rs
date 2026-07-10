@@ -13,6 +13,7 @@
 //! longer decrypt. That is acceptable because this store holds only locally
 //! generated state with no cross-version persisted-data contract to preserve.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -21,6 +22,16 @@ use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 
 use mycellium_core::storage::Storage;
+use serde::{Deserialize, Serialize};
+
+const JOURNAL_FILE: &str = ".transaction-v1";
+const JOURNAL_AAD: &[u8] = b"mycellium-storage-transaction-v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum Mutation {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
 
 /// A directory of encrypted key-value files.
 pub struct FileStore {
@@ -33,7 +44,9 @@ impl FileStore {
     pub fn open(dir: PathBuf, key: [u8; 32]) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         crate::perms::restrict_dir(&dir);
-        Ok(FileStore { dir, key })
+        let mut store = FileStore { dir, key };
+        store.recover_transaction()?;
+        Ok(store)
     }
 
     /// The on-disk path for a key (hex of the raw key bytes — always a safe name).
@@ -45,17 +58,45 @@ impl FileStore {
         }
         self.dir.join(name)
     }
-}
 
-impl Storage for FileStore {
-    type Error = io::Error;
+    fn journal_path(&self) -> PathBuf {
+        self.dir.join(JOURNAL_FILE)
+    }
 
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, io::Error> {
-        let blob = match fs::read(self.path(key)) {
-            Ok(blob) => blob,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
+    fn ensure_ready(&self) -> io::Result<()> {
+        if self.journal_path().exists() {
+            return Err(io::Error::other(
+                "transaction recovery required; reopen the store",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Begin an isolated write transaction. Reads observe staged mutations;
+    /// dropping without [`FileTransaction::commit`] rolls them back.
+    pub fn transaction(&mut self) -> FileTransaction<'_> {
+        FileTransaction {
+            store: self,
+            changes: BTreeMap::new(),
+        }
+    }
+
+    fn encrypt(&self, aad: &[u8], value: &[u8]) -> io::Result<Vec<u8>> {
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|_| io::Error::other("RNG failure"))?;
+        let key_ga: Key = self.key.into();
+        let nonce_ga: Nonce = nonce.into();
+        let ciphertext = ChaCha20Poly1305::new(&key_ga)
+            .encrypt(&nonce_ga, Payload { msg: value, aad })
+            .map_err(|_| io::Error::other("encryption failed"))?;
+
+        let mut blob = Vec::with_capacity(12 + ciphertext.len());
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ciphertext);
+        Ok(blob)
+    }
+
+    fn decrypt(&self, aad: &[u8], blob: &[u8]) -> io::Result<Vec<u8>> {
         if blob.len() < 12 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -66,52 +107,141 @@ impl Storage for FileStore {
         let key_ga: Key = self.key.into();
         let nonce_arr: [u8; 12] = nonce.try_into().unwrap();
         let nonce_ga: Nonce = nonce_arr.into();
-        // Bind the logical storage key as associated data so a ciphertext written
-        // for key K fails the auth tag if an at-rest attacker relocates it onto a
-        // different key K''s file (record confusion / rollback across keys).
-        let plaintext = ChaCha20Poly1305::new(&key_ga)
+        ChaCha20Poly1305::new(&key_ga)
             .decrypt(
                 &nonce_ga,
                 Payload {
                     msg: ciphertext,
-                    aad: key,
+                    aad,
                 },
             )
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))
+    }
+
+    fn apply(&mut self, mutations: &[Mutation]) -> io::Result<()> {
+        for mutation in mutations {
+            match mutation {
+                Mutation::Put(key, value) => self.put_raw(key, value)?,
+                Mutation::Delete(key) => self.delete_raw(key)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn put_raw(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        let blob = self.encrypt(key, value)?;
+        crate::atomic_write(&self.path(key), &blob)
+    }
+
+    fn delete_raw(&mut self, key: &[u8]) -> io::Result<()> {
+        match fs::remove_file(self.path(key)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn recover_transaction(&mut self) -> io::Result<()> {
+        let blob = match fs::read(self.journal_path()) {
+            Ok(blob) => blob,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let plaintext = self.decrypt(JOURNAL_AAD, &blob)?;
+        let mutations: Vec<Mutation> = mycellium_core::wire::decode(&plaintext)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "corrupt transaction"))?;
+        self.apply(&mutations)?;
+        self.finish_transaction()
+    }
+
+    fn finish_transaction(&self) -> io::Result<()> {
+        match fs::remove_file(self.journal_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        }
+        fs::File::open(&self.dir)?.sync_all()
+    }
+}
+
+/// An in-memory overlay committed through an encrypted, fsynced write-ahead
+/// journal. Once the journal is durable, recovery replays every mutation after
+/// a crash, so callers observe all-or-eventually-all rather than a torn update.
+pub struct FileTransaction<'a> {
+    store: &'a mut FileStore,
+    changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl FileTransaction<'_> {
+    /// Durably commit every staged mutation as one recoverable unit.
+    pub fn commit(self) -> io::Result<()> {
+        self.store.ensure_ready()?;
+        let mutations: Vec<Mutation> = self
+            .changes
+            .into_iter()
+            .map(|(key, value)| match value {
+                Some(value) => Mutation::Put(key, value),
+                None => Mutation::Delete(key),
+            })
+            .collect();
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let plaintext = mycellium_core::wire::encode(&mutations);
+        let journal = self.store.encrypt(JOURNAL_AAD, &plaintext)?;
+        crate::atomic_write(&self.store.journal_path(), &journal)?;
+        self.store.apply(&mutations)?;
+        self.store.finish_transaction()
+    }
+}
+
+impl Storage for FileTransaction<'_> {
+    type Error = io::Error;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        match self.changes.get(key) {
+            Some(value) => Ok(value.clone()),
+            None => self.store.get(key),
+        }
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        self.changes.insert(key.to_vec(), Some(value.to_vec()));
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error> {
+        self.changes.insert(key.to_vec(), None);
+        Ok(())
+    }
+}
+
+impl Storage for FileStore {
+    type Error = io::Error;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, io::Error> {
+        self.ensure_ready()?;
+        let blob = match fs::read(self.path(key)) {
+            Ok(blob) => blob,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // Bind the logical storage key as associated data so a ciphertext written
+        // for key K fails the auth tag if an at-rest attacker relocates it onto a
+        // different key K''s file (record confusion / rollback across keys).
+        let plaintext = self.decrypt(key, &blob)?;
         Ok(Some(plaintext))
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), io::Error> {
-        let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce).map_err(|_| io::Error::other("RNG failure"))?;
-        let key_ga: Key = self.key.into();
-        let nonce_ga: Nonce = nonce.into();
-        // Bind the logical storage key as associated data (see `get`): the on-disk
-        // filename is `hex(key)` but is not itself authenticated, so without this an
-        // attacker with write access could swap one key's blob onto another's path.
-        let ciphertext = ChaCha20Poly1305::new(&key_ga)
-            .encrypt(
-                &nonce_ga,
-                Payload {
-                    msg: value,
-                    aad: key,
-                },
-            )
-            .map_err(|_| io::Error::other("encryption failed"))?;
-
-        let mut blob = Vec::with_capacity(12 + ciphertext.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ciphertext);
-        let p = self.path(key);
-        crate::atomic_write(&p, &blob)
+        self.ensure_ready()?;
+        // `put_raw` binds the logical storage key as associated data (see `get`).
+        self.put_raw(key, value)
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<(), io::Error> {
-        match fs::remove_file(self.path(key)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.ensure_ready()?;
+        self.delete_raw(key)
     }
 }
 
@@ -164,6 +294,57 @@ mod tests {
 
         store.delete(b"k").unwrap();
         assert_eq!(store.get(b"k").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_commits_all_changes_and_drop_rolls_back() {
+        let dir = temp_dir("transaction");
+        let mut store = FileStore::open(dir.clone(), [4u8; 32]).unwrap();
+        store.put(b"old", b"before").unwrap();
+
+        {
+            let mut tx = store.transaction();
+            tx.put(b"new", b"value").unwrap();
+            tx.delete(b"old").unwrap();
+            assert_eq!(tx.get(b"new").unwrap().as_deref(), Some(&b"value"[..]));
+            assert_eq!(tx.get(b"old").unwrap(), None);
+        }
+        assert_eq!(store.get(b"new").unwrap(), None);
+        assert_eq!(store.get(b"old").unwrap().as_deref(), Some(&b"before"[..]));
+
+        let mut tx = store.transaction();
+        tx.put(b"new", b"value").unwrap();
+        tx.delete(b"old").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(store.get(b"new").unwrap().as_deref(), Some(&b"value"[..]));
+        assert_eq!(store.get(b"old").unwrap(), None);
+        assert!(!store.journal_path().exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_replays_a_durable_transaction_journal() {
+        let dir = temp_dir("journal-recovery");
+        {
+            let mut store = FileStore::open(dir.clone(), [5u8; 32]).unwrap();
+            store.put(b"old", b"before").unwrap();
+            let mutations = vec![
+                Mutation::Put(b"new".to_vec(), b"after".to_vec()),
+                Mutation::Delete(b"old".to_vec()),
+            ];
+            let plaintext = mycellium_core::wire::encode(&mutations);
+            let journal = store.encrypt(JOURNAL_AAD, &plaintext).unwrap();
+            crate::atomic_write(&store.journal_path(), &journal).unwrap();
+            assert!(store.get(b"old").is_err());
+            // Simulate termination after the commit point but before applying
+            // any data files: the next open must finish the committed unit.
+        }
+
+        let store = FileStore::open(dir.clone(), [5u8; 32]).unwrap();
+        assert_eq!(store.get(b"new").unwrap().as_deref(), Some(&b"after"[..]));
+        assert_eq!(store.get(b"old").unwrap(), None);
+        assert!(!store.journal_path().exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

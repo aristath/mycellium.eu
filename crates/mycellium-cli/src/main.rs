@@ -562,7 +562,7 @@ fn chat(peer: &str, whoami: &str, tui: bool) -> Result<()> {
         .context("peer record has no dialable address")?;
 
     if location.starts_with('/') {
-        let mut node = Libp2pNode::new(identity.device_secret(), None)?;
+        let node = Libp2pNode::new(identity.device_secret(), None)?;
         let mut conn = node
             .dial_str(&location)
             .with_context(|| format!("could not connect to {location}"))?;

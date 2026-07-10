@@ -312,10 +312,11 @@ pub fn discover(peer: &str, want: &[String]) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let (peer_handle, peer_record) = resolve_record(&mut fs, peer)?;
+    let network = DirectNetwork::new(identity.device_secret());
     let mut last_error = None;
 
     for device in &peer_record.record.devices {
-        match request_discovery_from_device(identity.device_secret(), device, want) {
+        match request_discovery_from_device(&network, device, want) {
             Ok(records) => {
                 let report = peerbook::import_records(&mut fs, records);
                 println!(
@@ -408,6 +409,39 @@ pub fn dht_lookup(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> R
 
 // ---- direct delivery --------------------------------------------------------
 
+/// Process-local direct-network actor. TCP deposits open ordinary sockets;
+/// libp2p deposits lazily start one swarm and reuse it for every device copy,
+/// discovery request, and retry made by this process.
+#[derive(Clone)]
+struct DirectNetwork {
+    device_secret: [u8; 32],
+    libp2p: Arc<Mutex<Option<libp2p_net::Libp2pDialer>>>,
+}
+
+impl DirectNetwork {
+    fn new(device_secret: [u8; 32]) -> Self {
+        Self {
+            device_secret,
+            libp2p: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn with_libp2p(device_secret: [u8; 32], dialer: libp2p_net::Libp2pDialer) -> Self {
+        Self {
+            device_secret,
+            libp2p: Arc::new(Mutex::new(Some(dialer))),
+        }
+    }
+
+    fn libp2p(&self) -> Option<libp2p_net::Libp2pDialer> {
+        let mut dialer = self.libp2p.lock().ok()?;
+        if dialer.is_none() {
+            *dialer = libp2p_net::Libp2pDialer::new(self.device_secret).ok();
+        }
+        dialer.clone()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn send(
     peer: &str,
@@ -424,27 +458,26 @@ pub fn send(
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let _ = flush_outbox(&identity, &mut fs);
+    let network = DirectNetwork::new(identity.device_secret());
+    let _ = flush_outbox_with_network(&identity, &mut fs, &network);
     let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
 
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let device_secret = identity.device_secret();
     let my_record = own_record(&fs, &me)?;
     let net = LocalNet::load(&fs);
 
-    let mut deliver = |store: &mut FileStore,
-                       handle: &Handle,
-                       _record: &SignedRecord,
-                       device: &Device,
-                       item: MailItem|
-     -> DeliveryPath {
-        deliver_or_park(store, device_secret, handle, device, item, now)
-    };
+    let mut deliver =
+        |store: &mut FileStore,
+         handle: &Handle,
+         _record: &SignedRecord,
+         device: &Device,
+         item: MailItem|
+         -> DeliveryPath { deliver_or_park(store, &network, handle, device, item, now) };
     let mut self_deliver =
         |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
-            let _ = deliver_or_park(store, device_secret, handle, device, item, now);
+            let _ = deliver_or_park(store, &network, handle, device, item, now);
         };
 
     let out = flow::send_app(
@@ -516,8 +549,7 @@ fn delivery_summary(
 pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
-    let mut fs = open_history(&identity)?;
-    let _ = flush_outbox(&identity, &mut fs);
+    let fs = open_history(&identity)?;
     let blocked = blocklist::load(&fs)?;
     let my_record = own_record(&fs, &me)?;
     let identity = Arc::new(identity);
@@ -525,12 +557,16 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let my_record = Arc::new(my_record);
     let blocked = Arc::new(blocked);
     let fs = Arc::new(Mutex::new(fs));
-    start_retry_worker(Arc::clone(&identity), Arc::clone(&fs));
 
     if libp2p {
         let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
         let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
             .context("could not start libp2p node")?;
+        let network = DirectNetwork::with_libp2p(identity.device_secret(), node.dialer());
+        if let Ok(mut store) = fs.lock() {
+            let _ = flush_outbox_with_network(&identity, &mut store, &network);
+        }
+        start_retry_worker(Arc::clone(&fs), network);
         println!(
             "serving (libp2p) on {addr} as {} ({})",
             me.as_str(),
@@ -554,6 +590,11 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
         }
     } else {
         let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
+        let network = DirectNetwork::new(identity.device_secret());
+        if let Ok(mut store) = fs.lock() {
+            let _ = flush_outbox_with_network(&identity, &mut store, &network);
+        }
+        start_retry_worker(Arc::clone(&fs), network);
         println!("serving on {addr} as {}", me.as_str());
         let workers = connection_workers(
             Arc::clone(&identity),
@@ -613,14 +654,14 @@ where
     sender
 }
 
-fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>) {
+fn start_retry_worker(fs: Arc<Mutex<FileStore>>, network: DirectNetwork) {
     std::thread::spawn(move || loop {
-        retry_due_deliveries(&identity, &fs);
+        retry_due_deliveries(&fs, &network);
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
 }
 
-fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>) {
+fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
     enum Target {
         Device(Device),
         Retry,
@@ -670,9 +711,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>) {
         }
 
         let accepted = match &target {
-            Target::Device(device) => {
-                direct_push(identity.device_secret(), device, &entry.id, &entry.item)
-            }
+            Target::Device(device) => direct_push(network, device, &entry.id, &entry.item),
             Target::Retry => false,
             Target::Drop => unreachable!(),
         };
@@ -823,6 +862,15 @@ fn short_outbox_id(id: &str) -> &str {
 }
 
 pub fn flush_outbox(identity: &Identity, fs: &mut FileStore) -> Result<(usize, usize)> {
+    let network = DirectNetwork::new(identity.device_secret());
+    flush_outbox_with_network(identity, fs, &network)
+}
+
+fn flush_outbox_with_network(
+    identity: &Identity,
+    fs: &mut FileStore,
+    network: &DirectNetwork,
+) -> Result<(usize, usize)> {
     let entries = outbox::load(fs)?;
     if entries.is_empty() {
         return Ok((0, 0));
@@ -857,16 +905,7 @@ pub fn flush_outbox(identity: &Identity, fs: &mut FileStore) -> Result<(usize, u
         else {
             return outbox::Attempt::Drop;
         };
-        if deliver_direct(
-            fs,
-            identity.device_secret(),
-            device,
-            &entry.id,
-            &entry.item,
-            now,
-        )
-        .is_delivered()
-        {
+        if deliver_direct(fs, network, device, &entry.id, &entry.item, now).is_delivered() {
             outbox::Attempt::Delivered
         } else {
             outbox::Attempt::Retry
@@ -879,14 +918,14 @@ pub fn flush_outbox(identity: &Identity, fs: &mut FileStore) -> Result<(usize, u
 
 fn deliver_direct(
     store: &mut FileStore,
-    device_secret: [u8; 32],
+    network: &DirectNetwork,
     device: &Device,
     delivery_id: &str,
     item: &MailItem,
     now: u64,
 ) -> DeliveryPath {
     let key = device_slot(&device.device_key);
-    let ok = direct_push(device_secret, device, delivery_id, item);
+    let ok = direct_push(network, device, delivery_id, item);
     let _ = reachability::record(store, &key, DeliveryPath::Direct, ok, now);
     if ok {
         DeliveryPath::Direct
@@ -896,7 +935,7 @@ fn deliver_direct(
 }
 
 fn direct_push(
-    device_secret: [u8; 32],
+    network: &DirectNetwork,
     device: &Device,
     delivery_id: &str,
     item: &MailItem,
@@ -918,18 +957,15 @@ fn direct_push(
         }
         DirectTransport::Libp2p => {
             let addr = String::from_utf8_lossy(&device.peer_id.0);
-            let mut node = match libp2p_net::Libp2pNode::new(device_secret, None) {
-                Ok(node) => node,
-                Err(_) => return false,
+            let Some(dialer) = network.libp2p() else {
+                return false;
             };
-            let ok = match node.dial_str(&addr) {
+            match dialer.dial_str(&addr) {
                 Ok(mut conn) => {
                     exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
                 }
                 Err(_) => false,
-            };
-            node.drain(300);
-            ok
+            }
         }
     }
 }
@@ -959,7 +995,7 @@ where
 /// Persist before networking, then remove only after a recipient-device ACK.
 fn deliver_or_park(
     store: &mut FileStore,
-    device_secret: [u8; 32],
+    network: &DirectNetwork,
     recipient: &Handle,
     device: &Device,
     item: MailItem,
@@ -980,7 +1016,7 @@ fn deliver_or_park(
         return DeliveryPath::Failed;
     }
 
-    if deliver_direct(store, device_secret, device, &delivery_id, &item, now).is_delivered() {
+    if deliver_direct(store, network, device, &delivery_id, &item, now).is_delivered() {
         // Acceptance is already proven. If cleanup fails, leaving the entry is
         // safe: the recipient deduplicates the retry and returns the ACK again.
         let _ = outbox::remove(store, &delivery_id);
@@ -993,8 +1029,8 @@ fn deliver_or_park(
 /// Persist a follow-up generated while accepting inbound mail. The acceptance
 /// ACK must not wait on more network I/O; the background retry worker delivers
 /// this item after the receive transaction releases local state.
-fn park_delivery(
-    store: &mut FileStore,
+fn park_delivery<S: Storage>(
+    store: &mut S,
     recipient: &Handle,
     device: &Device,
     item: MailItem,
@@ -1009,7 +1045,7 @@ fn park_delivery(
 }
 
 fn request_discovery_from_device(
-    device_secret: [u8; 32],
+    network: &DirectNetwork,
     device: &Device,
     want: &[String],
 ) -> Result<Vec<crate::groups::DiscoveryRecord>> {
@@ -1028,14 +1064,14 @@ fn request_discovery_from_device(
         }
         DirectTransport::Libp2p => {
             let addr = String::from_utf8_lossy(&device.peer_id.0);
-            let mut node = libp2p_net::Libp2pNode::new(device_secret, None)?;
-            let mut conn = node
+            let dialer = network
+                .libp2p()
+                .ok_or_else(|| anyhow!("could not start libp2p network actor"))?;
+            let mut conn = dialer
                 .dial_str(&addr)
                 .with_context(|| format!("could not connect to {addr}"))?;
             conn.send_frame(&frame)?;
-            let records = decode_discovery_response(&conn.recv_frame()?)?;
-            node.drain(300);
-            Ok(records)
+            decode_discovery_response(&conn.recv_frame()?)
         }
     }
 }
@@ -1073,13 +1109,30 @@ fn handle_delivery_frame<W: FrameWriter>(
         Ok(inbox::Seen::New) => {}
     }
 
-    remember_sender(fs, &item);
-    if process_item(identity, me, my_record, blocked, platform, fs, item)
-        != flow::ItemOutcome::Accepted
+    let mut tx = fs.transaction();
+    remember_sender(&mut tx, &item);
+    let mut sink = BufferedSink::default();
+    if process_item_with_sink(
+        identity, me, my_record, blocked, platform, &mut tx, item, &mut sink,
+    ) != flow::ItemOutcome::Accepted
     {
         return;
     }
-    if inbox::record(fs, delivery_id.clone(), digest, platform.now_unix_secs()).is_ok() {
+    if inbox::record(
+        &mut tx,
+        delivery_id.clone(),
+        digest,
+        platform.now_unix_secs(),
+    )
+    .is_err()
+    {
+        return;
+    }
+    if tx.commit().is_ok() {
+        let mut cli = CliSink;
+        for event in sink.0 {
+            flow::FlowSink::emit(&mut cli, event);
+        }
         send_delivery_ack(identity, writer, delivery_id, &payload);
     }
 }
@@ -1143,7 +1196,10 @@ fn handle_discovery_frame<W: FrameWriter>(
     }
 }
 
-fn remember_sender(fs: &mut FileStore, item: &MailItem) {
+fn remember_sender<S: Storage>(fs: &mut S, item: &MailItem)
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let env = match item {
         MailItem::Direct(env)
         | MailItem::SelfSync { envelope: env, .. }
@@ -1220,6 +1276,15 @@ impl flow::FlowSink for CliSink {
     }
 }
 
+#[derive(Default)]
+struct BufferedSink(Vec<flow::FlowEvent>);
+
+impl flow::FlowSink for BufferedSink {
+    fn emit(&mut self, event: flow::FlowEvent) {
+        self.0.push(event);
+    }
+}
+
 pub fn process_item(
     identity: &Identity,
     me: &Handle,
@@ -1229,15 +1294,34 @@ pub fn process_item(
     fs: &mut FileStore,
     item: MailItem,
 ) -> flow::ItemOutcome {
+    let mut sink = CliSink;
+    process_item_with_sink(
+        identity, me, my_record, blocked, platform, fs, item, &mut sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_item_with_sink<S: Storage>(
+    identity: &Identity,
+    me: &Handle,
+    my_record: &SignedRecord,
+    blocked: &[String],
+    platform: &mut OsPlatform,
+    fs: &mut S,
+    item: MailItem,
+    sink: &mut dyn flow::FlowSink,
+) -> flow::ItemOutcome
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let now = platform.now_unix_secs();
     let net = LocalNet::load(fs);
-    let mut deliver = |store: &mut FileStore,
+    let mut deliver = |store: &mut S,
                        handle: &Handle,
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem|
      -> DeliveryPath { park_delivery(store, handle, device, item, now) };
-    let mut sink = CliSink;
     flow::process_item(
         identity,
         fs,
@@ -1247,7 +1331,7 @@ pub fn process_item(
         my_record,
         blocked,
         item,
-        &mut sink,
+        sink,
         &mut deliver,
     )
 }
@@ -1334,23 +1418,22 @@ pub fn group_send(
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let _ = flush_outbox(&identity, &mut fs);
+    let network = DirectNetwork::new(identity.device_secret());
+    let _ = flush_outbox_with_network(&identity, &mut fs, &network);
     let mut stored = resolve_group(&fs, group)?;
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
 
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let device_secret = identity.device_secret();
     let net = LocalNet::load(&fs);
-    let mut deliver = |store: &mut FileStore,
-                       handle: &Handle,
-                       _record: &SignedRecord,
-                       device: &Device,
-                       item: MailItem|
-     -> DeliveryPath {
-        deliver_or_park(store, device_secret, handle, device, item, now)
-    };
+    let mut deliver =
+        |store: &mut FileStore,
+         handle: &Handle,
+         _record: &SignedRecord,
+         device: &Device,
+         item: MailItem|
+         -> DeliveryPath { deliver_or_park(store, &network, handle, device, item, now) };
 
     let out = flow::group_send(
         &identity,
@@ -1437,14 +1520,14 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
     let stored = resolve_group(&fs, group)?;
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
     let now = OsPlatform.now_unix_secs();
-    let device_secret = identity.device_secret();
+    let network = DirectNetwork::new(identity.device_secret());
     let net = LocalNet::load(&fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem| {
-        let _ = deliver_or_park(store, device_secret, handle, device, item, now);
+        let _ = deliver_or_park(store, &network, handle, device, item, now);
     };
     flow::group_leave(
         &identity,
@@ -1479,7 +1562,7 @@ pub fn group_sync(whoami: &str) -> Result<()> {
     }
 
     let now = OsPlatform.now_unix_secs();
-    let device_secret = identity.device_secret();
+    let network = DirectNetwork::new(identity.device_secret());
     let mut synced = 0usize;
     for id in groups::list(&fs)? {
         let Some(stored) = groups::load(&fs, &id)? else {
@@ -1512,7 +1595,7 @@ pub fn group_sync(whoami: &str) -> Result<()> {
                 continue;
             };
             let item = MailItem::GroupSync(env);
-            let _ = deliver_or_park(&mut fs, device_secret, &me, device, item, now);
+            let _ = deliver_or_park(&mut fs, &network, &me, device, item, now);
         }
         synced += 1;
     }
@@ -1551,14 +1634,14 @@ fn distribute_group_key_direct(
     fs: &mut FileStore,
 ) {
     let now = OsPlatform.now_unix_secs();
-    let device_secret = identity.device_secret();
+    let network = DirectNetwork::new(identity.device_secret());
     let net = LocalNet::load(fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem| {
-        let _ = deliver_or_park(store, device_secret, handle, device, item, now);
+        let _ = deliver_or_park(store, &network, handle, device, item, now);
     };
     flow::distribute_key(
         identity,
@@ -2189,6 +2272,16 @@ mod tests {
         sent: Option<Vec<u8>>,
     }
 
+    #[derive(Default)]
+    struct CaptureWriter(Vec<Vec<u8>>);
+
+    impl FrameWriter for CaptureWriter {
+        fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
+            self.0.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
     impl FrameWriter for AckWire {
         fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
             self.sent = Some(bytes.to_vec());
@@ -2262,6 +2355,71 @@ mod tests {
             &payload,
             &device.device_key,
         ));
+    }
+
+    #[test]
+    fn recipient_commits_message_and_dedup_record_before_ack() {
+        let mut platform = SeededPlatform(20);
+        let alice = Identity::generate(&mut platform).unwrap();
+        let bob = Identity::generate(&mut platform).unwrap();
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_handle = Handle::new("bob").unwrap();
+        let alice_record = crate::wireops::build_record(
+            &mut platform,
+            &alice,
+            &alice_handle,
+            "Alice",
+            "127.0.0.1:1",
+        );
+        let bob_record =
+            crate::wireops::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        let app = crate::wireops::text_message(&mut platform, "hello");
+        let envelope = crate::wireops::seal_to_with_record(
+            &mut platform,
+            &alice,
+            &alice_handle,
+            &alice_record,
+            bob_record.record.primary(),
+            &app.encode(),
+        )
+        .unwrap();
+        let item = MailItem::Direct(envelope);
+        let payload = wire::encode(&item);
+        let digest = payload_digest(&payload);
+        let dir = std::env::temp_dir().join(format!(
+            "mycellium-acceptance-transaction-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = FileStore::open(dir.clone(), [7; 32]).unwrap();
+        let mut writer = CaptureWriter::default();
+
+        handle_delivery_frame(
+            &bob,
+            &bob_handle,
+            &bob_record,
+            &[],
+            &mut OsPlatform,
+            &mut store,
+            &mut writer,
+            "delivery-atomic".into(),
+            item,
+        );
+
+        assert_eq!(writer.0.len(), 1, "ACK is emitted after commit");
+        assert_eq!(history::load(&store, "alice").unwrap().len(), 1);
+        assert_eq!(
+            inbox::seen(&store, "delivery-atomic", &digest).unwrap(),
+            inbox::Seen::Duplicate
+        );
+        drop(store);
+        let reopened = FileStore::open(dir.clone(), [7; 32]).unwrap();
+        assert_eq!(history::load(&reopened, "alice").unwrap().len(), 1);
+        assert_eq!(
+            inbox::seen(&reopened, "delivery-atomic", &digest).unwrap(),
+            inbox::Seen::Duplicate
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

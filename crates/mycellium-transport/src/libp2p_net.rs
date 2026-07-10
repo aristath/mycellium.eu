@@ -8,6 +8,7 @@
 //!
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -59,20 +60,32 @@ enum NodeEvent {
 
 /// A running libp2p node: owns the runtime and the swarm-driving task.
 pub struct Libp2pNode {
-    rt: Runtime,
-    control: stream::Control,
+    dialer: Libp2pDialer,
     incoming: stream::IncomingStreams,
-    cmd_tx: mpsc::UnboundedSender<Command>,
     event_rx: mpsc::UnboundedReceiver<NodeEvent>,
     peer_id: PeerId,
+}
+
+/// Cloneable outbound handle to one long-lived swarm.
+///
+/// Clones share the same runtime, peer identity, connections, and stream
+/// control. A listener can therefore keep accepting inbound streams while
+/// background retry workers open outbound streams through this handle.
+#[derive(Clone)]
+pub struct Libp2pDialer {
+    rt: Arc<Runtime>,
+    control: stream::Control,
+    cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
 impl Libp2pNode {
     /// Build a node from the device key, optionally listening on `listen_addr`.
     pub fn new(device_secret: [u8; 32], listen_addr: Option<Multiaddr>) -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?,
+        );
 
         let mut secret = device_secret;
         let keypair = identity::Keypair::ed25519_from_bytes(&mut secret)
@@ -131,11 +144,14 @@ impl Libp2pNode {
             Ok::<_, anyhow::Error>((control, incoming))
         })?;
 
-        Ok(Libp2pNode {
+        let dialer = Libp2pDialer {
             rt,
             control,
-            incoming,
             cmd_tx,
+        };
+        Ok(Libp2pNode {
+            dialer,
+            incoming,
             event_rx,
             peer_id,
         })
@@ -144,7 +160,7 @@ impl Libp2pNode {
     /// Block until this node reports a concrete listen address (the OS-assigned
     /// `/ip4/…/tcp/<port>` after a `tcp/0` bind), or time out.
     pub fn listen_addr(&mut self) -> Result<Multiaddr> {
-        let handle = self.rt.handle().clone();
+        let handle = self.dialer.rt.handle().clone();
         let event_rx = &mut self.event_rx;
         handle.block_on(async {
             match tokio::time::timeout(LISTEN_TIMEOUT, event_rx.recv()).await {
@@ -160,19 +176,62 @@ impl Libp2pNode {
         self.peer_id
     }
 
+    /// Clone an outbound handle backed by this node's existing swarm.
+    pub fn dialer(&self) -> Libp2pDialer {
+        self.dialer.clone()
+    }
+
     /// Dial a peer given its multiaddr as a string.
-    pub fn dial_str(&mut self, target: &str) -> Result<Libp2pConnection> {
+    pub fn dial_str(&self, target: &str) -> Result<Libp2pConnection> {
+        self.dialer.dial_str(target)
+    }
+
+    /// Dial a peer given its full multiaddr (must include `/p2p/<peer-id>`).
+    pub fn dial(&self, target: &Multiaddr) -> Result<Libp2pConnection> {
+        self.dialer.dial(target)
+    }
+
+    /// Wait for an inbound `/mycellium/1.0` stream and return it as a connection.
+    pub fn accept(&mut self) -> Result<Libp2pConnection> {
+        let next = self.dialer.rt.block_on(self.incoming.next());
+        let (_peer, stream) = next.ok_or_else(|| anyhow!("stream listener closed"))?;
+        Ok(Libp2pConnection {
+            handle: self.dialer.rt.handle().clone(),
+            stream,
+        })
+    }
+
+    /// Let the background swarm run for `millis` so buffered stream data is
+    /// actually transmitted before the node (and its runtime) is dropped.
+    pub fn drain(&self, millis: u64) {
+        self.dialer
+            .rt
+            .block_on(async move { tokio::time::sleep(Duration::from_millis(millis)).await });
+    }
+}
+
+impl Libp2pDialer {
+    /// Start one outbound-only swarm. Keep this handle and clone it instead of
+    /// constructing a node for every delivery.
+    pub fn new(device_secret: [u8; 32]) -> Result<Self> {
+        Ok(Libp2pNode::new(device_secret, None)?.dialer())
+    }
+
+    /// Dial a peer given its multiaddr as a string.
+    pub fn dial_str(&self, target: &str) -> Result<Libp2pConnection> {
         let addr: Multiaddr = target
             .parse()
             .map_err(|_| anyhow!("'{target}' is not a valid multiaddr"))?;
         self.dial(&addr)
     }
 
-    /// Dial a peer given its full multiaddr (must include `/p2p/<peer-id>`).
-    pub fn dial(&mut self, target: &Multiaddr) -> Result<Libp2pConnection> {
+    /// Dial a peer through the shared swarm.
+    pub fn dial(&self, target: &Multiaddr) -> Result<Libp2pConnection> {
         let peer = peer_from_multiaddr(target)
             .ok_or_else(|| anyhow!("multiaddr is missing a /p2p/<peer-id> component"))?;
-        self.cmd_tx.send(Command::Dial(target.clone())).ok();
+        self.cmd_tx
+            .send(Command::Dial(target.clone()))
+            .map_err(|_| anyhow!("libp2p swarm stopped"))?;
 
         let mut control = self.control.clone();
         let stream = self.rt.block_on(async move {
@@ -191,23 +250,6 @@ impl Libp2pNode {
             handle: self.rt.handle().clone(),
             stream,
         })
-    }
-
-    /// Wait for an inbound `/mycellium/1.0` stream and return it as a connection.
-    pub fn accept(&mut self) -> Result<Libp2pConnection> {
-        let next = self.rt.block_on(self.incoming.next());
-        let (_peer, stream) = next.ok_or_else(|| anyhow!("stream listener closed"))?;
-        Ok(Libp2pConnection {
-            handle: self.rt.handle().clone(),
-            stream,
-        })
-    }
-
-    /// Let the background swarm run for `millis` so buffered stream data is
-    /// actually transmitted before the node (and its runtime) is dropped.
-    pub fn drain(&self, millis: u64) {
-        self.rt
-            .block_on(async move { tokio::time::sleep(Duration::from_millis(millis)).await });
     }
 }
 
@@ -619,25 +661,31 @@ mod tests {
     }
 
     #[test]
-    fn two_nodes_stream_a_message() {
-        // Bob listens; Alice dials Bob's PeerId and sends a framed message.
-        let mut bob = Libp2pNode::new([7u8; 32], Some(listen_addr(41001))).unwrap();
+    fn one_outbound_actor_reuses_its_swarm_for_multiple_streams() {
+        let mut bob = Libp2pNode::new([7u8; 32], Some(listen_addr(0))).unwrap();
         let bob_peer = bob.peer_id();
+        let bob_addr = bob.listen_addr().unwrap();
 
         let bob_thread = std::thread::spawn(move || {
-            let mut conn = bob.accept().unwrap();
-            conn.recv().unwrap()
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let mut conn = bob.accept().unwrap();
+                received.push(conn.recv().unwrap());
+            }
+            received
         });
 
-        let mut alice = Libp2pNode::new([9u8; 32], None).unwrap();
-        let dial: Multiaddr = format!("/ip4/127.0.0.1/tcp/41001/p2p/{bob_peer}")
-            .parse()
-            .unwrap();
-        let mut conn = alice.dial(&dial).unwrap();
-        conn.send(b"hello over libp2p").unwrap();
+        // `Libp2pDialer::new` drops its temporary node shell. The cloneable
+        // dialer keeps the one runtime and swarm alive across both deposits.
+        let alice = Libp2pDialer::new([9u8; 32]).unwrap();
+        let dial: Multiaddr = format!("{bob_addr}/p2p/{bob_peer}").parse().unwrap();
+        for message in [b"first".as_slice(), b"second".as_slice()] {
+            let mut conn = alice.dial(&dial).unwrap();
+            conn.send(message).unwrap();
+        }
 
         let received = bob_thread.join().unwrap();
-        assert_eq!(received, b"hello over libp2p");
+        assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
     }
 
     #[test]
