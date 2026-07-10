@@ -9,7 +9,7 @@ use mycellium_core::identity::{Handle, Identity, PeerId};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::{Ratchet, RatchetMessage};
-use mycellium_core::record::{Device, Record, SignedPreKey, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 
@@ -49,12 +49,7 @@ fn valid_signed_record(p: &mut SeededPlatform) -> SignedRecord {
         handle: Handle::new("ari").unwrap(),
         name: String::new(),
         wallet: id.wallet_public(),
-        devices: vec![Device {
-            device_key: id.device_public(),
-            peer_id: PeerId(vec![1, 2, 3, 4]),
-            id_key: id.messaging_public(),
-            signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), &id),
-        }],
+        devices: vec![Device::create(&id, PeerId(vec![1, 2, 3, 4]), 1)],
         seq: 1,
     };
     SignedRecord::sign(record, &id)

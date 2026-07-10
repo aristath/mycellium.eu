@@ -189,7 +189,7 @@ pub trait FlowSink {
 /// broadcast, chat, and the group paths): resolve `handle`, look it up through
 /// the injected [`FlowNet`], check the record's self-signature, fail closed on a
 /// changed pinned wallet ([`verified::level`]), and refuse a rolled-back record
-/// ([`antirollback::check_and_pin`], which also pins the seq on success).
+/// ([`antirollback::check_and_pin`], which pins every component version).
 ///
 /// Contacts-nickname resolution is host-specific (the native CLI resolves a
 /// saved nickname to a handle first), so this takes an already-resolved handle
@@ -216,13 +216,8 @@ where
     }
     // Anti-rollback: refuse (and never pin) a record older than one we've already
     // seen for this handle — a downgrade the wallet-change guard cannot see (HIGH).
-    if !antirollback::check_and_pin(
-        store,
-        handle.as_str(),
-        &record.record.wallet,
-        record.record.seq,
-    )
-    .map_err(|_| TrustError::StaleRecord)?
+    if !antirollback::check_and_pin(store, handle.as_str(), &record)
+        .map_err(|_| TrustError::StaleRecord)?
     {
         return Err(TrustError::StaleRecord);
     }

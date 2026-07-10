@@ -1,61 +1,128 @@
-//! Client-side anti-rollback for signed peer records.
+//! Atomic anti-rollback version vectors for split peer records.
 //!
-//! A record carries a wallet-signed, monotonic `seq`. Any resolver, import path,
-//! or stale file can still present an older — still validly-signed, same-wallet —
-//! record to roll a peer back to a stale device set (for example re-introducing a
-//! device the victim removed after a compromise, so a sender seals to it again).
-//! The wallet-change (TOFU) guard can't catch that: the wallet is unchanged.
-//!
-//! So each client pins the highest `seq` it has seen per handle and refuses a
-//! regression inside the trust boundary that matters: the client.
+//! Identity membership, stable device keys, and device reachability advance
+//! independently. One wallet-scoped pin stores the high-water mark for every
+//! component, so a fresh address can never hide a rolled-back identity/device
+//! claim (or vice versa).
 
-use mycellium_core::identity::WalletPublicKey;
+use serde::{Deserialize, Serialize};
+
+use mycellium_core::identity::{DevicePublicKey, WalletPublicKey};
+use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
+use mycellium_core::wire;
 
 fn key(handle: &str, wallet: &WalletPublicKey) -> Vec<u8> {
-    let mut k = b"seqpin:".to_vec();
-    k.extend_from_slice(handle.as_bytes());
-    k.push(b':');
-    k.extend_from_slice(&wallet.0);
-    k
+    let mut key = b"record-versions-v1:".to_vec();
+    key.extend_from_slice(handle.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(&wallet.0);
+    key
 }
 
-/// The highest record `seq` pinned for one handle/wallet claim, if any.
-pub fn highest<S: Storage>(
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct VersionPins {
+    identity: u64,
+    identity_digest: [u8; 32],
+    devices: Vec<DevicePins>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DevicePins {
+    key: DevicePublicKey,
+    stable: u64,
+    stable_digest: [u8; 32],
+    reachability: u64,
+    reachability_digest: [u8; 32],
+}
+
+fn digest<T: Serialize>(value: &T) -> [u8; 32] {
+    mycellium_core::delivery::payload_digest(&wire::canonical(value))
+}
+
+fn load<S: Storage>(
     store: &S,
     handle: &str,
     wallet: &WalletPublicKey,
-) -> Result<Option<u64>, S::Error> {
-    Ok(store.get(&key(handle, wallet))?.and_then(|b| {
-        <[u8; 8]>::try_from(b.as_slice())
-            .ok()
-            .map(u64::from_le_bytes)
-    }))
+) -> Result<VersionPins, S::Error> {
+    Ok(store
+        .get(&key(handle, wallet))?
+        .and_then(|bytes| wire::decode(&bytes).ok())
+        .unwrap_or_default())
 }
 
-/// Check `seq` against the pinned high-water mark for `handle` and, if it is not
-/// a rollback, advance the pin. Returns `Ok(true)` when the record is fresh
-/// (`seq >= pinned`, or nothing pinned yet); `Ok(false)` when it is a rollback
-/// (`seq < pinned`), leaving the pin unchanged.
+/// Atomically validate and advance every component in a verified record.
 pub fn check_and_pin<S: Storage>(
     store: &mut S,
     handle: &str,
-    wallet: &WalletPublicKey,
-    seq: u64,
+    record: &SignedRecord,
 ) -> Result<bool, S::Error> {
-    if let Some(seen) = highest(store, handle, wallet)? {
-        if seq < seen {
-            return Ok(false);
+    let wallet = &record.record.wallet;
+    let mut pins = load(store, handle, wallet)?;
+    let identity_digest = mycellium_core::delivery::payload_digest(&record.record.signing_bytes());
+    if record.record.seq < pins.identity
+        || (record.record.seq == pins.identity
+            && pins.identity != 0
+            && identity_digest != pins.identity_digest)
+    {
+        return Ok(false);
+    }
+    for device in &record.record.devices {
+        let stable_digest = digest(&device.signed.record);
+        let reachability_digest = digest(&device.reachability.record);
+        if let Some(known) = pins
+            .devices
+            .iter()
+            .find(|known| known.key == device.device_key)
+        {
+            if device.signed.record.seq < known.stable
+                || (device.signed.record.seq == known.stable
+                    && stable_digest != known.stable_digest)
+                || device.reachability.record.seq < known.reachability
+                || (device.reachability.record.seq == known.reachability
+                    && reachability_digest != known.reachability_digest)
+            {
+                return Ok(false);
+            }
         }
     }
-    store.put(&key(handle, wallet), &seq.to_le_bytes())?;
+
+    if record.record.seq > pins.identity || pins.identity == 0 {
+        pins.identity = record.record.seq;
+        pins.identity_digest = identity_digest;
+    }
+    for device in &record.record.devices {
+        let stable_digest = digest(&device.signed.record);
+        let reachability_digest = digest(&device.reachability.record);
+        match pins
+            .devices
+            .iter_mut()
+            .find(|known| known.key == device.device_key)
+        {
+            Some(known) => {
+                if device.signed.record.seq > known.stable {
+                    known.stable = device.signed.record.seq;
+                    known.stable_digest = stable_digest;
+                }
+                if device.reachability.record.seq > known.reachability {
+                    known.reachability = device.reachability.record.seq;
+                    known.reachability_digest = reachability_digest;
+                }
+            }
+            None => pins.devices.push(DevicePins {
+                key: device.device_key,
+                stable: device.signed.record.seq,
+                stable_digest,
+                reachability: device.reachability.record.seq,
+                reachability_digest,
+            }),
+        }
+    }
+    store.put(&key(handle, wallet), &wire::encode(&pins))?;
     Ok(true)
 }
 
-/// Clear the local high-water mark for `handle`.
-///
-/// This is only for explicit user-controlled local resets. Normal import and
-/// discovery paths must keep using [`check_and_pin`].
+/// Clear every component high-water mark for one explicit handle/wallet reset.
 pub fn clear<S: Storage>(
     store: &mut S,
     handle: &str,
@@ -67,6 +134,9 @@ pub fn clear<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mycellium_core::identity::{Handle, Identity, PeerId};
+    use mycellium_core::platform::Platform;
+    use mycellium_core::record::{Device, Record, SignedRecord};
     use std::collections::HashMap;
     use std::convert::Infallible;
 
@@ -74,46 +144,64 @@ mod tests {
     struct Mem(HashMap<Vec<u8>, Vec<u8>>);
     impl Storage for Mem {
         type Error = Infallible;
-        fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, Infallible> {
-            Ok(self.0.get(k).cloned())
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.get(key).cloned())
         }
-        fn put(&mut self, k: &[u8], v: &[u8]) -> Result<(), Infallible> {
-            self.0.insert(k.to_vec(), v.to_vec());
+        fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+            self.0.insert(key.to_vec(), value.to_vec());
             Ok(())
         }
-        fn delete(&mut self, k: &[u8]) -> Result<(), Infallible> {
-            self.0.remove(k);
+        fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error> {
+            self.0.remove(key);
             Ok(())
         }
     }
 
-    #[test]
-    fn pins_and_rejects_rollback() {
-        let mut s = Mem::default();
-        let wallet = WalletPublicKey([2; 33]);
-        // First sight of any seq is accepted and pinned.
-        assert!(check_and_pin(&mut s, "bob", &wallet, 5).unwrap());
-        // Equal or higher is fresh and advances the pin.
-        assert!(check_and_pin(&mut s, "bob", &wallet, 5).unwrap());
-        assert!(check_and_pin(&mut s, "bob", &wallet, 9).unwrap());
-        // A lower seq, whatever path supplied it, is refused.
-        assert!(!check_and_pin(&mut s, "bob", &wallet, 8).unwrap());
-        // ...and the rejected attempt did not lower the pin.
-        assert_eq!(highest(&s, "bob", &wallet).unwrap(), Some(9));
-        // A different handle is independent.
-        assert!(check_and_pin(&mut s, "carol", &wallet, 1).unwrap());
-        // A competing wallet cannot poison this wallet's sequence space.
-        let other = WalletPublicKey([3; 33]);
-        assert!(check_and_pin(&mut s, "bob", &other, 1).unwrap());
+    struct TestPlatform;
+    impl Platform for TestPlatform {
+        fn fill_random(&mut self, bytes: &mut [u8]) {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = index as u8;
+            }
+        }
+        fn now_unix_secs(&self) -> u64 {
+            1
+        }
+    }
+
+    fn signed(
+        identity: &Identity,
+        identity_seq: u64,
+        component_seq: u64,
+        address: &[u8],
+    ) -> SignedRecord {
+        SignedRecord::sign(
+            Record {
+                handle: Handle::new("bob").unwrap(),
+                name: "Bob".into(),
+                wallet: identity.wallet_public(),
+                devices: vec![Device::create(
+                    identity,
+                    PeerId(address.to_vec()),
+                    component_seq,
+                )],
+                seq: identity_seq,
+            },
+            identity,
+        )
     }
 
     #[test]
-    fn explicit_clear_removes_the_pin() {
-        let mut s = Mem::default();
-        let wallet = WalletPublicKey([2; 33]);
-        assert!(check_and_pin(&mut s, "bob", &wallet, 9).unwrap());
-        clear(&mut s, "bob", &wallet).unwrap();
-        assert_eq!(highest(&s, "bob", &wallet).unwrap(), None);
-        assert!(check_and_pin(&mut s, "bob", &wallet, 1).unwrap());
+    fn independently_pins_identity_device_and_reachability_versions() {
+        let identity = Identity::generate(&mut TestPlatform).unwrap();
+        let mut store = Mem::default();
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 5, 9, b"one")).unwrap());
+        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 4, 10, b"one")).unwrap());
+        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 6, 8, b"one")).unwrap());
+        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 5, 9, b"two")).unwrap());
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 6, 10, b"two")).unwrap());
+
+        clear(&mut store, "bob", &identity.wallet_public()).unwrap();
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 1, 1, b"reset")).unwrap());
     }
 }

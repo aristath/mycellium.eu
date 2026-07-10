@@ -558,7 +558,7 @@ fn chat(peer: &str, whoami: &str, tui: bool) -> Result<()> {
         })?;
         (peer_handle, peer_record, my_record)
     };
-    let location = String::from_utf8(peer_record.record.primary().peer_id.0.clone())
+    let location = String::from_utf8(peer_record.record.primary().peer_id().0.clone())
         .context("peer record has no dialable address")?;
 
     if location.starts_with('/') {
@@ -588,7 +588,7 @@ fn chat(peer: &str, whoami: &str, tui: bool) -> Result<()> {
     } else {
         let mut transport = TcpTransport::dialer();
         let mut conn = transport
-            .dial(&peer_record.record.primary().peer_id)
+            .dial(peer_record.record.primary().peer_id())
             .with_context(|| format!("could not connect to {location}"))?;
         let session = handshake_initiator(
             &mut conn,

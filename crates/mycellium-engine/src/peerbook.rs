@@ -54,18 +54,18 @@ where
     record
         .verify()
         .map_err(|_| anyhow::anyhow!("record failed verification"))?;
-    if record.record.devices.iter().any(|d| d.peer_id.0.is_empty()) {
+    if record
+        .record
+        .devices
+        .iter()
+        .any(|d| d.peer_id().0.is_empty())
+    {
         anyhow::bail!(
             "record for '{}' has an empty device address",
             handle.as_str()
         );
     }
-    if !antirollback::check_and_pin(
-        store,
-        handle.as_str(),
-        &record.record.wallet,
-        record.record.seq,
-    )? {
+    if !antirollback::check_and_pin(store, handle.as_str(), &record)? {
         anyhow::bail!("stale record for '{}'", handle.as_str());
     }
 
@@ -159,7 +159,11 @@ pub fn build_record(
         handle: user_id(handle.as_str()),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        devices: vec![crate::wireops::this_device(identity, addr)],
+        devices: vec![crate::wireops::this_device(
+            identity,
+            addr,
+            platform.now_unix_secs(),
+        )],
         seq: platform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)

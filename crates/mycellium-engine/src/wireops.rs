@@ -11,7 +11,7 @@ use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::Ratchet;
-use mycellium_core::record::{Device, Record, SignedPreKey, SignedRecord};
+use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::userid::user_id;
 use mycellium_core::x3dh;
 
@@ -77,13 +77,8 @@ pub fn group_ad(group_id: &str) -> Vec<u8> {
 }
 
 /// This device's peer-record entry (keys + signed pre-key).
-pub fn this_device(identity: &Identity, addr: &str) -> Device {
-    Device {
-        device_key: identity.device_public(),
-        peer_id: PeerId(addr.as_bytes().to_vec()),
-        id_key: identity.messaging_public(),
-        signed_pre_key: SignedPreKey::create(identity.signed_pre_key_public(), identity),
-    }
+pub fn this_device(identity: &Identity, addr: &str, seq: u64) -> Device {
+    Device::create(identity, PeerId(addr.as_bytes().to_vec()), seq)
 }
 
 /// Build and sign this identity's peer record.
@@ -100,7 +95,7 @@ pub fn build_record<P: Platform>(
         handle: user_id(handle.as_str()),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        devices: vec![this_device(identity, addr)],
+        devices: vec![this_device(identity, addr, platform.now_unix_secs())],
         seq: platform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)

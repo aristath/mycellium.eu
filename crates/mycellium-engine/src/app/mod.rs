@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
 use mycellium_core::group::Group;
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, PeerId, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
@@ -137,20 +137,44 @@ pub fn register(handle: &str, addr: &str, libp2p: bool) -> Result<()> {
         .as_ref()
         .map(|r| r.record.devices.clone())
         .unwrap_or_default();
-    let mine = this_device(&identity, &location);
-    match devices.iter_mut().find(|d| d.device_key == mine.device_key) {
-        Some(slot) => *slot = mine,
-        None => devices.push(mine),
+    let now = OsPlatform.now_unix_secs();
+    let mut membership_changed = false;
+    match devices
+        .iter_mut()
+        .find(|device| device.device_key == identity.device_public())
+    {
+        Some(device) => {
+            let reachability_seq = now.max(device.reachability.record.seq.saturating_add(1));
+            *device = device
+                .refresh_reachability(
+                    &identity,
+                    PeerId(location.as_bytes().to_vec()),
+                    reachability_seq,
+                )
+                .map_err(|_| anyhow!("could not sign refreshed reachability"))?;
+        }
+        None => {
+            devices.push(this_device(&identity, &location, now));
+            membership_changed = true;
+        }
     }
-    let prev = existing.as_ref().map(|r| r.record.seq).unwrap_or(0);
-    let signed = peerbook::with_devices(
-        &mut OsPlatform,
-        &identity,
-        &handle,
-        &display_name_for(&handle),
-        devices,
-        prev,
-    );
+    let name = display_name_for(&handle);
+    let signed = match existing {
+        Some(mut record) if !membership_changed && record.record.name == name => {
+            // The wallet-signed identity and stable device records remain
+            // byte-for-byte unchanged for a pure address refresh.
+            record.record.devices = devices;
+            record
+        }
+        existing => peerbook::with_devices(
+            &mut OsPlatform,
+            &identity,
+            &handle,
+            &name,
+            devices,
+            existing.as_ref().map(|r| r.record.seq).unwrap_or(0),
+        ),
+    };
     peerbook::put(&mut fs, &handle, signed.clone())?;
     println!("registered '{}' locally at {}", handle.as_str(), location);
     println!("record: {}", peerbook::encode(&signed));
@@ -237,7 +261,7 @@ pub fn list_devices(handle: &str) -> Result<()> {
         println!(
             "  {}  {}",
             short_device_id(&d.device_key),
-            String::from_utf8_lossy(&d.peer_id.0)
+            String::from_utf8_lossy(&d.peer_id().0)
         );
     }
     Ok(())
@@ -663,7 +687,7 @@ fn start_retry_worker(fs: Arc<Mutex<FileStore>>, network: DirectNetwork) {
 
 fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
     enum Target {
-        Device(Device),
+        Device(Box<Device>),
         Retry,
         Drop,
     }
@@ -696,7 +720,7 @@ fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
                         .iter()
                         .find(|device| device_slot(&device.device_key) == entry.slot)
                         .cloned()
-                        .map(Target::Device)
+                        .map(|device| Target::Device(Box::new(device)))
                         .unwrap_or(Target::Drop),
                     Ok(None) | Err(_) => Target::Retry,
                 },
@@ -946,17 +970,17 @@ fn direct_push(
         item: Box::new(item.clone()),
     };
     let frame = wire::encode(&frame);
-    match direct_transport(&device.peer_id.0) {
+    match direct_transport(&device.peer_id().0) {
         DirectTransport::None => false,
         DirectTransport::Tcp => {
-            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let addr = String::from_utf8_lossy(&device.peer_id().0);
             let Ok(mut conn) = net::TcpConnection::connect(&addr) else {
                 return false;
             };
             exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
         }
         DirectTransport::Libp2p => {
-            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let addr = String::from_utf8_lossy(&device.peer_id().0);
             let Some(dialer) = network.libp2p() else {
                 return false;
             };
@@ -1053,17 +1077,17 @@ fn request_discovery_from_device(
         want: want.to_vec(),
     };
     let frame = wire::encode(&request);
-    match direct_transport(&device.peer_id.0) {
+    match direct_transport(&device.peer_id().0) {
         DirectTransport::None => bail!("device has no dialable address"),
         DirectTransport::Tcp => {
-            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let addr = String::from_utf8_lossy(&device.peer_id().0);
             let mut conn = net::TcpConnection::connect(&addr)
                 .with_context(|| format!("could not connect to {addr}"))?;
             conn.send_frame(&frame)?;
             decode_discovery_response(&conn.recv_frame()?)
         }
         DirectTransport::Libp2p => {
-            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let addr = String::from_utf8_lossy(&device.peer_id().0);
             let dialer = network
                 .libp2p()
                 .ok_or_else(|| anyhow!("could not start libp2p network actor"))?;
@@ -1827,7 +1851,7 @@ fn best_dht_record_candidate(
                 }
                 let replace = best
                     .as_ref()
-                    .map(|known| record.record.seq > known.record.seq)
+                    .map(|known| record.freshness() > known.freshness())
                     .unwrap_or(true);
                 if replace {
                     best = Some(record);
@@ -2310,7 +2334,7 @@ mod tests {
     fn direct_delivery_requires_the_recipient_devices_acceptance_ack() {
         let mut platform = SeededPlatform(30);
         let bob = Identity::generate(&mut platform).unwrap();
-        let device = crate::wireops::this_device(&bob, "127.0.0.1:1");
+        let device = crate::wireops::this_device(&bob, "127.0.0.1:1", 1);
         let item = sample_mail();
         let payload = wire::encode(&item);
         let frame = wire::encode(&PeerFrame::Delivery {
@@ -2336,7 +2360,7 @@ mod tests {
         let mut platform = SeededPlatform(30);
         let bob = Identity::generate(&mut platform).unwrap();
         let mallory = Identity::generate(&mut SeededPlatform(130)).unwrap();
-        let device = crate::wireops::this_device(&bob, "127.0.0.1:1");
+        let device = crate::wireops::this_device(&bob, "127.0.0.1:1", 1);
         let item = sample_mail();
         let payload = wire::encode(&item);
         let frame = wire::encode(&PeerFrame::Delivery {

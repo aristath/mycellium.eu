@@ -38,7 +38,7 @@ mod tests {
     use crate::identity::Identity;
     use crate::platform::Platform;
     use crate::ratchet::Ratchet;
-    use crate::record::{Record, SignedPreKey};
+    use crate::record::{Device, Record};
     use crate::x3dh;
 
     struct SeededPlatform(u8);
@@ -59,12 +59,11 @@ mod tests {
             handle: Handle::new(handle).unwrap(),
             name: String::new(),
             wallet: id.wallet_public(),
-            devices: alloc::vec![crate::record::Device {
-                device_key: id.device_public(),
-                peer_id: crate::identity::PeerId(alloc::vec![]),
-                id_key: id.messaging_public(),
-                signed_pre_key: SignedPreKey::create(id.signed_pre_key_public(), id),
-            }],
+            devices: alloc::vec![Device::create(
+                id,
+                crate::identity::PeerId(alloc::vec![]),
+                1,
+            )],
             seq: 1,
         };
         SignedRecord::sign(record, id)
