@@ -488,7 +488,7 @@ fn init_client_config(path: Option<&str>) -> Result<()> {
         passphrase: file.passphrase,
         display_name: file.display_name.unwrap_or_default(),
         dht_bootstrap: file.dht_bootstrap,
-    });
+    })?;
     Ok(())
 }
 

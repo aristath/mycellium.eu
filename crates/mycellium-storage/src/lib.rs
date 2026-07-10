@@ -16,14 +16,20 @@ pub mod store;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// Create a directory and apply the platform's restrictive private-data mode.
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    perms::restrict_dir(path);
+    Ok(())
+}
+
 /// Durably replace one file: restrictive temp creation, full write, file sync,
 /// atomic rename, then parent-directory sync.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    perms::restrict_dir(parent);
+    create_private_dir(parent)?;
 
     let mut nonce = [0u8; 8];
     getrandom::getrandom(&mut nonce).map_err(|_| io::Error::other("RNG failure"))?;

@@ -13,7 +13,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -46,25 +46,18 @@ impl Default for ClientConfig {
     }
 }
 
-static CONFIG: OnceLock<Mutex<ClientConfig>> = OnceLock::new();
+static CONFIG: OnceLock<ClientConfig> = OnceLock::new();
 
-fn config_cell() -> &'static Mutex<ClientConfig> {
-    CONFIG.get_or_init(|| Mutex::new(ClientConfig::default()))
-}
-
-/// Replace the process-local client config.
-pub fn configure(config: ClientConfig) {
-    *config_cell().lock().unwrap() = config;
+/// Set the immutable process-local client config exactly once.
+pub fn configure(config: ClientConfig) -> Result<()> {
+    CONFIG
+        .set(config)
+        .map_err(|_| anyhow!("client storage is already configured"))
 }
 
 /// Return the current process-local client config.
 pub fn config() -> ClientConfig {
-    config_cell().lock().unwrap().clone()
-}
-
-/// Update just the configured display name.
-pub fn set_display_name(display_name: impl Into<String>) {
-    config_cell().lock().unwrap().display_name = display_name.into();
+    CONFIG.get().cloned().unwrap_or_default()
 }
 
 /// This account's display name, recorded in peer records.

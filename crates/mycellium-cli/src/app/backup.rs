@@ -27,7 +27,10 @@ pub struct Backup {
 
 pub fn export_backup(path: &str) -> Result<()> {
     // Require unlocking the identity to authorize the export.
-    let _ = store::load_identity()?;
+    let identity = store::load_identity()?;
+    // Opening the store replays any committed transaction journal before raw
+    // encrypted files are collected into the bundle.
+    drop(open_history(&identity)?);
     let identity = std::fs::read(store::path()).context("could not read identity")?;
 
     let store_dir = store::data_dir().join("history");
@@ -86,14 +89,85 @@ pub fn import_backup(path: &str) -> Result<()> {
         }
     }
 
-    std::fs::create_dir_all(store::data_dir())?;
-    mycellium_storage::atomic_write(&store::path(), &backup.identity)?;
-
-    let store_dir = store::data_dir().join("history");
-    std::fs::create_dir_all(&store_dir)?;
-    for (name, data) in &backup.store {
-        mycellium_storage::atomic_write(&store_dir.join(name), data)?;
-    }
+    publish_backup_tree(&store::data_dir(), &backup)?;
     println!("imported identity + {} store entries", backup.store.len());
     Ok(())
+}
+
+/// Stage the complete encrypted tree beside its destination and publish it with
+/// one directory rename. A crash before rename leaves no apparent identity; a
+/// retry removes the known staging directory and starts clean. A crash after
+/// rename sees the complete tree.
+fn publish_backup_tree(destination: &std::path::Path, backup: &Backup) -> Result<()> {
+    if destination.exists() {
+        let mut entries = std::fs::read_dir(destination)?;
+        if entries.next().transpose()?.is_some() {
+            bail!("data directory '{}' is not empty", destination.display());
+        }
+        std::fs::remove_dir(destination)?;
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    mycellium_storage::create_private_dir(parent)?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid data directory"))?;
+    let staging = parent.join(format!(".{name}.import-staging"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+
+    let result = (|| -> Result<()> {
+        let history = staging.join("history");
+        mycellium_storage::create_private_dir(&history)?;
+        mycellium_storage::atomic_write(&staging.join("identity.enc"), &backup.identity)?;
+        for (name, data) in &backup.store {
+            mycellium_storage::atomic_write(&history.join(name), data)?;
+        }
+        std::fs::File::open(&history)?.sync_all()?;
+        std::fs::File::open(&staging)?.sync_all()?;
+        std::fs::rename(&staging, destination)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_tree_is_published_as_one_complete_directory() {
+        let parent =
+            std::env::temp_dir().join(format!("mycellium-backup-publish-{}", std::process::id()));
+        let destination = parent.join("account");
+        let staging = parent.join(".account.import-staging");
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("partial"), b"old failed import").unwrap();
+        let backup = Backup {
+            identity: b"sealed identity".to_vec(),
+            store: vec![("00ff".into(), b"encrypted history".to_vec())],
+        };
+
+        publish_backup_tree(&destination, &backup).unwrap();
+
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(destination.join("identity.enc")).unwrap(),
+            b"sealed identity"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("history/00ff")).unwrap(),
+            b"encrypted history"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
 }
