@@ -1,3 +1,4 @@
+//! CLI formatting and message-building helpers.
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
@@ -32,18 +33,18 @@ pub fn preview(text: &str) -> String {
 
 /// Bind both peers' messaging identities into the AEAD associated data, so a
 /// ciphertext is cryptographically tied to *this* pair. Initiator's key first.
-// The platform-agnostic crypto helpers live in `crate::wireops`; these are the
+// The platform-agnostic crypto helpers live in the engine; these are the
 // native entry points that supply the OS platform.
-pub use crate::wireops::{associated_data, hex};
+pub use mycellium_engine::wireops::{associated_data, hex};
 
 /// A short random message id (native).
 pub fn random_id() -> String {
-    crate::wireops::random_id(&mut OsPlatform)
+    mycellium_engine::wireops::random_id(&mut OsPlatform)
 }
 
 /// A plain-text application message (no expiry).
 pub fn text_message(text: &str) -> AppMessage {
-    crate::wireops::text_message(&mut OsPlatform, text)
+    mycellium_engine::wireops::text_message(&mut OsPlatform, text)
 }
 
 /// Parse a duration like `30s`, `10m`, `1h`, `7d` into seconds.
@@ -205,26 +206,6 @@ fn save_attachment_in(
         }
     }
     anyhow::bail!("too many attachments named '{safe}'")
-}
-
-/// If the message is a file, save it and return where.
-pub fn maybe_save_attachment(app: &AppMessage) -> Option<std::path::PathBuf> {
-    if let Body::File { name, data, .. } = &app.body {
-        match save_attachment(name, data) {
-            Ok(path) => return Some(path),
-            Err(err) => eprintln!("(could not save attachment: {err})"),
-        }
-    }
-    None
-}
-
-pub fn from_hex(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        bail!("hex string has an odd length");
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| anyhow!("invalid hex")))
-        .collect()
 }
 
 #[cfg(test)]

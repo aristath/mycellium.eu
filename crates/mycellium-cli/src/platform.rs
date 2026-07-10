@@ -1,4 +1,4 @@
-//! Native [`Platform`]: OS entropy and the system clock.
+//! Native CLI [`Platform`]: OS entropy and the system clock.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

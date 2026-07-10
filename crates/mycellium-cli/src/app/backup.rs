@@ -1,3 +1,4 @@
+//! CLI backup and local-data lifecycle commands.
 #![allow(clippy::too_many_arguments)]
 use super::*;
 

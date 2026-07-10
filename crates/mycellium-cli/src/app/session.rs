@@ -1,3 +1,4 @@
+//! Interactive CLI session handshakes.
 #![allow(clippy::too_many_arguments)]
 use super::*;
 

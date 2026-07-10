@@ -4,6 +4,8 @@
 //! Peers exchange/import self-authenticating records, then messages travel over
 //! direct transports or wait in the sender's local outbox.
 
+mod app;
+mod platform;
 mod tui;
 
 use std::io::BufRead;
@@ -13,22 +15,22 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
+use app::*;
 use mycellium_core::identity::Handle;
 use mycellium_core::message::AppMessage;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::RatchetMessage;
 use mycellium_core::transport::Transport;
 use mycellium_core::wire;
-use mycellium_engine::app::*;
 use mycellium_engine::blocklist;
 use mycellium_engine::history::{self, StoredMessage};
 use mycellium_engine::peerbook;
-use mycellium_engine::platform::OsPlatform;
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
 use mycellium_transport::libp2p_net::{self, Libp2pNode};
 use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_transport::net::TcpTransport;
+use platform::OsPlatform;
 
 #[derive(Parser)]
 #[command(name = "mycellium", about = "Hard-serverless peer-to-peer messenger")]
@@ -307,7 +309,7 @@ enum DraftAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_client_config(cli.config.as_deref())?;
-    match cli.command {
+    let result = match cli.command {
         Command::IdentityNew => identity_new(),
         Command::IdentityAdopt { wallet_secret } => identity_adopt(&wallet_secret),
         Command::IdentityShow => identity_show(),
@@ -444,6 +446,18 @@ fn main() -> Result<()> {
             DraftAction::Clear { peer } => draft_clear(&peer),
         },
         Command::Wipe { yes } => wipe(yes),
+    };
+    print_engine_diagnostics();
+    result
+}
+
+fn print_engine_diagnostics() {
+    for diagnostic in mycellium_engine::take_diagnostics() {
+        match diagnostic {
+            mycellium_engine::EngineDiagnostic::CorruptLocalState { what } => eprintln!(
+                "(warning: corrupt {what} in local storage — treated as empty; back up before it is overwritten)"
+            ),
+        }
     }
 }
 

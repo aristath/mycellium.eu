@@ -1,4 +1,4 @@
-//! Native hard-serverless orchestration.
+//! Native hard-serverless CLI orchestration.
 //!
 //! This app layer has no directory, queue, relay, mailbox, push, or hosted
 //! rendezvous dependency. It keeps signed peer records locally, sends only over
@@ -14,7 +14,6 @@ use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN}
 use mycellium_core::group::Group;
 use mycellium_core::identity::{DevicePublicKey, Handle, Identity, PeerId, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
-use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::Ratchet;
 use mycellium_core::record::{Device, SignedRecord};
@@ -31,20 +30,14 @@ use mycellium_transport::libp2p_net::{self};
 use mycellium_transport::link::{FrameReader, FrameWriter, Wire};
 use mycellium_transport::net::{self, TcpTransport};
 
-use crate::antirollback;
-use crate::blocklist;
-use crate::contacts::{self, Contact};
-use crate::draft;
-use crate::expiry;
-use crate::flow;
-use crate::groups::{self, GroupSyncPayload, MailItem, PeerFrame, StoredGroup};
-use crate::history;
-use crate::inbox;
-use crate::outbox;
-use crate::peerbook::{self, PeerRecord};
 use crate::platform::OsPlatform;
-use crate::reachability::{self, DeliveryPath};
-use crate::verified;
+use mycellium_engine::contacts::{self, Contact};
+use mycellium_engine::groups::{self, GroupSyncPayload, MailItem, PeerFrame, StoredGroup};
+use mycellium_engine::peerbook::{self, PeerRecord};
+use mycellium_engine::reachability::{self, DeliveryPath};
+use mycellium_engine::{
+    antirollback, blocklist, draft, expiry, flow, history, inbox, outbox, verified, wireops,
+};
 
 mod backup;
 mod session;
@@ -581,6 +574,7 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let my_record = Arc::new(my_record);
     let blocked = Arc::new(blocked);
     let fs = Arc::new(Mutex::new(fs));
+    crate::print_engine_diagnostics();
 
     if libp2p {
         let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
@@ -775,6 +769,7 @@ fn serve_connection<C>(
             return;
         };
         if handle_discovery_frame(&mut fs, &mut conn, &frame) {
+            crate::print_engine_diagnostics();
             continue;
         }
         if let PeerFrame::Delivery { delivery_id, item } = frame {
@@ -790,6 +785,7 @@ fn serve_connection<C>(
                 *item,
             );
         }
+        crate::print_engine_diagnostics();
     }
 }
 
@@ -1072,7 +1068,7 @@ fn request_discovery_from_device(
     network: &DirectNetwork,
     device: &Device,
     want: &[String],
-) -> Result<Vec<crate::groups::DiscoveryRecord>> {
+) -> Result<Vec<groups::DiscoveryRecord>> {
     let request = PeerFrame::DiscoveryRequest {
         want: want.to_vec(),
     };
@@ -1100,7 +1096,7 @@ fn request_discovery_from_device(
     }
 }
 
-fn decode_discovery_response(frame: &[u8]) -> Result<Vec<crate::groups::DiscoveryRecord>> {
+fn decode_discovery_response(frame: &[u8]) -> Result<Vec<groups::DiscoveryRecord>> {
     match wire::decode::<PeerFrame>(frame)? {
         PeerFrame::DiscoveryResponse { records } => Ok(records),
         _ => bail!("peer returned a non-discovery frame"),
@@ -1307,21 +1303,6 @@ impl flow::FlowSink for BufferedSink {
     fn emit(&mut self, event: flow::FlowEvent) {
         self.0.push(event);
     }
-}
-
-pub fn process_item(
-    identity: &Identity,
-    me: &Handle,
-    my_record: &SignedRecord,
-    blocked: &[String],
-    platform: &mut OsPlatform,
-    fs: &mut FileStore,
-    item: MailItem,
-) -> flow::ItemOutcome {
-    let mut sink = CliSink;
-    process_item_with_sink(
-        identity, me, my_record, blocked, platform, fs, item, &mut sink,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1608,7 +1589,7 @@ pub fn group_sync(whoami: &str) -> Result<()> {
             continue;
         };
         for device in &siblings {
-            let Ok(env) = crate::wireops::seal_to_with_record(
+            let Ok(env) = wireops::seal_to_with_record(
                 &mut OsPlatform,
                 &identity,
                 &me,
@@ -2188,32 +2169,6 @@ pub fn expire_show(target: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecord {
-    crate::wireops::build_record(
-        &mut OsPlatform,
-        identity,
-        handle,
-        &display_name_for(handle),
-        addr,
-    )
-}
-
-pub fn seal_to(
-    identity: &Identity,
-    me: &Handle,
-    device: &Device,
-    plaintext: &[u8],
-) -> Result<Envelope> {
-    crate::wireops::seal_to(
-        &mut OsPlatform,
-        identity,
-        me,
-        &display_name_for(me),
-        device,
-        plaintext,
-    )
-}
-
 pub fn short_device_id(key: &DevicePublicKey) -> String {
     hex(&key.0[..4])
 }
@@ -2237,7 +2192,7 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-pub use crate::wireops::{device_slot, my_group_id, this_device};
+pub use mycellium_engine::wireops::{device_slot, my_group_id, this_device};
 
 #[cfg(test)]
 mod tests {
@@ -2334,7 +2289,7 @@ mod tests {
     fn direct_delivery_requires_the_recipient_devices_acceptance_ack() {
         let mut platform = SeededPlatform(30);
         let bob = Identity::generate(&mut platform).unwrap();
-        let device = crate::wireops::this_device(&bob, "127.0.0.1:1", 1);
+        let device = wireops::this_device(&bob, "127.0.0.1:1", 1);
         let item = sample_mail();
         let payload = wire::encode(&item);
         let frame = wire::encode(&PeerFrame::Delivery {
@@ -2360,7 +2315,7 @@ mod tests {
         let mut platform = SeededPlatform(30);
         let bob = Identity::generate(&mut platform).unwrap();
         let mallory = Identity::generate(&mut SeededPlatform(130)).unwrap();
-        let device = crate::wireops::this_device(&bob, "127.0.0.1:1", 1);
+        let device = wireops::this_device(&bob, "127.0.0.1:1", 1);
         let item = sample_mail();
         let payload = wire::encode(&item);
         let frame = wire::encode(&PeerFrame::Delivery {
@@ -2388,17 +2343,12 @@ mod tests {
         let bob = Identity::generate(&mut platform).unwrap();
         let alice_handle = Handle::new("alice").unwrap();
         let bob_handle = Handle::new("bob").unwrap();
-        let alice_record = crate::wireops::build_record(
-            &mut platform,
-            &alice,
-            &alice_handle,
-            "Alice",
-            "127.0.0.1:1",
-        );
+        let alice_record =
+            wireops::build_record(&mut platform, &alice, &alice_handle, "Alice", "127.0.0.1:1");
         let bob_record =
-            crate::wireops::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
-        let app = crate::wireops::text_message(&mut platform, "hello");
-        let envelope = crate::wireops::seal_to_with_record(
+            wireops::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        let app = wireops::text_message(&mut platform, "hello");
+        let envelope = wireops::seal_to_with_record(
             &mut platform,
             &alice,
             &alice_handle,

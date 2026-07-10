@@ -75,7 +75,7 @@ pub enum Attempt {
 /// Run one flush pass over `entries` at time `now`, retrying entries whose delay
 /// has elapsed via `deliver` and returning `(delivered_count, remaining)`.
 ///
-/// This is the pure, network-free core of [`crate::app::flush_outbox`]:
+/// This is the pure, network-free core used by a shell's outbox flush:
 /// - a **not-yet-due** entry (`now < send_after`) is skipped this pass — it is
 ///   *not* an attempt and does *not* count against [`MAX_ATTEMPTS`] — but a
 ///   not-yet-due entry that has outlived its [`TTL_SECS`] is still dropped;

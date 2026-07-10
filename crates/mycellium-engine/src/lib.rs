@@ -1,22 +1,17 @@
 //! The Mycellium engine: the headless peer logic that a front-end drives.
 //!
-//! It composes the core protocol with host-port adapters for transport and
-//! storage, then owns the actual messaging behaviour: conversations and
-//! history, local peer records, multi-device delivery, contacts, and blocking.
+//! It owns platform-neutral messaging behaviour over core capabilities:
+//! conversations and history, peer records, multi-device fan-out, contacts,
+//! trust, and blocking.
 //! It carries no argument parsing and no terminal UI — those live in a shell
 //! crate (e.g. `mycellium-cli`), so the same engine can back a GUI or mobile app.
 //!
-//! [`app`] holds the orchestration (the commands a shell invokes); the other
-//! modules are the domain state it operates on, generic over
-//! `mycellium_core::storage`.
+//! Native command orchestration belongs to the shell crate; this crate exposes
+//! domain state and structured [`flow::FlowEvent`] values.
 
-// `app` (native orchestration) and `platform` (OS clock + RNG) pull in the
-// filesystem, env, and P2P transport. They are gated behind the default
-// `native` feature; the other modules are pure domain state, generic over
-// `mycellium_core::storage`.
+use std::sync::{Mutex, OnceLock};
+
 pub mod antirollback;
-#[cfg(feature = "native")]
-pub mod app;
 pub mod blocklist;
 pub mod contacts;
 pub mod draft;
@@ -31,18 +26,36 @@ pub mod peerbook;
 pub mod reachability;
 pub mod verified;
 
-/// Log a loud warning that persisted `what` is present but couldn't be decoded.
-/// The single place the corruption policy is spelled out, so every store module
-/// surfaces corruption identically instead of some silently swallowing it.
+/// A structured engine diagnostic for a host surface to render or record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineDiagnostic {
+    /// Persisted bytes were present but could not be decoded. They remain in
+    /// place until overwritten so a backup may still recover them.
+    CorruptLocalState { what: String },
+}
+
+static DIAGNOSTICS: OnceLock<Mutex<Vec<EngineDiagnostic>>> = OnceLock::new();
+
+/// Drain diagnostics accumulated since the previous call.
+pub fn take_diagnostics() -> Vec<EngineDiagnostic> {
+    let diagnostics = DIAGNOSTICS.get_or_init(|| Mutex::new(Vec::new()));
+    diagnostics
+        .lock()
+        .map(|mut diagnostics| core::mem::take(&mut *diagnostics))
+        .unwrap_or_default()
+}
+
+/// Record corrupt persisted state without coupling the engine to stderr.
 pub(crate) fn warn_corrupt(what: &str) {
-    // stderr is a native-only reporting channel.
-    #[cfg(not(target_arch = "wasm32"))]
-    eprintln!("(warning: corrupt {what} in local storage — treated as empty; back up before it is overwritten)");
-    let _ = what;
+    if let Ok(mut diagnostics) = DIAGNOSTICS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        diagnostics.push(EngineDiagnostic::CorruptLocalState {
+            what: what.to_string(),
+        });
+    }
 }
 
 /// Decode stored bytes, distinguishing *absent* (→ default, silently) from
-/// *present-but-corrupt* (→ default, but logged loudly). This keeps local-state
+/// *present-but-corrupt* (→ default, with a structured diagnostic). This keeps local-state
 /// corruption / partial writes / format-migration failures visible instead of
 /// looking like messages/groups/contacts silently vanished. The raw bytes are
 /// left in place until the next write, so a backup/export can still recover them.
@@ -60,8 +73,8 @@ where
 }
 
 /// The single-value analogue of [`decode_or_warn`]: an *absent* key is `None`
-/// silently (no data), while a *present-but-corrupt* blob is `None` but logged
-/// loudly — never a silent drop. Use for optional getters (`get(..) -> Option<T>`)
+/// silently (no data), while a *present-but-corrupt* blob is `None` with a
+/// diagnostic — never a silent drop. Use for optional getters (`get(..) -> Option<T>`)
 /// whose value type has no meaningful `Default`.
 pub(crate) fn load_opt<T>(bytes: Option<Vec<u8>>, what: &str) -> Option<T>
 where
@@ -76,6 +89,4 @@ where
         }
     }
 }
-#[cfg(feature = "native")]
-pub mod platform;
 pub mod wireops;

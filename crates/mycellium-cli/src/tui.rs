@@ -23,9 +23,9 @@ use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::RatchetMessage;
 use mycellium_core::wire;
 
-use mycellium_engine::app::Session;
+use crate::app::Session;
+use crate::platform::OsPlatform;
 use mycellium_engine::history::{self, StoredMessage};
-use mycellium_engine::platform::OsPlatform;
 use mycellium_storage::filestore::FileStore;
 use mycellium_transport::link::{FrameReader, FrameWriter};
 
