@@ -49,6 +49,13 @@ Authorization: Bearer <session_token>
 `POST /login/email/request` returns `dev_token` for now. That is temporary. The
 real version should send that token through the configured email provider.
 
+Current upload limits:
+
+```text
+backup: 16 MiB
+public record: 1 MiB
+```
+
 ## Storage
 
 Metadata lives in `redb`.

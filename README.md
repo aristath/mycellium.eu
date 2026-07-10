@@ -164,6 +164,13 @@ Authorization: Bearer <session_token>
 `/login/email/request` currently returns `dev_token` directly. That is a
 development placeholder until a real email sender is wired in.
 
+Current upload limits:
+
+```text
+backup: 16 MiB
+public record: 1 MiB
+```
+
 The registry stores metadata in `redb` and opaque encrypted account bytes in
 filesystem blobs. Public records are still signed records; clients must verify
 them locally.

@@ -22,6 +22,8 @@ use crate::{
 const LOGIN_TTL_SECS: i64 = 15 * 60;
 const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 const EMAIL_LOGIN_LIMIT: u64 = 5;
+const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PUBLIC_RECORD_BYTES: usize = 1024 * 1024;
 
 /// HTTP app state.
 pub struct AppState<S> {
@@ -156,6 +158,7 @@ where
 {
     let account_id = parse_account_id(&account_id)?;
     authorize(&state, &headers, &account_id)?;
+    require_size_at_most(bytes.len(), MAX_BACKUP_BYTES)?;
     let blob = state
         .blobs
         .put(&account_id, AccountBlobKind::Backup, &bytes)?;
@@ -200,6 +203,7 @@ where
 {
     let account_id = parse_account_id(&account_id)?;
     authorize(&state, &headers, &account_id)?;
+    require_size_at_most(bytes.len(), MAX_PUBLIC_RECORD_BYTES)?;
     let blob = state
         .blobs
         .put(&account_id, AccountBlobKind::PublicRecord, &bytes)?;
@@ -284,6 +288,13 @@ impl ApiError {
             message: "rate limited".into(),
         }
     }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "payload too large".into(),
+        }
+    }
 }
 
 impl From<RegistryError> for ApiError {
@@ -333,6 +344,13 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 fn parse_account_id(value: &str) -> ApiResult<AccountId> {
     value.parse().map_err(ApiError::from)
+}
+
+fn require_size_at_most(size: usize, max: usize) -> ApiResult<()> {
+    if size > max {
+        return Err(ApiError::payload_too_large());
+    }
+    Ok(())
 }
 
 fn check_rate_limit<S: RegistryStore>(
@@ -503,5 +521,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn record_upload_is_size_limited() {
+        let app = redb_router(tmpdir("size")).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login/email/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"ari@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(response).await;
+        let login_token = body["dev_token"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login/confirm")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{login_token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json(response).await;
+        let account_id = body["account_id"].as_str().unwrap();
+        let session_token = body["session_token"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/accounts/{account_id}/record"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(vec![0u8; MAX_PUBLIC_RECORD_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn upload_limits_are_explicit_abuse_guards() {
+        assert!(require_size_at_most(MAX_BACKUP_BYTES, MAX_BACKUP_BYTES).is_ok());
+        assert!(require_size_at_most(MAX_PUBLIC_RECORD_BYTES, MAX_PUBLIC_RECORD_BYTES).is_ok());
+
+        assert_eq!(
+            require_size_at_most(MAX_BACKUP_BYTES + 1, MAX_BACKUP_BYTES)
+                .unwrap_err()
+                .status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            require_size_at_most(MAX_PUBLIC_RECORD_BYTES + 1, MAX_PUBLIC_RECORD_BYTES)
+                .unwrap_err()
+                .status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 }

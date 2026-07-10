@@ -385,6 +385,13 @@ Authorization: Bearer <session_token>
 `/login/email/request` currently returns a `dev_token` directly. That is a
 development placeholder until a real email sender exists.
 
+Current upload limits are deliberately small:
+
+```text
+backup: 16 MiB
+public record: 1 MiB
+```
+
 The registry binary is configured by:
 
 ```text
