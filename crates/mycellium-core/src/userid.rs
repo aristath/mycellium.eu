@@ -1,11 +1,9 @@
 //! Username → public identifier (Layer 6 privacy).
 //!
-//! The directory keys on `user_id(username)`, **never the plaintext username**.
-//! The id is a 128-bit hash rendered as 32 hex chars — a valid [`Handle`] — so a
-//! client that knows the name can compute it and look someone up, but a leaked
-//! or curious directory only ever holds opaque ids. It cannot be dumped into a
-//! phonebook of every user; at most someone can *test* a name they already guess
-//! (unavoidable, since lookup itself must be answerable).
+//! Public peer records key on `user_id(username)`, **never the plaintext
+//! username**. The id is a 128-bit hash rendered as 32 hex chars — a valid
+//! [`Handle`] — so a client that knows the name can compute the record id, while
+//! record exports and peerbooks carry opaque ids.
 //!
 //! The plaintext username lives only on users' devices — shown in the UI, and
 //! carried inside messages as a self-verifying display name (its hash must equal
@@ -17,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::identity::Handle;
 
-/// The public directory identifier for a username (hash, not the name).
+/// The public record identifier for a username (hash, not the name).
 pub fn user_id(username: &str) -> Handle {
     let mut hasher = Sha256::new();
     hasher.update(b"mycellium-user:");

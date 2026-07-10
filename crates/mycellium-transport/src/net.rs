@@ -2,8 +2,7 @@
 //!
 //! It carries the app-layer end-to-end payload (X3DH + Double Ratchet), which
 //! is what actually secures messages, so a bare TCP link is a genuine *direct*
-//! line for the POC. libp2p (NAT traversal, DHT, relay) is the production
-//! Transport to swap in behind this same trait — see `docs/CONCEPT.md` Layer 10.
+//! line for the POC. libp2p is another direct transport behind this same trait.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};

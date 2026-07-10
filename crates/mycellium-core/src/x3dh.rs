@@ -67,7 +67,7 @@ pub struct Initiated {
 }
 
 /// Run X3DH as the **initiator** (Alice) against the responder's public keys,
-/// which come from the responder's directory record.
+/// which come from the responder's signed peer record.
 pub fn initiate<P: Platform>(
     platform: &mut P,
     initiator: &Identity,

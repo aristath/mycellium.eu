@@ -1,10 +1,8 @@
 //! Platform-agnostic envelope sealing/opening and record building.
 //!
-//! These are the pure-crypto building blocks shared by the native orchestration
-//! (`app`, behind the `native` feature) and the browser (wasm) build. They take a
-//! [`Platform`] explicitly (clock + RNG) rather than hardcoding the OS one, and
-//! take the identity's display name and queue URL as arguments rather than
-//! reading the environment — so they run anywhere, including wasm32.
+//! These pure-crypto building blocks take a [`Platform`] explicitly (clock + RNG)
+//! rather than hardcoding the OS one, and take the identity's display name as an
+//! argument rather than reading the environment.
 
 use anyhow::{anyhow, bail, Result};
 
@@ -60,8 +58,7 @@ pub fn text_message<P: Platform>(platform: &mut P, text: &str) -> AppMessage {
     app_message(platform, Body::Text(text.to_string()))
 }
 
-/// The mailbox slot a device drains: the full hex of its key. Account-wide items
-/// (groups, control, receipts) use the `"account"` slot instead.
+/// The stable device slot id: the full hex of its device key.
 pub fn device_slot(key: &DevicePublicKey) -> String {
     hex(&key.0)
 }
@@ -79,8 +76,7 @@ pub fn group_ad(group_id: &str) -> Vec<u8> {
     ad
 }
 
-/// This device's directory entry (keys + signed pre-key). Pure — derived from
-/// the identity.
+/// This device's peer-record entry (keys + signed pre-key).
 pub fn this_device(identity: &Identity, addr: &str) -> Device {
     Device {
         device_key: identity.device_public(),
@@ -90,24 +86,20 @@ pub fn this_device(identity: &Identity, addr: &str) -> Device {
     }
 }
 
-/// Build and sign this identity's directory record. `name` is the display name
-/// and `queue` the queue endpoint (supplied by the caller, not the environment).
+/// Build and sign this identity's peer record.
 pub fn build_record<P: Platform>(
     platform: &mut P,
     identity: &Identity,
     handle: &Handle,
     name: &str,
-    queue: &str,
     addr: &str,
 ) -> SignedRecord {
     let record = Record {
-        // The record binds `user_id(name)`, so the directory never sees the name.
+        // The record binds `user_id(handle)`, so discovery can carry the record
+        // without becoming naming authority.
         handle: user_id(handle.as_str()),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        queue: queue.to_string(),
-        // No failover endpoints from this builder yet; single-queue as before.
-        queues: vec![],
         devices: vec![this_device(identity, addr)],
         seq: platform.now_unix_secs(),
     };
@@ -141,8 +133,8 @@ pub fn seal_to_with_record<P: Platform>(
     let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk)
         .map_err(|e| anyhow!("{e}"))?;
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
-    // Pad inside the AEAD, so the queue and a network observer see a coarse
-    // size bucket instead of the exact message length (#51, docs/PRIVACY-MODES.md).
+    // Pad inside the AEAD, so a network observer sees a coarse size bucket
+    // instead of the exact message length.
     let sealed = ratchet.encrypt(&pad_bucket(plaintext), &ad);
     Ok(Envelope {
         from: me.clone(),
@@ -154,20 +146,19 @@ pub fn seal_to_with_record<P: Platform>(
 }
 
 /// Asynchronously X3DH-seal `plaintext` for one recipient `device` (offline,
-/// one-shot session). `my_name`/`my_queue` populate the sender's self-record
-/// embedded in the envelope. Builds the sender record once, then delegates to
+/// one-shot session). `my_name` populates the sender's self-record embedded in
+/// the envelope. Builds the sender record once, then delegates to
 /// [`seal_to_with_record`] — the one-shot convenience for callers that seal to a
-/// single device (`forward`, `broadcast`, wasm `seal`, the failover tests).
+/// single device.
 pub fn seal_to<P: Platform>(
     platform: &mut P,
     identity: &Identity,
     me: &Handle,
     my_name: &str,
-    my_queue: &str,
     device: &Device,
     plaintext: &[u8],
 ) -> Result<Envelope> {
-    let sender_record = build_record(platform, identity, me, my_name, my_queue, "");
+    let sender_record = build_record(platform, identity, me, my_name, "");
     seal_to_with_record(platform, identity, me, &sender_record, device, plaintext)
 }
 
@@ -202,15 +193,14 @@ pub fn open_envelope<P: Platform>(
     Ok((env.from.clone(), plaintext))
 }
 
-/// Size buckets (bytes of the pre-seal payload) that queued envelope plaintexts
-/// are padded up to, so the queue sees coarse blob sizes rather than exact
-/// message lengths (#51). See `docs/PRIVACY-MODES.md`.
+/// Size buckets (bytes of the pre-seal payload) that envelope plaintexts are
+/// padded up to, so the wire sees coarse blob sizes rather than exact message
+/// lengths.
 const PAD_BUCKETS: &[usize] = &[256, 1024, 4096, 16384, 65536, 262144];
 
 /// Pad `payload` up to a size bucket. Layout: `[u32-LE real_len][payload][zeros]`.
 /// The result is sealed inside the envelope AEAD, so the padding is authenticated.
-/// Payloads larger than the top bucket (only a near-max attachment) round up to
-/// the next 64 KiB, staying bounded by the queue's request cap.
+/// Payloads larger than the top bucket round up to the next 64 KiB.
 fn pad_bucket(payload: &[u8]) -> Vec<u8> {
     let needed = 4 + payload.len();
     let target = PAD_BUCKETS

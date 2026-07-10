@@ -1,8 +1,7 @@
 //! A local, encrypted address book: nickname → handle, with the contact's
 //! wallet **pinned** on first add (trust-on-first-use). A later lookup whose
-//! wallet differs from the pin means the directory handed us a different
-//! identity — the exact "dishonest directory" case out-of-band verification
-//! guards against (Layer 5).
+//! wallet differs from the pin means the resolved signed record no longer
+//! matches the identity you trusted before.
 //!
 //! Generic over [`Storage`], so it's unit-tested with an in-memory store and
 //! runs on the encrypted `FileStore`.

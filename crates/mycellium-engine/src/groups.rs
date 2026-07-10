@@ -1,17 +1,17 @@
-//! CLI-side group state: what a mailbox item can be, the invite payload, and
-//! persistence of a member's group state (generic over [`Storage`], so it's
-//! unit-tested with an in-memory store and runs on the encrypted `FileStore`).
+//! Group state: what a sealed peer item can be, the invite payload, and
+//! persistence of a member's group state.
 
 use serde::{Deserialize, Serialize};
 
 use mycellium_core::group::{GroupMessage, GroupState, SenderKeyDistribution};
 use mycellium_core::offline::Envelope;
+use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
 use mycellium_core::wire;
 
-/// Anything that can sit in a mailbox. Direct messages and group invites travel
-/// inside a pairwise end-to-end [`Envelope`]; group text is already end-to-end
-/// under the sender key, so it rides on its own.
+/// Anything that can be handed directly to a peer device. Direct messages and
+/// group invites travel inside a pairwise end-to-end [`Envelope`]; group text is
+/// already end-to-end under the sender key, so it rides on its own.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MailItem {
     /// A one-to-one offline message.
@@ -20,7 +20,7 @@ pub enum MailItem {
     /// The envelope (sealed device→device) carries the message; `peer` is the
     /// conversation it belongs to.
     SelfSync {
-        /// The handle the original message was sent to.
+        /// The handle the original message was addressed to.
         peer: String,
         /// The message, sealed from the sending device to this one.
         envelope: Envelope,
@@ -45,6 +45,24 @@ pub enum MailItem {
     /// control — you block a peer locally, or leave yourself. Decrypts to a
     /// [`GroupLeavePayload`].
     GroupLeave(Envelope),
+    /// Ask a directly reachable peer for signed peer records. Discovery is
+    /// deliberately record-only: no messages, no custody, no authority.
+    DiscoveryRequest {
+        /// Empty means "send the peer records you are willing to gossip."
+        want: Vec<String>,
+    },
+    /// A non-authoritative peer record pack returned over a direct connection.
+    DiscoveryResponse {
+        /// Self-authenticating records; receivers verify before importing.
+        records: Vec<DiscoveryRecord>,
+    },
+}
+
+/// One signed peer record carried by discovery gossip.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryRecord {
+    pub handle: String,
+    pub record: SignedRecord,
 }
 
 /// The end-to-end payload of a [`MailItem::GroupLeave`]: which group the

@@ -1,15 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 
-/// This account's own message-queue endpoint (empty = no queue / pure P2P).
-/// Recorded in your record so senders find it.
-pub fn own_queue() -> String {
-    store::queue_url()
-}
-
-/// This account's own display name. When set (the email client sets it), it's
-/// the free-form name others see; when empty (the CLI), the identifier itself is
-/// used, preserving the old behaviour.
+/// This account's own display name. When set, it is the free-form name others
+/// see; when empty, the handle itself is used.
 pub fn own_name() -> String {
     store::display_name()
 }

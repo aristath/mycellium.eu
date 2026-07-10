@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # libp2p v0.56 records optional DNS/mDNS dependencies in Cargo.lock even
+    # though mycellium-transport disables those features. Verified with:
+    # cargo tree -p mycellium-transport --target all
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+]

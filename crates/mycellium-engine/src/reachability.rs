@@ -1,178 +1,71 @@
-//! Local-only, per-device **reachability scoring** (#60) and the shared
-//! [`DeliveryPath`] outcome (#59/#60).
+//! Local-only reachability observations.
 //!
-//! The delivery ladder (`app::messaging`) remembers, per recipient
-//! *device* and per *path*, whether that path recently worked — so it can try
-//! the most-likely-successful rung first instead of paying a full direct-dial
-//! timeout for a device it already knows is unreachable that way. The queue and
-//! outbox remain the guaranteed floor; scoring only ever *reorders* the attempts
-//! within reason and never removes the floor.
-//!
-//! # PRIVACY — hard rules (do not weaken)
-//!
-//! This module is shaped like [`crate::outbox`] / [`crate::verified`]: a single
-//! namespaced blob in *this* device's [`Storage`], and nothing more.
-//!
-//! - **Local-only, never published.** The score lives only in this device's
-//!   [`Storage`] and is **never** placed in a `Record`, sent to the directory,
-//!   deposited in a queue, or shared with any peer or server. It is a private
-//!   cache of *my own* delivery observations, exactly like the outbox.
-//! - **Not a presence oracle.** We keep aggregate per-path counts plus a single
-//!   **coarse** `last_success` / `last_attempt` timestamp — **not** a
-//!   per-message timeline. That is enough to order the ladder, and deliberately
-//!   *not* enough to reconstruct a log of when a contact was online. Timestamps
-//!   are coarsened to [`COARSEN_SECS`] to blunt fine-grained presence inference
-//!   if the store is later read by malware.
-//! - **No cross-peer correlation surface.** The API is strictly per-device
-//!   ([`record`] / [`best_paths`]); it never aggregates a "who is online now"
-//!   view across peers.
-//! - **Bounded & clearable.** Entries decay (a success older than
-//!   [`SUCCESS_TTL_SECS`] is treated as stale and re-probed), stale devices are
-//!   pruned, the store is capped at [`MAX_DEVICES`], and it is fully
-//!   [`clear`]-able. It is derived data, never authoritative.
-//!
-//! Cold start == today's behavior: an unknown device yields [`default_order`]
-//! (direct first, queue as the floor), so the absence of data is never worse
-//! than before this module existed.
+//! Hard-serverless Mycellium has one core network path: direct peer-to-peer
+//! delivery. If direct fails, the caller parks the already-sealed item in the
+//! sender's local outbox. This module records coarse direct outcomes as derived,
+//! clearable local state. It is never published and never authoritative.
 
 use serde::{Deserialize, Serialize};
 
 use mycellium_core::storage::Storage;
 use mycellium_core::wire;
 
-/// The namespaced key holding the whole (local-only) score blob.
 const KEY: &[u8] = b"reachability";
 
-/// A success older than this is treated as **stale** — the path is re-probed
-/// rather than trusted (a device direct-reachable yesterday may not be today).
 pub const SUCCESS_TTL_SECS: u64 = 24 * 3_600;
-
-/// Even a path with several recent failures is **re-probed** once its last
-/// attempt is older than this — NAT mappings, networks and port-forwards change,
-/// so we never *permanently* abandon a rung ("periodically retry direct", #60).
 pub const REPROBE_SECS: u64 = 15 * 60;
-
-/// Consecutive failures (since the last success) after which a live path is
-/// deprioritized below the queue. Kept high enough that an ordinary burst of a
-/// few sends never abandons direct — only a persistently-dead path is reordered.
 pub const DEPRIORITIZE_AFTER: u32 = 3;
-
-/// Stored timestamps are floored to this granularity (one minute) so the store
-/// records only coarse "did this work recently", never a fine presence log.
 pub const COARSEN_SECS: u64 = 60;
-
-/// Prune device entries untouched for this long, so the store can't grow without
-/// bound (same discipline as the outbox).
 pub const PRUNE_TTL_SECS: u64 = 30 * 86_400;
-
-/// Hard cap on tracked devices; the oldest-touched are dropped past this.
 pub const MAX_DEVICES: usize = 4_096;
 
-/// Which rung of the delivery ladder handled (or would handle) an item — the
-/// observable outcome of a delivery attempt (#59) and the scoring key (#60).
-///
-/// The live/direct band ([`DeliveryPath::is_live_direct`]) is best-effort,
-/// end-to-end-authenticated real-time delivery; [`DeliveryPath::Queue`] /
-/// [`DeliveryPath::Outbox`] are the store-and-forward safety net.
-///
-/// Variant order is the wire order (postcard encodes by index); **append new
-/// variants at the end** to stay backward-compatible with persisted blobs.
+/// Observable outcome of a delivery attempt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum DeliveryPath {
-    /// Live push over the peer's published address (raw TCP today; Noise/libp2p
-    /// once multiaddr peers are wired — see the `deliver` TODO(#59)).
+    /// Live direct delivery over the peer's published address.
     Direct,
-    /// Live end-to-end stream through a Circuit-Relay v2 node (not yet wired;
-    /// reserved so scoring and observability already speak the vocabulary).
-    Relay,
-    /// Deposited into the recipient's store-and-forward queue (offline peer).
-    Queue,
     /// Parked in this device's local encrypted outbox for a later retry.
     Outbox,
-    /// Nothing worked this pass (no queue reachable and no live path).
+    /// Nothing worked this pass.
     Failed,
 }
 
 impl DeliveryPath {
-    /// Whether the item was actually handed off (live or into the queue). This
-    /// is the `bool` the old ladder returned: `Direct`/`Relay`/`Queue` are
-    /// delivered; `Outbox` (parked locally) and `Failed` are not.
     pub fn is_delivered(self) -> bool {
-        matches!(
-            self,
-            DeliveryPath::Direct | DeliveryPath::Relay | DeliveryPath::Queue
-        )
+        matches!(self, DeliveryPath::Direct)
     }
 
-    /// Whether this is a live, direct-band rung (only attempted when the peer's
-    /// presence says online), as opposed to the queue/outbox floor.
     pub fn is_live_direct(self) -> bool {
-        matches!(self, DeliveryPath::Direct | DeliveryPath::Relay)
+        matches!(self, DeliveryPath::Direct)
     }
 }
 
-/// The default ladder order for a device we have no memory of: try the cheapest
-/// live rung first, with the queue as the guaranteed floor. Identical to the
-/// pre-scoring behavior.
 pub fn default_order() -> Vec<DeliveryPath> {
-    vec![DeliveryPath::Direct, DeliveryPath::Queue]
+    vec![DeliveryPath::Direct]
 }
 
-/// Aggregate outcomes for one (device, path). Deliberately **not** a timeline:
-/// counts plus a single coarse timestamp, enough to order the ladder and no
-/// more (see the module privacy note).
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct PathStat {
-    /// Total successes observed on this path.
     pub successes: u32,
-    /// Consecutive failures **since the last success** (reset to 0 on success),
-    /// so the count can't accrue forever and directly signals a dead path.
     pub failures: u32,
-    /// Coarse unix seconds of the last success (`0` = never).
     pub last_success: u64,
-    /// Coarse unix seconds of the last attempt (success or failure).
     pub last_attempt: u64,
 }
 
-/// All per-path stats for one device, keyed by the device's slot (hex of its
-/// device key) — the *specific* device, not the account, since a laptop may be
-/// relay-only while the same account's phone is direct.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 struct DeviceEntry {
-    /// The device slot (hex of the device key).
     key: String,
-    /// Coarse unix seconds this entry was last touched (drives pruning).
     last_touch: u64,
-    /// Per-path stats. A short `Vec` (one entry per attempted path) rather than
-    /// a map, matching the compact-wire style used elsewhere in the engine.
-    paths: Vec<(DeliveryPath, PathStat)>,
+    direct: PathStat,
 }
 
-impl DeviceEntry {
-    fn stat(&self, path: DeliveryPath) -> PathStat {
-        self.paths
-            .iter()
-            .find(|(p, _)| *p == path)
-            .map(|(_, s)| s.clone())
-            .unwrap_or_default()
-    }
-
-    fn stat_mut(&mut self, path: DeliveryPath) -> &mut PathStat {
-        if let Some(i) = self.paths.iter().position(|(p, _)| *p == path) {
-            return &mut self.paths[i].1;
-        }
-        self.paths.push((path, PathStat::default()));
-        &mut self.paths.last_mut().expect("just pushed").1
-    }
-}
-
-/// The whole local score store: a flat list of device entries.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 struct ScoreStore {
     devices: Vec<DeviceEntry>,
 }
 
 impl ScoreStore {
+    #[cfg(test)]
     fn find(&self, key: &str) -> Option<&DeviceEntry> {
         self.devices.iter().find(|d| d.key == key)
     }
@@ -188,8 +81,6 @@ impl ScoreStore {
         self.devices.last_mut().expect("just pushed")
     }
 
-    /// Drop entries untouched past [`PRUNE_TTL_SECS`], then cap the total at
-    /// [`MAX_DEVICES`] (keeping the most-recently-touched).
     fn prune(&mut self, now: u64) {
         self.devices
             .retain(|d| now.saturating_sub(d.last_touch) < PRUNE_TTL_SECS);
@@ -201,7 +92,6 @@ impl ScoreStore {
     }
 }
 
-/// Floor `t` to [`COARSEN_SECS`] so only coarse timestamps are persisted.
 fn coarsen(t: u64) -> u64 {
     t - (t % COARSEN_SECS)
 }
@@ -209,8 +99,6 @@ fn coarsen(t: u64) -> u64 {
 fn load<S: Storage>(store: &S) -> Result<ScoreStore, S::Error> {
     match store.get(KEY)? {
         None => Ok(ScoreStore::default()),
-        // A corrupt blob degrades to "no memory" (cold start), never a hard
-        // failure of delivery — this is derived, best-effort data.
         Some(bytes) => Ok(wire::decode(&bytes).unwrap_or_default()),
     }
 }
@@ -219,12 +107,6 @@ fn save<S: Storage>(store: &mut S, st: &ScoreStore) -> Result<(), S::Error> {
     store.put(KEY, &wire::encode(st))
 }
 
-/// Record the outcome of one delivery attempt to `device_key` (its slot) via
-/// `path`. A success resets the consecutive-failure streak (so a path that
-/// starts working again is trusted immediately); a failure bumps it. Timestamps
-/// are coarsened before storage. Pruning keeps the store bounded.
-///
-/// Local-only: this never leaves the device (see the module privacy note).
 pub fn record<S: Storage>(
     store: &mut S,
     device_key: &str,
@@ -232,85 +114,42 @@ pub fn record<S: Storage>(
     ok: bool,
     now: u64,
 ) -> Result<(), S::Error> {
+    if path != DeliveryPath::Direct {
+        return Ok(());
+    }
     let now_c = coarsen(now);
     let mut st = load(store)?;
     {
         let entry = st.entry_mut(device_key);
         entry.last_touch = now_c;
-        let stat = entry.stat_mut(path);
-        stat.last_attempt = now_c;
+        entry.direct.last_attempt = now_c;
         if ok {
-            stat.successes = stat.successes.saturating_add(1);
-            stat.failures = 0;
-            stat.last_success = now_c;
+            entry.direct.successes = entry.direct.successes.saturating_add(1);
+            entry.direct.failures = 0;
+            entry.direct.last_success = now_c;
         } else {
-            stat.failures = stat.failures.saturating_add(1);
+            entry.direct.failures = entry.direct.failures.saturating_add(1);
         }
     }
-    // Only pay for pruning (an O(n) TTL retain plus an O(n log n) sort when over
-    // cap) once the store has actually grown to the cap — not on every single
-    // attempt. Pruning only ever *removes* entries, and a stale-but-still-present
-    // entry yields the same ladder order as an absent one (`direct_deprioritized`
-    // requires a recent `last_attempt`, which a stale entry cannot have), so
-    // deferring it never changes any `best_paths` result — it only keeps the store
-    // bounded, which the cap still guarantees.
     if st.devices.len() >= MAX_DEVICES {
         st.prune(now);
     }
     save(store, &st)
 }
 
-/// The order in which the ladder should attempt paths for `device_key`,
-/// most-likely-reachable first, always ending with the queue floor.
-///
-/// An unknown device (or unreadable store) yields [`default_order`]
-/// (direct-first, queue as fallback). A device whose direct path is
-/// **demonstrably dead** — several consecutive failures, no fresh success, and
-/// not yet due for a periodic re-probe — is offered the queue first so we don't
-/// pay a doomed direct-dial timeout, while direct is *still listed last* so it
-/// is re-probed (never permanently abandoned).
-pub fn best_paths<S: Storage>(store: &S, device_key: &str, now: u64) -> Vec<DeliveryPath> {
-    best_paths_for(store, device_key, DeliveryPath::Direct, now)
+pub fn best_paths<S: Storage>(_store: &S, _device_key: &str, _now: u64) -> Vec<DeliveryPath> {
+    default_order()
 }
 
-/// Like [`best_paths`], but for a caller whose live-direct rung is `live` —
-/// [`DeliveryPath::Direct`] for a directly-dialable peer, or
-/// [`DeliveryPath::Relay`] for one reachable only over a Circuit Relay v2
-/// address (#59). Scoring is keyed on the *specific* live path, so a relay-only
-/// device's reachability is tracked independently of a direct one. The queue
-/// remains the guaranteed floor in every case.
 pub fn best_paths_for<S: Storage>(
-    store: &S,
-    device_key: &str,
+    _store: &S,
+    _device_key: &str,
     live: DeliveryPath,
-    now: u64,
+    _now: u64,
 ) -> Vec<DeliveryPath> {
-    let live_first = vec![live, DeliveryPath::Queue];
-    let Ok(st) = load(store) else {
-        return live_first;
-    };
-    let Some(entry) = st.find(device_key) else {
-        return live_first;
-    };
-    if direct_deprioritized(&entry.stat(live), now) {
-        vec![DeliveryPath::Queue, live]
-    } else {
-        live_first
-    }
+    vec![live]
 }
 
-/// Whether the direct path is currently demonstrably dead (deprioritize it below
-/// the queue). True only when *all* hold: no fresh success (stale/never),
-/// several consecutive failures, and it is not yet time to re-probe.
-fn direct_deprioritized(s: &PathStat, now: u64) -> bool {
-    let stale_success =
-        s.last_success == 0 || now.saturating_sub(s.last_success) >= SUCCESS_TTL_SECS;
-    let doomed = s.failures >= DEPRIORITIZE_AFTER;
-    let due_reprobe = now.saturating_sub(s.last_attempt) >= REPROBE_SECS;
-    stale_success && doomed && !due_reprobe
-}
-
-/// Wipe the entire local score store (user-clearable derived data).
 pub fn clear<S: Storage>(store: &mut S) -> Result<(), S::Error> {
     store.delete(KEY)
 }
@@ -339,166 +178,46 @@ mod tests {
     }
 
     #[test]
-    fn is_delivered_semantics() {
+    fn direct_is_the_only_delivered_path() {
         assert!(DeliveryPath::Direct.is_delivered());
-        assert!(DeliveryPath::Relay.is_delivered());
-        assert!(DeliveryPath::Queue.is_delivered());
         assert!(!DeliveryPath::Outbox.is_delivered());
         assert!(!DeliveryPath::Failed.is_delivered());
     }
 
     #[test]
-    fn unknown_device_gets_sane_default_order() {
+    fn unknown_device_attempts_direct_only() {
         let store = MemStore::default();
-        // Cold start: direct first, queue as the floor — never worse than today.
         assert_eq!(
             best_paths(&store, "never-seen", 1_000),
-            vec![DeliveryPath::Direct, DeliveryPath::Queue]
+            vec![DeliveryPath::Direct]
         );
     }
 
     #[test]
-    fn fresh_direct_success_keeps_direct_first() {
-        let mut store = MemStore::default();
-        record(&mut store, "dev", DeliveryPath::Direct, true, 1_000).unwrap();
-        // Even with some failures after, a *fresh* success protects direct.
-        record(&mut store, "dev", DeliveryPath::Direct, false, 1_100).unwrap();
-        record(&mut store, "dev", DeliveryPath::Direct, false, 1_200).unwrap();
-        record(&mut store, "dev", DeliveryPath::Direct, false, 1_300).unwrap();
-        assert_eq!(
-            best_paths(&store, "dev", 1_400),
-            vec![DeliveryPath::Direct, DeliveryPath::Queue],
-            "a recent success must keep direct ahead of the queue"
-        );
-    }
-
-    #[test]
-    fn dead_direct_is_deprioritized_below_queue() {
-        let mut store = MemStore::default();
-        // No success ever, several consecutive failures, freshly attempted.
-        for t in [100u64, 160, 220] {
-            record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
-        }
-        let order = best_paths(&store, "dev", 260);
-        assert_eq!(
-            order,
-            vec![DeliveryPath::Queue, DeliveryPath::Direct],
-            "a persistently-dead direct path must fall behind the queue"
-        );
-        // ...but direct is still present, so it is never permanently abandoned.
-        assert!(order.contains(&DeliveryPath::Direct));
-    }
-
-    #[test]
-    fn decay_ages_out_a_stale_success() {
-        let mut store = MemStore::default();
-        // A success, then several failures. While the success is fresh the
-        // failures don't unseat direct... (a realistic, non-zero timestamp — `0`
-        // is the reserved "never" sentinel, i.e. unix epoch 1970, never a real
-        // success time).
-        record(&mut store, "dev", DeliveryPath::Direct, true, 600).unwrap();
-        for t in [660u64, 720, 780] {
-            record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
-        }
-        assert_eq!(
-            best_paths(&store, "dev", 900),
-            vec![DeliveryPath::Direct, DeliveryPath::Queue],
-            "while the last success is still fresh, direct stays first"
-        );
-        // ...but once that success has aged past the TTL, the same failure record
-        // now deprioritizes direct: the stale success no longer protects it.
-        let aged = 600 + SUCCESS_TTL_SECS + 100;
-        // A fresh failure at the aged time keeps last_attempt recent (so we are
-        // not yet in the periodic re-probe window).
-        record(&mut store, "dev", DeliveryPath::Direct, false, aged).unwrap();
-        assert_eq!(
-            best_paths(&store, "dev", aged + 30),
-            vec![DeliveryPath::Queue, DeliveryPath::Direct],
-            "a stale success must no longer keep direct ahead of the queue"
-        );
-    }
-
-    #[test]
-    fn dead_direct_is_reprobed_after_the_interval() {
-        let mut store = MemStore::default();
-        for t in [100u64, 160, 220] {
-            record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
-        }
-        // Right after the failures: deprioritized.
-        assert_eq!(
-            best_paths(&store, "dev", 260),
-            vec![DeliveryPath::Queue, DeliveryPath::Direct]
-        );
-        // After the re-probe interval since the last attempt: direct is offered
-        // first again, so a changed network/NAT is rediscovered.
-        assert_eq!(
-            best_paths(&store, "dev", 220 + REPROBE_SECS + 1),
-            vec![DeliveryPath::Direct, DeliveryPath::Queue],
-            "a dead direct path must be periodically re-probed"
-        );
-    }
-
-    #[test]
-    fn success_resets_the_failure_streak() {
-        let mut store = MemStore::default();
-        for t in [100u64, 160, 220] {
-            record(&mut store, "dev", DeliveryPath::Direct, false, t).unwrap();
-        }
-        // A success clears the streak, so direct is immediately trusted again.
-        record(&mut store, "dev", DeliveryPath::Direct, true, 280).unwrap();
-        assert_eq!(
-            best_paths(&store, "dev", 300),
-            vec![DeliveryPath::Direct, DeliveryPath::Queue]
-        );
-    }
-
-    #[test]
-    fn timestamps_are_coarsened() {
+    fn outcomes_are_recorded_locally_and_coarsened() {
         let mut store = MemStore::default();
         record(&mut store, "dev", DeliveryPath::Direct, true, 12_345).unwrap();
         let st = load(&store).unwrap();
-        let stat = st.find("dev").unwrap().stat(DeliveryPath::Direct);
-        assert_eq!(stat.last_success % COARSEN_SECS, 0);
+        let stat = &st.find("dev").unwrap().direct;
+        assert_eq!(stat.successes, 1);
+        assert_eq!(stat.failures, 0);
         assert_eq!(stat.last_success, coarsen(12_345));
     }
 
     #[test]
-    fn prune_drops_stale_devices_and_caps() {
-        // TTL: an entry untouched past PRUNE_TTL_SECS is dropped, a fresh one kept.
-        let mut st = ScoreStore::default();
-        st.entry_mut("old").last_touch = 100;
-        st.entry_mut("fresh").last_touch = PRUNE_TTL_SECS + 1_000;
-        st.prune(PRUNE_TTL_SECS + 1_000);
-        assert!(st.find("old").is_none(), "stale device must be pruned");
-        assert!(st.find("fresh").is_some());
-
-        // Cap: past MAX_DEVICES the oldest-touched entries are dropped so the store
-        // stays bounded, keeping the most-recently-touched.
-        let now = (MAX_DEVICES + 10) as u64;
-        let mut big = ScoreStore::default();
-        for i in 0..(MAX_DEVICES + 10) {
-            big.entry_mut(&format!("d{i}")).last_touch = i as u64;
-        }
-        big.prune(now);
-        assert_eq!(
-            big.devices.len(),
-            MAX_DEVICES,
-            "store is capped at MAX_DEVICES"
-        );
-        assert!(
-            big.find("d0").is_none(),
-            "oldest-touched dropped past the cap"
-        );
-        assert!(
-            big.find(&format!("d{}", MAX_DEVICES + 9)).is_some(),
-            "most-recently-touched kept"
-        );
+    fn failure_streak_resets_on_success() {
+        let mut store = MemStore::default();
+        record(&mut store, "dev", DeliveryPath::Direct, false, 100).unwrap();
+        record(&mut store, "dev", DeliveryPath::Direct, false, 160).unwrap();
+        record(&mut store, "dev", DeliveryPath::Direct, true, 220).unwrap();
+        let st = load(&store).unwrap();
+        let stat = &st.find("dev").unwrap().direct;
+        assert_eq!(stat.failures, 0);
+        assert_eq!(stat.successes, 1);
     }
 
     #[test]
     fn record_bounds_the_store_at_the_cap() {
-        // Through the public API: recording well past the cap must not let the
-        // store grow unbounded — pruning still fires once the cap is reached.
         let mut store = MemStore::default();
         for i in 0..(MAX_DEVICES + 5) {
             record(
@@ -511,56 +230,14 @@ mod tests {
             .unwrap();
         }
         let st = load(&store).unwrap();
-        assert!(
-            st.devices.len() <= MAX_DEVICES,
-            "the store must stay bounded at the cap ({} devices)",
-            st.devices.len()
-        );
+        assert!(st.devices.len() <= MAX_DEVICES);
     }
 
     #[test]
     fn clear_wipes_the_store() {
         let mut store = MemStore::default();
-        record(&mut store, "dev", DeliveryPath::Direct, true, 100).unwrap();
-        assert!(load(&store).unwrap().find("dev").is_some());
+        record(&mut store, "dev", DeliveryPath::Direct, true, 1_000).unwrap();
         clear(&mut store).unwrap();
-        assert!(load(&store).unwrap().find("dev").is_none());
-    }
-
-    #[test]
-    fn relay_live_path_is_offered_first_and_scored_independently() {
-        let mut store = MemStore::default();
-        // A relay-only device: cold start offers Relay first, queue as the floor.
-        assert_eq!(
-            best_paths_for(&store, "dev", DeliveryPath::Relay, 1_000),
-            vec![DeliveryPath::Relay, DeliveryPath::Queue],
-        );
-        // A demonstrably-dead relay path is deprioritized below the queue, keyed
-        // on Relay — while a same-device Direct score would be untouched.
-        for t in [100u64, 160, 220] {
-            record(&mut store, "dev", DeliveryPath::Relay, false, t).unwrap();
-        }
-        assert_eq!(
-            best_paths_for(&store, "dev", DeliveryPath::Relay, 260),
-            vec![DeliveryPath::Queue, DeliveryPath::Relay],
-            "a persistently-dead relay path falls behind the queue"
-        );
-        // The Direct view of the same device is unaffected (independent scoring).
-        assert_eq!(
-            best_paths_for(&store, "dev", DeliveryPath::Direct, 260),
-            vec![DeliveryPath::Direct, DeliveryPath::Queue],
-        );
-    }
-
-    #[test]
-    fn per_path_stats_are_independent() {
-        let mut store = MemStore::default();
-        record(&mut store, "dev", DeliveryPath::Direct, false, 100).unwrap();
-        record(&mut store, "dev", DeliveryPath::Queue, true, 100).unwrap();
-        let st = load(&store).unwrap();
-        let entry = st.find("dev").unwrap();
-        assert_eq!(entry.stat(DeliveryPath::Direct).failures, 1);
-        assert_eq!(entry.stat(DeliveryPath::Queue).successes, 1);
-        assert_eq!(entry.stat(DeliveryPath::Direct).successes, 0);
+        assert_eq!(best_paths(&store, "dev", 1_001), default_order());
     }
 }

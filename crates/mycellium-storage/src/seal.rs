@@ -2,11 +2,9 @@
 //! **ChaCha20-Poly1305** AEAD, with a small JSON `Sealed` wire struct
 //! (salt + nonce + ciphertext).
 //!
-//! Both at-rest secret stores ride on this exact code so their on-disk format
-//! stays **bit-compatible**: the CLI's identity file ([`crate::store`]) and the
-//! SDK's passphrase [`SecretStore`](../../mycellium_sdk/secrets) both call
-//! [`seal`] / [`open`]. Security material that must decrypt across two crates
-//! cannot afford two hand-copied implementations that silently drift apart.
+//! The CLI's identity file ([`crate::store`]) uses this for wallet and device
+//! secret material. Keeping the primitive small and central avoids hand-copied
+//! sealing code silently drifting apart.
 //!
 //! Fails **closed**: a wrong passphrase (or any tampering) trips the AEAD tag and
 //! returns [`SealError::WrongKeyOrCorrupt`] — never a wrong or empty plaintext.
@@ -26,7 +24,7 @@ struct Sealed {
 }
 
 /// Why a [`seal`] / [`open`] failed. Callers map this onto their own error
-/// taxonomy (anyhow in the CLI store, `SdkError` in the SDK).
+/// taxonomy.
 #[derive(Debug)]
 pub enum SealError {
     /// Argon2id key derivation failed.

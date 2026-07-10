@@ -1,7 +1,0 @@
-{
-  "name": "mycellium-client-e2e",
-  "private": true,
-  "type": "module",
-  "scripts": { "test": "node browser.test.mjs" },
-  "dependencies": { "puppeteer-core": "^23.0.0" }
-}

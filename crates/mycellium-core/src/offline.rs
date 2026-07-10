@@ -1,11 +1,10 @@
-//! Offline delivery — the async, store-and-forward path (deferred from Layer 4).
+//! Deferred delivery payloads for direct handoff and local retry.
 //!
 //! When the recipient isn't online for a live handshake, the sender uses the
 //! keys the recipient *already published* (identity + signed pre-key) to run
 //! X3DH **asynchronously**, encrypts the message with a fresh ratchet, and packs
-//! everything a recipient needs into one [`Envelope`]. The envelope waits in a
-//! mailbox (which can only store it, never read it) until the recipient comes
-//! online, runs the responder side, and decrypts.
+//! everything a recipient needs into one [`Envelope`]. The sender can retry this
+//! opaque envelope later without learning anything new or involving custody.
 //!
 //! Each offline message is a self-contained one-shot session — simple, and
 //! enough for the POC. Long-lived asynchronous ratchets are future work.
@@ -18,7 +17,7 @@ use crate::record::SignedRecord;
 use crate::x3dh::HandshakeInit;
 
 /// Everything the recipient needs to authenticate the sender and decrypt one
-/// offline message. Opaque to whatever stores it.
+/// deferred message. Opaque to local retry storage and direct transports.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Envelope {
     /// The sender's handle (authenticated by `sender_record`).
@@ -60,8 +59,6 @@ mod tests {
             handle: Handle::new(handle).unwrap(),
             name: String::new(),
             wallet: id.wallet_public(),
-            queue: String::new(),
-            queues: alloc::vec![],
             devices: alloc::vec![crate::record::Device {
                 device_key: id.device_public(),
                 peer_id: crate::identity::PeerId(alloc::vec![]),

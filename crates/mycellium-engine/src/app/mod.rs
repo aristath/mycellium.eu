@@ -1,17 +1,20 @@
-//! The engine's orchestration (headless): create/restore an identity, register,
-//! open a direct line (X3DH + Double Ratchet), deliver live or via the mailbox,
-//! run groups and multi-device — everything a shell drives, minus presentation.
+//! Native hard-serverless orchestration.
+//!
+//! This app layer has no directory, queue, relay, mailbox, push, or hosted
+//! rendezvous dependency. It keeps signed peer records locally, sends only over
+//! direct peer-to-peer transports, and parks undelivered messages in the local
+//! outbox.
 #![allow(clippy::too_many_arguments)]
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use mycellium_core::group::Group;
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::Ratchet;
-use mycellium_core::record::{Device, Record, SignedRecord};
+use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_core::transport::Transport;
@@ -19,62 +22,1863 @@ use mycellium_core::userid::user_id;
 use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 
-use crate::blocklist;
-use crate::contacts::{self, Contact};
-use crate::draft;
-use crate::expiry;
-use crate::groups::{self, GroupSyncPayload, MailItem, StoredGroup};
-use crate::history;
-use crate::inbound;
-use crate::outbox;
-use crate::platform::OsPlatform;
-use crate::reachability::{self, DeliveryPath};
-use crate::verified::{self, TrustLevel};
-use mycellium_directory_client::DirectoryClient;
-use mycellium_queue_client::{wallet_hex, QueueClient};
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
 use mycellium_transport::libp2p_net::{self};
 use mycellium_transport::link::{FrameReader, FrameWriter, Wire};
 use mycellium_transport::net::{self, TcpTransport};
 
-/// The cluster-wide mailbox slot, read by every device of an account. Shared by
-/// several submodules, so it lives at the `app` root (reached via `super::*`).
-const ACCOUNT_SLOT: &str = "account";
-
-/// The engine (native CLI) [`crate::flow::FlowNet`]: directory lookups over the
-/// native blocking [`DirectoryClient`]. Borrows the client so the send shell and
-/// the trust chokepoint share one connection without cloning.
-pub(crate) struct EngineNet<'a> {
-    pub dir: &'a DirectoryClient,
-}
-
-impl crate::flow::FlowNet for EngineNet<'_> {
-    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
-        self.dir.lookup(handle)
-    }
-    fn publish(&self, identity: &Identity, record: &SignedRecord) -> anyhow::Result<()> {
-        let token = self.dir.login(identity)?;
-        self.dir.publish(&token, record)
-    }
-}
+use crate::antirollback;
+use crate::blocklist;
+use crate::contacts::{self, Contact};
+use crate::draft;
+use crate::expiry;
+use crate::flow;
+use crate::groups::{self, GroupSyncPayload, MailItem, StoredGroup};
+use crate::history;
+use crate::outbox;
+use crate::peerbook::{self, PeerRecord};
+use crate::platform::OsPlatform;
+use crate::reachability::{self, DeliveryPath};
+use crate::verified;
 
 mod backup;
-mod devices;
-mod directory_ops;
-mod grouping;
-mod messaging;
-mod organize;
-mod pairing;
 mod session;
 mod util;
 
 pub use backup::*;
-pub use devices::*;
-pub use directory_ops::*;
-pub use grouping::*;
-pub use messaging::*;
-pub use organize::*;
-pub use pairing::*;
 pub use session::*;
 pub use util::*;
+
+#[derive(Clone)]
+struct LocalNet {
+    records: Vec<PeerRecord>,
+}
+
+impl LocalNet {
+    fn load(store: &impl Storage) -> Self {
+        Self {
+            records: peerbook::load(store).unwrap_or_default(),
+        }
+    }
+}
+
+impl flow::FlowNet for LocalNet {
+    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
+        self.records
+            .iter()
+            .find(|entry| entry.handle == handle.as_str())
+            .map(|entry| entry.record.clone())
+            .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))
+    }
+}
+
+// ---- identity / records -----------------------------------------------------
+
+pub fn identity_new() -> Result<()> {
+    if store::exists() {
+        bail!("an identity already exists at {}", store::path().display());
+    }
+    let identity = Identity::generate(&mut OsPlatform)?;
+    store::save_identity(&identity)?;
+    println!("New identity created.");
+    println!("wallet: {}", hex(&identity.wallet_public().0));
+    println!("device: {}", hex(&identity.device_public().0));
+    Ok(())
+}
+
+pub fn identity_show() -> Result<()> {
+    let identity = store::load_identity()?;
+    println!("wallet:    {}", hex(&identity.wallet_public().0));
+    println!("device:    {}", hex(&identity.device_public().0));
+    println!("device-id: {}", short_device_id(&identity.device_public()));
+    println!("messaging: {}", hex(&identity.messaging_public().0));
+    Ok(())
+}
+
+pub fn identity_export_wallet(yes: bool) -> Result<()> {
+    if !yes {
+        bail!("refusing to print the wallet secret without --yes");
+    }
+    let identity = store::load_identity()?;
+    println!("{}", hex(&identity.wallet_secret()));
+    Ok(())
+}
+
+pub fn identity_adopt(wallet_secret: &str) -> Result<()> {
+    if store::exists() {
+        bail!("an identity already exists at {}", store::path().display());
+    }
+    let wallet_secret = hex_32(wallet_secret)?;
+    let identity = Identity::adopt(&mut OsPlatform, wallet_secret)?;
+    store::save_identity(&identity)?;
+    println!("Adopted wallet on a fresh device.");
+    println!("wallet: {}", hex(&identity.wallet_public().0));
+    println!("device: {}", hex(&identity.device_public().0));
+    Ok(())
+}
+
+pub fn register(handle: &str, addr: &str, libp2p: bool) -> Result<()> {
+    let identity = store::load_identity()?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let location = if libp2p {
+        libp2p_net::advertised_multiaddr(addr, identity.device_secret())?
+    } else {
+        addr.to_string()
+    };
+
+    let mut fs = open_history(&identity)?;
+    let existing = reusable_own_record(&identity, &handle, peerbook::get(&fs, &handle)?)?;
+    let mut devices = existing
+        .as_ref()
+        .map(|r| r.record.devices.clone())
+        .unwrap_or_default();
+    let mine = this_device(&identity, &location);
+    match devices.iter_mut().find(|d| d.device_key == mine.device_key) {
+        Some(slot) => *slot = mine,
+        None => devices.push(mine),
+    }
+    let prev = existing.as_ref().map(|r| r.record.seq).unwrap_or(0);
+    let signed = peerbook::with_devices(
+        &mut OsPlatform,
+        &identity,
+        &handle,
+        &display_name_for(&handle),
+        devices,
+        prev,
+    );
+    peerbook::put(&mut fs, &handle, signed.clone())?;
+    println!("registered '{}' locally at {}", handle.as_str(), location);
+    println!("record: {}", peerbook::encode(&signed));
+    report_configured_dht_publish(&identity, &handle, &signed);
+    Ok(())
+}
+
+fn reusable_own_record(
+    identity: &Identity,
+    handle: &Handle,
+    existing: Option<SignedRecord>,
+) -> Result<Option<SignedRecord>> {
+    let Some(record) = existing else {
+        return Ok(None);
+    };
+    record.verify().map_err(|_| {
+        anyhow!(
+            "local record for '{}' failed verification; run `record remove {}` before registering it here",
+            handle.as_str(),
+            handle.as_str()
+        )
+    })?;
+    if record.record.wallet != identity.wallet_public() {
+        bail!(
+            "local record for '{}' belongs to a different wallet; run `record remove {}` before registering it here",
+            handle.as_str(),
+            handle.as_str()
+        );
+    }
+    Ok(Some(record))
+}
+
+pub fn record_export(handle: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let record = peerbook::get(&fs, &handle)?.ok_or_else(|| {
+        anyhow!(
+            "no local record for '{}' — run `register` or `record import`",
+            handle.as_str()
+        )
+    })?;
+    println!("{}", peerbook::encode(&record));
+    Ok(())
+}
+
+pub fn record_import(handle: &str, encoded: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let record = peerbook::decode(encoded)?;
+    peerbook::put(&mut fs, &handle, record)?;
+    println!("imported signed record for '{}'", handle.as_str());
+    Ok(())
+}
+
+pub fn records_list() -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let records = peerbook::load(&fs)?;
+    if records.is_empty() {
+        println!("no local peer records");
+        return Ok(());
+    }
+    for entry in records {
+        println!(
+            "{}  wallet={}  devices={}",
+            entry.handle,
+            hex(&entry.record.record.wallet.0),
+            entry.record.record.devices.len()
+        );
+    }
+    Ok(())
+}
+
+pub fn list_devices(handle: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let record = peerbook::get(&fs, &handle)?
+        .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))?;
+    println!("devices for '{}':", handle.as_str());
+    for d in &record.record.devices {
+        println!(
+            "  {}  {}",
+            short_device_id(&d.device_key),
+            String::from_utf8_lossy(&d.peer_id.0)
+        );
+    }
+    Ok(())
+}
+
+pub fn revoke_device(handle: &str, device_id: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let record = peerbook::get(&fs, &handle)?
+        .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))?;
+    if record.record.wallet != identity.wallet_public() {
+        bail!(
+            "cannot edit '{}' because its record is signed by a different wallet",
+            handle.as_str()
+        );
+    }
+    let matches = record
+        .record
+        .devices
+        .iter()
+        .filter(|device| short_device_id(&device.device_key) == device_id)
+        .count();
+    if matches == 0 {
+        bail!("no device '{device_id}' in '{}'", handle.as_str());
+    }
+    if matches > 1 {
+        bail!("device id '{device_id}' is ambiguous; use a fresh record export");
+    }
+    let devices: Vec<Device> = record
+        .record
+        .devices
+        .iter()
+        .filter(|device| short_device_id(&device.device_key) != device_id)
+        .cloned()
+        .collect();
+    if devices.is_empty() {
+        bail!("refusing to publish a record with no devices");
+    }
+    let signed = peerbook::with_devices(
+        &mut OsPlatform,
+        &identity,
+        &handle,
+        &display_name_for(&handle),
+        devices,
+        record.record.seq,
+    );
+    peerbook::put(&mut fs, &handle, signed.clone())?;
+    println!("revoked device '{device_id}' from '{}'", handle.as_str());
+    println!("record: {}", peerbook::encode(&signed));
+    report_configured_dht_publish(&identity, &handle, &signed);
+    Ok(())
+}
+
+pub fn remove_record(handle: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    if peerbook::remove(&mut fs, &handle)? {
+        antirollback::clear(&mut fs, handle.as_str())?;
+        println!("removed local record for '{}'", handle.as_str());
+    } else {
+        antirollback::clear(&mut fs, handle.as_str())?;
+        println!("no local record for '{}'", handle.as_str());
+    }
+    Ok(())
+}
+
+pub fn discover(peer: &str, want: &[String]) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
+    let mut last_error = None;
+
+    for device in &peer_record.record.devices {
+        match request_discovery_from_device(identity.device_secret(), device, want) {
+            Ok(records) => {
+                let report = peerbook::import_records(&mut fs, records);
+                println!(
+                    "discovered through '{}' — imported {} record(s), skipped {}",
+                    peer_handle.as_str(),
+                    report.imported,
+                    report.skipped.len()
+                );
+                for (handle, reason) in report.skipped {
+                    eprintln!("skipped {handle}: {reason}");
+                }
+                return Ok(());
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    let detail = last_error
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "peer has no devices".to_string());
+    bail!(
+        "could not discover through '{}': {detail}",
+        peer_handle.as_str()
+    )
+}
+
+pub fn dht_serve(addr: &str, bootstrap: &[String]) -> Result<()> {
+    let identity = store::load_identity()?;
+    let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad DHT listen address")?;
+    let bootstrap = effective_bootstrap(bootstrap)?;
+    println!("starting DHT discovery node on {addr}");
+    libp2p_net::dht_serve(identity.device_secret(), listen_addr, bootstrap)
+}
+
+pub fn dht_publish(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let record = own_record(&fs, &handle)?;
+    let listen_addr = listen
+        .map(libp2p_net::listen_multiaddr)
+        .transpose()
+        .context("bad DHT listen address")?;
+    let bootstrap = effective_bootstrap(bootstrap)?;
+    libp2p_net::dht_put(
+        identity.device_secret(),
+        listen_addr,
+        bootstrap,
+        dht_record_key(&handle),
+        wire::encode(&record),
+    )?;
+    println!(
+        "published signed record for '{}' to the DHT",
+        handle.as_str()
+    );
+    Ok(())
+}
+
+pub fn dht_lookup(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let listen_addr = listen
+        .map(libp2p_net::listen_multiaddr)
+        .transpose()
+        .context("bad DHT listen address")?;
+    let bootstrap = effective_bootstrap(bootstrap)?;
+    let candidates = libp2p_net::dht_get_records(
+        identity.device_secret(),
+        listen_addr,
+        bootstrap,
+        dht_record_key(&handle),
+    )?;
+    let (best, skipped) = best_dht_record_candidate(&handle, candidates);
+    let Some(record) = best else {
+        bail!("no DHT record found for '{}'", handle.as_str());
+    };
+    peerbook::put(&mut fs, &handle, record)?;
+    if skipped > 0 {
+        println!(
+            "imported signed DHT record for '{}' (skipped {skipped} invalid candidate(s))",
+            handle.as_str()
+        );
+    } else {
+        println!("imported signed DHT record for '{}'", handle.as_str());
+    }
+    Ok(())
+}
+
+// ---- direct delivery --------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn send(
+    peer: &str,
+    whoami: &str,
+    message: Option<&str>,
+    reply_to: Option<&str>,
+    react: Option<&str>,
+    to: Option<&str>,
+    file: Option<&str>,
+    edit: Option<&str>,
+    delete: Option<&str>,
+    expire: Option<&str>,
+) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let _ = flush_outbox(&identity, &mut fs);
+    let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
+
+    let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
+    let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
+    let now = OsPlatform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let my_record = own_record(&fs, &me)?;
+    let net = LocalNet::load(&fs);
+
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        let path = deliver_direct(store, device_secret, device, &item, now);
+        if !path.is_delivered() {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+            DeliveryPath::Outbox
+        } else {
+            path
+        }
+    };
+    let mut self_deliver =
+        |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
+            if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+            }
+        };
+
+    let out = flow::send_app(
+        &identity,
+        &mut fs,
+        &mut OsPlatform,
+        &net,
+        &me,
+        &my_record,
+        &peer_handle,
+        &peer_record,
+        &app,
+        &mut deliver,
+        &mut self_deliver,
+    );
+
+    let total = out.delivered + out.outboxed;
+    print_delivery_summary(
+        peer_handle.as_str(),
+        &out.id,
+        out.delivered,
+        out.outboxed,
+        total,
+    );
+    Ok(())
+}
+
+fn print_delivery_summary(peer: &str, id: &str, delivered: u32, pending: u32, total: u32) {
+    println!("{}", delivery_summary(peer, id, delivered, pending, total));
+}
+
+fn delivery_summary(peer: &str, id: &str, delivered: u32, pending: u32, total: u32) -> String {
+    let delivered_devices = plural(delivered as usize, "device", "devices");
+    let total_devices = plural(total as usize, "device", "devices");
+    let pending_devices = plural(pending as usize, "device", "devices");
+    if pending == 0 {
+        format!("delivered to '{peer}' — {delivered}/{total} {total_devices} (#{id})")
+    } else if delivered == 0 {
+        format!("saved for '{peer}' — waiting for direct delivery to {pending} {pending_devices} (#{id})")
+    } else {
+        format!(
+            "partially delivered to '{peer}' — {delivered} {delivered_devices} reached, {pending} pending locally (#{id})"
+        )
+    }
+}
+
+pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let blocked = blocklist::load(&fs)?;
+    let my_record = own_record(&fs, &me)?;
+    let mut platform = OsPlatform;
+
+    if libp2p {
+        let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
+        let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
+            .context("could not start libp2p node")?;
+        println!(
+            "serving (libp2p) on {addr} as {} ({})",
+            me.as_str(),
+            node.peer_id()
+        );
+        loop {
+            let mut conn = match node.accept() {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            while let Ok(frame) = conn.recv_frame() {
+                if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
+                    if handle_discovery_frame(&mut fs, &mut conn, &item) {
+                        continue;
+                    }
+                    remember_sender(&mut fs, &item);
+                    let _ = process_item(
+                        &identity,
+                        &me,
+                        &my_record,
+                        &blocked,
+                        &mut platform,
+                        &mut fs,
+                        item,
+                    );
+                }
+            }
+        }
+    } else {
+        let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
+        println!("serving on {addr} as {}", me.as_str());
+        loop {
+            let mut conn = match transport.accept() {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            while let Ok(frame) = conn.recv_frame() {
+                if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
+                    if handle_discovery_frame(&mut fs, &mut conn, &item) {
+                        continue;
+                    }
+                    remember_sender(&mut fs, &item);
+                    let _ = process_item(
+                        &identity,
+                        &me,
+                        &my_record,
+                        &blocked,
+                        &mut platform,
+                        &mut fs,
+                        item,
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn outbox_list() -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let entries = outbox::load(&fs)?;
+    print_outbox_entries(&entries);
+    Ok(())
+}
+
+pub fn outbox_retry() -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let (delivered, _) = flush_outbox(&identity, &mut fs)?;
+    if delivered > 0 {
+        println!(
+            "delivered {delivered} pending {}",
+            plural(delivered, "message", "messages")
+        );
+    }
+    let entries = outbox::load(&fs)?;
+    print_outbox_entries(&entries);
+    Ok(())
+}
+
+pub fn outbox_cancel(id: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let mut entries = outbox::load(&fs)?;
+    if entries.is_empty() {
+        println!("outbox empty");
+        return Ok(());
+    }
+
+    if id == "all" {
+        let removed = entries.len();
+        outbox::save(&mut fs, &[])?;
+        println!(
+            "cancelled {removed} pending local delivery {}",
+            plural(removed, "item", "items")
+        );
+        return Ok(());
+    }
+
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| entry.id.starts_with(id).then_some(index))
+        .collect();
+    match matches.len() {
+        0 => bail!("no pending local delivery item matches '{id}'"),
+        1 => {
+            let removed = entries.remove(matches[0]);
+            outbox::save(&mut fs, &entries)?;
+            println!(
+                "cancelled pending local delivery {} for '{}'",
+                short_outbox_id(&removed.id),
+                removed.recipient
+            );
+        }
+        n => bail!("'{id}' matches {n} pending items; use a longer id prefix"),
+    }
+    Ok(())
+}
+
+fn print_outbox_entries(entries: &[outbox::OutboxEntry]) {
+    if entries.is_empty() {
+        println!("outbox empty");
+        return;
+    }
+    let now = OsPlatform.now_unix_secs();
+    println!(
+        "{} pending local delivery {}:",
+        entries.len(),
+        plural(entries.len(), "item", "items")
+    );
+    for e in entries {
+        println!(
+            "  {} -> {}  (device {}, {}s old, {} {})",
+            short_outbox_id(&e.id),
+            e.recipient,
+            &e.slot[..8.min(e.slot.len())],
+            now.saturating_sub(e.created_at),
+            e.attempts,
+            plural(e.attempts as usize, "attempt", "attempts")
+        );
+    }
+}
+
+fn short_outbox_id(id: &str) -> &str {
+    &id[..12.min(id.len())]
+}
+
+pub fn flush_outbox(identity: &Identity, fs: &mut FileStore) -> Result<(usize, usize)> {
+    let entries = outbox::load(fs)?;
+    if entries.is_empty() {
+        return Ok((0, 0));
+    }
+    let now = OsPlatform.now_unix_secs();
+    let (delivered, remaining) = outbox::flush_pass(entries, now, |entry| {
+        let Ok(handle) = Handle::new(entry.recipient.clone()) else {
+            return outbox::Attempt::Drop;
+        };
+        let mut record = match peerbook::get(fs, &handle) {
+            Ok(record) => record,
+            Err(_) => return outbox::Attempt::Retry,
+        };
+        if record.is_none() {
+            let _ = import_from_configured_dht(identity, fs, &handle);
+            record = match peerbook::get(fs, &handle) {
+                Ok(record) => record,
+                Err(_) => return outbox::Attempt::Retry,
+            };
+        }
+        let Some(record) = record else {
+            return outbox::Attempt::Retry;
+        };
+        if record.verify().is_err() {
+            return outbox::Attempt::Retry;
+        }
+        let Some(device) = record
+            .record
+            .devices
+            .iter()
+            .find(|d| device_slot(&d.device_key) == entry.slot)
+        else {
+            return outbox::Attempt::Drop;
+        };
+        if deliver_direct(fs, identity.device_secret(), device, &entry.item, now).is_delivered() {
+            outbox::Attempt::Delivered
+        } else {
+            outbox::Attempt::Retry
+        }
+    });
+    let waiting = remaining.len();
+    outbox::save(fs, &remaining)?;
+    Ok((delivered, waiting))
+}
+
+fn deliver_direct(
+    store: &mut FileStore,
+    device_secret: [u8; 32],
+    device: &Device,
+    item: &MailItem,
+    now: u64,
+) -> DeliveryPath {
+    let key = device_slot(&device.device_key);
+    let ok = direct_push(device_secret, device, item);
+    let _ = reachability::record(store, &key, DeliveryPath::Direct, ok, now);
+    if ok {
+        DeliveryPath::Direct
+    } else {
+        DeliveryPath::Failed
+    }
+}
+
+fn direct_push(device_secret: [u8; 32], device: &Device, item: &MailItem) -> bool {
+    let Ok(frame) = serde_json::to_vec(item) else {
+        return false;
+    };
+    match direct_transport(&device.peer_id.0) {
+        DirectTransport::None => false,
+        DirectTransport::Tcp => {
+            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            match net::TcpConnection::connect(&addr) {
+                Ok(mut conn) => conn.send_frame(&frame).is_ok(),
+                Err(_) => false,
+            }
+        }
+        DirectTransport::Libp2p => {
+            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let mut node = match libp2p_net::Libp2pNode::new(device_secret, None) {
+                Ok(node) => node,
+                Err(_) => return false,
+            };
+            let ok = match node.dial_str(&addr) {
+                Ok(mut conn) => conn.send_frame(&frame).is_ok(),
+                Err(_) => false,
+            };
+            node.drain(300);
+            ok
+        }
+    }
+}
+
+fn request_discovery_from_device(
+    device_secret: [u8; 32],
+    device: &Device,
+    want: &[String],
+) -> Result<Vec<crate::groups::DiscoveryRecord>> {
+    let request = MailItem::DiscoveryRequest {
+        want: want.to_vec(),
+    };
+    let frame = serde_json::to_vec(&request)?;
+    match direct_transport(&device.peer_id.0) {
+        DirectTransport::None => bail!("device has no dialable address"),
+        DirectTransport::Tcp => {
+            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let mut conn = net::TcpConnection::connect(&addr)
+                .with_context(|| format!("could not connect to {addr}"))?;
+            conn.send_frame(&frame)?;
+            decode_discovery_response(&conn.recv_frame()?)
+        }
+        DirectTransport::Libp2p => {
+            let addr = String::from_utf8_lossy(&device.peer_id.0);
+            let mut node = libp2p_net::Libp2pNode::new(device_secret, None)?;
+            let mut conn = node
+                .dial_str(&addr)
+                .with_context(|| format!("could not connect to {addr}"))?;
+            conn.send_frame(&frame)?;
+            let records = decode_discovery_response(&conn.recv_frame()?)?;
+            node.drain(300);
+            Ok(records)
+        }
+    }
+}
+
+fn decode_discovery_response(frame: &[u8]) -> Result<Vec<crate::groups::DiscoveryRecord>> {
+    match serde_json::from_slice::<MailItem>(frame)? {
+        MailItem::DiscoveryResponse { records } => Ok(records),
+        _ => bail!("peer returned a non-discovery frame"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectTransport {
+    Tcp,
+    Libp2p,
+    None,
+}
+
+fn direct_transport(peer_id: &[u8]) -> DirectTransport {
+    match core::str::from_utf8(peer_id) {
+        Ok("") => DirectTransport::None,
+        Ok(addr) if addr.starts_with('/') => DirectTransport::Libp2p,
+        Ok(_) => DirectTransport::Tcp,
+        Err(_) => DirectTransport::None,
+    }
+}
+
+fn handle_discovery_frame<W: FrameWriter>(
+    fs: &mut FileStore,
+    writer: &mut W,
+    item: &MailItem,
+) -> bool {
+    match item {
+        MailItem::DiscoveryRequest { want } => {
+            let records = match peerbook::pack(fs, want) {
+                Ok(records) => records,
+                Err(err) => {
+                    eprintln!("(could not build discovery response: {err})");
+                    Vec::new()
+                }
+            };
+            let response = MailItem::DiscoveryResponse { records };
+            if let Ok(frame) = serde_json::to_vec(&response) {
+                let _ = writer.send_frame(&frame);
+            }
+            true
+        }
+        MailItem::DiscoveryResponse { records } => {
+            let report = peerbook::import_records(fs, records.clone());
+            if report.imported > 0 || !report.skipped.is_empty() {
+                println!(
+                    "discovery imported {} record(s), skipped {}",
+                    report.imported,
+                    report.skipped.len()
+                );
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn remember_sender(fs: &mut FileStore, item: &MailItem) {
+    let env = match item {
+        MailItem::Direct(env)
+        | MailItem::SelfSync { envelope: env, .. }
+        | MailItem::GroupSync(env)
+        | MailItem::GroupInvite(env)
+        | MailItem::GroupLeave(env) => Some(env),
+        MailItem::GroupText { .. }
+        | MailItem::DiscoveryRequest { .. }
+        | MailItem::DiscoveryResponse { .. } => None,
+    };
+    if let Some(env) = env {
+        let _ = peerbook::put(fs, &env.from, env.sender_record.clone());
+    }
+}
+
+// ---- receive processing -----------------------------------------------------
+
+struct CliSink;
+
+impl flow::FlowSink for CliSink {
+    fn emit(&mut self, event: flow::FlowEvent) {
+        use flow::FlowEvent::*;
+        match event {
+            DirectMessage { from, id, text, .. } => {
+                if id.is_empty() {
+                    println!("from {from}: {text}");
+                } else {
+                    println!("from {from}: {text}  (#{id})");
+                }
+            }
+            SelfMirror { peer, id, text } => println!("-> {peer}: {text}  (#{id})"),
+            GroupMessage {
+                name,
+                sender,
+                id,
+                text,
+                ..
+            } => {
+                println!("[{name}] {sender}: {text}  (#{id})")
+            }
+            Edited {
+                thread, id, group, ..
+            } => {
+                if group {
+                    println!("[{thread}] edited #{id}");
+                } else {
+                    println!("from {thread}: edited #{id}");
+                }
+            }
+            Deleted { thread, id, group } => {
+                if group {
+                    println!("[{thread}] deleted #{id}");
+                } else {
+                    println!("from {thread}: deleted #{id}");
+                }
+            }
+            Receipt {
+                from,
+                message_id,
+                read,
+            } => {
+                let mark = if read { "read" } else { "delivered" };
+                println!("ok {from} {mark} your message #{message_id}");
+            }
+            GroupJoined { name, inviter, .. } => {
+                println!("joined group '{name}' (invited by {inviter})")
+            }
+            GroupLeft { name, member, .. } => println!("'{member}' left '{name}'"),
+            GroupBootstrapped { name, .. } => println!("bootstrapped into group '{name}'"),
+            Attachment { name, data, .. } => match save_attachment(&name, &data) {
+                Ok(path) => println!("(saved attachment to {})", path.display()),
+                Err(err) => eprintln!("(could not save attachment: {err})"),
+            },
+            Warn(msg) => eprintln!("({msg})"),
+        }
+    }
+}
+
+pub fn process_item(
+    identity: &Identity,
+    me: &Handle,
+    my_record: &SignedRecord,
+    blocked: &[String],
+    platform: &mut OsPlatform,
+    fs: &mut FileStore,
+    item: MailItem,
+) -> flow::ItemOutcome {
+    let now = platform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let net = LocalNet::load(fs);
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        let path = deliver_direct(store, device_secret, device, &item, now);
+        if !path.is_delivered() {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+            DeliveryPath::Outbox
+        } else {
+            path
+        }
+    };
+    let mut self_deliver =
+        |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
+            if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+            }
+        };
+
+    let mut sink = CliSink;
+    flow::process_item(
+        identity,
+        fs,
+        platform,
+        &net,
+        me,
+        my_record,
+        blocked,
+        item,
+        &mut sink,
+        &mut deliver,
+        &mut self_deliver,
+    )
+}
+
+// ---- groups -----------------------------------------------------------------
+
+pub fn group_create(name: &str, members: &[String], whoami: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let my_record = own_record(&fs, &me)?;
+
+    let mut all = Vec::new();
+    for member in members {
+        let handle = Handle::new(member.clone()).map_err(|_| anyhow!("invalid member handle"))?;
+        if !all.iter().any(|m| m == handle.as_str()) {
+            all.push(handle.as_str().to_string());
+        }
+    }
+    if !all.iter().any(|m| m == me.as_str()) {
+        all.push(me.as_str().to_string());
+    }
+    ensure_peer_records(&identity, &mut fs, &all)?;
+
+    let mut platform = OsPlatform;
+    let group_id = random_id();
+    let group = Group::new(&mut platform, my_group_id(&identity));
+    let mut stored = StoredGroup {
+        id: group_id.clone(),
+        name: name.to_string(),
+        members: all.clone(),
+        me: me.as_str().to_string(),
+        sender_handles: Vec::new(),
+        state: group.export(),
+    };
+    stored.note_sender(my_group_id(&identity), me.as_str());
+    groups::save(&mut fs, &stored)?;
+
+    distribute_group_key_direct(&identity, &me, &my_record, &stored, &group, &all, &mut fs);
+    println!(
+        "created group '{name}' ({group_id}) with {} members",
+        all.len()
+    );
+    Ok(())
+}
+
+pub fn group_add(group: &str, member: &str, whoami: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let my_record = own_record(&fs, &me)?;
+    let member = Handle::new(member.to_string()).map_err(|_| anyhow!("invalid member handle"))?;
+
+    let mut stored = resolve_group(&fs, group)?;
+    if stored.members.iter().any(|m| m == member.as_str()) {
+        bail!("'{}' is already in '{}'", member.as_str(), stored.name);
+    }
+    stored.members.push(member.as_str().to_string());
+    ensure_peer_records(&identity, &mut fs, &stored.members)?;
+    groups::save(&mut fs, &stored)?;
+
+    let session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
+    let targets = stored.members.clone();
+    distribute_group_key_direct(
+        &identity, &me, &my_record, &stored, &session, &targets, &mut fs,
+    );
+    println!("invited '{}' to '{}'", member.as_str(), stored.name);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn group_send(
+    group: &str,
+    whoami: &str,
+    message: Option<&str>,
+    reply_to: Option<&str>,
+    react: Option<&str>,
+    to: Option<&str>,
+    file: Option<&str>,
+    edit: Option<&str>,
+    delete: Option<&str>,
+    expire: Option<&str>,
+) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let _ = flush_outbox(&identity, &mut fs);
+    let mut stored = resolve_group(&fs, group)?;
+    ensure_peer_records(&identity, &mut fs, &stored.members)?;
+
+    let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
+    let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
+    let now = OsPlatform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let net = LocalNet::load(&fs);
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        let path = deliver_direct(store, device_secret, device, &item, now);
+        if !path.is_delivered() {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+            DeliveryPath::Outbox
+        } else {
+            path
+        }
+    };
+
+    let out = flow::group_send(
+        &identity,
+        &mut fs,
+        &net,
+        &me,
+        &mut stored,
+        &app,
+        &mut deliver,
+    );
+    print_group_delivery_summary(&stored.name, &out.id, out.direct, out.outboxed);
+    Ok(())
+}
+
+fn print_group_delivery_summary(group: &str, id: &str, delivered: u32, pending: u32) {
+    println!("{}", group_delivery_summary(group, id, delivered, pending));
+}
+
+fn group_delivery_summary(group: &str, id: &str, delivered: u32, pending: u32) -> String {
+    let delivered_copies = plural(delivered as usize, "copy", "copies");
+    let pending_copies = plural(pending as usize, "copy", "copies");
+    if pending == 0 {
+        format!("delivered to group '{group}' — {delivered} direct {delivered_copies} (#{id})")
+    } else if delivered == 0 {
+        format!("saved for group '{group}' — {pending} {pending_copies} pending locally (#{id})")
+    } else {
+        format!(
+            "partially delivered to group '{group}' — {delivered} direct {delivered_copies}, {pending} pending locally (#{id})"
+        )
+    }
+}
+
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
+}
+
+pub fn group_history(group: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let stored = resolve_group(&fs, group)?;
+    let now = OsPlatform.now_unix_secs();
+    let transcript = history::group_load_active(&mut fs, &stored.id, now)?;
+    if transcript.is_empty() {
+        println!("no messages in '{}'", stored.name);
+        return Ok(());
+    }
+    for m in transcript {
+        println!("[{}] {}: {}", stored.name, m.sender, m.text);
+    }
+    Ok(())
+}
+
+pub fn group_info(group: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let stored = resolve_group(&fs, group)?;
+    println!("{} ({})", stored.name, stored.id);
+    println!("members: {}", stored.members.join(", "));
+    Ok(())
+}
+
+pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let my_record = own_record(&fs, &me)?;
+    let stored = resolve_group(&fs, group)?;
+    ensure_peer_records(&identity, &mut fs, &stored.members)?;
+    let now = OsPlatform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let net = LocalNet::load(&fs);
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem| {
+        if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+        }
+    };
+    flow::group_leave(
+        &identity,
+        &mut fs,
+        &mut OsPlatform,
+        &net,
+        &me,
+        &my_record,
+        &stored,
+        &mut deliver,
+    );
+    println!("left group '{}'", stored.name);
+    Ok(())
+}
+
+pub fn group_sync(whoami: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
+    let mut fs = open_history(&identity)?;
+    let my_record = own_record(&fs, &me)?;
+    let my_key = identity.device_public();
+    let siblings: Vec<Device> = my_record
+        .record
+        .devices
+        .iter()
+        .filter(|d| d.device_key != my_key)
+        .cloned()
+        .collect();
+    if siblings.is_empty() {
+        println!("no other devices to sync to");
+        return Ok(());
+    }
+
+    let now = OsPlatform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let mut synced = 0usize;
+    for id in groups::list(&fs)? {
+        let Some(stored) = groups::load(&fs, &id)? else {
+            continue;
+        };
+        let Ok(group) = Group::import(stored.state.clone()) else {
+            continue;
+        };
+        let mut keys = group.known_keys();
+        keys.push((my_group_id(&identity), group.distribution()));
+        let payload = GroupSyncPayload {
+            group_id: stored.id.clone(),
+            name: stored.name.clone(),
+            members: stored.members.clone(),
+            keys,
+            sender_handles: stored.sender_handles.clone(),
+        };
+        let Ok(plaintext) = serde_json::to_vec(&payload) else {
+            continue;
+        };
+        for device in &siblings {
+            let Ok(env) = crate::wireops::seal_to_with_record(
+                &mut OsPlatform,
+                &identity,
+                &me,
+                &my_record,
+                device,
+                &plaintext,
+            ) else {
+                continue;
+            };
+            let item = MailItem::GroupSync(env);
+            if !deliver_direct(&mut fs, device_secret, device, &item, now).is_delivered() {
+                let slot = device_slot(&device.device_key);
+                let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, item, now);
+            }
+        }
+        synced += 1;
+    }
+    println!(
+        "synced {synced} {} to {} other {}",
+        plural(synced, "group", "groups"),
+        siblings.len(),
+        plural(siblings.len(), "device", "devices")
+    );
+    Ok(())
+}
+
+pub fn group_list() -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let ids = groups::list(&fs)?;
+    if ids.is_empty() {
+        println!("no groups");
+        return Ok(());
+    }
+    for id in ids {
+        if let Some(g) = groups::load(&fs, &id)? {
+            println!("{} ({}) — {} members", g.name, g.id, g.members.len());
+        }
+    }
+    Ok(())
+}
+
+fn distribute_group_key_direct(
+    identity: &Identity,
+    me: &Handle,
+    my_record: &SignedRecord,
+    stored: &StoredGroup,
+    group: &Group,
+    targets: &[String],
+    fs: &mut FileStore,
+) {
+    let now = OsPlatform.now_unix_secs();
+    let device_secret = identity.device_secret();
+    let net = LocalNet::load(fs);
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem| {
+        if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
+            let slot = device_slot(&device.device_key);
+            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
+        }
+    };
+    flow::distribute_key(
+        identity,
+        fs,
+        &mut OsPlatform,
+        &net,
+        me,
+        my_record,
+        &stored.id,
+        &stored.name,
+        &group.distribution(),
+        &stored.members,
+        targets,
+        &mut deliver,
+    );
+}
+
+fn ensure_peer_records(identity: &Identity, fs: &mut FileStore, handles: &[String]) -> Result<()> {
+    for handle in handles {
+        let handle =
+            Handle::new(handle.clone()).map_err(|_| anyhow!("invalid handle '{handle}'"))?;
+        if peerbook::get(fs, &handle)?.is_none() {
+            let _ = import_from_configured_dht(identity, fs, &handle);
+        }
+        if peerbook::get(fs, &handle)?.is_none() {
+            bail!(
+                "no local signed record for '{}' — import their record first",
+                handle.as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve_group(fs: &FileStore, key: &str) -> Result<StoredGroup> {
+    if let Some(g) = groups::load(fs, key)? {
+        return Ok(g);
+    }
+    let mut matches = Vec::new();
+    for id in groups::list(fs)? {
+        if let Some(g) = groups::load(fs, &id)? {
+            if g.name == key {
+                matches.push(g);
+            }
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => bail!("no such group '{key}'"),
+        _ => bail!("group name '{key}' is ambiguous; use the group id"),
+    }
+}
+
+// ---- trust / contacts -------------------------------------------------------
+
+pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
+    let resolved = contacts::resolve(fs, input)?;
+    let net = LocalNet::load(fs);
+    match flow::lookup_verified(fs, &net, &resolved) {
+        Ok(pair) => Ok(pair),
+        Err(flow::TrustError::BadHandle) => {
+            let handle =
+                Handle::new(resolved.clone()).map_err(|_| anyhow!("invalid handle '{resolved}'"))?;
+            let identity = store::load_identity()?;
+            match import_from_configured_dht(&identity, fs, &handle) {
+                Ok(true) => {
+                    let net = LocalNet::load(fs);
+                    flow::lookup_verified(fs, &net, &resolved).map_err(|err| match err {
+                        flow::TrustError::BadHandle => {
+                            anyhow!("no signed record for '{resolved}'")
+                        }
+                        flow::TrustError::Unverified => anyhow!("peer record failed verification"),
+                        flow::TrustError::IdentityChanged => anyhow!(
+                            "IDENTITY CHANGED for '{resolved}'. Refusing until you verify the new record out of band."
+                        ),
+                        flow::TrustError::StaleRecord => {
+                            anyhow!("STALE RECORD for '{resolved}'. Refusing rollback.")
+                        }
+                    })
+                }
+                Ok(false) => Err(anyhow!("no local signed record for '{resolved}'")),
+                Err(err) => Err(anyhow!(
+                    "no local signed record for '{resolved}', and DHT lookup failed: {err}"
+                )),
+            }
+        }
+        Err(flow::TrustError::Unverified) => Err(anyhow!("peer record failed verification")),
+        Err(flow::TrustError::IdentityChanged) => bail!(
+            "IDENTITY CHANGED for '{resolved}'. Refusing until you verify the new record out of band."
+        ),
+        Err(flow::TrustError::StaleRecord) => {
+            bail!("STALE RECORD for '{resolved}'. Refusing rollback.")
+        }
+    }
+}
+
+fn own_record(fs: &FileStore, me: &Handle) -> Result<SignedRecord> {
+    peerbook::get(fs, me)?.ok_or_else(|| {
+        anyhow!(
+            "no local signed record for '{}' — run `register {} --addr <host:port>` first",
+            me.as_str(),
+            me.as_str()
+        )
+    })
+}
+
+fn effective_bootstrap(extra: &[String]) -> Result<Vec<libp2p_net::P2pMultiaddr>> {
+    let mut addrs = store::config().dht_bootstrap;
+    for addr in extra {
+        if !addrs.iter().any(|known| known == addr) {
+            addrs.push(addr.clone());
+        }
+    }
+    libp2p_net::parse_multiaddrs(&addrs)
+}
+
+const MAX_DHT_RECORD_BYTES: usize = 64 * 1024;
+
+fn decode_dht_record_candidate(handle: &Handle, bytes: &[u8]) -> Result<SignedRecord> {
+    if bytes.len() > MAX_DHT_RECORD_BYTES {
+        bail!("DHT record is too large");
+    }
+    let record: SignedRecord = wire::decode(bytes).map_err(|_| anyhow!("bad DHT record"))?;
+    if record.record.handle != user_id(handle.as_str()) {
+        bail!("DHT record belongs to a different handle");
+    }
+    record
+        .verify()
+        .map_err(|_| anyhow!("DHT record failed verification"))?;
+    Ok(record)
+}
+
+fn best_dht_record_candidate(
+    handle: &Handle,
+    candidates: Vec<Vec<u8>>,
+) -> (Option<SignedRecord>, usize) {
+    let mut best = None::<SignedRecord>;
+    let mut skipped = 0usize;
+    for bytes in candidates {
+        match decode_dht_record_candidate(handle, &bytes) {
+            Ok(record) => {
+                let replace = best
+                    .as_ref()
+                    .map(|known| record.record.seq > known.record.seq)
+                    .unwrap_or(true);
+                if replace {
+                    best = Some(record);
+                }
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+    (best, skipped)
+}
+
+fn import_from_configured_dht(
+    identity: &Identity,
+    fs: &mut FileStore,
+    handle: &Handle,
+) -> Result<bool> {
+    let bootstrap = effective_bootstrap(&[])?;
+    if bootstrap.is_empty() {
+        return Ok(false);
+    }
+    let candidates = libp2p_net::dht_get_records(
+        identity.device_secret(),
+        None,
+        bootstrap,
+        dht_record_key(handle),
+    )?;
+    let (best, _skipped) = best_dht_record_candidate(handle, candidates);
+    let Some(record) = best else {
+        return Ok(false);
+    };
+    peerbook::put(fs, handle, record)?;
+    Ok(true)
+}
+
+fn publish_to_configured_dht(
+    identity: &Identity,
+    handle: &Handle,
+    record: &SignedRecord,
+) -> Result<bool> {
+    let bootstrap = effective_bootstrap(&[])?;
+    if bootstrap.is_empty() {
+        return Ok(false);
+    }
+    libp2p_net::dht_put(
+        identity.device_secret(),
+        None,
+        bootstrap,
+        dht_record_key(handle),
+        wire::encode(record),
+    )?;
+    Ok(true)
+}
+
+fn report_configured_dht_publish(identity: &Identity, handle: &Handle, record: &SignedRecord) {
+    match publish_to_configured_dht(identity, handle, record) {
+        Ok(true) => println!(
+            "published signed record for '{}' to the configured DHT",
+            handle.as_str()
+        ),
+        Ok(false) => {}
+        Err(err) => eprintln!(
+            "warning: could not publish signed record for '{}' to the configured DHT: {err}",
+            handle.as_str()
+        ),
+    }
+}
+
+fn dht_record_key(handle: &Handle) -> Vec<u8> {
+    format!("mycellium/record/{}", handle.as_str()).into_bytes()
+}
+
+pub fn verify(peer: &str, confirm: bool) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
+    let wallet = peer_record.record.wallet;
+    let sn = safety::safety_number(&identity.wallet_public(), &wallet);
+    let level = verified::level(&fs, peer_handle.as_str(), &wallet);
+    println!("'{}' - {}", peer_handle.as_str(), level.label());
+    println!("safety number: {sn}");
+    if confirm {
+        verified::mark(&mut fs, peer_handle.as_str(), &wallet)?;
+        println!("marked '{}' as verified", peer_handle.as_str());
+    }
+    Ok(())
+}
+
+pub fn contact_add(nickname: &str, handle: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let record = peerbook::get(&fs, &handle)?
+        .ok_or_else(|| anyhow!("import a signed record for '{}' first", handle.as_str()))?;
+    let contact = Contact {
+        nickname: nickname.to_string(),
+        handle: handle.as_str().to_string(),
+        wallet: record.record.wallet,
+    };
+    contacts::save(&mut fs, &contact)?;
+    println!("added '{}' -> {}", nickname, handle.as_str());
+    Ok(())
+}
+
+pub fn contact_list() -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let list = contacts::list(&fs)?;
+    if list.is_empty() {
+        println!("no contacts");
+        return Ok(());
+    }
+    for c in list {
+        let verified_here =
+            verified::get(&fs, &c.handle).ok().flatten().as_ref() == Some(&c.wallet);
+        let mark = if verified_here { "verified" } else { "pinned" };
+        println!("{} -> {}   [{mark}]", c.nickname, c.handle);
+    }
+    Ok(())
+}
+
+pub fn contact_remove(nickname: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    contacts::remove(&mut fs, nickname)?;
+    println!("removed '{nickname}'");
+    Ok(())
+}
+
+// ---- local organization -----------------------------------------------------
+
+pub fn set_blocked(handle: &str, blocked: bool) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    if blocked {
+        blocklist::block(&mut fs, handle)?;
+        println!("blocked '{handle}'");
+    } else {
+        blocklist::unblock(&mut fs, handle)?;
+        println!("unblocked '{handle}'");
+    }
+    Ok(())
+}
+
+pub fn list_blocked() -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let list = blocklist::load(&fs)?;
+    if list.is_empty() {
+        println!("no blocked handles");
+    } else {
+        for h in list {
+            println!("{h}");
+        }
+    }
+    Ok(())
+}
+
+pub fn clear_history(peer: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, peer)?;
+    history::clear(&mut fs, &key)?;
+    println!("cleared history with '{key}'");
+    Ok(())
+}
+
+pub fn show_history(peer: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, peer)?;
+    let now = OsPlatform.now_unix_secs();
+    let transcript = history::load_active(&mut fs, &key, now)?;
+    if transcript.is_empty() {
+        println!("no stored history with '{key}'");
+        return Ok(());
+    }
+    for m in transcript {
+        let who = if m.from_me { "you" } else { key.as_str() };
+        println!("{who}: {}", m.text);
+    }
+    Ok(())
+}
+
+pub fn conversations() -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let now = OsPlatform.now_unix_secs();
+    let mut any = false;
+    for peer in history::peers(&fs)? {
+        let msgs = history::load_active(&mut fs, &peer, now)?;
+        if let Some(last) = msgs.last() {
+            let who = if last.from_me { "you" } else { peer.as_str() };
+            println!("{peer:16} {who}: {}", preview(&last.text));
+            any = true;
+        }
+    }
+    if !any {
+        println!("no conversations yet");
+    }
+    Ok(())
+}
+
+pub fn search(query: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let now = OsPlatform.now_unix_secs();
+    let needle = query.to_lowercase();
+    let mut hits = 0usize;
+    for peer in history::peers(&fs)? {
+        for m in history::load_active(&mut fs, &peer, now)? {
+            if m.text.to_lowercase().contains(&needle) {
+                let who = if m.from_me { "you" } else { peer.as_str() };
+                println!("[{peer}] {who}: {}", m.text);
+                hits += 1;
+            }
+        }
+    }
+    if hits == 0 {
+        println!("no matches for '{query}'");
+    } else {
+        println!("{hits} match(es)");
+    }
+    Ok(())
+}
+
+pub fn draft_cmd(peer: &str, text: Option<&str>) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, peer)?;
+    match text {
+        Some(t) => {
+            draft::set(&mut fs, &key, t)?;
+            println!("draft saved for '{key}'");
+        }
+        None => match draft::get(&fs, &key)? {
+            Some(d) => println!("draft for '{key}': {d}"),
+            None => println!("no draft for '{key}'"),
+        },
+    }
+    Ok(())
+}
+
+pub fn draft_clear(peer: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, peer)?;
+    draft::clear(&mut fs, &key)?;
+    println!("cleared draft for '{key}'");
+    Ok(())
+}
+
+pub fn expire_set(target: &str, duration: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let secs = parse_duration(duration)?;
+    let mut fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, target)?;
+    expiry::set(&mut fs, &key, secs)?;
+    println!("messages to '{key}' now disappear after {duration}");
+    Ok(())
+}
+
+pub fn expire_clear(target: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let mut fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, target)?;
+    expiry::clear(&mut fs, &key)?;
+    println!("cleared disappearing-message timer for '{key}'");
+    Ok(())
+}
+
+pub fn expire_show(target: &str) -> Result<()> {
+    let identity = store::load_identity()?;
+    let fs = open_history(&identity)?;
+    let key = contacts::resolve(&fs, target)?;
+    match expiry::get(&fs, &key)? {
+        Some(secs) => println!("'{key}': messages disappear after {secs}s"),
+        None => println!("'{key}': no disappearing-message timer"),
+    }
+    Ok(())
+}
+
+pub fn build_record(identity: &Identity, handle: &Handle, addr: &str) -> SignedRecord {
+    crate::wireops::build_record(
+        &mut OsPlatform,
+        identity,
+        handle,
+        &display_name_for(handle),
+        addr,
+    )
+}
+
+pub fn seal_to(
+    identity: &Identity,
+    me: &Handle,
+    device: &Device,
+    plaintext: &[u8],
+) -> Result<Envelope> {
+    crate::wireops::seal_to(
+        &mut OsPlatform,
+        identity,
+        me,
+        &display_name_for(me),
+        device,
+        plaintext,
+    )
+}
+
+pub fn short_device_id(key: &DevicePublicKey) -> String {
+    hex(&key.0[..4])
+}
+
+fn hex_32(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex_bytes(s)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("expected 32-byte hex string"))
+}
+
+fn hex_bytes(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        bail!("hex string has an odd length");
+    }
+    (0..s.len() / 2)
+        .map(|i| {
+            u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| anyhow!("invalid hex string"))
+        })
+        .collect()
+}
+
+pub use crate::wireops::{device_slot, my_group_id, this_device};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestPlatform;
+
+    impl Platform for TestPlatform {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(13).wrapping_add(9);
+            }
+        }
+
+        fn now_unix_secs(&self) -> u64 {
+            42
+        }
+    }
+
+    struct SeededPlatform(u8);
+
+    impl Platform for SeededPlatform {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = self.0.wrapping_add((i as u8).wrapping_mul(31));
+            }
+            self.0 = self.0.wrapping_add(1);
+        }
+
+        fn now_unix_secs(&self) -> u64 {
+            42
+        }
+    }
+
+    fn signed_record(handle: &Handle) -> SignedRecord {
+        let mut platform = TestPlatform;
+        let identity = Identity::generate(&mut platform).unwrap();
+        peerbook::build_record(&mut platform, &identity, handle, "Name", "127.0.0.1:1")
+    }
+
+    #[test]
+    fn dht_candidate_accepts_matching_signed_record() {
+        let handle = Handle::new("alice").unwrap();
+        let record = signed_record(&handle);
+        let decoded = decode_dht_record_candidate(&handle, &wire::encode(&record)).unwrap();
+
+        assert_eq!(decoded.record.handle, user_id("alice"));
+    }
+
+    #[test]
+    fn dht_candidate_rejects_wrong_handle() {
+        let alice = Handle::new("alice").unwrap();
+        let bob = Handle::new("bob").unwrap();
+        let record = signed_record(&alice);
+
+        assert!(decode_dht_record_candidate(&bob, &wire::encode(&record)).is_err());
+    }
+
+    #[test]
+    fn dht_candidate_rejects_oversized_values() {
+        let handle = Handle::new("alice").unwrap();
+        let bytes = vec![0u8; MAX_DHT_RECORD_BYTES + 1];
+
+        assert!(decode_dht_record_candidate(&handle, &bytes).is_err());
+    }
+
+    #[test]
+    fn register_reuses_only_same_wallet_records() {
+        let handle = Handle::new("alice").unwrap();
+        let mut platform = SeededPlatform(1);
+        let identity = Identity::generate(&mut platform).unwrap();
+        let record =
+            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+
+        let reusable = reusable_own_record(&identity, &handle, Some(record)).unwrap();
+
+        assert!(reusable.is_some());
+    }
+
+    #[test]
+    fn register_rejects_foreign_wallet_records() {
+        let handle = Handle::new("alice").unwrap();
+        let mut mine_platform = SeededPlatform(1);
+        let mut foreign_platform = SeededPlatform(99);
+        let identity = Identity::generate(&mut mine_platform).unwrap();
+        let foreign = Identity::generate(&mut foreign_platform).unwrap();
+        let foreign_record = peerbook::build_record(
+            &mut foreign_platform,
+            &foreign,
+            &handle,
+            "Alice",
+            "127.0.0.1:1",
+        );
+
+        let err = reusable_own_record(&identity, &handle, Some(foreign_record)).unwrap_err();
+
+        assert!(err.to_string().contains("different wallet"));
+    }
+
+    #[test]
+    fn delivery_summaries_do_not_fake_sent_state() {
+        assert_eq!(
+            delivery_summary("bob", "abc123", 1, 0, 1),
+            "delivered to 'bob' — 1/1 device (#abc123)"
+        );
+        assert_eq!(
+            delivery_summary("bob", "abc123", 0, 2, 2),
+            "saved for 'bob' — waiting for direct delivery to 2 devices (#abc123)"
+        );
+        assert_eq!(
+            delivery_summary("bob", "abc123", 1, 1, 2),
+            "partially delivered to 'bob' — 1 device reached, 1 pending locally (#abc123)"
+        );
+    }
+
+    #[test]
+    fn group_delivery_summaries_do_not_fake_sent_state() {
+        assert_eq!(
+            group_delivery_summary("team", "abc123", 3, 0),
+            "delivered to group 'team' — 3 direct copies (#abc123)"
+        );
+        assert_eq!(
+            group_delivery_summary("team", "abc123", 0, 3),
+            "saved for group 'team' — 3 copies pending locally (#abc123)"
+        );
+        assert_eq!(
+            group_delivery_summary("team", "abc123", 2, 1),
+            "partially delivered to group 'team' — 2 direct copies, 1 pending locally (#abc123)"
+        );
+    }
+}

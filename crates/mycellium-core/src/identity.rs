@@ -4,8 +4,8 @@
 //! account secret, **not** a seed phrase. The wallet key certifies two
 //! subordinate keys: the **device key** (Ed25519, basis of the libp2p PeerId)
 //! and the **messaging key** (X25519, used by X3DH). One root vouches for
-//! everything. Recovery is via the directory's email verification; extra devices
-//! adopt the account through [`crate::pairing`].
+//! everything. A fresh device starts from fresh local secret material and
+//! publishes a new signed record for peers to import or verify.
 //!
 //! Public material and the local secret bundle both live here. Secret keys are
 //! held only inside [`Identity`], which never derives `Debug` and zeroizes its
@@ -80,8 +80,8 @@ impl Handle {
 
 /// A compressed secp256k1 public key (33 bytes): the **root wallet identity**.
 ///
-/// This is who you are. It signs your directory record and authenticates you at
-/// login (SIWE). It never takes part in the encrypted channel.
+/// This is who you are. It signs your peer record. It never takes part in the
+/// encrypted channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletPublicKey(#[serde(with = "BigArray")] pub [u8; 33]);
 
@@ -123,14 +123,11 @@ pub struct Signature(pub Vec<u8>);
 /// own derived keypairs.
 ///
 /// This is the crown jewel of a device. The account is a raw random wallet
-/// secret — **not** a seed phrase; there is no mnemonic. Recovery is via the
-/// directory's email verification, and additional devices adopt the account
-/// through the [`crate::pairing`] protocol (never by transferring a phrase). It
-/// intentionally does not implement `Debug` or `Clone`.
+/// secret — **not** a seed phrase; there is no mnemonic. It intentionally does
+/// not implement `Debug` or `Clone`.
 pub struct Identity {
     /// The account wallet's raw secp256k1 secret scalar. Held encrypted at rest
-    /// and only ever moved to another device over an authenticated pairing
-    /// channel — never shown to the user or serialized to a URL.
+    /// and never shown to the user or serialized to a URL.
     wallet_secret: [u8; 32],
     device_seed: [u8; 32],
     wallet: WalletSigningKey,
@@ -157,10 +154,9 @@ impl Identity {
         Self::build(wallet_secret, device_seed)
     }
 
-    /// Adopt an **existing** account (its wallet secret, received over pairing)
-    /// on a **new device**: a fresh device seed is drawn, so the new device joins
-    /// the cluster with its own message keys and never inherits another device's
-    /// traffic keys.
+    /// Adopt an **existing** account wallet on a **new device**: a fresh device
+    /// seed is drawn, so the new device joins the cluster with its own message
+    /// keys and never inherits another device's traffic keys.
     pub fn adopt<P: Platform>(platform: &mut P, wallet_secret: [u8; 32]) -> Result<Self, Error> {
         let mut device_seed = [0u8; 32];
         platform.fill_random(&mut device_seed);
@@ -204,8 +200,8 @@ impl Identity {
         self.device_seed
     }
 
-    /// The account wallet secret, to persist (encrypted) and to hand to a new
-    /// device over the pairing channel. Handle with the utmost care.
+    /// The account wallet secret, to persist encrypted. Handle with the utmost
+    /// care.
     pub fn wallet_secret(&self) -> [u8; 32] {
         self.wallet_secret
     }
@@ -345,8 +341,8 @@ mod tests {
     #[test]
     fn a_new_device_shares_the_wallet_but_not_message_keys() {
         let a = Identity::generate(&mut SeededPlatform(1)).unwrap();
-        // Adopting the account (via its wallet secret, as pairing delivers it) on
-        // a new device: same wallet, fresh device keys.
+        // Adopting the account wallet on a new device: same wallet, fresh
+        // device keys.
         let b = Identity::adopt(&mut SeededPlatform(200), a.wallet_secret()).unwrap();
         assert_eq!(a.wallet_public(), b.wallet_public(), "same account");
         assert_ne!(a.device_public(), b.device_public(), "new device key");

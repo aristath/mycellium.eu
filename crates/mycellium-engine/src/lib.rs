@@ -1,8 +1,8 @@
 //! The Mycellium engine: the headless peer logic that a front-end drives.
 //!
-//! It composes the core protocol with the host-port adapters (transport,
-//! storage, directory-client) and owns the actual messaging behaviour:
-//! conversations and history, groups, multi-device delivery, contacts, presence.
+//! It composes the core protocol with host-port adapters for transport and
+//! storage, then owns the actual messaging behaviour: conversations and
+//! history, local peer records, multi-device delivery, contacts, and blocking.
 //! It carries no argument parsing and no terminal UI — those live in a shell
 //! crate (e.g. `mycellium-cli`), so the same engine can back a GUI or mobile app.
 //!
@@ -11,10 +11,9 @@
 //! `mycellium_core::storage`.
 
 // `app` (native orchestration) and `platform` (OS clock + RNG) pull in the
-// filesystem, env, native HTTP clients, and the P2P transport — none of which
-// exist on wasm32. They're gated behind the default `native` feature; the other
-// modules are pure domain state, generic over `mycellium_core::storage`, and
-// compile to wasm so the browser build can drive them.
+// filesystem, env, and P2P transport. They are gated behind the default
+// `native` feature; the other modules are pure domain state, generic over
+// `mycellium_core::storage`.
 pub mod antirollback;
 #[cfg(feature = "native")]
 pub mod app;
@@ -25,10 +24,9 @@ pub mod expiry;
 pub mod flow;
 pub mod groups;
 pub mod history;
-pub mod inbound;
 pub mod names;
 pub mod outbox;
-pub mod privacy;
+pub mod peerbook;
 pub mod reachability;
 pub mod verified;
 
@@ -36,8 +34,7 @@ pub mod verified;
 /// The single place the corruption policy is spelled out, so every store module
 /// surfaces corruption identically instead of some silently swallowing it.
 pub(crate) fn warn_corrupt(what: &str) {
-    // stderr isn't available under wasm32-unknown-unknown; the browser build
-    // surfaces corruption via its own error path.
+    // stderr is a native-only reporting channel.
     #[cfg(not(target_arch = "wasm32"))]
     eprintln!("(warning: corrupt {what} in local storage — treated as empty; back up before it is overwritten)");
     let _ = what;

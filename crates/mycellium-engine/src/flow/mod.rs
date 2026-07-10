@@ -1,23 +1,17 @@
 //! `engine::flow` — the shared, platform-generic messaging orchestration.
 //!
-//! The three clients (native CLI/engine, the UniFFI SDK, and the browser wasm
-//! build) used to each carry their own copy of this logic, which drifted and
-//! grew latent security gaps. `flow` owns the orchestration **once**, generic
-//! over the [`Storage`] and [`Platform`] ports plus an injected [`FlowNet`] seam
-//! (each client binds its own `HttpTransport` — `ureq` / `xhr` / the native
-//! blocking clients), and a per-device `deliver` closure that performs the
-//! client-specific delivery. It never names a concrete `FileStore`,
-//! `OsPlatform`, `DirectoryClient`, `QueueClient`, or transport, so it compiles
-//! to wasm32 alongside the browser build.
+//! This module owns platform-generic messaging orchestration: trust checks,
+//! fan-out, receive handling, history writes, and group state transitions. Hosts
+//! inject a [`FlowNet`] that resolves signed peer records and a per-device
+//! delivery closure that performs direct transport and local retry.
 
 use mycellium_core::group::{Group, GroupMessage, SenderKeyDistribution};
 use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
-use mycellium_core::record::{Device, Record, SignedRecord};
+use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
-use mycellium_core::userid::user_id;
 
 use crate::blocklist;
 use crate::groups::{
@@ -30,32 +24,24 @@ use crate::verified;
 use crate::wireops;
 use crate::{antirollback, verified::TrustLevel};
 
-/// The directory lookup seam. Each client wraps its own `DirectoryClient`
-/// (bound to `ureq` / `xhr` / the native blocking transport); `flow` only needs
-/// to resolve a handle to its signed directory record.
+/// The peer-record seam. Each host resolves a handle to a self-authenticating
+/// signed peer record; `flow` never treats the transport as authority.
 pub trait FlowNet {
-    /// Look up a peer's signed directory record.
+    /// Look up a peer's signed record.
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord>;
-
-    /// Log in as `identity` and publish its signed directory `record` (a PUT to
-    /// the record's own id). The clients own login + transport; `flow` only needs
-    /// to hand the account its freshly signed record to store.
-    fn publish(&self, identity: &Identity, record: &SignedRecord) -> anyhow::Result<()>;
 }
 
 /// Why the shared trust chokepoint ([`lookup_verified`]) refused a record.
 ///
-/// The three clients each render this differently (the CLI prints a rich
-/// out-of-band-verification hint, the SDK maps to `SdkError` + fires
-/// `on_key_change`, wasm returns a `JsValue` string), so `flow` returns the
-/// *reason* and leaves presentation to the host.
+/// Hosts render this differently, so `flow` returns the *reason* and leaves
+/// presentation to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustError {
-    /// The wallet the directory served no longer matches the pinned/verified one
+    /// The resolved wallet no longer matches the pinned/verified one
     /// — a possible impersonation, or the peer re-registered with a new key.
     IdentityChanged,
-    /// The directory served a record older than one we've already pinned (a
-    /// rollback that could re-introduce a removed device or redirect mail).
+    /// Discovery returned a record older than one we've already pinned (a
+    /// rollback that could re-introduce a removed device or redirect delivery).
     StaleRecord,
     /// The record's self-signature did not verify.
     Unverified,
@@ -63,33 +49,28 @@ pub enum TrustError {
     BadHandle,
 }
 
-/// The disposition of one inbound [`MailItem`] after [`process_item`]: whether it
-/// was consumed, or must stay in the caller's inbound retry store for another
-/// attempt. This unifies the three clients' old retry contracts (the engine's
-/// `Result<()>.is_ok()`, the SDK's `Processed`, and wasm's `bool`).
+/// The disposition of one inbound [`MailItem`] after [`process_item`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemOutcome {
     /// Fully handled (applied, dropped, or permanently rejected) — remove it.
     Handled,
     /// Not handled yet (undecryptable, or for a group whose invite/sync hasn't
-    /// arrived) — keep it in the inbound store and re-try on the next drain.
+    /// arrived) — the host may keep it for a later direct retry.
     Retry,
 }
 
 /// One observable outcome of processing an inbound item, emitted through a
 /// [`FlowSink`]. The receive orchestration ([`process_item`]) has already applied
 /// every state change (history, groups, key material) to the store; a sink only
-/// *renders* — the CLI prints each event with its terminal wording, the SDK turns
-/// the message-bearing ones into `Message` DTOs, and wasm persists attachment
-/// bytes it couldn't store generically. This is the single seam that replaces the
-/// ~30 `println!`s the three receive paths used to each carry.
+/// *renders*. This keeps receive handling independent from terminal wording and
+/// attachment persistence details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowEvent {
     /// A decrypted 1:1 message from `from` (never our own — see [`FlowEvent::SelfMirror`]).
     DirectMessage {
         /// The authenticated sender's handle.
         from: String,
-        /// The message id (empty only for a legacy/undecodable raw payload).
+        /// The message id (empty only for an undecodable raw payload).
         id: String,
         /// The display text ([`AppMessage::summary`]).
         text: String,
@@ -176,9 +157,7 @@ pub enum FlowEvent {
         /// The group's display name.
         name: String,
     },
-    /// An inbound attachment the host must persist however it renders: the CLI
-    /// writes it to the downloads dir, wasm keeps it as a `data:` URL, the SDK
-    /// ignores it (the "📎 name" summary is already in history).
+    /// An inbound attachment the host must persist however it renders.
     Attachment {
         /// The bearing message's id (the key hosts store it under).
         id: String,
@@ -199,8 +178,7 @@ pub enum FlowEvent {
 /// presentation and so never needs the store, network, or identity.
 pub trait FlowSink {
     /// Render one [`FlowEvent`]. Called while `process_item` holds the store, so a
-    /// sink must not need store access during the call (it buffers instead — see
-    /// the wasm attachment sink).
+    /// sink must not need store access during the call.
     fn emit(&mut self, event: FlowEvent);
 }
 
@@ -225,8 +203,8 @@ where
 {
     let handle = Handle::new(handle.to_string()).map_err(|_| TrustError::BadHandle)?;
     let record = net.lookup(&handle).map_err(|_| TrustError::BadHandle)?;
-    // The directory does not verify records; check the self-signature before we
-    // trust the record's device keys / queue (core review).
+    // Resolution does not verify records; check the self-signature before we
+    // trust the record's device keys.
     record.verify().map_err(|_| TrustError::Unverified)?;
     // Fail closed if the current wallet doesn't match a pinned/verified one: the
     // peer re-registered, or someone is impersonating them (core review).
@@ -243,83 +221,15 @@ where
     Ok((handle, record))
 }
 
-/// The **shared device-merge + record-publish**: fold THIS device into the
-/// account's signed directory record and re-publish it, so re-registering, a
-/// prior pairing, or a relay-address swap never drops a sibling device. This is
-/// the one copy of what used to be triplicated across the engine's
-/// `register`/`republish_this_device`, the SDK's `publish_merged`, and the wasm
-/// `publish_merged`.
-///
-/// It looks up the account's current record through the injected [`FlowNet`],
-/// **replaces** this device's slot (matched by `device_key`) with a fresh entry
-/// carrying `addr` (or appends it if absent), bumps `seq` past the existing one
-/// (`max(existing+1, now)`, so directories accept the update), re-signs under the
-/// account wallet, and publishes via [`FlowNet::publish`] (login + PUT). The host
-/// resolves the transport address string first (the native build turns a relay
-/// circuit / libp2p multiaddr into `addr`; the SDK/wasm pass `""`), keeping the
-/// libp2p resolution out of this wasm-clean layer. Returns the published record.
-pub fn publish_merged<P, N>(
-    identity: &Identity,
-    platform: &mut P,
-    net: &N,
-    me: &Handle,
-    name: &str,
-    queue: &str,
-    addr: &str,
-) -> anyhow::Result<SignedRecord>
-where
-    P: Platform,
-    N: FlowNet,
-{
-    // The account's current record (if any) — its devices are the ones we merge
-    // into, and its seq is what we bump past.
-    let existing = net.lookup(me).ok();
-    let mut devices = existing
-        .as_ref()
-        .map(|r| r.record.devices.clone())
-        .unwrap_or_default();
-    let mine = wireops::this_device(identity, addr);
-    match devices.iter_mut().find(|d| d.device_key == mine.device_key) {
-        Some(slot) => *slot = mine, // refresh this device's advertised address/keys
-        None => devices.push(mine), // first publish from this device — add it
-    }
-    let now = platform.now_unix_secs();
-    let seq = existing
-        .as_ref()
-        .map(|r| r.record.seq.saturating_add(1))
-        .unwrap_or(now)
-        .max(now);
-    let record = Record {
-        // The record binds the *id*, never the plaintext handle (Layer 6).
-        handle: user_id(me.as_str()),
-        name: name.to_string(),
-        wallet: identity.wallet_public(),
-        queue: queue.to_string(),
-        queues: vec![],
-        devices,
-        seq,
-    };
-    let signed = SignedRecord::sign(record, identity);
-    net.publish(identity, &signed)?;
-    Ok(signed)
-}
-
-/// The per-path tally of one 1:1 send (Layer 11 device fan-out), returned by
-/// [`send_app`]. `delivered` counts devices handed off live or into the queue;
-/// `outboxed` counts devices parked for retry (or that couldn't be sealed).
-/// `direct`/`relay`/`queued` break the live/queue delivery down for reporting.
+/// The tally of one 1:1 send device fan-out, returned by [`send_app`].
 #[derive(Debug, Clone, Default)]
 pub struct SendOutcome {
     /// The sent message's id (`AppMessage::id`).
     pub id: String,
-    /// Devices the copy reached (direct + relay + queued).
+    /// Devices the copy reached directly.
     pub delivered: u32,
     /// Devices reached by a live direct push.
     pub direct: u32,
-    /// Devices reached live through a Circuit Relay v2 node.
-    pub relay: u32,
-    /// Devices reached by a queue deposit.
-    pub queued: u32,
     /// Devices we couldn't reach (parked in the outbox for retry).
     pub outboxed: u32,
 }
@@ -331,11 +241,10 @@ pub struct SendOutcome {
 /// records our own transcript copy; then it self-syncs the send to our *own*
 /// other devices via `self_deliver`.
 ///
-/// The two closures own the client-specific transport + retry policy: the engine
-/// binds its live delivery ladder (direct TCP/libp2p + relay + reachability
-/// scoring) with an outbox fallback, while the SDK/wasm deposit into the
-/// recipient's queue. The store is threaded *through* the closures (rather than
-/// captured) so the seal loop and the closures' own writes share one handle.
+/// The two closures own the client-specific transport + retry policy: direct
+/// TCP/libp2p with an outbox fallback. The store is threaded *through* the
+/// closures (rather than captured) so the seal loop and the closures' own writes
+/// share one handle.
 ///
 /// The caller resolves and trust-checks the peer via [`lookup_verified`] first
 /// and passes the already-verified `peer_record` in, so this never re-fetches or
@@ -347,8 +256,7 @@ pub fn send_app<S, P, N>(
     platform: &mut P,
     net: &N,
     me: &Handle,
-    my_name: &str,
-    my_queue: &str,
+    sender_record: &SignedRecord,
     peer: &Handle,
     peer_record: &SignedRecord,
     app: &AppMessage,
@@ -366,30 +274,17 @@ where
         ..Default::default()
     };
 
-    // Sign our sender self-record ONCE (two secp256k1 signs) and reuse it across
-    // every device of this send — the peer's cluster and our own siblings all
-    // embed the identical record, so re-signing it per device is pure waste.
-    let sender_record = wireops::build_record(platform, identity, me, my_name, my_queue, "");
-
     // Fan out one sealed copy per recipient device (Layer 11) — each device has
     // its own keys. A device we can't reach is parked by the `deliver` closure.
     for device in &peer_record.record.devices {
         let Ok(env) =
-            wireops::seal_to_with_record(platform, identity, me, &sender_record, device, &encoded)
+            wireops::seal_to_with_record(platform, identity, me, sender_record, device, &encoded)
         else {
             continue;
         };
         match deliver(store, peer, peer_record, device, MailItem::Direct(env)) {
             DeliveryPath::Direct => {
                 out.direct += 1;
-                out.delivered += 1;
-            }
-            DeliveryPath::Relay => {
-                out.relay += 1;
-                out.delivered += 1;
-            }
-            DeliveryPath::Queue => {
-                out.queued += 1;
                 out.delivered += 1;
             }
             DeliveryPath::Outbox | DeliveryPath::Failed => {}
@@ -435,7 +330,7 @@ where
                 platform,
                 identity,
                 me,
-                &sender_record,
+                sender_record,
                 device,
                 &encoded,
             ) else {
@@ -454,22 +349,16 @@ where
 
 /// Seal our current group sender key to every device of each `targets` handle,
 /// **failing closed** on a member whose record is unverifiable or whose pinned
-/// wallet has changed. This is the one shared copy of what used to be the
-/// engine's `distribute_key_to`, the SDK's `distribute_key`, and the wasm
-/// `distribute_key`.
+/// wallet has changed.
 ///
 /// The flow owns the shared logic — lookup, `verify()`, the TOFU pin check
 /// ([`verified::level`] against `store`), and per-device sealing ([`wireops::seal_to`]).
-/// `deliver` performs the client-specific per-device delivery: the engine runs
-/// its live ladder + outbox fallback (which is why it is handed the store back
-/// mutably), while the SDK/wasm deposit into the recipient's queue. The store is
-/// threaded through `deliver` rather than captured by it so the pin check (which
-/// only reads) and the engine's reachability/outbox writes share the one handle.
+/// `deliver` performs the client-specific per-device delivery. The store is
+/// threaded through `deliver` rather than captured by it so the pin check and
+/// local retry writes share the one handle.
 ///
-/// The pin check is the security fix this unification carries: previously only
-/// the engine held a store, so a compelled directory that swapped a member's
-/// *pinned* wallet could still harvest the group key from the SDK/wasm. Now all
-/// three refuse it.
+/// The pin check fails closed if a member's resolved wallet no longer matches
+/// the pinned wallet.
 #[allow(clippy::too_many_arguments)]
 pub fn distribute_key<S, P, N>(
     identity: &Identity,
@@ -477,8 +366,7 @@ pub fn distribute_key<S, P, N>(
     platform: &mut P,
     net: &N,
     me: &Handle,
-    my_name: &str,
-    my_queue: &str,
+    sender_record: &SignedRecord,
     group_id: &str,
     name: &str,
     distribution: &SenderKeyDistribution,
@@ -501,10 +389,6 @@ pub fn distribute_key<S, P, N>(
         return;
     };
 
-    // Sign our sender self-record ONCE and reuse it for every device of every
-    // target — it is identical across the whole distribution fan-out.
-    let sender_record = wireops::build_record(platform, identity, me, my_name, my_queue, "");
-
     for target in targets {
         let Ok(handle) = Handle::new(target.clone()) else {
             continue;
@@ -517,7 +401,7 @@ pub fn distribute_key<S, P, N>(
             continue;
         }
         // Fail closed if the member's wallet no longer matches the pinned or
-        // verified one — a compelled directory that swaps a member's wallet must
+        // verified one — a resolver that swaps a member's wallet must
         // not trick us into sealing our group sender key to the impostor (the
         // same fail-closed check 1:1 sends make; core review).
         if verified::level(store, handle.as_str(), &record.record.wallet)
@@ -535,7 +419,7 @@ pub fn distribute_key<S, P, N>(
                 platform,
                 identity,
                 me,
-                &sender_record,
+                sender_record,
                 device,
                 &plaintext,
             ) else {
@@ -556,11 +440,10 @@ pub fn distribute_key<S, P, N>(
 /// our cluster; only this exact device is skipped. Finally it records our own
 /// group-transcript copy (an edit/delete is applied in place instead).
 ///
-/// `deliver` owns the client-specific transport + retry policy — the engine binds
-/// its live ladder + outbox, the SDK/wasm deposit into each member's queue. The
-/// store is threaded *through* it so the seal loop and the closure's own writes
-/// share one handle. Unlike [`send_app`], group text is encrypted once under the
-/// group key (not X3DH-sealed per device), so no per-peer name/queue is needed.
+/// `deliver` owns the client-specific transport + retry policy. The store is
+/// threaded *through* it so the seal loop and the closure's own writes share one
+/// handle. Unlike [`send_app`], group text is encrypted once under the group key,
+/// not X3DH-sealed per device.
 pub fn group_send<S, N>(
     identity: &Identity,
     store: &mut S,
@@ -625,14 +508,6 @@ where
                     out.direct += 1;
                     out.delivered += 1;
                 }
-                DeliveryPath::Relay => {
-                    out.relay += 1;
-                    out.delivered += 1;
-                }
-                DeliveryPath::Queue => {
-                    out.queued += 1;
-                    out.delivered += 1;
-                }
                 DeliveryPath::Outbox | DeliveryPath::Failed => {
                     out.outboxed += 1;
                 }
@@ -663,10 +538,8 @@ where
 /// OTHER member's devices via `net.lookup` + `deliver`, so they drop us and re-key;
 /// then it removes the group locally.
 ///
-/// This is the copy the SDK and wasm previously lacked entirely — they did a bare
-/// local `groups::remove` and never told the group, so a departed SDK/wasm user's
-/// client kept working keys and no other member rekeyed. `deliver` owns the
-/// client-specific transport + retry policy; the store is threaded through it.
+/// `deliver` owns the client-specific transport + retry policy; the store is
+/// threaded through it.
 #[allow(clippy::too_many_arguments)]
 pub fn group_leave<S, P, N>(
     identity: &Identity,
@@ -674,8 +547,7 @@ pub fn group_leave<S, P, N>(
     platform: &mut P,
     net: &N,
     me: &Handle,
-    my_name: &str,
-    my_queue: &str,
+    sender_record: &SignedRecord,
     group: &StoredGroup,
     deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
 ) where
@@ -689,8 +561,6 @@ pub fn group_leave<S, P, N>(
     let Ok(plaintext) = serde_json::to_vec(&payload) else {
         return;
     };
-    // Sign our sender self-record ONCE and reuse it across every member's devices.
-    let sender_record = wireops::build_record(platform, identity, me, my_name, my_queue, "");
     for member in &group.members {
         if member == me.as_str() {
             continue; // our own departure isn't announced to ourselves
@@ -713,7 +583,7 @@ pub fn group_leave<S, P, N>(
                 platform,
                 identity,
                 me,
-                &sender_record,
+                sender_record,
                 device,
                 &plaintext,
             ) else {
@@ -727,15 +597,14 @@ pub fn group_leave<S, P, N>(
     let _ = groups::remove(store, &group.id);
 }
 
-/// The immutable per-item receive context, bundled so the six inbound handlers
+/// The immutable per-item receive context, bundled so the six receive handlers
 /// don't each thread five shared references. All fields are `Copy` shared refs, so
 /// this is `Copy` and free to pass by value.
 #[derive(Clone, Copy)]
 struct Recv<'a> {
     identity: &'a Identity,
     me: &'a Handle,
-    my_name: &'a str,
-    my_queue: &'a str,
+    sender_record: &'a SignedRecord,
     blocked: &'a [String],
 }
 
@@ -745,13 +614,10 @@ struct Recv<'a> {
 /// receipt, a group key (re)distribution) *inside* the flow. Returns whether the
 /// item was [`ItemOutcome::Handled`] or must be kept for [`ItemOutcome::Retry`].
 ///
-/// This is the single copy of what used to be triplicated across the engine's
-/// `process_item` + six `handle_*`, the SDK's `process_blob` + `process_*`, and
-/// wasm's `process_blob` (whose `_ => true` catch-all silently dropped `SelfSync`,
-/// `GroupSync`, and `GroupLeave` — all now handled here). `deliver`/`self_deliver`
-/// are the same client-specific per-device delivery closures [`send_app`] and
-/// [`distribute_key`] take, threaded so the follow-up sends reuse the host's
-/// transport + retry policy; the store is passed *through* them, never captured.
+/// `deliver`/`self_deliver` are the same client-specific per-device delivery
+/// closures [`send_app`] and [`distribute_key`] take, threaded so the follow-up
+/// sends reuse the host's transport + retry policy; the store is passed
+/// *through* them, never captured.
 #[allow(clippy::too_many_arguments)]
 pub fn process_item<S, P, N>(
     identity: &Identity,
@@ -759,8 +625,7 @@ pub fn process_item<S, P, N>(
     platform: &mut P,
     net: &N,
     me: &Handle,
-    my_name: &str,
-    my_queue: &str,
+    sender_record: &SignedRecord,
     blocked: &[String],
     item: MailItem,
     sink: &mut dyn FlowSink,
@@ -775,8 +640,7 @@ where
     let r = Recv {
         identity,
         me,
-        my_name,
-        my_queue,
+        sender_record,
         blocked,
     };
     match item {
@@ -794,6 +658,9 @@ where
         }
         MailItem::GroupSync(env) => recv_group_sync(r, store, platform, net, sink, &env, deliver),
         MailItem::GroupLeave(env) => recv_group_leave(r, store, platform, net, sink, &env, deliver),
+        MailItem::DiscoveryRequest { .. } | MailItem::DiscoveryResponse { .. } => {
+            ItemOutcome::Handled
+        }
     }
 }
 
@@ -948,8 +815,7 @@ fn send_read_receipt<S, P, N>(
         platform,
         net,
         r.me,
-        r.my_name,
-        r.my_queue,
+        r.sender_record,
         to,
         &record,
         &receipt,
@@ -1359,8 +1225,7 @@ fn distribute_group_key<S, P, N>(
         platform,
         net,
         r.me,
-        r.my_name,
-        r.my_queue,
+        r.sender_record,
         &stored.id,
         &stored.name,
         &group.distribution(),
@@ -1413,9 +1278,6 @@ mod recv_tests {
         fn lookup(&self, _handle: &Handle) -> anyhow::Result<SignedRecord> {
             anyhow::bail!("no network in this test")
         }
-        fn publish(&self, _identity: &Identity, _record: &SignedRecord) -> anyhow::Result<()> {
-            anyhow::bail!("no network in this test")
-        }
     }
 
     #[derive(Default)]
@@ -1440,14 +1302,14 @@ mod recv_tests {
                 DeliveryPath::Failed
             };
         let mut self_deliver = |_: &mut MemStore, _: &Handle, _: &Device, _: MailItem| {};
+        let sender_record = wireops::build_record(&mut platform, me, my_handle, "", "127.0.0.1:1");
         process_item(
             me,
             store,
             &mut platform,
             &net,
             my_handle,
-            "",
-            "",
+            &sender_record,
             &[],
             item,
             sink,
@@ -1467,12 +1329,12 @@ mod recv_tests {
         let attacker = Identity::generate(&mut p).unwrap();
         let vh = Handle::new("victimhandle").unwrap();
         let ah = Handle::new("attackerhandle").unwrap();
-        let vrec = wireops::build_record(&mut p, &victim, &vh, "", "", "");
+        let vrec = wireops::build_record(&mut p, &victim, &vh, "", "");
         let vdev = vrec.record.primary();
 
         // ATTACK: a foreign identity seals a mirror to the victim, wrapped SelfSync.
         let forged = wireops::text_message(&mut p, "forged outgoing").encode();
-        let env = wireops::seal_to(&mut p, &attacker, &ah, "", "", vdev, &forged).unwrap();
+        let env = wireops::seal_to(&mut p, &attacker, &ah, "", vdev, &forged).unwrap();
 
         let mut store = MemStore::default();
         let mut sink = CollectSink::default();
