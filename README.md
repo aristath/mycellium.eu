@@ -6,10 +6,14 @@ The core rule is simple:
 
 > A message is delivered peer-to-peer, or it is not delivered yet.
 
-There is no directory server, queue, relay, mailbox, push service, account
-registry, browser backend, or SDK server surface in the core workspace. Peers
-exchange self-authenticating records, dial each other directly, and keep
-undelivered messages in the sender's encrypted local outbox.
+There is no required directory server, queue, relay, mailbox, push service,
+browser backend, or SDK server surface in the message protocol. Peers exchange
+self-authenticating records, dial each other directly, and keep undelivered
+messages in the sender's encrypted local outbox.
+
+The workspace also contains an optional account registry. It exists for account
+UX: login identities, encrypted account backups, and publishing signed public
+records. It does not store, queue, relay, or route messages.
 
 ## Workspace
 
@@ -19,6 +23,8 @@ undelivered messages in the sender's encrypted local outbox.
   direct delivery, outbox, history, contacts, and verification.
 - `crates/mycellium-storage`: encrypted local identity and history storage.
 - `crates/mycellium-transport`: direct TCP and direct libp2p transports.
+- `crates/mycellium-registry`: optional account registry using `redb` metadata
+  and filesystem blobs.
 - `crates/mycellium-cli`: terminal client.
 
 ## Quickstart
@@ -121,6 +127,47 @@ cargo run -p mycellium-cli -- --config alice-laptop.json register alice --addr 1
 
 For direct interactive chat, run `listen` on one side and `chat` on the other.
 
+## Optional Registry
+
+Run the development registry:
+
+```sh
+MYCELLIUM_REGISTRY_BIND=127.0.0.1:8787 \
+MYCELLIUM_REGISTRY_DATA_DIR=.mycellium-registry \
+cargo run -p mycellium-registry
+```
+
+Defaults:
+
+```text
+MYCELLIUM_REGISTRY_BIND=127.0.0.1:8787
+MYCELLIUM_REGISTRY_DATA_DIR=.mycellium-registry
+```
+
+Current API:
+
+```text
+POST /login/email/request
+POST /login/confirm
+PUT  /accounts/{account_id}/backup
+GET  /accounts/{account_id}/backup
+PUT  /accounts/{account_id}/record
+GET  /accounts/{account_id}/record
+```
+
+Protected endpoints use:
+
+```text
+Authorization: Bearer <session_token>
+```
+
+`/login/email/request` currently returns `dev_token` directly. That is a
+development placeholder until a real email sender is wired in.
+
+The registry stores metadata in `redb` and opaque encrypted account bytes in
+filesystem blobs. Public records are still signed records; clients must verify
+them locally.
+
 ## Commands
 
 ```sh
@@ -153,6 +200,7 @@ mycellium group info <group>
 mycellium group leave <group> --as <me>
 mycellium group sync --as <me>
 mycellium group list
+mycellium-registry
 ```
 
 ## Test

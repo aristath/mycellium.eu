@@ -363,6 +363,39 @@ reliability-sensitive, and novelty is not useful there.
 The registry code must still depend on a small `RegistryStore` interface, not on
 `redb` as protocol doctrine. The backend is replaceable infrastructure.
 
+### 6.4 Current Registry Surface
+
+The current development registry exposes only account UX:
+
+```text
+POST /login/email/request
+POST /login/confirm
+PUT  /accounts/{account_id}/backup
+GET  /accounts/{account_id}/backup
+PUT  /accounts/{account_id}/record
+GET  /accounts/{account_id}/record
+```
+
+Protected endpoints use a bearer session:
+
+```text
+Authorization: Bearer <session_token>
+```
+
+`/login/email/request` currently returns a `dev_token` directly. That is a
+development placeholder until a real email sender exists.
+
+The registry binary is configured by:
+
+```text
+MYCELLIUM_REGISTRY_BIND
+MYCELLIUM_REGISTRY_DATA_DIR
+```
+
+This HTTP surface does not change the delivery law. It publishes and retrieves
+account data and signed records. It does not store, queue, relay, or route
+messages.
+
 ---
 
 ## 7. Security Model
@@ -490,6 +523,7 @@ If a registry exists, success means:
 - `redb` is the preferred first embedded metadata backend
 - registry storage is modeled as portable key-value records plus indexes
 - opaque account bytes can live in file/blob storage
+- registry HTTP stays limited to account UX and signed-record publication
 - removing the registry does not break existing local identity or direct delivery
 
 ---

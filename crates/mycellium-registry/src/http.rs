@@ -15,12 +15,13 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountBlobKind, AccountId, FileBlobStore, RedbRegistryStore, Registry, RegistryError,
-    RegistryStore, Result,
+    AccountBlobKind, AccountId, FileBlobStore, LoginIdentityHash, RedbRegistryStore, Registry,
+    RegistryError, RegistryStore, Result,
 };
 
 const LOGIN_TTL_SECS: i64 = 15 * 60;
 const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const EMAIL_LOGIN_LIMIT: u64 = 5;
 
 /// HTTP app state.
 pub struct AppState<S> {
@@ -93,6 +94,16 @@ async fn request_email_login<S>(
 where
     S: RegistryStore + Send + Sync + 'static,
 {
+    check_rate_limit(
+        &state,
+        &format!(
+            "login:email:{}",
+            LoginIdentityHash::email(&body.email)?.as_str()
+        ),
+        now(),
+        LOGIN_TTL_SECS,
+        EMAIL_LOGIN_LIMIT,
+    )?;
     let challenge = state
         .registry
         .request_email_login(&body.email, now(), LOGIN_TTL_SECS)?;
@@ -266,6 +277,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn rate_limited() -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".into(),
+        }
+    }
 }
 
 impl From<RegistryError> for ApiError {
@@ -315,6 +333,23 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 fn parse_account_id(value: &str) -> ApiResult<AccountId> {
     value.parse().map_err(ApiError::from)
+}
+
+fn check_rate_limit<S: RegistryStore>(
+    state: &AppState<S>,
+    key: &str,
+    now: i64,
+    window_secs: i64,
+    limit: u64,
+) -> ApiResult<()> {
+    let bucket = state
+        .registry
+        .store()
+        .bump_rate_limit(key, now, window_secs)?;
+    if bucket.count > limit {
+        return Err(ApiError::rate_limited());
+    }
+    Ok(())
 }
 
 fn now() -> i64 {
@@ -434,5 +469,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn email_login_is_rate_limited() {
+        let app = redb_router(tmpdir("rate")).unwrap();
+
+        for _ in 0..EMAIL_LOGIN_LIMIT {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/login/email/request")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"email":"ari@example.com"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login/email/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"ari@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
