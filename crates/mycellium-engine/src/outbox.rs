@@ -23,6 +23,10 @@ pub const MAX_ATTEMPTS: u32 = 100;
 /// Give up on an entry this long after it was first parked (7 days).
 pub const TTL_SECS: u64 = 7 * 86_400;
 
+/// Retry starts quickly, then backs off to avoid hammering an offline peer.
+pub const RETRY_BASE_SECS: u64 = 5;
+pub const RETRY_MAX_SECS: u64 = 60 * 60;
+
 /// One undelivered, already-sealed item awaiting a retry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxEntry {
@@ -104,6 +108,7 @@ where
             Attempt::Drop => {}
             Attempt::Retry => {
                 entry.attempts += 1;
+                entry.send_after = now.saturating_add(retry_delay(&entry));
                 if !entry.is_expired(now) {
                     remaining.push(entry);
                 }
@@ -111,6 +116,14 @@ where
         }
     }
     (delivered, remaining)
+}
+
+fn retry_delay(entry: &OutboxEntry) -> u64 {
+    let exponent = entry.attempts.saturating_sub(1).min(10);
+    let delay = RETRY_BASE_SECS.saturating_mul(1u64 << exponent);
+    let digest = mycellium_core::delivery::payload_digest(entry.id.as_bytes());
+    let jitter = u64::from(digest[0]) % RETRY_BASE_SECS;
+    delay.saturating_add(jitter).min(RETRY_MAX_SECS)
 }
 
 /// Load the whole outbox.
@@ -166,6 +179,58 @@ pub fn enqueue_at<S: Storage>(
 /// Number of items currently waiting.
 pub fn len<S: Storage>(store: &S) -> Result<usize, S::Error> {
     Ok(load(store)?.len())
+}
+
+/// Remove one delivery after recipient-authenticated acceptance.
+pub fn remove<S: Storage>(store: &mut S, id: &str) -> Result<bool, S::Error> {
+    let mut entries = load(store)?;
+    let before = entries.len();
+    entries.retain(|entry| entry.id != id);
+    let removed = entries.len() != before;
+    if removed {
+        save(store, &entries)?;
+    }
+    Ok(removed)
+}
+
+/// Explicit user retry overrides any scheduled backoff.
+pub fn make_all_due<S: Storage>(store: &mut S) -> Result<(), S::Error> {
+    let mut entries = load(store)?;
+    for entry in &mut entries {
+        entry.send_after = 0;
+    }
+    save(store, &entries)
+}
+
+/// Apply one background attempt result if the delivery is still pending.
+pub fn record_attempt<S: Storage>(
+    store: &mut S,
+    id: &str,
+    now: u64,
+    accepted: bool,
+) -> Result<bool, S::Error> {
+    let entries = load(store)?;
+    let mut found = false;
+    let mut remaining = Vec::with_capacity(entries.len());
+    for mut entry in entries {
+        if entry.id != id {
+            remaining.push(entry);
+            continue;
+        }
+        found = true;
+        if !accepted {
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.send_after = now.saturating_add(retry_delay(&entry));
+            if !entry.is_expired(now) {
+                remaining.push(entry);
+            }
+        }
+    }
+    if !found {
+        return Ok(false);
+    }
+    save(store, &remaining)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -335,6 +400,28 @@ mod tests {
         assert_eq!(delivered, 0);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].attempts, 1);
+        assert!(remaining[0].send_after > 10);
+    }
+
+    #[test]
+    fn recording_one_attempt_does_not_mutate_other_due_deliveries() {
+        let mut store = MemStore::default();
+        save(&mut store, &[sample("1"), sample("2")]).unwrap();
+
+        record_attempt(&mut store, "1", 100, false).unwrap();
+        let entries = load(&store).unwrap();
+        let first = entries.iter().find(|entry| entry.id == "1").unwrap();
+        let second = entries.iter().find(|entry| entry.id == "2").unwrap();
+        assert_eq!(first.attempts, 1);
+        assert!(first.send_after > 100);
+        assert_eq!(second.attempts, 0);
+        assert_eq!(second.send_after, 0);
+
+        make_all_due(&mut store).unwrap();
+        assert!(load(&store)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.send_after == 0));
     }
 
     #[test]

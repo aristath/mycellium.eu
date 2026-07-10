@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use mycellium_core::delivery::DeliveryAck;
 use mycellium_core::group::{GroupMessage, GroupState, SenderKeyDistribution};
 use mycellium_core::offline::Envelope;
 use mycellium_core::record::SignedRecord;
@@ -45,17 +46,23 @@ pub enum MailItem {
     /// control — you block a peer locally, or leave yourself. Decrypts to a
     /// [`GroupLeavePayload`].
     GroupLeave(Envelope),
+}
+
+/// One versioned application frame carried over a direct connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PeerFrame {
+    /// A sender-owned delivery that remains pending until its ACK verifies.
+    Delivery {
+        delivery_id: String,
+        item: Box<MailItem>,
+    },
+    /// Recipient-device proof of durable acceptance.
+    Ack(DeliveryAck),
     /// Ask a directly reachable peer for signed peer records. Discovery is
-    /// deliberately record-only: no messages, no custody, no authority.
-    DiscoveryRequest {
-        /// Empty means "send the peer records you are willing to gossip."
-        want: Vec<String>,
-    },
-    /// A non-authoritative peer record pack returned over a direct connection.
-    DiscoveryResponse {
-        /// Self-authenticating records; receivers verify before importing.
-        records: Vec<DiscoveryRecord>,
-    },
+    /// record-only: no messages, custody, or authority.
+    DiscoveryRequest { want: Vec<String> },
+    /// A non-authoritative signed peer-record pack.
+    DiscoveryResponse { records: Vec<DiscoveryRecord> },
 }
 
 /// One signed peer record carried by discovery gossip.

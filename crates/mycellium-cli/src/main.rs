@@ -154,6 +154,10 @@ enum Command {
         peer: String,
         #[arg(long)]
         confirm: bool,
+        /// Explicitly replace a previously pinned/verified wallet after
+        /// comparing the new safety number out of band.
+        #[arg(long)]
+        accept_change: bool,
     },
     Block {
         handle: String,
@@ -419,7 +423,11 @@ fn main() -> Result<()> {
             ContactAction::List => contact_list(),
             ContactAction::Remove { nickname } => contact_remove(&nickname),
         },
-        Command::Verify { peer, confirm } => verify(&peer, confirm),
+        Command::Verify {
+            peer,
+            confirm,
+            accept_change,
+        } => verify(&peer, confirm, accept_change),
         Command::Block { handle } => set_blocked(&handle, true),
         Command::Unblock { handle } => set_blocked(&handle, false),
         Command::Blocked => list_blocked(),

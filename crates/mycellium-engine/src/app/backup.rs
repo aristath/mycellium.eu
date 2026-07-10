@@ -45,14 +45,8 @@ pub fn export_backup(path: &str) -> Result<()> {
         identity,
         store: entries,
     };
-    std::fs::write(path, wire::encode(&backup)).context("could not write backup")?;
-    // Restrict the file where the platform supports it (the bundle is a
-    // high-value collection, even though every entry is already encrypted).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    mycellium_storage::atomic_write(std::path::Path::new(path), &wire::encode(&backup))
+        .context("could not write backup")?;
     println!(
         "exported identity + {} store entries to {path}",
         backup.store.len()
@@ -75,19 +69,29 @@ pub fn import_backup(path: &str) -> Result<()> {
     let bytes = std::fs::read(path).context("could not read backup")?;
     let backup: Backup = wire::decode(&bytes).map_err(|_| anyhow!("not a valid backup file"))?;
 
+    // Authenticate and structurally validate the crown-jewel blob before any
+    // destination file exists. A bad passphrase or corrupt backup leaves the
+    // configured data directory untouched.
+    let _identity = store::open_identity(&backup.identity)?;
+
+    let mut names = std::collections::HashSet::new();
+    for (name, _) in &backup.store {
+        let valid = !name.is_empty()
+            && name.len().is_multiple_of(2)
+            && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && names.insert(name.clone());
+        if !valid {
+            bail!("backup contains an invalid or duplicate store entry name");
+        }
+    }
+
     std::fs::create_dir_all(store::data_dir())?;
-    std::fs::write(store::path(), &backup.identity)?;
+    mycellium_storage::atomic_write(&store::path(), &backup.identity)?;
 
     let store_dir = store::data_dir().join("history");
     std::fs::create_dir_all(&store_dir)?;
     for (name, data) in &backup.store {
-        // Only ever write a basename inside the store dir.
-        if let Some(safe) = std::path::Path::new(name)
-            .file_name()
-            .and_then(|n| n.to_str())
-        {
-            std::fs::write(store_dir.join(safe), data)?;
-        }
+        mycellium_storage::atomic_write(&store_dir.join(name), data)?;
     }
     println!("imported identity + {} store entries", backup.store.len());
     Ok(())

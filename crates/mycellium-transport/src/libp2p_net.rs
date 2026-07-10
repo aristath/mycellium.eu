@@ -30,6 +30,9 @@ pub type P2pMultiaddr = Multiaddr;
 
 /// How long `listen_addr` waits for the swarm to make progress.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound one framed stream operation so an idle peer cannot pin a synchronous
+/// engine worker forever while it waits for payload bytes or an acceptance ACK.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The composite network behaviour driving this node.
 #[derive(NetworkBehaviour)]
@@ -442,12 +445,22 @@ impl crate::link::FrameReader for Libp2pReadHalf {
     fn recv_frame(&mut self) -> anyhow::Result<Vec<u8>> {
         let read = &mut self.read;
         let bytes = self.handle.block_on(async move {
-            let mut header = [0u8; 4];
-            read.read_exact(&mut header).await?;
-            let n = crate::link::frame_len(header)?;
-            let mut buf = vec![0u8; n];
-            read.read_exact(&mut buf).await?;
-            Ok::<_, io::Error>(buf)
+            match tokio::time::timeout(IO_TIMEOUT, async {
+                let mut header = [0u8; 4];
+                read.read_exact(&mut header).await?;
+                let n = crate::link::frame_len(header)?;
+                let mut buf = vec![0u8; n];
+                read.read_exact(&mut buf).await?;
+                Ok::<_, io::Error>(buf)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stream read timed out",
+                )),
+            }
         })?;
         Ok(bytes)
     }
@@ -457,11 +470,21 @@ impl crate::link::FrameWriter for Libp2pWriteHalf {
     fn send_frame(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         let write = &mut self.write;
         self.handle.block_on(async move {
-            write
-                .write_all(&crate::link::frame_header(bytes.len()))
-                .await?;
-            write.write_all(bytes).await?;
-            write.flush().await
+            match tokio::time::timeout(IO_TIMEOUT, async {
+                write
+                    .write_all(&crate::link::frame_header(bytes.len()))
+                    .await?;
+                write.write_all(bytes).await?;
+                write.flush().await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stream write timed out",
+                )),
+            }
         })?;
         Ok(())
     }
@@ -473,23 +496,43 @@ impl Connection for Libp2pConnection {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         let stream = &mut self.stream;
         self.handle.block_on(async move {
-            stream
-                .write_all(&crate::link::frame_header(bytes.len()))
-                .await?;
-            stream.write_all(bytes).await?;
-            stream.flush().await
+            match tokio::time::timeout(IO_TIMEOUT, async {
+                stream
+                    .write_all(&crate::link::frame_header(bytes.len()))
+                    .await?;
+                stream.write_all(bytes).await?;
+                stream.flush().await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stream write timed out",
+                )),
+            }
         })
     }
 
     fn recv(&mut self) -> io::Result<Vec<u8>> {
         let stream = &mut self.stream;
         self.handle.block_on(async move {
-            let mut header = [0u8; 4];
-            stream.read_exact(&mut header).await?;
-            let n = crate::link::frame_len(header)?;
-            let mut buf = vec![0u8; n];
-            stream.read_exact(&mut buf).await?;
-            Ok(buf)
+            match tokio::time::timeout(IO_TIMEOUT, async {
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).await?;
+                let n = crate::link::frame_len(header)?;
+                let mut buf = vec![0u8; n];
+                stream.read_exact(&mut buf).await?;
+                Ok(buf)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stream read timed out",
+                )),
+            }
         })
     }
 }

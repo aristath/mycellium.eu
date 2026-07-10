@@ -14,7 +14,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ed25519_dalek::SigningKey as DeviceSigningKey;
+use ed25519_dalek::{Signature as EdSignature, SigningKey as DeviceSigningKey};
 use hkdf::Hkdf;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature as EcdsaSignature, SigningKey as WalletSigningKey, VerifyingKey};
@@ -100,6 +100,20 @@ impl WalletPublicKey {
 /// gets a new device key, re-certified by the unchanged wallet key (Layer 9.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePublicKey(pub [u8; 32]);
+
+impl DevicePublicKey {
+    /// Verify a signature made by the corresponding device key.
+    pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&self.0).map_err(|_| Error::Malformed)?;
+        let bytes: [u8; 64] = sig
+            .0
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::BadSignature)?;
+        key.verify(msg, &EdSignature::from_bytes(&bytes))
+            .map_err(|_| Error::BadSignature)
+    }
+}
 
 /// An X25519 public key (32 bytes): the long-term **messaging key** for X3DH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +298,11 @@ impl Identity {
     pub fn sign(&self, msg: &[u8]) -> Signature {
         let sig: EcdsaSignature = self.wallet.sign(msg);
         Signature(sig.to_bytes().to_vec())
+    }
+
+    /// Sign a device-scoped protocol statement with this device's Ed25519 key.
+    pub fn sign_device(&self, msg: &[u8]) -> Signature {
+        Signature(self.device.sign(msg).to_bytes().to_vec())
     }
 }
 

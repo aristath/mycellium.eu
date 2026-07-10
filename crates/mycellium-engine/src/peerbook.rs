@@ -60,7 +60,12 @@ where
             handle.as_str()
         );
     }
-    if !antirollback::check_and_pin(store, handle.as_str(), record.record.seq)? {
+    if !antirollback::check_and_pin(
+        store,
+        handle.as_str(),
+        &record.record.wallet,
+        record.record.seq,
+    )? {
         anyhow::bail!("stale record for '{}'", handle.as_str());
     }
 

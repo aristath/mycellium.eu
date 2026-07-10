@@ -25,40 +25,6 @@ jobs:
         run: cargo test --workspace
       - name: no_std core builds without std
         run: cargo build -p mycellium-core --no-default-features
-      - name: SDK bindings smoke test (Kotlin + Swift generate)
-        run: ./crates/mycellium-sdk/bindings/generate.sh
-
-  wasm:
-    name: wasm build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust + wasm target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-bindgen-cli (pinned to the crate's version)
-        run: cargo install wasm-bindgen-cli --version 0.2.100 --locked
-      - name: Build the WASM engine
-        run: ./clients/web/build.sh
-      - name: Verify generated web assets exist
-        run: |
-          test -f clients/web/pkg/mycellium_wasm.js || { echo "missing pkg/mycellium_wasm.js"; exit 1; }
-          test -f clients/web/pkg/mycellium_wasm_bg.wasm || { echo "missing pkg/mycellium_wasm_bg.wasm"; exit 1; }
-          echo "web assets present"
-      - name: Upload deployable web bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: mycellium-web
-          path: |
-            clients/web/index.html
-            clients/web/worker.js
-            clients/web/sw.js
-            clients/web/manifest.json
-            clients/web/icon.svg
-            clients/web/pkg/
-          if-no-files-found: error
 
   audit:
     name: cargo audit

@@ -119,10 +119,7 @@ pub fn save_identity(identity: &Identity) -> Result<()> {
     let sealed = seal::seal(&passphrase, &plaintext)
         .map_err(|e| anyhow!("failed to encrypt identity: {e}"))?;
 
-    fs::create_dir_all(home())?;
-    crate::perms::restrict_dir(&home());
-    fs::write(path(), sealed)?;
-    crate::perms::restrict_file(&path());
+    crate::atomic_write(&path(), &sealed)?;
     Ok(())
 }
 
@@ -131,8 +128,14 @@ pub fn load_identity() -> Result<Identity> {
     let bytes =
         fs::read(path()).context("no identity found — run `mycellium identity-new` first")?;
 
+    open_identity(&bytes)
+}
+
+/// Validate and decrypt an encoded identity blob using the configured
+/// passphrase. Backup import uses this before writing anything to disk.
+pub fn open_identity(bytes: &[u8]) -> Result<Identity> {
     let passphrase = passphrase("Passphrase to unlock your identity")?;
-    let plaintext = seal::open(&passphrase, &bytes).map_err(|e| match e {
+    let plaintext = seal::open(&passphrase, bytes).map_err(|e| match e {
         SealError::Corrupt => anyhow!("identity file is corrupt"),
         SealError::WrongKeyOrCorrupt => anyhow!("wrong passphrase or corrupt identity"),
         other => anyhow!("{other}"),

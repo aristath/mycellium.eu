@@ -24,6 +24,7 @@ pub mod expiry;
 pub mod flow;
 pub mod groups;
 pub mod history;
+pub mod inbox;
 pub mod names;
 pub mod outbox;
 pub mod peerbook;

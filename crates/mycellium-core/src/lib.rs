@@ -20,6 +20,7 @@
 extern crate alloc;
 
 mod cipher;
+pub mod delivery;
 pub mod error;
 pub mod group;
 pub mod identity;

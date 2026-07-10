@@ -234,8 +234,16 @@ pub fn group_append<S: Storage>(
     store: &mut S,
     group_id: &str,
     message: GroupStoredMessage,
-) -> Result<(), S::Error> {
-    append_segment(store, GHIST, group_id, message, "group transcript")
+) -> Result<bool, S::Error> {
+    if !message.id.is_empty()
+        && group_load(store, group_id)?
+            .iter()
+            .any(|known| known.id == message.id)
+    {
+        return Ok(false);
+    }
+    append_segment(store, GHIST, group_id, message, "group transcript")?;
+    Ok(true)
 }
 
 /// Load a peer's transcript (empty if none / unreadable).
@@ -255,15 +263,21 @@ pub fn append<S: Storage>(
     store: &mut S,
     peer: &str,
     message: StoredMessage,
-) -> Result<(), S::Error> {
-    append_segment(store, HIST, peer, message, "1:1 transcript")?;
+) -> Result<bool, S::Error> {
+    let inserted = message.id.is_empty()
+        || !load(store, peer)?
+            .iter()
+            .any(|known| known.id == message.id);
+    if inserted {
+        append_segment(store, HIST, peer, message, "1:1 transcript")?;
+    }
 
     let mut names = peers(store)?;
     if !names.iter().any(|p| p == peer) {
         names.push(peer.to_string());
         store.put(PEER_INDEX, &wire::encode(&names))?;
     }
-    Ok(())
+    Ok(inserted)
 }
 
 /// Load a peer's transcript, pruning any messages expired as of `now`.

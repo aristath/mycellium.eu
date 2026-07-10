@@ -6,10 +6,13 @@
 //! outbox.
 #![allow(clippy::too_many_arguments)]
 
+use std::sync::{mpsc, Arc, Mutex};
+
 use anyhow::{anyhow, bail, Context, Result};
 
+use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
 use mycellium_core::group::Group;
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
@@ -34,8 +37,9 @@ use crate::contacts::{self, Contact};
 use crate::draft;
 use crate::expiry;
 use crate::flow;
-use crate::groups::{self, GroupSyncPayload, MailItem, StoredGroup};
+use crate::groups::{self, GroupSyncPayload, MailItem, PeerFrame, StoredGroup};
 use crate::history;
+use crate::inbox;
 use crate::outbox;
 use crate::peerbook::{self, PeerRecord};
 use crate::platform::OsPlatform;
@@ -292,11 +296,13 @@ pub fn remove_record(handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
+    let wallet = peerbook::get(&fs, &handle)?.map(|record| record.record.wallet);
     if peerbook::remove(&mut fs, &handle)? {
-        antirollback::clear(&mut fs, handle.as_str())?;
+        if let Some(wallet) = wallet {
+            antirollback::clear(&mut fs, handle.as_str(), &wallet)?;
+        }
         println!("removed local record for '{}'", handle.as_str());
     } else {
-        antirollback::clear(&mut fs, handle.as_str())?;
         println!("no local record for '{}'", handle.as_str());
     }
     Ok(())
@@ -305,7 +311,7 @@ pub fn remove_record(handle: &str) -> Result<()> {
 pub fn discover(peer: &str, want: &[String]) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
+    let (peer_handle, peer_record) = resolve_record(&mut fs, peer)?;
     let mut last_error = None;
 
     for device in &peer_record.record.devices {
@@ -383,7 +389,8 @@ pub fn dht_lookup(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> R
         bootstrap,
         dht_record_key(&handle),
     )?;
-    let (best, skipped) = best_dht_record_candidate(&handle, candidates);
+    let wallet = trusted_wallet(&fs, &handle)?;
+    let (best, skipped) = best_dht_record_candidate(&handle, candidates, wallet)?;
     let Some(record) = best else {
         bail!("no DHT record found for '{}'", handle.as_str());
     };
@@ -433,21 +440,11 @@ pub fn send(
                        device: &Device,
                        item: MailItem|
      -> DeliveryPath {
-        let path = deliver_direct(store, device_secret, device, &item, now);
-        if !path.is_delivered() {
-            let slot = device_slot(&device.device_key);
-            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-            DeliveryPath::Outbox
-        } else {
-            path
-        }
+        deliver_or_park(store, device_secret, handle, device, item, now)
     };
     let mut self_deliver =
         |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
-            if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
-                let slot = device_slot(&device.device_key);
-                let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-            }
+            let _ = deliver_or_park(store, device_secret, handle, device, item, now);
         };
 
     let out = flow::send_app(
@@ -462,34 +459,56 @@ pub fn send(
         &app,
         &mut deliver,
         &mut self_deliver,
-    );
+    )?;
 
-    let total = out.delivered + out.outboxed;
+    let total = out.delivered + out.outboxed + out.failed;
     print_delivery_summary(
         peer_handle.as_str(),
         &out.id,
         out.delivered,
         out.outboxed,
+        out.failed,
         total,
     );
     Ok(())
 }
 
-fn print_delivery_summary(peer: &str, id: &str, delivered: u32, pending: u32, total: u32) {
-    println!("{}", delivery_summary(peer, id, delivered, pending, total));
+fn print_delivery_summary(
+    peer: &str,
+    id: &str,
+    delivered: u32,
+    pending: u32,
+    failed: u32,
+    total: u32,
+) {
+    println!(
+        "{}",
+        delivery_summary(peer, id, delivered, pending, failed, total)
+    );
 }
 
-fn delivery_summary(peer: &str, id: &str, delivered: u32, pending: u32, total: u32) -> String {
+fn delivery_summary(
+    peer: &str,
+    id: &str,
+    delivered: u32,
+    pending: u32,
+    failed: u32,
+    total: u32,
+) -> String {
     let delivered_devices = plural(delivered as usize, "device", "devices");
     let total_devices = plural(total as usize, "device", "devices");
     let pending_devices = plural(pending as usize, "device", "devices");
-    if pending == 0 {
+    if failed > 0 {
+        format!(
+            "delivery to '{peer}' incomplete — {delivered} accepted, {pending} pending locally, {failed} not saved (#{id})"
+        )
+    } else if pending == 0 {
         format!("delivered to '{peer}' — {delivered}/{total} {total_devices} (#{id})")
     } else if delivered == 0 {
         format!("saved for '{peer}' — waiting for direct delivery to {pending} {pending_devices} (#{id})")
     } else {
         format!(
-            "partially delivered to '{peer}' — {delivered} {delivered_devices} reached, {pending} pending locally (#{id})"
+            "partially delivered to '{peer}' — {delivered} {delivered_devices} accepted, {pending} pending locally (#{id})"
         )
     }
 }
@@ -498,9 +517,15 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
+    let _ = flush_outbox(&identity, &mut fs);
     let blocked = blocklist::load(&fs)?;
     let my_record = own_record(&fs, &me)?;
-    let mut platform = OsPlatform;
+    let identity = Arc::new(identity);
+    let me = Arc::new(me);
+    let my_record = Arc::new(my_record);
+    let blocked = Arc::new(blocked);
+    let fs = Arc::new(Mutex::new(fs));
+    start_retry_worker(Arc::clone(&identity), Arc::clone(&fs));
 
     if libp2p {
         let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
@@ -511,54 +536,196 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
             me.as_str(),
             node.peer_id()
         );
+        let workers = connection_workers(
+            Arc::clone(&identity),
+            Arc::clone(&me),
+            Arc::clone(&my_record),
+            Arc::clone(&blocked),
+            Arc::clone(&fs),
+        );
         loop {
-            let mut conn = match node.accept() {
+            let conn = match node.accept() {
                 Ok(conn) => conn,
                 Err(_) => continue,
             };
-            while let Ok(frame) = conn.recv_frame() {
-                if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
-                    if handle_discovery_frame(&mut fs, &mut conn, &item) {
-                        continue;
-                    }
-                    remember_sender(&mut fs, &item);
-                    let _ = process_item(
-                        &identity,
-                        &me,
-                        &my_record,
-                        &blocked,
-                        &mut platform,
-                        &mut fs,
-                        item,
-                    );
-                }
+            if workers.send(conn).is_err() {
+                bail!("connection workers stopped");
             }
         }
     } else {
         let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
         println!("serving on {addr} as {}", me.as_str());
+        let workers = connection_workers(
+            Arc::clone(&identity),
+            Arc::clone(&me),
+            Arc::clone(&my_record),
+            Arc::clone(&blocked),
+            Arc::clone(&fs),
+        );
         loop {
-            let mut conn = match transport.accept() {
+            let conn = match transport.accept() {
                 Ok(conn) => conn,
                 Err(_) => continue,
             };
-            while let Ok(frame) = conn.recv_frame() {
-                if let Ok(item) = serde_json::from_slice::<MailItem>(&frame) {
-                    if handle_discovery_frame(&mut fs, &mut conn, &item) {
-                        continue;
-                    }
-                    remember_sender(&mut fs, &item);
-                    let _ = process_item(
-                        &identity,
-                        &me,
-                        &my_record,
-                        &blocked,
-                        &mut platform,
-                        &mut fs,
-                        item,
-                    );
-                }
+            if workers.send(conn).is_err() {
+                bail!("connection workers stopped");
             }
+        }
+    }
+}
+
+fn connection_workers<C>(
+    identity: Arc<Identity>,
+    me: Arc<Handle>,
+    my_record: Arc<SignedRecord>,
+    blocked: Arc<Vec<String>>,
+    fs: Arc<Mutex<FileStore>>,
+) -> mpsc::SyncSender<C>
+where
+    C: FrameReader + FrameWriter + Send + 'static,
+{
+    let count = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(2)
+        .max(2);
+    let (sender, receiver) = mpsc::sync_channel::<C>(count * 2);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..count {
+        let receiver = Arc::clone(&receiver);
+        let identity = Arc::clone(&identity);
+        let me = Arc::clone(&me);
+        let my_record = Arc::clone(&my_record);
+        let blocked = Arc::clone(&blocked);
+        let fs = Arc::clone(&fs);
+        std::thread::spawn(move || loop {
+            let conn = {
+                let Ok(receiver) = receiver.lock() else {
+                    return;
+                };
+                match receiver.recv() {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                }
+            };
+            serve_connection(conn, &identity, &me, &my_record, &blocked, &fs);
+        });
+    }
+    sender
+}
+
+fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>) {
+    std::thread::spawn(move || loop {
+        retry_due_deliveries(&identity, &fs);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    });
+}
+
+fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>) {
+    enum Target {
+        Device(Device),
+        Retry,
+        Drop,
+    }
+
+    let now = OsPlatform.now_unix_secs();
+    let due: Vec<outbox::OutboxEntry> = {
+        let Ok(fs) = fs.lock() else {
+            return;
+        };
+        match outbox::load(&*fs) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|entry| entry.is_due(now) && !entry.is_expired(now))
+                .collect(),
+            Err(_) => return,
+        }
+    };
+
+    for entry in due {
+        let target = {
+            let Ok(fs) = fs.lock() else {
+                return;
+            };
+            match Handle::new(entry.recipient.clone()) {
+                Err(_) => Target::Drop,
+                Ok(handle) => match peerbook::get(&*fs, &handle) {
+                    Ok(Some(record)) => record
+                        .record
+                        .devices
+                        .iter()
+                        .find(|device| device_slot(&device.device_key) == entry.slot)
+                        .cloned()
+                        .map(Target::Device)
+                        .unwrap_or(Target::Drop),
+                    Ok(None) | Err(_) => Target::Retry,
+                },
+            }
+        };
+
+        if matches!(target, Target::Drop) {
+            if let Ok(mut fs) = fs.lock() {
+                let _ = outbox::remove(&mut *fs, &entry.id);
+            }
+            continue;
+        }
+
+        let accepted = match &target {
+            Target::Device(device) => {
+                direct_push(identity.device_secret(), device, &entry.id, &entry.item)
+            }
+            Target::Retry => false,
+            Target::Drop => unreachable!(),
+        };
+
+        let Ok(mut fs) = fs.lock() else {
+            return;
+        };
+        if let Target::Device(device) = &target {
+            let _ = reachability::record(
+                &mut *fs,
+                &device_slot(&device.device_key),
+                DeliveryPath::Direct,
+                accepted,
+                now,
+            );
+        }
+        let _ = outbox::record_attempt(&mut *fs, &entry.id, now, accepted);
+    }
+}
+
+fn serve_connection<C>(
+    mut conn: C,
+    identity: &Identity,
+    me: &Handle,
+    my_record: &SignedRecord,
+    blocked: &[String],
+    fs: &Mutex<FileStore>,
+) where
+    C: FrameReader + FrameWriter,
+{
+    let mut platform = OsPlatform;
+    while let Ok(bytes) = conn.recv_frame() {
+        let Ok(frame) = wire::decode::<PeerFrame>(&bytes) else {
+            continue;
+        };
+        let Ok(mut fs) = fs.lock() else {
+            return;
+        };
+        if handle_discovery_frame(&mut fs, &mut conn, &frame) {
+            continue;
+        }
+        if let PeerFrame::Delivery { delivery_id, item } = frame {
+            handle_delivery_frame(
+                identity,
+                me,
+                my_record,
+                blocked,
+                &mut platform,
+                &mut fs,
+                &mut conn,
+                delivery_id,
+                *item,
+            );
         }
     }
 }
@@ -574,6 +741,7 @@ pub fn outbox_list() -> Result<()> {
 pub fn outbox_retry() -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
+    outbox::make_all_due(&mut fs)?;
     let (delivered, _) = flush_outbox(&identity, &mut fs)?;
     if delivered > 0 {
         println!(
@@ -689,7 +857,16 @@ pub fn flush_outbox(identity: &Identity, fs: &mut FileStore) -> Result<(usize, u
         else {
             return outbox::Attempt::Drop;
         };
-        if deliver_direct(fs, identity.device_secret(), device, &entry.item, now).is_delivered() {
+        if deliver_direct(
+            fs,
+            identity.device_secret(),
+            device,
+            &entry.id,
+            &entry.item,
+            now,
+        )
+        .is_delivered()
+        {
             outbox::Attempt::Delivered
         } else {
             outbox::Attempt::Retry
@@ -704,11 +881,12 @@ fn deliver_direct(
     store: &mut FileStore,
     device_secret: [u8; 32],
     device: &Device,
+    delivery_id: &str,
     item: &MailItem,
     now: u64,
 ) -> DeliveryPath {
     let key = device_slot(&device.device_key);
-    let ok = direct_push(device_secret, device, item);
+    let ok = direct_push(device_secret, device, delivery_id, item);
     let _ = reachability::record(store, &key, DeliveryPath::Direct, ok, now);
     if ok {
         DeliveryPath::Direct
@@ -717,18 +895,26 @@ fn deliver_direct(
     }
 }
 
-fn direct_push(device_secret: [u8; 32], device: &Device, item: &MailItem) -> bool {
-    let Ok(frame) = serde_json::to_vec(item) else {
-        return false;
+fn direct_push(
+    device_secret: [u8; 32],
+    device: &Device,
+    delivery_id: &str,
+    item: &MailItem,
+) -> bool {
+    let payload = wire::encode(item);
+    let frame = PeerFrame::Delivery {
+        delivery_id: delivery_id.to_string(),
+        item: Box::new(item.clone()),
     };
+    let frame = wire::encode(&frame);
     match direct_transport(&device.peer_id.0) {
         DirectTransport::None => false,
         DirectTransport::Tcp => {
             let addr = String::from_utf8_lossy(&device.peer_id.0);
-            match net::TcpConnection::connect(&addr) {
-                Ok(mut conn) => conn.send_frame(&frame).is_ok(),
-                Err(_) => false,
-            }
+            let Ok(mut conn) = net::TcpConnection::connect(&addr) else {
+                return false;
+            };
+            exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
         }
         DirectTransport::Libp2p => {
             let addr = String::from_utf8_lossy(&device.peer_id.0);
@@ -737,7 +923,9 @@ fn direct_push(device_secret: [u8; 32], device: &Device, item: &MailItem) -> boo
                 Err(_) => return false,
             };
             let ok = match node.dial_str(&addr) {
-                Ok(mut conn) => conn.send_frame(&frame).is_ok(),
+                Ok(mut conn) => {
+                    exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
+                }
                 Err(_) => false,
             };
             node.drain(300);
@@ -746,15 +934,89 @@ fn direct_push(device_secret: [u8; 32], device: &Device, item: &MailItem) -> boo
     }
 }
 
+fn exchange_delivery<C>(
+    conn: &mut C,
+    frame: &[u8],
+    delivery_id: &str,
+    payload: &[u8],
+    recipient: &DevicePublicKey,
+) -> bool
+where
+    C: FrameReader + FrameWriter,
+{
+    if conn.send_frame(frame).is_err() {
+        return false;
+    }
+    let Ok(bytes) = conn.recv_frame() else {
+        return false;
+    };
+    let Ok(PeerFrame::Ack(ack)) = wire::decode::<PeerFrame>(&bytes) else {
+        return false;
+    };
+    ack.verify(delivery_id, payload, recipient).is_ok()
+}
+
+/// Persist before networking, then remove only after a recipient-device ACK.
+fn deliver_or_park(
+    store: &mut FileStore,
+    device_secret: [u8; 32],
+    recipient: &Handle,
+    device: &Device,
+    item: MailItem,
+    now: u64,
+) -> DeliveryPath {
+    let delivery_id = random_id();
+    let slot = device_slot(&device.device_key);
+    if outbox::enqueue(
+        store,
+        delivery_id.clone(),
+        recipient.as_str(),
+        &slot,
+        item.clone(),
+        now,
+    )
+    .is_err()
+    {
+        return DeliveryPath::Failed;
+    }
+
+    if deliver_direct(store, device_secret, device, &delivery_id, &item, now).is_delivered() {
+        // Acceptance is already proven. If cleanup fails, leaving the entry is
+        // safe: the recipient deduplicates the retry and returns the ACK again.
+        let _ = outbox::remove(store, &delivery_id);
+        DeliveryPath::Direct
+    } else {
+        DeliveryPath::Outbox
+    }
+}
+
+/// Persist a follow-up generated while accepting inbound mail. The acceptance
+/// ACK must not wait on more network I/O; the background retry worker delivers
+/// this item after the receive transaction releases local state.
+fn park_delivery(
+    store: &mut FileStore,
+    recipient: &Handle,
+    device: &Device,
+    item: MailItem,
+    now: u64,
+) -> DeliveryPath {
+    let delivery_id = random_id();
+    let slot = device_slot(&device.device_key);
+    match outbox::enqueue(store, delivery_id, recipient.as_str(), &slot, item, now) {
+        Ok(()) => DeliveryPath::Outbox,
+        Err(_) => DeliveryPath::Failed,
+    }
+}
+
 fn request_discovery_from_device(
     device_secret: [u8; 32],
     device: &Device,
     want: &[String],
 ) -> Result<Vec<crate::groups::DiscoveryRecord>> {
-    let request = MailItem::DiscoveryRequest {
+    let request = PeerFrame::DiscoveryRequest {
         want: want.to_vec(),
     };
-    let frame = serde_json::to_vec(&request)?;
+    let frame = wire::encode(&request);
     match direct_transport(&device.peer_id.0) {
         DirectTransport::None => bail!("device has no dialable address"),
         DirectTransport::Tcp => {
@@ -779,10 +1041,57 @@ fn request_discovery_from_device(
 }
 
 fn decode_discovery_response(frame: &[u8]) -> Result<Vec<crate::groups::DiscoveryRecord>> {
-    match serde_json::from_slice::<MailItem>(frame)? {
-        MailItem::DiscoveryResponse { records } => Ok(records),
+    match wire::decode::<PeerFrame>(frame)? {
+        PeerFrame::DiscoveryResponse { records } => Ok(records),
         _ => bail!("peer returned a non-discovery frame"),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_delivery_frame<W: FrameWriter>(
+    identity: &Identity,
+    me: &Handle,
+    my_record: &SignedRecord,
+    blocked: &[String],
+    platform: &mut OsPlatform,
+    fs: &mut FileStore,
+    writer: &mut W,
+    delivery_id: String,
+    item: MailItem,
+) {
+    if delivery_id.is_empty() || delivery_id.len() > MAX_DELIVERY_ID_LEN {
+        return;
+    }
+    let payload = wire::encode(&item);
+    let digest = payload_digest(&payload);
+    match inbox::seen(fs, &delivery_id, &digest) {
+        Ok(inbox::Seen::Duplicate) => {
+            send_delivery_ack(identity, writer, delivery_id, &payload);
+            return;
+        }
+        Ok(inbox::Seen::Collision) | Err(_) => return,
+        Ok(inbox::Seen::New) => {}
+    }
+
+    remember_sender(fs, &item);
+    if process_item(identity, me, my_record, blocked, platform, fs, item)
+        != flow::ItemOutcome::Accepted
+    {
+        return;
+    }
+    if inbox::record(fs, delivery_id.clone(), digest, platform.now_unix_secs()).is_ok() {
+        send_delivery_ack(identity, writer, delivery_id, &payload);
+    }
+}
+
+fn send_delivery_ack<W: FrameWriter>(
+    identity: &Identity,
+    writer: &mut W,
+    delivery_id: String,
+    payload: &[u8],
+) {
+    let frame = PeerFrame::Ack(DeliveryAck::accepted(identity, delivery_id, payload));
+    let _ = writer.send_frame(&wire::encode(&frame));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,10 +1113,10 @@ fn direct_transport(peer_id: &[u8]) -> DirectTransport {
 fn handle_discovery_frame<W: FrameWriter>(
     fs: &mut FileStore,
     writer: &mut W,
-    item: &MailItem,
+    frame: &PeerFrame,
 ) -> bool {
-    match item {
-        MailItem::DiscoveryRequest { want } => {
+    match frame {
+        PeerFrame::DiscoveryRequest { want } => {
             let records = match peerbook::pack(fs, want) {
                 Ok(records) => records,
                 Err(err) => {
@@ -815,13 +1124,11 @@ fn handle_discovery_frame<W: FrameWriter>(
                     Vec::new()
                 }
             };
-            let response = MailItem::DiscoveryResponse { records };
-            if let Ok(frame) = serde_json::to_vec(&response) {
-                let _ = writer.send_frame(&frame);
-            }
+            let response = PeerFrame::DiscoveryResponse { records };
+            let _ = writer.send_frame(&wire::encode(&response));
             true
         }
-        MailItem::DiscoveryResponse { records } => {
+        PeerFrame::DiscoveryResponse { records } => {
             let report = peerbook::import_records(fs, records.clone());
             if report.imported > 0 || !report.skipped.is_empty() {
                 println!(
@@ -843,9 +1150,7 @@ fn remember_sender(fs: &mut FileStore, item: &MailItem) {
         | MailItem::GroupSync(env)
         | MailItem::GroupInvite(env)
         | MailItem::GroupLeave(env) => Some(env),
-        MailItem::GroupText { .. }
-        | MailItem::DiscoveryRequest { .. }
-        | MailItem::DiscoveryResponse { .. } => None,
+        MailItem::GroupText { .. } => None,
     };
     if let Some(env) = env {
         let _ = peerbook::put(fs, &env.from, env.sender_record.clone());
@@ -925,31 +1230,13 @@ pub fn process_item(
     item: MailItem,
 ) -> flow::ItemOutcome {
     let now = platform.now_unix_secs();
-    let device_secret = identity.device_secret();
     let net = LocalNet::load(fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem|
-     -> DeliveryPath {
-        let path = deliver_direct(store, device_secret, device, &item, now);
-        if !path.is_delivered() {
-            let slot = device_slot(&device.device_key);
-            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-            DeliveryPath::Outbox
-        } else {
-            path
-        }
-    };
-    let mut self_deliver =
-        |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
-            if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
-                let slot = device_slot(&device.device_key);
-                let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-            }
-        };
-
+     -> DeliveryPath { park_delivery(store, handle, device, item, now) };
     let mut sink = CliSink;
     flow::process_item(
         identity,
@@ -962,7 +1249,6 @@ pub fn process_item(
         item,
         &mut sink,
         &mut deliver,
-        &mut self_deliver,
     )
 }
 
@@ -1063,14 +1349,7 @@ pub fn group_send(
                        device: &Device,
                        item: MailItem|
      -> DeliveryPath {
-        let path = deliver_direct(store, device_secret, device, &item, now);
-        if !path.is_delivered() {
-            let slot = device_slot(&device.device_key);
-            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-            DeliveryPath::Outbox
-        } else {
-            path
-        }
+        deliver_or_park(store, device_secret, handle, device, item, now)
     };
 
     let out = flow::group_send(
@@ -1081,25 +1360,38 @@ pub fn group_send(
         &mut stored,
         &app,
         &mut deliver,
-    );
-    print_group_delivery_summary(&stored.name, &out.id, out.direct, out.outboxed);
+    )?;
+    print_group_delivery_summary(&stored.name, &out.id, out.direct, out.outboxed, out.failed);
     Ok(())
 }
 
-fn print_group_delivery_summary(group: &str, id: &str, delivered: u32, pending: u32) {
-    println!("{}", group_delivery_summary(group, id, delivered, pending));
+fn print_group_delivery_summary(group: &str, id: &str, delivered: u32, pending: u32, failed: u32) {
+    println!(
+        "{}",
+        group_delivery_summary(group, id, delivered, pending, failed)
+    );
 }
 
-fn group_delivery_summary(group: &str, id: &str, delivered: u32, pending: u32) -> String {
+fn group_delivery_summary(
+    group: &str,
+    id: &str,
+    delivered: u32,
+    pending: u32,
+    failed: u32,
+) -> String {
     let delivered_copies = plural(delivered as usize, "copy", "copies");
     let pending_copies = plural(pending as usize, "copy", "copies");
-    if pending == 0 {
-        format!("delivered to group '{group}' — {delivered} direct {delivered_copies} (#{id})")
+    if failed > 0 {
+        format!(
+            "delivery to group '{group}' incomplete — {delivered} accepted, {pending} pending locally, {failed} not saved (#{id})"
+        )
+    } else if pending == 0 {
+        format!("delivered to group '{group}' — {delivered} accepted {delivered_copies} (#{id})")
     } else if delivered == 0 {
         format!("saved for group '{group}' — {pending} {pending_copies} pending locally (#{id})")
     } else {
         format!(
-            "partially delivered to group '{group}' — {delivered} direct {delivered_copies}, {pending} pending locally (#{id})"
+            "partially delivered to group '{group}' — {delivered} accepted {delivered_copies}, {pending} pending locally (#{id})"
         )
     }
 }
@@ -1152,10 +1444,7 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem| {
-        if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
-            let slot = device_slot(&device.device_key);
-            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-        }
+        let _ = deliver_or_park(store, device_secret, handle, device, item, now);
     };
     flow::group_leave(
         &identity,
@@ -1223,10 +1512,7 @@ pub fn group_sync(whoami: &str) -> Result<()> {
                 continue;
             };
             let item = MailItem::GroupSync(env);
-            if !deliver_direct(&mut fs, device_secret, device, &item, now).is_delivered() {
-                let slot = device_slot(&device.device_key);
-                let _ = outbox::enqueue(&mut fs, random_id(), me.as_str(), &slot, item, now);
-            }
+            let _ = deliver_or_park(&mut fs, device_secret, &me, device, item, now);
         }
         synced += 1;
     }
@@ -1272,10 +1558,7 @@ fn distribute_group_key_direct(
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem| {
-        if !deliver_direct(store, device_secret, device, &item, now).is_delivered() {
-            let slot = device_slot(&device.device_key);
-            let _ = outbox::enqueue(store, random_id(), handle.as_str(), &slot, item, now);
-        }
+        let _ = deliver_or_park(store, device_secret, handle, device, item, now);
     };
     flow::distribute_key(
         identity,
@@ -1306,6 +1589,18 @@ fn ensure_peer_records(identity: &Identity, fs: &mut FileStore, handles: &[Strin
                 handle.as_str()
             );
         }
+        let record = peerbook::get(fs, &handle)?.expect("record checked above");
+        if record.record.wallet != identity.wallet_public()
+            && matches!(
+                verified::level(fs, handle.as_str(), &record.record.wallet),
+                verified::TrustLevel::Unverified | verified::TrustLevel::Changed
+            )
+        {
+            bail!(
+                "group member '{}' is unverified; verify or pin the contact before sharing group keys",
+                handle.as_str()
+            );
+        }
     }
     Ok(())
 }
@@ -1331,10 +1626,10 @@ pub fn resolve_group(fs: &FileStore, key: &str) -> Result<StoredGroup> {
 
 // ---- trust / contacts -------------------------------------------------------
 
-pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
+pub fn resolve_record(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
     let resolved = contacts::resolve(fs, input)?;
     let net = LocalNet::load(fs);
-    match flow::lookup_verified(fs, &net, &resolved) {
+    match flow::resolve_record(fs, &net, &resolved) {
         Ok(pair) => Ok(pair),
         Err(flow::TrustError::BadHandle) => {
             let handle =
@@ -1343,7 +1638,7 @@ pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, Signe
             match import_from_configured_dht(&identity, fs, &handle) {
                 Ok(true) => {
                     let net = LocalNet::load(fs);
-                    flow::lookup_verified(fs, &net, &resolved).map_err(|err| match err {
+                    flow::resolve_record(fs, &net, &resolved).map_err(|err| match err {
                         flow::TrustError::BadHandle => {
                             anyhow!("no signed record for '{resolved}'")
                         }
@@ -1369,6 +1664,24 @@ pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, Signe
         Err(flow::TrustError::StaleRecord) => {
             bail!("STALE RECORD for '{resolved}'. Refusing rollback.")
         }
+    }
+}
+
+/// Resolve a peer and require an explicit local TOFU pin or out-of-band
+/// verification before message or group-secret delivery.
+pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
+    let (handle, record) = resolve_record(fs, input)?;
+    match verified::level(fs, handle.as_str(), &record.record.wallet) {
+        verified::TrustLevel::Pinned | verified::TrustLevel::Verified => Ok((handle, record)),
+        verified::TrustLevel::Changed => bail!(
+            "IDENTITY CHANGED for '{}'. Refusing until you verify the new record out of band.",
+            handle.as_str()
+        ),
+        verified::TrustLevel::Unverified => bail!(
+            "first contact '{}' is unverified; run `verify {} --confirm` after comparing its safety number, or add it as a contact to pin it",
+            handle.as_str(),
+            handle.as_str()
+        ),
     }
 }
 
@@ -1411,12 +1724,24 @@ fn decode_dht_record_candidate(handle: &Handle, bytes: &[u8]) -> Result<SignedRe
 fn best_dht_record_candidate(
     handle: &Handle,
     candidates: Vec<Vec<u8>>,
-) -> (Option<SignedRecord>, usize) {
+    trusted_wallet: Option<WalletPublicKey>,
+) -> Result<(Option<SignedRecord>, usize)> {
     let mut best = None::<SignedRecord>;
+    let mut selected_wallet = trusted_wallet;
     let mut skipped = 0usize;
+    let mut conflicting_wallet = false;
     for bytes in candidates {
         match decode_dht_record_candidate(handle, &bytes) {
             Ok(record) => {
+                match selected_wallet {
+                    Some(wallet) if wallet != record.record.wallet => {
+                        conflicting_wallet = true;
+                        skipped += 1;
+                        continue;
+                    }
+                    None => selected_wallet = Some(record.record.wallet),
+                    Some(_) => {}
+                }
                 let replace = best
                     .as_ref()
                     .map(|known| record.record.seq > known.record.seq)
@@ -1428,7 +1753,27 @@ fn best_dht_record_candidate(
             Err(_) => skipped += 1,
         }
     }
-    (best, skipped)
+    if trusted_wallet.is_none() && conflicting_wallet {
+        bail!(
+            "conflicting wallets claim '{}'; discovery cannot choose identity authority",
+            handle.as_str()
+        );
+    }
+    Ok((best, skipped))
+}
+
+fn trusted_wallet(fs: &FileStore, handle: &Handle) -> Result<Option<WalletPublicKey>> {
+    let Some(record) = peerbook::get(fs, handle)? else {
+        return Ok(None);
+    };
+    Ok(
+        match verified::level(fs, handle.as_str(), &record.record.wallet) {
+            verified::TrustLevel::Pinned | verified::TrustLevel::Verified => {
+                Some(record.record.wallet)
+            }
+            verified::TrustLevel::Changed | verified::TrustLevel::Unverified => None,
+        },
+    )
 }
 
 fn import_from_configured_dht(
@@ -1446,7 +1791,8 @@ fn import_from_configured_dht(
         bootstrap,
         dht_record_key(handle),
     )?;
-    let (best, _skipped) = best_dht_record_candidate(handle, candidates);
+    let wallet = trusted_wallet(fs, handle)?;
+    let (best, _skipped) = best_dht_record_candidate(handle, candidates, wallet)?;
     let Some(record) = best else {
         return Ok(false);
     };
@@ -1491,16 +1837,50 @@ fn dht_record_key(handle: &Handle) -> Vec<u8> {
     format!("mycellium/record/{}", handle.as_str()).into_bytes()
 }
 
-pub fn verify(peer: &str, confirm: bool) -> Result<()> {
+pub fn verify(peer: &str, confirm: bool, accept_change: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
+    let resolved = contacts::resolve(&fs, peer)?;
+    let peer_handle =
+        Handle::new(resolved.clone()).map_err(|_| anyhow!("invalid handle '{resolved}'"))?;
+    if peerbook::get(&fs, &peer_handle)?.is_none() {
+        let _ = import_from_configured_dht(&identity, &mut fs, &peer_handle);
+    }
+    let peer_record = peerbook::get(&fs, &peer_handle)?
+        .ok_or_else(|| anyhow!("no signed record for '{}'", peer_handle.as_str()))?;
+    peer_record
+        .verify()
+        .map_err(|_| anyhow!("peer record failed verification"))?;
     let wallet = peer_record.record.wallet;
     let sn = safety::safety_number(&identity.wallet_public(), &wallet);
     let level = verified::level(&fs, peer_handle.as_str(), &wallet);
     println!("'{}' - {}", peer_handle.as_str(), level.label());
     println!("safety number: {sn}");
-    if confirm {
+    if accept_change {
+        if level != verified::TrustLevel::Changed {
+            bail!(
+                "'{}' has no changed identity to accept",
+                peer_handle.as_str()
+            );
+        }
+        verified::mark(&mut fs, peer_handle.as_str(), &wallet)?;
+        for mut contact in contacts::list(&fs)? {
+            if contact.handle == peer_handle.as_str() {
+                contact.wallet = wallet;
+                contacts::save(&mut fs, &contact)?;
+            }
+        }
+        println!(
+            "accepted the new verified identity for '{}'",
+            peer_handle.as_str()
+        );
+    } else if confirm {
+        if level == verified::TrustLevel::Changed {
+            bail!(
+                "identity changed for '{}'; compare the new safety number and use --accept-change explicitly",
+                peer_handle.as_str()
+            );
+        }
         verified::mark(&mut fs, peer_handle.as_str(), &wallet)?;
         println!("marked '{}' as verified", peer_handle.as_str());
     }
@@ -1755,6 +2135,7 @@ pub use crate::wireops::{device_slot, my_group_id, this_device};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mycellium_core::group::GroupMessage;
 
     struct TestPlatform;
 
@@ -1791,6 +2172,98 @@ mod tests {
         peerbook::build_record(&mut platform, &identity, handle, "Name", "127.0.0.1:1")
     }
 
+    fn sample_mail() -> MailItem {
+        MailItem::GroupText {
+            group_id: "group-1".into(),
+            message: GroupMessage {
+                sender: vec![1],
+                iteration: 0,
+                ciphertext: vec![2, 3],
+                signature: vec![4; 64],
+            },
+        }
+    }
+
+    struct AckWire {
+        signer: Identity,
+        sent: Option<Vec<u8>>,
+    }
+
+    impl FrameWriter for AckWire {
+        fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
+            self.sent = Some(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    impl FrameReader for AckWire {
+        fn recv_frame(&mut self) -> Result<Vec<u8>> {
+            let frame = self.sent.as_ref().unwrap();
+            let PeerFrame::Delivery { delivery_id, item } =
+                wire::decode::<PeerFrame>(frame).unwrap()
+            else {
+                panic!("expected delivery frame");
+            };
+            let payload = wire::encode(&*item);
+            Ok(wire::encode(&PeerFrame::Ack(DeliveryAck::accepted(
+                &self.signer,
+                delivery_id,
+                &payload,
+            ))))
+        }
+    }
+
+    #[test]
+    fn direct_delivery_requires_the_recipient_devices_acceptance_ack() {
+        let mut platform = SeededPlatform(30);
+        let bob = Identity::generate(&mut platform).unwrap();
+        let device = crate::wireops::this_device(&bob, "127.0.0.1:1");
+        let item = sample_mail();
+        let payload = wire::encode(&item);
+        let frame = wire::encode(&PeerFrame::Delivery {
+            delivery_id: "delivery-1".into(),
+            item: Box::new(item),
+        });
+        let mut conn = AckWire {
+            signer: bob,
+            sent: None,
+        };
+
+        assert!(exchange_delivery(
+            &mut conn,
+            &frame,
+            "delivery-1",
+            &payload,
+            &device.device_key,
+        ));
+    }
+
+    #[test]
+    fn direct_delivery_rejects_an_ack_signed_by_the_wrong_device() {
+        let mut platform = SeededPlatform(30);
+        let bob = Identity::generate(&mut platform).unwrap();
+        let mallory = Identity::generate(&mut SeededPlatform(130)).unwrap();
+        let device = crate::wireops::this_device(&bob, "127.0.0.1:1");
+        let item = sample_mail();
+        let payload = wire::encode(&item);
+        let frame = wire::encode(&PeerFrame::Delivery {
+            delivery_id: "delivery-1".into(),
+            item: Box::new(item),
+        });
+        let mut conn = AckWire {
+            signer: mallory,
+            sent: None,
+        };
+
+        assert!(!exchange_delivery(
+            &mut conn,
+            &frame,
+            "delivery-1",
+            &payload,
+            &device.device_key,
+        ));
+    }
+
     #[test]
     fn dht_candidate_accepts_matching_signed_record() {
         let handle = Handle::new("alice").unwrap();
@@ -1815,6 +2288,54 @@ mod tests {
         let bytes = vec![0u8; MAX_DHT_RECORD_BYTES + 1];
 
         assert!(decode_dht_record_candidate(&handle, &bytes).is_err());
+    }
+
+    #[test]
+    fn dht_cannot_choose_between_competing_unpinned_wallets() {
+        let handle = Handle::new("alice").unwrap();
+        let first = signed_record(&handle);
+        let mut other_platform = SeededPlatform(180);
+        let other_identity = Identity::generate(&mut other_platform).unwrap();
+        let other = peerbook::build_record(
+            &mut other_platform,
+            &other_identity,
+            &handle,
+            "Other Alice",
+            "127.0.0.1:2",
+        );
+
+        let err = best_dht_record_candidate(
+            &handle,
+            vec![wire::encode(&first), wire::encode(&other)],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("conflicting wallets"));
+    }
+
+    #[test]
+    fn dht_freshness_is_selected_only_within_the_trusted_wallet() {
+        let handle = Handle::new("alice").unwrap();
+        let trusted = signed_record(&handle);
+        let wallet = trusted.record.wallet;
+        let mut other_platform = SeededPlatform(180);
+        let other_identity = Identity::generate(&mut other_platform).unwrap();
+        let other = peerbook::build_record(
+            &mut other_platform,
+            &other_identity,
+            &handle,
+            "Other Alice",
+            "127.0.0.1:2",
+        );
+
+        let (selected, skipped) = best_dht_record_candidate(
+            &handle,
+            vec![wire::encode(&other), wire::encode(&trusted)],
+            Some(wallet),
+        )
+        .unwrap();
+        assert_eq!(selected.unwrap().record.wallet, wallet);
+        assert_eq!(skipped, 1);
     }
 
     #[test]
@@ -1853,32 +2374,36 @@ mod tests {
     #[test]
     fn delivery_summaries_do_not_fake_sent_state() {
         assert_eq!(
-            delivery_summary("bob", "abc123", 1, 0, 1),
+            delivery_summary("bob", "abc123", 1, 0, 0, 1),
             "delivered to 'bob' — 1/1 device (#abc123)"
         );
         assert_eq!(
-            delivery_summary("bob", "abc123", 0, 2, 2),
+            delivery_summary("bob", "abc123", 0, 2, 0, 2),
             "saved for 'bob' — waiting for direct delivery to 2 devices (#abc123)"
         );
         assert_eq!(
-            delivery_summary("bob", "abc123", 1, 1, 2),
-            "partially delivered to 'bob' — 1 device reached, 1 pending locally (#abc123)"
+            delivery_summary("bob", "abc123", 1, 1, 0, 2),
+            "partially delivered to 'bob' — 1 device accepted, 1 pending locally (#abc123)"
+        );
+        assert_eq!(
+            delivery_summary("bob", "abc123", 0, 1, 1, 2),
+            "delivery to 'bob' incomplete — 0 accepted, 1 pending locally, 1 not saved (#abc123)"
         );
     }
 
     #[test]
     fn group_delivery_summaries_do_not_fake_sent_state() {
         assert_eq!(
-            group_delivery_summary("team", "abc123", 3, 0),
-            "delivered to group 'team' — 3 direct copies (#abc123)"
+            group_delivery_summary("team", "abc123", 3, 0, 0),
+            "delivered to group 'team' — 3 accepted copies (#abc123)"
         );
         assert_eq!(
-            group_delivery_summary("team", "abc123", 0, 3),
+            group_delivery_summary("team", "abc123", 0, 3, 0),
             "saved for group 'team' — 3 copies pending locally (#abc123)"
         );
         assert_eq!(
-            group_delivery_summary("team", "abc123", 2, 1),
-            "partially delivered to group 'team' — 2 direct copies, 1 pending locally (#abc123)"
+            group_delivery_summary("team", "abc123", 2, 1, 0),
+            "partially delivered to group 'team' — 2 accepted copies, 1 pending locally (#abc123)"
         );
     }
 }
