@@ -2427,7 +2427,7 @@ mod tests {
             &mut store,
             &mut writer,
             "delivery-atomic".into(),
-            item,
+            item.clone(),
         );
 
         assert_eq!(writer.0.len(), 1, "ACK is emitted after commit");
@@ -2436,6 +2436,21 @@ mod tests {
             inbox::seen(&store, "delivery-atomic", &digest).unwrap(),
             inbox::Seen::Duplicate
         );
+        // Model a lost first ACK: the sender retries the exact delivery. The
+        // recipient must not reapply it, but must return the signed ACK again.
+        handle_delivery_frame(
+            &bob,
+            &bob_handle,
+            &bob_record,
+            &[],
+            &mut OsPlatform,
+            &mut store,
+            &mut writer,
+            "delivery-atomic".into(),
+            item,
+        );
+        assert_eq!(writer.0.len(), 2);
+        assert_eq!(history::load(&store, "alice").unwrap().len(), 1);
         drop(store);
         let reopened = FileStore::open(dir.clone(), [7; 32]).unwrap();
         assert_eq!(history::load(&reopened, "alice").unwrap().len(), 1);

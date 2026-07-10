@@ -349,6 +349,48 @@ mod tests {
     }
 
     #[test]
+    fn abrupt_exit_after_journal_helper() {
+        let Some(dir) = std::env::var_os("MYCELLIUM_CRASH_TEST_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let mut store = FileStore::open(dir, [6u8; 32]).unwrap();
+        store.put(b"old", b"before").unwrap();
+        let mutations = vec![
+            Mutation::Put(b"new".to_vec(), b"committed".to_vec()),
+            Mutation::Delete(b"old".to_vec()),
+        ];
+        let plaintext = mycellium_core::wire::encode(&mutations);
+        let journal = store.encrypt(JOURNAL_AAD, &plaintext).unwrap();
+        crate::atomic_write(&store.journal_path(), &journal).unwrap();
+        // No unwinding, Drop, or cleanup: model power loss immediately after
+        // the durable write-ahead commit point.
+        std::process::exit(91);
+    }
+
+    #[test]
+    fn committed_transaction_survives_abrupt_process_exit() {
+        let dir = temp_dir("process-crash-recovery");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("filestore::tests::abrupt_exit_after_journal_helper")
+            .arg("--nocapture")
+            .env("MYCELLIUM_CRASH_TEST_DIR", &dir)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(91));
+
+        let store = FileStore::open(dir.clone(), [6u8; 32]).unwrap();
+        assert_eq!(
+            store.get(b"new").unwrap().as_deref(),
+            Some(&b"committed"[..])
+        );
+        assert_eq!(store.get(b"old").unwrap(), None);
+        assert!(!store.journal_path().exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn wrong_key_cannot_read() {
         let dir = temp_dir("wk");
         {

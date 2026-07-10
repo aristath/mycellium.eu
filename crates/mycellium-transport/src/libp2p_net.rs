@@ -229,11 +229,19 @@ impl Libp2pDialer {
     pub fn dial(&self, target: &Multiaddr) -> Result<Libp2pConnection> {
         let peer = peer_from_multiaddr(target)
             .ok_or_else(|| anyhow!("multiaddr is missing a /p2p/<peer-id> component"))?;
+        let mut control = self.control.clone();
+        // Reuse an established connection without asking the swarm to dial it
+        // again. This is the common retry/multi-message path.
+        if let Ok(stream) = self.rt.block_on(control.open_stream(peer, PROTOCOL)) {
+            return Ok(Libp2pConnection {
+                handle: self.rt.handle().clone(),
+                stream,
+            });
+        }
         self.cmd_tx
             .send(Command::Dial(target.clone()))
             .map_err(|_| anyhow!("libp2p swarm stopped"))?;
 
-        let mut control = self.control.clone();
         let stream = self.rt.block_on(async move {
             // The dial is asynchronous; retry opening the stream until the
             // connection is up (or give up after a few seconds).
@@ -661,10 +669,13 @@ mod tests {
     }
 
     #[test]
-    fn one_outbound_actor_reuses_its_swarm_for_multiple_streams() {
+    fn one_outbound_actor_reuses_its_swarm_across_multiple_peers() {
         let mut bob = Libp2pNode::new([7u8; 32], Some(listen_addr(0))).unwrap();
         let bob_peer = bob.peer_id();
         let bob_addr = bob.listen_addr().unwrap();
+        let mut carol = Libp2pNode::new([8u8; 32], Some(listen_addr(0))).unwrap();
+        let carol_peer = carol.peer_id();
+        let carol_addr = carol.listen_addr().unwrap();
 
         let bob_thread = std::thread::spawn(move || {
             let mut received = Vec::new();
@@ -674,18 +685,26 @@ mod tests {
             }
             received
         });
+        let carol_thread = std::thread::spawn(move || {
+            let mut conn = carol.accept().unwrap();
+            conn.recv().unwrap()
+        });
 
         // `Libp2pDialer::new` drops its temporary node shell. The cloneable
         // dialer keeps the one runtime and swarm alive across both deposits.
         let alice = Libp2pDialer::new([9u8; 32]).unwrap();
-        let dial: Multiaddr = format!("{bob_addr}/p2p/{bob_peer}").parse().unwrap();
-        for message in [b"first".as_slice(), b"second".as_slice()] {
-            let mut conn = alice.dial(&dial).unwrap();
-            conn.send(message).unwrap();
-        }
+        let bob_dial: Multiaddr = format!("{bob_addr}/p2p/{bob_peer}").parse().unwrap();
+        let carol_dial: Multiaddr = format!("{carol_addr}/p2p/{carol_peer}").parse().unwrap();
+        let mut conn = alice.dial(&bob_dial).unwrap();
+        conn.send(b"first").unwrap();
+        let mut conn = alice.dial(&carol_dial).unwrap();
+        conn.send(b"other peer").unwrap();
+        let mut conn = alice.dial(&bob_dial).unwrap();
+        conn.send(b"second").unwrap();
 
         let received = bob_thread.join().unwrap();
         assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(carol_thread.join().unwrap(), b"other peer");
     }
 
     #[test]
