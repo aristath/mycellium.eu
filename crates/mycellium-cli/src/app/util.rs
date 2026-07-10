@@ -31,20 +31,11 @@ pub fn preview(text: &str) -> String {
     text
 }
 
-/// Bind both peers' messaging identities into the AEAD associated data, so a
-/// ciphertext is cryptographically tied to *this* pair. Initiator's key first.
-// The platform-agnostic crypto helpers live in the engine; these are the
-// native entry points that supply the OS platform.
-pub use mycellium_engine::wireops::{associated_data, hex};
+pub use mycellium_engine::wireops::hex;
 
 /// A short random message id (native).
 pub fn random_id() -> String {
     mycellium_engine::wireops::random_id(&mut OsPlatform)
-}
-
-/// A plain-text application message (no expiry).
-pub fn text_message(text: &str) -> AppMessage {
-    mycellium_engine::wireops::text_message(&mut OsPlatform, text)
 }
 
 /// Parse a duration like `30s`, `10m`, `1h`, `7d` into seconds.

@@ -172,7 +172,13 @@ pub fn open_envelope<P: Platform>(
     if user_id(env.from.as_str()) != env.sender_record.record.handle {
         bail!("sender name does not match its record");
     }
-    if env.init.initiator_ik != env.sender_record.record.primary().id_key {
+    if !env
+        .sender_record
+        .record
+        .devices
+        .iter()
+        .any(|device| device.id_key == env.init.initiator_ik)
+    {
         bail!("handshake is not bound to the sender's identity");
     }
     let shared = x3dh::respond(identity, &env.init).map_err(|e| anyhow!("{e}"))?;
@@ -227,7 +233,26 @@ fn unpad_bucket(padded: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod pad_tests {
-    use super::{pad_bucket, unpad_bucket, PAD_BUCKETS};
+    use super::*;
+    use mycellium_core::identity::{Handle, Identity, PeerId};
+    use mycellium_core::platform::Platform;
+    use mycellium_core::record::{Device, Record, SignedRecord};
+    use mycellium_core::userid::user_id;
+
+    struct SeededPlatform(u8);
+
+    impl Platform for SeededPlatform {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = self.0.wrapping_add((i as u8).wrapping_mul(31));
+            }
+            self.0 = self.0.wrapping_add(1);
+        }
+
+        fn now_unix_secs(&self) -> u64 {
+            42
+        }
+    }
 
     #[test]
     fn round_trips_and_lands_on_a_bucket() {
@@ -261,5 +286,43 @@ mod pad_tests {
         let mut bad = 999u32.to_le_bytes().to_vec();
         bad.extend_from_slice(&[0u8; 10]);
         assert!(unpad_bucket(&bad).is_err());
+    }
+
+    #[test]
+    fn envelope_from_authorized_secondary_device_opens() {
+        let mut platform = SeededPlatform(7);
+        let alice_primary = Identity::generate(&mut platform).unwrap();
+        let alice_secondary =
+            Identity::adopt(&mut platform, alice_primary.wallet_secret()).unwrap();
+        let bob = Identity::generate(&mut platform).unwrap();
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_device = Device::create(&bob, PeerId(b"127.0.0.1:2".to_vec()), 1);
+        let alice_record = SignedRecord::sign(
+            Record {
+                handle: user_id(alice_handle.as_str()),
+                name: "Alice".into(),
+                wallet: alice_primary.wallet_public(),
+                devices: vec![
+                    Device::create(&alice_primary, PeerId(b"127.0.0.1:1".to_vec()), 1),
+                    Device::create(&alice_secondary, PeerId(b"127.0.0.1:3".to_vec()), 1),
+                ],
+                seq: 1,
+            },
+            &alice_secondary,
+        );
+        let envelope = seal_to_with_record(
+            &mut platform,
+            &alice_secondary,
+            &alice_handle,
+            &alice_record,
+            &bob_device,
+            b"hello",
+        )
+        .unwrap();
+
+        let (from, plaintext) = open_envelope(&mut platform, &bob, &envelope).unwrap();
+
+        assert_eq!(from.as_str(), "alice");
+        assert_eq!(plaintext, b"hello");
     }
 }

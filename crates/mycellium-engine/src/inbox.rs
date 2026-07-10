@@ -12,9 +12,8 @@ use mycellium_core::wire;
 
 const KEY: &[u8] = b"accepted-deliveries";
 
-/// Keep duplicate-suppression state longer than the sender's maximum outbox
-/// lifetime, so every legitimate retry remains recognizable.
-pub const RETENTION_SECS: u64 = crate::outbox::TTL_SECS + 86_400;
+/// Keep duplicate-suppression state for a bounded local window.
+pub const RETENTION_SECS: u64 = 8 * 86_400;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedDelivery {

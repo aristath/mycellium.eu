@@ -14,20 +14,19 @@ use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN}
 use mycellium_core::group::Group;
 use mycellium_core::identity::{DevicePublicKey, Handle, Identity, PeerId, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
+use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
-use mycellium_core::ratchet::Ratchet;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_core::transport::Transport;
 use mycellium_core::userid::user_id;
 use mycellium_core::wire;
-use mycellium_core::x3dh::{self, HandshakeInit};
 
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
 use mycellium_transport::libp2p_net::{self};
-use mycellium_transport::link::{FrameReader, FrameWriter, Wire};
+use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_transport::net::{self, TcpTransport};
 
 use crate::platform::OsPlatform;
@@ -40,11 +39,9 @@ use mycellium_engine::{
 };
 
 mod backup;
-mod session;
 mod util;
 
 pub use backup::*;
-pub use session::*;
 pub use util::*;
 
 #[derive(Clone)]
@@ -584,7 +581,7 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
         if let Ok(mut store) = fs.lock() {
             let _ = flush_outbox_with_network(&identity, &mut store, &network);
         }
-        start_retry_worker(Arc::clone(&fs), network);
+        start_retry_worker(Arc::clone(&identity), Arc::clone(&fs), network);
         println!(
             "serving (libp2p) on {addr} as {} ({})",
             me.as_str(),
@@ -612,7 +609,7 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
         if let Ok(mut store) = fs.lock() {
             let _ = flush_outbox_with_network(&identity, &mut store, &network);
         }
-        start_retry_worker(Arc::clone(&fs), network);
+        start_retry_worker(Arc::clone(&identity), Arc::clone(&fs), network);
         println!("serving on {addr} as {}", me.as_str());
         let workers = connection_workers(
             Arc::clone(&identity),
@@ -672,16 +669,16 @@ where
     sender
 }
 
-fn start_retry_worker(fs: Arc<Mutex<FileStore>>, network: DirectNetwork) {
+fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>, network: DirectNetwork) {
     std::thread::spawn(move || loop {
-        retry_due_deliveries(&fs, &network);
+        retry_due_deliveries(&identity, &fs, &network);
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
 }
 
-fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
+fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &DirectNetwork) {
     enum Target {
-        Device(Box<Device>),
+        Device(Handle, Box<Device>),
         Retry,
         Drop,
     }
@@ -694,7 +691,7 @@ fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
         match outbox::load(&*fs) {
             Ok(entries) => entries
                 .into_iter()
-                .filter(|entry| entry.is_due(now) && !entry.is_expired(now))
+                .filter(|entry| entry.is_due(now))
                 .collect(),
             Err(_) => return,
         }
@@ -714,7 +711,7 @@ fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
                         .iter()
                         .find(|device| device_slot(&device.device_key) == entry.slot)
                         .cloned()
-                        .map(|device| Target::Device(Box::new(device)))
+                        .map(|device| Target::Device(handle, Box::new(device)))
                         .unwrap_or(Target::Drop),
                     Ok(None) | Err(_) => Target::Retry,
                 },
@@ -723,30 +720,50 @@ fn retry_due_deliveries(fs: &Mutex<FileStore>, network: &DirectNetwork) {
 
         if matches!(target, Target::Drop) {
             if let Ok(mut fs) = fs.lock() {
-                let _ = outbox::remove(&mut *fs, &entry.id);
+                let _ = outbox::mark_failed(&mut *fs, &entry.id);
             }
             continue;
         }
 
-        let accepted = match &target {
-            Target::Device(device) => direct_push(network, device, &entry.id, &entry.item),
+        let mut accepted = match &target {
+            Target::Device(_, device) => direct_push(network, device, &entry.id, &entry.item),
             Target::Retry => false,
             Target::Drop => unreachable!(),
         };
 
-        let Ok(mut fs) = fs.lock() else {
+        let Ok(mut guard) = fs.lock() else {
             return;
         };
-        if let Target::Device(device) = &target {
+        if let Target::Device(handle, device) = &target {
             let _ = reachability::record(
-                &mut *fs,
+                &mut *guard,
                 &device_slot(&device.device_key),
                 DeliveryPath::Direct,
                 accepted,
                 now,
             );
+            if !accepted {
+                if let Some(fresh) =
+                    refresh_delivery_device(identity, &mut guard, handle, &entry.slot)
+                {
+                    drop(guard);
+                    accepted = direct_push(network, &fresh, &entry.id, &entry.item);
+                    let Ok(mut reopened) = fs.lock() else {
+                        return;
+                    };
+                    let _ = reachability::record(
+                        &mut *reopened,
+                        &device_slot(&fresh.device_key),
+                        DeliveryPath::Direct,
+                        accepted,
+                        now,
+                    );
+                    let _ = outbox::record_attempt(&mut *reopened, &entry.id, now, accepted);
+                    continue;
+                }
+            }
         }
-        let _ = outbox::record_attempt(&mut *fs, &entry.id, now, accepted);
+        let _ = outbox::record_attempt(&mut *guard, &entry.id, now, accepted);
     }
 }
 
@@ -823,8 +840,13 @@ pub fn outbox_cancel(id: &str) -> Result<()> {
     }
 
     if id == "all" {
-        let removed = entries.len();
-        outbox::save(&mut fs, &[])?;
+        let mut removed = 0usize;
+        for entry in entries.iter_mut().filter(|entry| entry.is_pending()) {
+            entry.status = outbox::OutboxStatus::Cancelled;
+            entry.send_after = 0;
+            removed += 1;
+        }
+        outbox::save(&mut fs, &entries)?;
         println!(
             "cancelled {removed} pending local delivery {}",
             plural(removed, "item", "items")
@@ -840,12 +862,23 @@ pub fn outbox_cancel(id: &str) -> Result<()> {
     match matches.len() {
         0 => bail!("no pending local delivery item matches '{id}'"),
         1 => {
-            let removed = entries.remove(matches[0]);
+            let entry = &mut entries[matches[0]];
+            if !entry.is_pending() {
+                bail!(
+                    "local delivery {} is already {:?}",
+                    short_outbox_id(&entry.id),
+                    entry.status
+                );
+            }
+            entry.status = outbox::OutboxStatus::Cancelled;
+            entry.send_after = 0;
+            let removed_id = entry.id.clone();
+            let removed_recipient = entry.recipient.clone();
             outbox::save(&mut fs, &entries)?;
             println!(
                 "cancelled pending local delivery {} for '{}'",
-                short_outbox_id(&removed.id),
-                removed.recipient
+                short_outbox_id(&removed_id),
+                removed_recipient
             );
         }
         n => bail!("'{id}' matches {n} pending items; use a longer id prefix"),
@@ -854,17 +887,33 @@ pub fn outbox_cancel(id: &str) -> Result<()> {
 }
 
 fn print_outbox_entries(entries: &[outbox::OutboxEntry]) {
-    if entries.is_empty() {
+    let pending = entries.iter().filter(|entry| entry.is_pending()).count();
+    if pending == 0 {
         println!("outbox empty");
+        let delivered = entries
+            .iter()
+            .filter(|entry| entry.status == outbox::OutboxStatus::Delivered)
+            .count();
+        let failed = entries
+            .iter()
+            .filter(|entry| entry.status == outbox::OutboxStatus::Failed)
+            .count();
+        let cancelled = entries
+            .iter()
+            .filter(|entry| entry.status == outbox::OutboxStatus::Cancelled)
+            .count();
+        if delivered + failed + cancelled > 0 {
+            println!("recorded: {delivered} delivered, {failed} failed, {cancelled} cancelled");
+        }
         return;
     }
     let now = OsPlatform.now_unix_secs();
     println!(
         "{} pending local delivery {}:",
-        entries.len(),
-        plural(entries.len(), "item", "items")
+        pending,
+        plural(pending, "item", "items")
     );
-    for e in entries {
+    for e in entries.iter().filter(|entry| entry.is_pending()) {
         println!(
             "  {} -> {}  (device {}, {}s old, {} {})",
             short_outbox_id(&e.id),
@@ -927,11 +976,17 @@ fn flush_outbox_with_network(
         };
         if deliver_direct(fs, network, device, &entry.id, &entry.item, now).is_delivered() {
             outbox::Attempt::Delivered
+        } else if let Some(device) = refresh_delivery_device(identity, fs, &handle, &entry.slot) {
+            if deliver_direct(fs, network, &device, &entry.id, &entry.item, now).is_delivered() {
+                outbox::Attempt::Delivered
+            } else {
+                outbox::Attempt::Retry
+            }
         } else {
             outbox::Attempt::Retry
         }
     });
-    let waiting = remaining.len();
+    let waiting = remaining.iter().filter(|entry| entry.is_pending()).count();
     outbox::save(fs, &remaining)?;
     Ok((delivered, waiting))
 }
@@ -1039,7 +1094,7 @@ fn deliver_or_park(
     if deliver_direct(store, network, device, &delivery_id, &item, now).is_delivered() {
         // Acceptance is already proven. If cleanup fails, leaving the entry is
         // safe: the recipient deduplicates the retry and returns the ACK again.
-        let _ = outbox::remove(store, &delivery_id);
+        let _ = outbox::mark_delivered(store, &delivery_id);
         DeliveryPath::Direct
     } else {
         DeliveryPath::Outbox
@@ -1128,6 +1183,9 @@ fn handle_delivery_frame<W: FrameWriter>(
         Ok(inbox::Seen::Collision) | Err(_) => return,
         Ok(inbox::Seen::New) => {}
     }
+    if sender_identity_changed(fs, &item) {
+        return;
+    }
 
     let mut tx = fs.transaction();
     remember_sender(&mut tx, &item);
@@ -1165,6 +1223,14 @@ fn send_delivery_ack<W: FrameWriter>(
 ) {
     let frame = PeerFrame::Ack(DeliveryAck::accepted(identity, delivery_id, payload));
     let _ = writer.send_frame(&wire::encode(&frame));
+}
+
+fn sender_identity_changed<S: Storage>(fs: &S, item: &MailItem) -> bool {
+    let Some(env) = envelope_sender(item) else {
+        return false;
+    };
+    verified::level(fs, env.from.as_str(), &env.sender_record.record.wallet)
+        == verified::TrustLevel::Changed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1220,16 +1286,20 @@ fn remember_sender<S: Storage>(fs: &mut S, item: &MailItem)
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    let env = match item {
+    let env = envelope_sender(item);
+    if let Some(env) = env {
+        let _ = peerbook::put(fs, &env.from, env.sender_record.clone());
+    }
+}
+
+fn envelope_sender(item: &MailItem) -> Option<&Envelope> {
+    match item {
         MailItem::Direct(env)
         | MailItem::SelfSync { envelope: env, .. }
         | MailItem::GroupSync(env)
         | MailItem::GroupInvite(env)
         | MailItem::GroupLeave(env) => Some(env),
         MailItem::GroupText { .. } => None,
-    };
-    if let Some(env) = env {
-        let _ = peerbook::put(fs, &env.from, env.sender_record.clone());
     }
 }
 
@@ -1888,6 +1958,24 @@ fn import_from_configured_dht(
     Ok(true)
 }
 
+fn refresh_delivery_device(
+    identity: &Identity,
+    fs: &mut FileStore,
+    handle: &Handle,
+    slot: &str,
+) -> Option<Device> {
+    if !import_from_configured_dht(identity, fs, handle).ok()? {
+        return None;
+    }
+    peerbook::get(fs, handle)
+        .ok()
+        .flatten()?
+        .record
+        .devices
+        .into_iter()
+        .find(|device| device_slot(&device.device_key) == slot)
+}
+
 fn publish_to_configured_dht(
     identity: &Identity,
     handle: &Handle,
@@ -2408,6 +2496,75 @@ mod tests {
             inbox::seen(&reopened, "delivery-atomic", &digest).unwrap(),
             inbox::Seen::Duplicate
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recipient_rejects_changed_sender_wallet_before_ack_or_storage() {
+        let mut platform = SeededPlatform(80);
+        let alice = Identity::generate(&mut platform).unwrap();
+        let mallory = Identity::generate(&mut platform).unwrap();
+        let bob = Identity::generate(&mut platform).unwrap();
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_handle = Handle::new("bob").unwrap();
+        let alice_record =
+            wireops::build_record(&mut platform, &alice, &alice_handle, "Alice", "127.0.0.1:1");
+        let mallory_record = wireops::build_record(
+            &mut platform,
+            &mallory,
+            &alice_handle,
+            "Fake Alice",
+            "127.0.0.1:9",
+        );
+        let bob_record =
+            wireops::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        let app = wireops::text_message(&mut platform, "not alice");
+        let envelope = wireops::seal_to_with_record(
+            &mut platform,
+            &mallory,
+            &alice_handle,
+            &mallory_record,
+            bob_record.record.primary(),
+            &app.encode(),
+        )
+        .unwrap();
+        let item = MailItem::Direct(envelope);
+        let payload = wire::encode(&item);
+        let digest = payload_digest(&payload);
+        let dir =
+            std::env::temp_dir().join(format!("mycellium-changed-sender-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = FileStore::open(dir.clone(), [8; 32]).unwrap();
+        contacts::save(
+            &mut store,
+            &Contact {
+                nickname: "alice".into(),
+                handle: "alice".into(),
+                wallet: alice_record.record.wallet,
+            },
+        )
+        .unwrap();
+        let mut writer = CaptureWriter::default();
+
+        handle_delivery_frame(
+            &bob,
+            &bob_handle,
+            &bob_record,
+            &[],
+            &mut OsPlatform,
+            &mut store,
+            &mut writer,
+            "delivery-changed".into(),
+            item,
+        );
+
+        assert!(writer.0.is_empty(), "changed identity is not ACKed");
+        assert!(history::load(&store, "alice").unwrap().is_empty());
+        assert_eq!(
+            inbox::seen(&store, "delivery-changed", &digest).unwrap(),
+            inbox::Seen::New
+        );
+        assert!(peerbook::get(&store, &alice_handle).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

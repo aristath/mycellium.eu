@@ -1,7 +1,7 @@
 # Serverless P2P Messaging Architecture
 
-**Document Version:** 2.0  
-**Date:** 2026-07-08  
+**Document Version:** 2.1  
+**Date:** 2026-07-10  
 **Status:** Hard Model Specification
 
 ---
@@ -10,8 +10,8 @@
 
 Mycellium is not a server-backed messenger with decentralization features.
 
-Mycellium is an edge-held messaging protocol: state lives with users, messages
-wait with senders, and the network only helps peers find each other.
+Mycellium is an edge-held messaging protocol: identity, delivery state, and
+messages live with users. The network only helps peers find each other.
 
 The hard serverless model is governed by one delivery law:
 
@@ -28,7 +28,7 @@ not store, queue, relay, or route messages.
 
 The goal is not to simulate WhatsApp without owning servers. The goal is to make
 messaging behave like a direct human-to-human line. When the line cannot be
-made, the message waits at the edge.
+made, the sender keeps the delivery locally until a direct line exists.
 
 ---
 
@@ -104,20 +104,25 @@ Bob.
 
 ## 3. Delivery Semantics
 
-### 3.1 Direct Or Pending
+### 3.1 Direct Or Local
 
-Every outgoing message has one of these core states:
+Every outgoing device-copy has one of these core states:
 
 | State | Meaning |
 |-------|---------|
-| `pending` | The message exists only on the sender's device. |
-| `connecting` | The sender is attempting to form a direct route. |
-| `delivered` | The recipient accepted the message over a direct peer-to-peer path. |
-| `failed` | The sender stopped retrying or the user cancelled delivery. |
+| `pending` | The sealed delivery item exists only on the sender's device and may be retried. |
+| `connecting` | The sender is attempting to form a direct route. This may be an ephemeral runtime state, not a durable record. |
+| `delivered` | The recipient device accepted the exact payload over a direct peer-to-peer path and returned a valid ACK. |
+| `failed` | The sender concluded this delivery item is no longer retryable. |
+| `cancelled` | The user explicitly stopped retrying this local delivery item. |
 
 There is no core `queued` state.
 
 There is no core "stored for recipient by infrastructure" state.
+
+Only `pending` items are retried. `delivered`, `failed`, and `cancelled` are
+local facts about the sender's own delivery responsibility; they do not imply
+that any server learned, stored, or routed the message.
 
 ### 3.2 Offline Delivery Means Delayed Edge Delivery
 
@@ -134,6 +139,10 @@ Offline delivery means:
 This is less convenient than hosted asynchronous messaging, and that is an
 intentional trade.
 
+If Alice has a stale address for Bob, retry may refresh Bob's signed discovery
+record and try again. That refresh is still discovery, not custody: it moves only
+self-authenticating records, not messages.
+
 ### 3.3 Sender Responsibility
 
 The sender's device owns pending delivery.
@@ -142,6 +151,23 @@ If Alice turns off every device before Bob is reachable, delivery waits. If Alic
 has multiple devices, those devices may sync pending outbox state with each
 other only through user-controlled, end-to-end-protected mechanisms. The core
 protocol must not assume a third-party pending-message host.
+
+### 3.4 Local Outbox
+
+The local outbox is the offline primitive. It is sender-owned delivery state, not
+a network service.
+
+A pending outbox entry carries the already-sealed payload for one recipient
+device. The sender may retry it, inspect it, or cancel it. A delivered entry is
+final only after the intended recipient device signs an acknowledgement bound to:
+
+- the delivery id
+- the exact payload bytes
+- the recipient device key
+
+Final delivery records may be retained locally as user-visible truth. Retention
+or compaction of those local records is product policy; it is not part of the
+message protocol.
 
 ---
 
@@ -161,6 +187,10 @@ It may store and return:
 
 The DHT does not decide whether a record is valid. The receiving node verifies
 the record locally.
+
+Retry may use the DHT to refresh a stale peer record after a failed direct
+connection. The DHT still carries only signed claims. It never receives the
+pending message.
 
 ### 4.2 Bootstrap Is Ignition
 
@@ -214,9 +244,12 @@ The user experience must expose that truth instead of hiding it behind a queue.
 Examples:
 
 - `waiting for peer`
+- `saved locally`
+- `connecting`
 - `route unavailable`
 - `retrying`
 - `peer discovered, connection failed`
+- `discovery refreshed`
 - `delivered`
 
 ### 5.3 Relays Are Outside The Core
@@ -234,9 +267,9 @@ Core Mycellium must remain understandable without relays:
 
 ---
 
-## 7. Security Model
+## 6. Security Model
 
-### 7.1 What The Hard Model Protects
+### 6.1 What The Hard Model Protects
 
 | Threat | Hard Model Response |
 |--------|---------------------|
@@ -246,7 +279,7 @@ Core Mycellium must remain understandable without relays:
 | Central service outage | Discovery may degrade, but existing peer knowledge remains useful. |
 | Server-side account control | Discovery records must be self-authenticating. |
 
-### 7.2 What The Hard Model Does Not Magically Solve
+### 6.2 What The Hard Model Does Not Magically Solve
 
 | Problem | Reality |
 |---------|---------|
@@ -260,9 +293,9 @@ The hard model chooses honesty over hidden infrastructure.
 
 ---
 
-## 8. Product Semantics
+## 7. Product Semantics
 
-### 8.1 No Fake Sent State
+### 7.1 No Fake Sent State
 
 The UI must not imply that a message has left the sender's responsibility when it
 has merely entered a server queue.
@@ -274,7 +307,7 @@ In the hard model, "sent" should mean one of two explicit things:
 
 Anything between those states should be visible as pending work.
 
-### 8.2 Pending Is Normal
+### 7.2 Pending Is Normal
 
 Pending messages are not errors. They are the natural consequence of a protocol
 that refuses third-party custody.
@@ -288,7 +321,7 @@ The product should make pending feel calm and legible:
 - allow manual retry
 - allow out-of-band address exchange
 
-### 8.3 Usability Adapts To Serverlessness
+### 7.3 Usability Adapts To Serverlessness
 
 The hard model does not preserve every convenience of server-backed messaging.
 
@@ -299,9 +332,9 @@ promise is user-held state, direct delivery, and no required message custodian.
 
 ---
 
-## 9. Implementation Direction
+## 8. Implementation Direction
 
-### 9.1 Discovery First
+### 8.1 Discovery First
 
 Implement self-authenticating records over a DHT or equivalent peer-discovery
 fabric.
@@ -313,7 +346,7 @@ Success means:
 - cached peers can replace the original bootstrap path
 - discovery failure does not invalidate existing local contacts
 
-### 9.2 Local Outbox As The Offline Primitive
+### 8.2 Local Outbox As The Offline Primitive
 
 Implement durable sender-side pending delivery.
 
@@ -322,9 +355,10 @@ Success means:
 - outgoing messages survive restart
 - retry policy is local and inspectable
 - delivery state is explicit
+- only pending entries retry
 - no queue or mailbox is required
 
-### 9.3 Direct Transport As The Core Path
+### 8.3 Direct Transport As The Core Path
 
 Implement delivery over direct peer-to-peer connections.
 
@@ -333,9 +367,9 @@ Success means:
 - no server sees message transport
 - no relay is required for the core success path
 - failed reachability leaves the message pending
-- delivery receipt is produced only after recipient acceptance
+- delivery receipt is produced only after recipient-device acceptance
 
-### 9.4 Optional Modes Stay Labelled
+### 8.4 Optional Modes Stay Labelled
 
 If compatibility modes exist, they must be labelled as such.
 
@@ -350,7 +384,7 @@ They may be useful, but they do not define core Mycellium.
 
 ---
 
-## 10. Final Definition
+## 9. Final Definition
 
 Hard serverless Mycellium is:
 

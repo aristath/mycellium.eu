@@ -1,12 +1,11 @@
-//! The local, encrypted **outbox**: sealed messages awaiting direct retry.
+//! The local, encrypted **outbox**: sender-owned delivery state.
 //!
 //! A message is normally delivered live to a peer-published device address. If
 //! that direct handoff fails, the already-sealed item is parked here and retried
 //! later on an explicit outbox flush or the next sending action.
 //!
-//! Entries are kept per (recipient, device slot) with the already-sealed item,
-//! and pruned once they exceed [`MAX_ATTEMPTS`] or [`TTL_SECS`] so the outbox
-//! can never grow without bound.
+//! Pending entries carry the already-sealed item for retry. Final entries remain
+//! as local truth: delivered, failed, or cancelled.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,17 +16,20 @@ use crate::groups::MailItem;
 
 const KEY: &[u8] = b"outbox";
 
-/// Give up on an entry after this many failed retries.
-pub const MAX_ATTEMPTS: u32 = 100;
-
-/// Give up on an entry this long after it was first parked (7 days).
-pub const TTL_SECS: u64 = 7 * 86_400;
-
 /// Retry starts quickly, then backs off to avoid hammering an offline peer.
 pub const RETRY_BASE_SECS: u64 = 5;
 pub const RETRY_MAX_SECS: u64 = 60 * 60;
 
-/// One undelivered, already-sealed item awaiting a retry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutboxStatus {
+    #[default]
+    Pending,
+    Delivered,
+    Failed,
+    Cancelled,
+}
+
+/// One sender-owned delivery item.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxEntry {
     /// Random id, used to remove the entry once delivered.
@@ -46,17 +48,18 @@ pub struct OutboxEntry {
     /// immediate.
     #[serde(default)]
     pub send_after: u64,
+    #[serde(default)]
+    pub status: OutboxStatus,
 }
 
 impl OutboxEntry {
-    /// Whether this entry has exhausted its retries or outlived its TTL at `now`.
-    pub fn is_expired(&self, now: u64) -> bool {
-        self.attempts >= MAX_ATTEMPTS || now.saturating_sub(self.created_at) >= TTL_SECS
+    pub fn is_pending(&self) -> bool {
+        self.status == OutboxStatus::Pending
     }
 
     /// Whether this entry's scheduled delay has elapsed at `now`.
     pub fn is_due(&self, now: u64) -> bool {
-        now >= self.send_after
+        self.is_pending() && now >= self.send_after
     }
 }
 
@@ -68,7 +71,7 @@ pub enum Attempt {
     /// Target is gone/unrecoverable (device removed, unparseable) — drop it
     /// without counting a retry.
     Drop,
-    /// Still undeliverable — count an attempt and keep it unless now spent.
+    /// Still undeliverable — count an attempt and keep it.
     Retry,
 }
 
@@ -76,9 +79,7 @@ pub enum Attempt {
 /// has elapsed via `deliver` and returning `(delivered_count, remaining)`.
 ///
 /// This is the pure, network-free core used by a shell's outbox flush:
-/// - a **not-yet-due** entry (`now < send_after`) is skipped this pass — it is
-///   *not* an attempt and does *not* count against [`MAX_ATTEMPTS`] — but a
-///   not-yet-due entry that has outlived its [`TTL_SECS`] is still dropped;
+/// - a **not-yet-due** entry (`now < send_after`) is skipped this pass;
 /// - a **due** entry is handed to `deliver`, and the returned [`Attempt`]
 ///   decides whether it is removed, dropped, or bumped-and-kept.
 ///
@@ -95,23 +96,24 @@ where
     let mut delivered = 0;
     let mut remaining: Vec<OutboxEntry> = Vec::new();
     for mut entry in entries {
-        // Not yet due: leave it for a later flush (no attempt), but still honor
-        // the TTL so a scheduled item can't outlive its expiry unnoticed.
         if !entry.is_due(now) {
-            if !entry.is_expired(now) {
-                remaining.push(entry);
-            }
+            remaining.push(entry);
             continue;
         }
         match deliver(&entry) {
-            Attempt::Delivered => delivered += 1,
-            Attempt::Drop => {}
+            Attempt::Delivered => {
+                entry.status = OutboxStatus::Delivered;
+                delivered += 1;
+                remaining.push(entry);
+            }
+            Attempt::Drop => {
+                entry.status = OutboxStatus::Failed;
+                remaining.push(entry);
+            }
             Attempt::Retry => {
                 entry.attempts += 1;
                 entry.send_after = now.saturating_add(retry_delay(&entry));
-                if !entry.is_expired(now) {
-                    remaining.push(entry);
-                }
+                remaining.push(entry);
             }
         }
     }
@@ -172,32 +174,57 @@ pub fn enqueue_at<S: Storage>(
         created_at: now,
         attempts: 0,
         send_after,
+        status: OutboxStatus::Pending,
     });
     save(store, &entries)
 }
 
 /// Number of items currently waiting.
 pub fn len<S: Storage>(store: &S) -> Result<usize, S::Error> {
-    Ok(load(store)?.len())
+    Ok(load(store)?
+        .iter()
+        .filter(|entry| entry.is_pending())
+        .count())
 }
 
-/// Remove one delivery after recipient-authenticated acceptance.
-pub fn remove<S: Storage>(store: &mut S, id: &str) -> Result<bool, S::Error> {
+fn set_status<S: Storage>(store: &mut S, id: &str, status: OutboxStatus) -> Result<bool, S::Error> {
     let mut entries = load(store)?;
-    let before = entries.len();
-    entries.retain(|entry| entry.id != id);
-    let removed = entries.len() != before;
-    if removed {
+    let mut found = false;
+    for entry in &mut entries {
+        if entry.id == id {
+            entry.status = status;
+            entry.send_after = 0;
+            found = true;
+        }
+    }
+    if found {
         save(store, &entries)?;
     }
-    Ok(removed)
+    Ok(found)
+}
+
+/// Mark one delivery as accepted by the recipient device.
+pub fn mark_delivered<S: Storage>(store: &mut S, id: &str) -> Result<bool, S::Error> {
+    set_status(store, id, OutboxStatus::Delivered)
+}
+
+/// Mark one pending delivery as cancelled by the local user.
+pub fn mark_cancelled<S: Storage>(store: &mut S, id: &str) -> Result<bool, S::Error> {
+    set_status(store, id, OutboxStatus::Cancelled)
+}
+
+/// Mark one delivery as no longer retryable.
+pub fn mark_failed<S: Storage>(store: &mut S, id: &str) -> Result<bool, S::Error> {
+    set_status(store, id, OutboxStatus::Failed)
 }
 
 /// Explicit user retry overrides any scheduled backoff.
 pub fn make_all_due<S: Storage>(store: &mut S) -> Result<(), S::Error> {
     let mut entries = load(store)?;
     for entry in &mut entries {
-        entry.send_after = 0;
+        if entry.is_pending() {
+            entry.send_after = 0;
+        }
     }
     save(store, &entries)
 }
@@ -218,12 +245,14 @@ pub fn record_attempt<S: Storage>(
             continue;
         }
         found = true;
-        if !accepted {
+        if accepted {
+            entry.status = OutboxStatus::Delivered;
+            entry.send_after = 0;
+            remaining.push(entry);
+        } else {
             entry.attempts = entry.attempts.saturating_add(1);
             entry.send_after = now.saturating_add(retry_delay(&entry));
-            if !entry.is_expired(now) {
-                remaining.push(entry);
-            }
+            remaining.push(entry);
         }
     }
     if !found {
@@ -274,6 +303,7 @@ mod tests {
             created_at: 0,
             attempts: 0,
             send_after: 0,
+            status: OutboxStatus::Pending,
         }
     }
 
@@ -302,16 +332,6 @@ mod tests {
             .collect();
         save(&mut store, &kept).unwrap();
         assert_eq!(len(&store).unwrap(), 0);
-    }
-
-    #[test]
-    fn expiry_by_attempts_or_ttl() {
-        let mut e = sample("1");
-        assert!(!e.is_expired(10));
-        e.attempts = MAX_ATTEMPTS;
-        assert!(e.is_expired(10));
-        e.attempts = 0;
-        assert!(e.is_expired(TTL_SECS + 1));
     }
 
     #[test]
@@ -366,7 +386,8 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].attempts, 0, "no attempt counted while pending");
 
-        // Once due: it is deposited exactly once and removed.
+        // Once due: it is deposited exactly once and marked final, so it never
+        // retries but still records the truth.
         let mut attempts = 0;
         let (delivered, remaining) = flush_pass(remaining, 200, |_| {
             attempts += 1;
@@ -374,23 +395,9 @@ mod tests {
         });
         assert_eq!(attempts, 1);
         assert_eq!(delivered, 1);
-        assert!(remaining.is_empty());
-    }
-
-    #[test]
-    fn not_yet_due_but_expired_is_dropped() {
-        // Scheduled far in the future but already past its TTL: expiry wins even
-        // though it was never due.
-        let e = OutboxEntry {
-            send_after: TTL_SECS + 10_000,
-            ..sample("1")
-        };
-        let (delivered, remaining) = flush_pass(vec![e], TTL_SECS + 1, |_| Attempt::Retry);
-        assert_eq!(delivered, 0);
-        assert!(
-            remaining.is_empty(),
-            "expired-while-pending entry must be dropped"
-        );
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].status, OutboxStatus::Delivered);
+        assert!(!remaining[0].is_pending());
     }
 
     #[test]
