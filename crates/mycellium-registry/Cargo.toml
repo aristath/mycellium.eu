@@ -1,0 +1,23 @@
+[package]
+name = "mycellium-registry"
+version = "0.0.0"
+description = "Simple Mycellium account registry: login indexes, signed-record pointers, and encrypted account blobs"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = "0.8"
+getrandom = "0.2"
+redb = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"

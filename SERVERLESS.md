@@ -22,9 +22,9 @@ Convenience features that require message custody, relays, push services,
 hosted rendezvous, or always-on delivery servers are not core Mycellium.
 
 Mycellium may still have a central registry for product account UX. That
-registry may create accounts, reserve handles, authenticate recovery, store
-encrypted wallet backups, and publish the latest signed public record. It must
-not store, queue, relay, or route messages.
+registry may create accounts, verify login identities, store encrypted wallet
+backups, and publish signed public records. Handles are display names, not
+unique identities. The registry must not store, queue, relay, or route messages.
 
 The goal is not to simulate WhatsApp without owning servers. The goal is to make
 messaging behave like a direct human-to-human line. When the line cannot be
@@ -265,11 +265,109 @@ Core Mycellium must remain understandable without relays:
 
 > Direct route, or pending locally.
 
+## 6. Registry And Account Identity
+
+### 6.1 Account Model
+
+The registry may provide account UX. It is not protocol identity authority.
+
+A registry account has:
+
+- `account_id`: a unique registry account identifier
+- `login_identities`: ways to prove account access, such as email magic links,
+  phone OTP, passkeys, biometrics, or future platform auth
+- `protocol_identity`: the Mycellium cryptographic identity root
+- `devices`: installed apps/devices authorized under that protocol identity
+- `handles`: non-unique user-readable display names
+
+Email is only the first login surface. It is not essential to the model and must
+not be baked into record validity.
+
+A user account may have multiple login identities. Adding phone, passkeys,
+biometrics, or future authentication methods should not change the protocol
+identity model.
+
+A handle is not unique and is not identity. It is display metadata.
+
+The registry may authenticate access to an account and store an encrypted wallet
+backup. It must not store raw keys. Key material should be created or decrypted
+by the client, with the user never needing to see it.
+
+On a new device, the user proves account access through any supported login
+identity, downloads the encrypted backup, decrypts it locally, creates fresh
+device keys, and publishes an updated signed record.
+
+### 6.2 Registry Storage Shape
+
+The registry storage model is key-value plus secondary indexes. It should not
+depend on complex relational joins.
+
+The registry needs searchable indexes for:
+
+- `account_id` to account metadata
+- login identity hash to `account_id`
+- login token hash to login attempt and expiry
+- `account_id` to current signed public record pointer
+- `account_id` to encrypted wallet backup pointer
+- rate-limit keys to counters and expiry
+
+Opaque per-user data may live outside the metadata store as one account bundle
+or as versioned blobs. For example:
+
+```text
+users/876/128/736/account.data
+```
+
+That bundle may contain encrypted backups, signed record snapshots, device-list
+snapshots, and export data. It is not a substitute for indexes. Login by email,
+phone, passkey, or future identity still requires a fast lookup from that login
+identity to `account_id`.
+
+The registry should be written behind a small storage interface. SQLite,
+Postgres, embedded key-value stores, distributed key-value stores, and object
+storage can all satisfy the model if they preserve the same record semantics.
+
+The durable rule is:
+
+```text
+metadata store = indexes and small operational facts
+blob/file store = opaque encrypted account bytes
+client = creates, decrypts, and owns key material
+```
+
+The metadata store is operational infrastructure. It is not protocol authority.
+Signed records still verify locally.
+
+### 6.3 Preferred First Registry Backend
+
+The first embedded metadata backend should be `redb`.
+
+Why:
+
+- native Rust
+- embedded, with no separate database service
+- ACID transactions
+- crash-safe storage
+- ordered key-value tables that fit registry records and indexes
+- simple enough to inspect, backup, and replace
+
+`fjall` is the larger/write-heavy Rust-native candidate. It may become useful if
+the registry needs LSM-tree behavior, compression, or heavier sustained writes.
+
+RocksDB is a battle-tested fallback if the project needs mature LSM behavior
+more than native Rust.
+
+`sled` should not be used for the registry core. Registry storage is
+reliability-sensitive, and novelty is not useful there.
+
+The registry code must still depend on a small `RegistryStore` interface, not on
+`redb` as protocol doctrine. The backend is replaceable infrastructure.
+
 ---
 
-## 6. Security Model
+## 7. Security Model
 
-### 6.1 What The Hard Model Protects
+### 7.1 What The Hard Model Protects
 
 | Threat | Hard Model Response |
 |--------|---------------------|
@@ -279,7 +377,7 @@ Core Mycellium must remain understandable without relays:
 | Central service outage | Discovery may degrade, but existing peer knowledge remains useful. |
 | Server-side account control | Discovery records must be self-authenticating. |
 
-### 6.2 What The Hard Model Does Not Magically Solve
+### 7.2 What The Hard Model Does Not Magically Solve
 
 | Problem | Reality |
 |---------|---------|
@@ -293,9 +391,9 @@ The hard model chooses honesty over hidden infrastructure.
 
 ---
 
-## 7. Product Semantics
+## 8. Product Semantics
 
-### 7.1 No Fake Sent State
+### 8.1 No Fake Sent State
 
 The UI must not imply that a message has left the sender's responsibility when it
 has merely entered a server queue.
@@ -307,7 +405,7 @@ In the hard model, "sent" should mean one of two explicit things:
 
 Anything between those states should be visible as pending work.
 
-### 7.2 Pending Is Normal
+### 8.2 Pending Is Normal
 
 Pending messages are not errors. They are the natural consequence of a protocol
 that refuses third-party custody.
@@ -321,7 +419,7 @@ The product should make pending feel calm and legible:
 - allow manual retry
 - allow out-of-band address exchange
 
-### 7.3 Usability Adapts To Serverlessness
+### 8.3 Usability Adapts To Serverlessness
 
 The hard model does not preserve every convenience of server-backed messaging.
 
@@ -332,9 +430,9 @@ promise is user-held state, direct delivery, and no required message custodian.
 
 ---
 
-## 8. Implementation Direction
+## 9. Implementation Direction
 
-### 8.1 Discovery First
+### 9.1 Discovery First
 
 Implement self-authenticating records over a DHT or equivalent peer-discovery
 fabric.
@@ -346,7 +444,7 @@ Success means:
 - cached peers can replace the original bootstrap path
 - discovery failure does not invalidate existing local contacts
 
-### 8.2 Local Outbox As The Offline Primitive
+### 9.2 Local Outbox As The Offline Primitive
 
 Implement durable sender-side pending delivery.
 
@@ -358,7 +456,7 @@ Success means:
 - only pending entries retry
 - no queue or mailbox is required
 
-### 8.3 Direct Transport As The Core Path
+### 9.3 Direct Transport As The Core Path
 
 Implement delivery over direct peer-to-peer connections.
 
@@ -369,7 +467,7 @@ Success means:
 - failed reachability leaves the message pending
 - delivery receipt is produced only after recipient-device acceptance
 
-### 8.4 Optional Modes Stay Labelled
+### 9.4 Optional Modes Stay Labelled
 
 If compatibility modes exist, they must be labelled as such.
 
@@ -382,9 +480,21 @@ Examples:
 
 They may be useful, but they do not define core Mycellium.
 
+### 9.5 Registry Account UX
+
+If a registry exists, success means:
+
+- account IDs are stable and unique
+- login identities are pluggable
+- handles remain non-unique display names
+- `redb` is the preferred first embedded metadata backend
+- registry storage is modeled as portable key-value records plus indexes
+- opaque account bytes can live in file/blob storage
+- removing the registry does not break existing local identity or direct delivery
+
 ---
 
-## 9. Final Definition
+## 10. Final Definition
 
 Hard serverless Mycellium is:
 
