@@ -1,10 +1,11 @@
 //! Encrypted identity storage (Layer 9 hardening).
 //!
-//! The account is a random **wallet secret** plus this device's own seed (there is
-//! no hosted recovery authority), so those 32-byte secrets must not sit in
-//! plaintext. We derive a key from a user passphrase with **Argon2id** and seal
-//! the `wallet_secret + device_seed` with **ChaCha20-Poly1305**. Moving an account
-//! to a fresh device is an explicit wallet-secret transfer.
+//! The account is a random **wallet secret** plus this device's own seed, so
+//! those 32-byte secrets must not sit in plaintext. We derive a key from a user
+//! passphrase with **Argon2id** and seal the `wallet_secret + device_seed` with
+//! **ChaCha20-Poly1305**. Moving an account to a fresh device is either an
+//! explicit wallet-secret transfer or a local decrypt of a registry-provided
+//! encrypted wallet backup.
 //!
 //! Interactive callers can type the passphrase at a **no-echo** terminal prompt.
 //! Noninteractive callers pass an explicit [`ClientConfig`] before using the

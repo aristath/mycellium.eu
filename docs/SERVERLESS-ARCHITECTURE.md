@@ -21,6 +21,11 @@ This architecture deliberately rejects infrastructure-mediated delivery.
 Convenience features that require message custody, relays, push services,
 hosted rendezvous, or always-on delivery servers are not core Mycellium.
 
+Mycellium may still have a central registry for product account UX. That
+registry may create accounts, reserve handles, authenticate recovery, store
+encrypted wallet backups, and publish the latest signed public record. It must
+not store, queue, relay, or route messages.
+
 The goal is not to simulate WhatsApp without owning servers. The goal is to make
 messaging behave like a direct human-to-human line. When the line cannot be
 made, the message waits at the edge.
@@ -32,11 +37,11 @@ made, the message waits at the edge.
 ### 1.1 No Required Server
 
 A Mycellium node may use a bootstrap hint, cached peers, LAN discovery, QR
-exchange, or any other entry point, but the protocol must not depend on a
-standing service.
+exchange, a registry record lookup, or any other entry point, but the
+message protocol must not depend on a standing service.
 
-A bootstrap node may help a peer enter the graph. It must not be required for
-message delivery, identity validity, conversation continuity, or account state.
+A bootstrap node may help a peer enter the graph. A registry may improve account
+UX. Neither may be required for message delivery or conversation continuity.
 
 ### 1.2 No Third-Party Message Custody
 
@@ -52,8 +57,9 @@ Delivery resumes when Alice and Bob can form a peer-to-peer path.
 Discovery is a transport for claims. It is not the source of truth.
 
 DHT records, bootstrap responses, peer gossip, cached addresses, QR imports, and
-manual configuration may all help a node find another node. None of them can
-make an identity, name, device, or reachability claim true.
+manual configuration may all help a node find another node. Registry record
+responses are the same kind of thing: carriers for signed claims. None of them
+can make an identity, name, device, or reachability claim true.
 
 All identity and reachability records must be self-authenticating and locally
 verified.
@@ -188,6 +194,57 @@ rules, and local trust policy verify.
 The network can help a node find "a claim about Alice." It cannot prove "this is
 Alice."
 
+### 4.4 Registry As Product Account UX
+
+The registry is allowed because users need an account concept that can survive
+device loss.
+
+It may store:
+
+- handle metadata
+- authentication material for recovery
+- account-bound encrypted wallet backup envelopes
+- latest signed public peer record
+
+It must not store:
+
+- message plaintext
+- message ciphertext for offline recipients
+- sender outbox contents
+- group sender keys
+- device traffic keys
+
+The client generates the wallet secret locally and uploads only an account-bound
+encrypted wallet backup envelope. The backup key is derived from OPAQUE export
+key material, not directly from a recovery secret, so a registry database leak is
+not an offline recovery-secret oracle. Recovery authenticates with OPAQUE,
+downloads the backup envelope, verifies the account metadata, decrypts it
+locally, and adopts the recovered wallet on a fresh device.
+
+Public registry lookup returns only the latest signed public peer record.
+Encrypted wallet backups are private recovery material and must require
+authenticated recovery. Recovery authentication must not send a long-lived
+reusable password proof over the network: clients authenticate with OPAQUE, and
+public deployments must use HTTPS. OPAQUE server setup material is sealed at
+rest with the registry secret, so a database-only leak does not expose reusable
+recovery credentials.
+
+This creates two distinct kinds of continuity:
+
+- account continuity: the service can let a user regain the handle/account
+- cryptographic identity continuity: only possible if the wallet backup can be
+  decrypted
+
+If recovery rotates to a new wallet because the old wallet cannot be decrypted,
+peers must see that as an identity change.
+
+Registry account operations are state-machine operations, not generic writes:
+registration start must bind registration finish to a handle and account id;
+auth finish must produce a short-lived single-use token scoped to a purpose and
+operation hash; record publication must authenticate before mutation; recovery
+and wallet rotation must complete server-side before the client writes recovered
+local identity state.
+
 ---
 
 ## 5. Reachability
@@ -242,6 +299,7 @@ paths, or user-selected convenience layers. They are not core Mycellium.
 | Circuit relay | Third-party live message path. |
 | TURN relay | Third-party live message path. |
 | Hosted rendezvous | Standing service dependency for peer negotiation. |
+| Message-carrying registry | Account UX is allowed; message custody is not. |
 | Distributed message store | Message custody moved from one server to many peers. |
 | Peer forwarding | Intermediary message custody or routing. |
 

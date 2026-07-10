@@ -1750,6 +1750,8 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+pub use crate::wireops::{device_slot, my_group_id, this_device};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1880,5 +1882,3 @@ mod tests {
         );
     }
 }
-
-pub use crate::wireops::{device_slot, my_group_id, this_device};

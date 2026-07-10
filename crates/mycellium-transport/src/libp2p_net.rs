@@ -8,7 +8,7 @@
 //!
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
@@ -144,16 +144,10 @@ impl Libp2pNode {
         let handle = self.rt.handle().clone();
         let event_rx = &mut self.event_rx;
         handle.block_on(async {
-            let start = Instant::now();
-            loop {
-                let remaining = LISTEN_TIMEOUT
-                    .checked_sub(start.elapsed())
-                    .ok_or_else(|| anyhow!("timed out waiting for a listen address"))?;
-                match tokio::time::timeout(remaining, event_rx.recv()).await {
-                    Ok(Some(NodeEvent::NewListenAddr(addr))) => return Ok(addr),
-                    Ok(None) => return Err(anyhow!("swarm event channel closed")),
-                    Err(_) => return Err(anyhow!("timed out waiting for a listen address")),
-                }
+            match tokio::time::timeout(LISTEN_TIMEOUT, event_rx.recv()).await {
+                Ok(Some(NodeEvent::NewListenAddr(addr))) => Ok(addr),
+                Ok(None) => Err(anyhow!("swarm event channel closed")),
+                Err(_) => Err(anyhow!("timed out waiting for a listen address")),
             }
         })
     }
@@ -238,13 +232,11 @@ pub fn dht_serve(
                 }
                 SwarmEvent::Behaviour(DhtBehaviourEvent::Kad(
                     kad::Event::OutboundQueryProgressed {
-                        result: QueryResult::Bootstrap(result),
+                        result: QueryResult::Bootstrap(Err(err)),
                         ..
                     },
                 )) => {
-                    if let Err(err) = result {
-                        eprintln!("(dht bootstrap failed: {err})");
-                    }
+                    eprintln!("(dht bootstrap failed: {err})");
                 }
                 _ => {}
             }

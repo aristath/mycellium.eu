@@ -4,6 +4,7 @@ members = [
     "crates/mycellium-core",
     "crates/mycellium-transport",
     "crates/mycellium-storage",
+    "crates/mycellium-registry",
     "crates/mycellium-engine",
     "crates/mycellium-cli",
 ]
