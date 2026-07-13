@@ -1221,18 +1221,16 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let now = platform.now_unix_secs();
-    let net = client::LocalNet::load(fs);
     let mut deliver = |store: &mut S,
                        handle: &Handle,
                        _record: &SignedRecord,
                        device: &Device,
                        item: MailItem|
      -> DeliveryPath { park_delivery(store, handle, device, item, now) };
-    flow::process_item(
+    client::process_item(
         identity,
         fs,
         platform,
-        &net,
         me,
         my_record,
         blocked,

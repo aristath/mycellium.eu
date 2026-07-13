@@ -668,6 +668,28 @@ pub fn leave_group<S, P>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn process_item<S, P>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    me: &Handle,
+    my_record: &SignedRecord,
+    blocked: &[String],
+    item: MailItem,
+    sink: &mut dyn flow::FlowSink,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+) -> flow::ItemOutcome
+where
+    S: Storage,
+    P: Platform,
+{
+    let net = LocalNet::load(store);
+    flow::process_item(
+        identity, store, platform, &net, me, my_record, blocked, item, sink, deliver,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
