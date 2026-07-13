@@ -1,8 +1,8 @@
-//! A `Transport` implementation over plain TCP — the POC's first transport.
+//! A `Transport` implementation over plain TCP.
 //!
 //! It carries the app-layer end-to-end payload (X3DH + Double Ratchet), which
 //! is what actually secures messages, so a bare TCP link is a genuine *direct*
-//! line for the POC. libp2p is another direct transport behind this same trait.
+//! line. libp2p is another direct transport behind this same trait.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};

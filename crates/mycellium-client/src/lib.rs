@@ -1,8 +1,11 @@
 //! Headless Mycellium client API.
 //!
 //! This crate is the reusable client boundary. It owns account/device record
-//! semantics and local peer-record mutations; shells decide only how to prompt,
-//! print, and connect transports.
+//! semantics, local client-state mutations, and the small direct-delivery
+//! runtime shared by native shells. Shells still decide how to prompt, print,
+//! configure discovery, and schedule background work.
+
+mod runtime;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -24,6 +27,11 @@ use mycellium_engine::verified;
 use mycellium_engine::wireops;
 use mycellium_engine::{antirollback, blocklist};
 use mycellium_engine::{draft, expiry};
+
+pub use runtime::{
+    deliver_direct, deliver_or_park, direct_push, exchange_delivery, flush_due_outbox,
+    DirectNetwork, OutboxFlush,
+};
 
 /// Public identity material useful for display.
 #[derive(Clone, Debug, PartialEq, Eq)]

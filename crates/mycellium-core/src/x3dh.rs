@@ -6,10 +6,9 @@
 //! involved are the initiator's identity + ephemeral and the responder's
 //! identity + signed pre-key.
 //!
-//! This is the **interactive** POC variant: the responder is online and holds
-//! its own secrets. One-time pre-keys are deferred (Layer 8.7). `SK` seeds the
-//! Double Ratchet, and the responder's signed pre-key doubles as its first
-//! ratchet public key.
+//! This is the online-responder path: the responder holds its own secrets.
+//! `SK` seeds the Double Ratchet, and the responder's signed pre-key doubles as
+//! its first ratchet public key.
 
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};

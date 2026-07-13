@@ -4,7 +4,7 @@
 //!
 //! - [`link`] — framing (`Wire`, `FrameReader`, `FrameWriter`) over any core
 //!   `Connection`.
-//! - [`net`] — a minimal framed TCP transport (the POC's first direct line).
+//! - [`net`] — a minimal framed TCP transport for local/direct operation.
 //! - [`libp2p_net`] — the production transport over rust-libp2p (TCP + Noise +
 //!   Yamux + a `/mycellium/1.0` stream protocol), behind the `libp2p` feature.
 //!

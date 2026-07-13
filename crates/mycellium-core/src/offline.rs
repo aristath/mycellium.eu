@@ -6,8 +6,10 @@
 //! everything a recipient needs into one [`Envelope`]. The sender can retry this
 //! opaque envelope later without learning anything new or involving custody.
 //!
-//! Each offline message is a self-contained one-shot session — simple, and
-//! enough for the POC. Long-lived asynchronous ratchets are future work.
+//! Each offline message is a self-contained one-shot session. That keeps local
+//! retry simple: a pending sender-owned item can be replayed until the active
+//! recipient device accepts it, without creating server-side custody or hidden
+//! synchronization state.
 
 use serde::{Deserialize, Serialize};
 

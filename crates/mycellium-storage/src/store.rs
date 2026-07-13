@@ -80,7 +80,12 @@ fn home() -> PathBuf {
 
 /// Path to the encrypted identity file.
 pub fn path() -> PathBuf {
-    home().join("identity.enc")
+    identity_path(home())
+}
+
+/// Path to an encrypted identity file under `data_dir`.
+pub fn identity_path(data_dir: impl Into<PathBuf>) -> PathBuf {
+    data_dir.into().join("identity.enc")
 }
 
 /// The data directory root, for other local state.
@@ -93,6 +98,11 @@ pub fn exists() -> bool {
     path().exists()
 }
 
+/// Whether an identity exists under `data_dir`.
+pub fn exists_in(data_dir: impl Into<PathBuf>) -> bool {
+    identity_path(data_dir).exists()
+}
+
 /// The minimum passphrase length enforced when *creating* an identity. Unlocking
 /// an existing one never checks length, so older shorter passphrases still work.
 pub const MIN_PASSPHRASE_LEN: usize = 8;
@@ -100,19 +110,23 @@ pub const MIN_PASSPHRASE_LEN: usize = 8;
 /// Encrypt and store `identity` under a passphrase.
 pub fn save_identity(identity: &Identity) -> Result<()> {
     let passphrase = new_passphrase("Choose a passphrase to encrypt your identity")?;
+    save_identity_with_passphrase_at(home(), identity, &passphrase)
+}
+
+/// Encrypt and store `identity` under `data_dir` using an explicit passphrase.
+///
+/// GUI and service callers use this instead of the process-global prompt/config
+/// path, so a failed unlock does not poison process state.
+pub fn save_identity_with_passphrase_at(
+    data_dir: impl Into<PathBuf>,
+    identity: &Identity,
+    passphrase: &str,
+) -> Result<()> {
     if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         bail!("passphrase must be at least {MIN_PASSPHRASE_LEN} characters");
     }
-
-    let secret = Secret {
-        wallet_secret: identity.wallet_secret().to_vec(),
-        device_seed: identity.device_seed().to_vec(),
-    };
-    let plaintext = serde_json::to_vec(&secret)?;
-    let sealed = seal::seal(&passphrase, &plaintext)
-        .map_err(|e| anyhow!("failed to encrypt identity: {e}"))?;
-
-    crate::atomic_write(&path(), &sealed)?;
+    let sealed = seal_identity(identity, passphrase)?;
+    crate::atomic_write(&identity_path(data_dir), &sealed)?;
     Ok(())
 }
 
@@ -124,11 +138,27 @@ pub fn load_identity() -> Result<Identity> {
     open_identity(&bytes)
 }
 
+/// Load an identity from `data_dir` using an explicit passphrase.
+pub fn load_identity_with_passphrase_from(
+    data_dir: impl Into<PathBuf>,
+    passphrase: &str,
+) -> Result<Identity> {
+    let path = identity_path(data_dir);
+    let bytes =
+        fs::read(&path).with_context(|| format!("no identity found at {}", path.display()))?;
+    open_identity_with_passphrase(&bytes, passphrase)
+}
+
 /// Validate and decrypt an encoded identity blob using the configured
 /// passphrase. Backup import uses this before writing anything to disk.
 pub fn open_identity(bytes: &[u8]) -> Result<Identity> {
     let passphrase = passphrase("Passphrase to unlock your identity")?;
-    let plaintext = seal::open(&passphrase, bytes).map_err(|e| match e {
+    open_identity_with_passphrase(bytes, &passphrase)
+}
+
+/// Validate and decrypt an encoded identity blob using an explicit passphrase.
+pub fn open_identity_with_passphrase(bytes: &[u8], passphrase: &str) -> Result<Identity> {
+    let plaintext = seal::open(passphrase, bytes).map_err(|e| match e {
         SealError::Corrupt => anyhow!("identity file is corrupt"),
         SealError::WrongKeyOrCorrupt => anyhow!("wrong passphrase or corrupt identity"),
         other => anyhow!("{other}"),
@@ -148,6 +178,15 @@ pub fn open_identity(bytes: &[u8]) -> Result<Identity> {
 
     Identity::from_wallet_secret(wallet_secret, device_seed)
         .map_err(|_| anyhow!("stored account key is invalid"))
+}
+
+fn seal_identity(identity: &Identity, passphrase: &str) -> Result<Vec<u8>> {
+    let secret = Secret {
+        wallet_secret: identity.wallet_secret().to_vec(),
+        device_seed: identity.device_seed().to_vec(),
+    };
+    let plaintext = serde_json::to_vec(&secret)?;
+    seal::seal(passphrase, &plaintext).map_err(|e| anyhow!("failed to encrypt identity: {e}"))
 }
 
 /// Obtain the configured passphrase or, failing that, a **no-echo** terminal
@@ -176,4 +215,46 @@ fn new_passphrase(prompt: &str) -> Result<String> {
         bail!("passphrases did not match");
     }
     Ok(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mycellium_core::identity::Identity;
+    use mycellium_core::platform::Platform;
+
+    struct SeededPlatform(u8);
+
+    impl Platform for SeededPlatform {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            for b in buf.iter_mut() {
+                *b = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+        }
+
+        fn now_unix_secs(&self) -> u64 {
+            42
+        }
+    }
+
+    #[test]
+    fn explicit_identity_storage_round_trips_without_global_config() {
+        let mut platform = SeededPlatform(1);
+        let identity = Identity::generate(&mut platform).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "mycellium-store-test-{}",
+            crate::seal::seal("pw", b"nonce").unwrap().len()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        save_identity_with_passphrase_at(&root, &identity, "long enough").unwrap();
+        assert!(exists_in(&root));
+        let loaded = load_identity_with_passphrase_from(&root, "long enough").unwrap();
+        assert_eq!(loaded.wallet_public(), identity.wallet_public());
+        assert_eq!(loaded.device_public(), identity.device_public());
+        assert!(load_identity_with_passphrase_from(&root, "wrong passphrase").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use mycellium_client as client;
+use mycellium_client::{self as client, DirectNetwork};
 use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
 use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
@@ -31,11 +31,13 @@ use mycellium_transport::net::{self, TcpTransport};
 use crate::platform::OsPlatform;
 use mycellium_engine::contacts;
 use mycellium_engine::groups::{DiscoveryRecord, MailItem, PeerFrame, StoredGroup};
+#[cfg(test)]
+use mycellium_engine::history;
 use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
 use mycellium_engine::wireops;
-use mycellium_engine::{expiry, flow, history, inbox, outbox, verified};
+use mycellium_engine::{expiry, flow, inbox, outbox, verified};
 
 mod backup;
 mod util;
@@ -276,39 +278,6 @@ pub fn dht_lookup(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> R
 }
 
 // ---- direct delivery --------------------------------------------------------
-
-/// Process-local direct-network actor. TCP deposits open ordinary sockets;
-/// libp2p deposits lazily start one swarm and reuse it for every device copy,
-/// discovery request, and retry made by this process.
-#[derive(Clone)]
-struct DirectNetwork {
-    device_secret: [u8; 32],
-    libp2p: Arc<Mutex<Option<libp2p_net::Libp2pDialer>>>,
-}
-
-impl DirectNetwork {
-    fn new(device_secret: [u8; 32]) -> Self {
-        Self {
-            device_secret,
-            libp2p: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn with_libp2p(device_secret: [u8; 32], dialer: libp2p_net::Libp2pDialer) -> Self {
-        Self {
-            device_secret,
-            libp2p: Arc::new(Mutex::new(Some(dialer))),
-        }
-    }
-
-    fn libp2p(&self) -> Option<libp2p_net::Libp2pDialer> {
-        let mut dialer = self.libp2p.lock().ok()?;
-        if dialer.is_none() {
-            *dialer = libp2p_net::Libp2pDialer::new(self.device_secret).ok();
-        }
-        dialer.clone()
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn send(
@@ -564,7 +533,9 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
         }
 
         let mut accepted = match &target {
-            Target::Device(_, device) => direct_push(network, device, &entry.id, &entry.item),
+            Target::Device(_, device) => {
+                client::direct_push(network, device, &entry.id, &entry.item)
+            }
             Target::Retry => false,
             Target::Drop => unreachable!(),
         };
@@ -585,7 +556,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
                     refresh_delivery_device(identity, &mut guard, handle, &entry.slot)
                 {
                     drop(guard);
-                    accepted = direct_push(network, &fresh, &entry.id, &entry.item);
+                    accepted = client::direct_push(network, &fresh, &entry.id, &entry.item);
                     let Ok(mut reopened) = fs.lock() else {
                         return;
                     };
@@ -772,10 +743,12 @@ fn flush_outbox_with_network(
         if device_slot(&device.device_key) != entry.slot {
             return outbox::Attempt::Drop;
         }
-        if deliver_direct(fs, network, device, &entry.id, &entry.item, now).is_delivered() {
+        if client::deliver_direct(fs, network, device, &entry.id, &entry.item, now).is_delivered() {
             outbox::Attempt::Delivered
         } else if let Some(device) = refresh_delivery_device(identity, fs, &handle, &entry.slot) {
-            if deliver_direct(fs, network, &device, &entry.id, &entry.item, now).is_delivered() {
+            if client::deliver_direct(fs, network, &device, &entry.id, &entry.item, now)
+                .is_delivered()
+            {
                 outbox::Attempt::Delivered
             } else {
                 outbox::Attempt::Retry
@@ -789,82 +762,6 @@ fn flush_outbox_with_network(
     Ok((delivered, waiting))
 }
 
-fn deliver_direct(
-    store: &mut FileStore,
-    network: &DirectNetwork,
-    device: &Device,
-    delivery_id: &str,
-    item: &MailItem,
-    now: u64,
-) -> DeliveryPath {
-    let key = device_slot(&device.device_key);
-    let ok = direct_push(network, device, delivery_id, item);
-    let _ = reachability::record(store, &key, DeliveryPath::Direct, ok, now);
-    if ok {
-        DeliveryPath::Direct
-    } else {
-        DeliveryPath::Failed
-    }
-}
-
-fn direct_push(
-    network: &DirectNetwork,
-    device: &Device,
-    delivery_id: &str,
-    item: &MailItem,
-) -> bool {
-    let payload = wire::encode(item);
-    let frame = PeerFrame::Delivery {
-        delivery_id: delivery_id.to_string(),
-        item: Box::new(item.clone()),
-    };
-    let frame = wire::encode(&frame);
-    match direct_transport(&device.peer_id().0) {
-        DirectTransport::None => false,
-        DirectTransport::Tcp => {
-            let addr = String::from_utf8_lossy(&device.peer_id().0);
-            let Ok(mut conn) = net::TcpConnection::connect(&addr) else {
-                return false;
-            };
-            exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
-        }
-        DirectTransport::Libp2p => {
-            let addr = String::from_utf8_lossy(&device.peer_id().0);
-            let Some(dialer) = network.libp2p() else {
-                return false;
-            };
-            match dialer.dial_str(&addr) {
-                Ok(mut conn) => {
-                    exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
-                }
-                Err(_) => false,
-            }
-        }
-    }
-}
-
-fn exchange_delivery<C>(
-    conn: &mut C,
-    frame: &[u8],
-    delivery_id: &str,
-    payload: &[u8],
-    recipient: &DevicePublicKey,
-) -> bool
-where
-    C: FrameReader + FrameWriter,
-{
-    if conn.send_frame(frame).is_err() {
-        return false;
-    }
-    let Ok(bytes) = conn.recv_frame() else {
-        return false;
-    };
-    let Ok(PeerFrame::Ack(ack)) = wire::decode::<PeerFrame>(&bytes) else {
-        return false;
-    };
-    ack.verify(delivery_id, payload, recipient).is_ok()
-}
-
 /// Persist before networking, then remove only after a recipient-device ACK.
 fn deliver_or_park(
     store: &mut FileStore,
@@ -875,27 +772,7 @@ fn deliver_or_park(
     now: u64,
 ) -> DeliveryPath {
     let delivery_id = random_id();
-    if client::park_outbox(
-        store,
-        delivery_id.clone(),
-        recipient,
-        device,
-        item.clone(),
-        now,
-    )
-    .is_err()
-    {
-        return DeliveryPath::Failed;
-    }
-
-    if deliver_direct(store, network, device, &delivery_id, &item, now).is_delivered() {
-        // Acceptance is already proven. If cleanup fails, leaving the entry is
-        // safe: the recipient deduplicates the retry and returns the ACK again.
-        let _ = client::mark_outbox_delivered(store, &delivery_id);
-        DeliveryPath::Direct
-    } else {
-        DeliveryPath::Outbox
-    }
+    client::deliver_or_park(store, network, recipient, device, delivery_id, item, now)
 }
 
 /// Persist a follow-up generated while accepting inbound mail. The acceptance
@@ -2008,7 +1885,7 @@ mod tests {
             sent: None,
         };
 
-        assert!(exchange_delivery(
+        assert!(client::exchange_delivery(
             &mut conn,
             &frame,
             "delivery-1",
@@ -2034,7 +1911,7 @@ mod tests {
             sent: None,
         };
 
-        assert!(!exchange_delivery(
+        assert!(!client::exchange_delivery(
             &mut conn,
             &frame,
             "delivery-1",

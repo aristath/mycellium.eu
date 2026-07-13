@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 mycellium-core = { path = "../mycellium-core" }
 mycellium-engine = { path = "../mycellium-engine" }
+mycellium-transport = { path = "../mycellium-transport" }
 anyhow = "1"
 
 [lints.rust]

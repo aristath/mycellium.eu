@@ -8,6 +8,7 @@ members = [
     "crates/mycellium-client",
     "crates/mycellium-registry",
     "crates/mycellium-cli",
+    "crates/mycellium-linux",
 ]
 
 [workspace.package]

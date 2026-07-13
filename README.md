@@ -28,6 +28,7 @@ records. It does not store, queue, relay, or route messages.
 - `crates/mycellium-registry`: optional account registry using `redb` metadata
   and filesystem blobs.
 - `crates/mycellium-cli`: terminal client.
+- `crates/mycellium-linux`: native Linux client shell.
 
 ## Quickstart
 
@@ -89,8 +90,8 @@ cargo run -p mycellium-cli -- --config alice.json dht publish alice --bootstrap 
 cargo run -p mycellium-cli -- --config bob.json dht lookup alice --bootstrap /ip4/127.0.0.1/tcp/9100/p2p/<bob-peer-id>
 ```
 
-Profiles may keep bootstrap peers in `dht_bootstrap`. Normal send, chat, and
-group flows try the local peerbook first, then import a signed record from the
+Profiles may keep bootstrap peers in `dht_bootstrap`. Normal send and group
+flows try the local peerbook first, then import a signed record from the
 configured DHT before failing. `register` automatically publishes the updated
 signed record when configured bootstrap peers exist; `dht publish` is still
 available as an explicit retry.
@@ -127,7 +128,16 @@ cargo run -p mycellium-cli -- --config alice-laptop.json record import alice '<a
 cargo run -p mycellium-cli -- --config alice-laptop.json register alice --addr 127.0.0.1:9011
 ```
 
-For direct interactive chat, run `listen` on one side and `chat` on the other.
+The native Linux client can be launched with:
+
+```sh
+cargo run -p mycellium-linux
+```
+
+It is a local client shell for identity unlock/create, contacts, signed records,
+conversation history, and sender-owned outbox state. Message transport still
+uses the same direct-delivery runtime as the CLI: a message is accepted by the
+recipient's active device, or it remains pending locally.
 
 ## Optional Registry
 
@@ -198,8 +208,6 @@ mycellium serve --as <me> --addr <host:port> [--libp2p]
 mycellium outbox list
 mycellium outbox retry
 mycellium outbox cancel <id|all>
-mycellium listen --addr <host:port> [--libp2p] [--tui]
-mycellium chat <peer> --as <me> [--tui]
 mycellium group create <name> --as <me> --members alice,bob
 mycellium group send <group> --as <me> --message <text>
 mycellium group add <group> --as <me> --member <handle>
