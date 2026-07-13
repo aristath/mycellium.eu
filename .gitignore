@@ -1,5 +1,8 @@
 /target
 Cargo.lock
 **/*.rs.bk
+.env.bunny
 
 crates/mycellium-wasm/target/
+
+.env.brevo

@@ -18,6 +18,7 @@ use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::transport::Transport;
+use mycellium_core::userid::UserId;
 use mycellium_core::wire;
 
 use mycellium_storage::filestore::FileStore;
@@ -226,7 +227,7 @@ pub fn dht_publish(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> 
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let record = own_record(&fs, &handle)?;
+    let record = own_record(&fs, &identity, &handle)?;
     let listen_addr = listen
         .map(libp2p_net::listen_multiaddr)
         .transpose()
@@ -303,13 +304,14 @@ pub fn send(
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let mut deliver =
-        |store: &mut FileStore,
-         handle: &Handle,
-         _record: &SignedRecord,
-         device: &Device,
-         item: MailItem|
-         -> DeliveryPath { deliver_or_park(store, &network, handle, device, item, now) };
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        deliver_or_park(store, &network, handle, record, device, item, now)
+    };
 
     let out = client::send_direct(
         &identity,
@@ -376,7 +378,7 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let fs = open_history(&identity)?;
     let blocked = client::list_blocked(&fs)?;
-    let my_record = own_record(&fs, &me)?;
+    let my_record = own_record(&fs, &identity, &me)?;
     let identity = Arc::new(identity);
     let me = Arc::new(me);
     let my_record = Arc::new(my_record);
@@ -489,7 +491,7 @@ fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>, networ
 
 fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &DirectNetwork) {
     enum Target {
-        Device(Handle, Box<Device>),
+        Device(Handle, UserId, Box<Device>),
         Retry,
         Drop,
     }
@@ -510,19 +512,22 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
             let Ok(fs) = fs.lock() else {
                 return;
             };
-            match Handle::new(entry.recipient.clone()) {
-                Err(_) => Target::Drop,
-                Ok(handle) => match peerbook::get(&*fs, &handle) {
+            match (
+                Handle::new(entry.recipient.clone()),
+                UserId::new(entry.recipient_user_id.clone()),
+            ) {
+                (Ok(handle), Ok(user_id)) => match peerbook::get_by_user_id(&*fs, &user_id) {
                     Ok(Some(record)) => {
                         let device = record.record.device;
                         if device_slot(&device.device_key) == entry.slot {
-                            Target::Device(handle, Box::new(device))
+                            Target::Device(handle, user_id, Box::new(device))
                         } else {
                             Target::Drop
                         }
                     }
                     Ok(None) | Err(_) => Target::Retry,
                 },
+                _ => Target::Drop,
             }
         };
 
@@ -534,7 +539,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
         }
 
         let mut accepted = match &target {
-            Target::Device(_, device) => {
+            Target::Device(_, _, device) => {
                 client::direct_push(network, device, &entry.id, &entry.item)
             }
             Target::Retry => false,
@@ -544,7 +549,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
         let Ok(mut guard) = fs.lock() else {
             return;
         };
-        if let Target::Device(handle, device) = &target {
+        if let Target::Device(handle, user_id, device) = &target {
             let _ = reachability::record(
                 &mut *guard,
                 &device_slot(&device.device_key),
@@ -554,7 +559,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
             );
             if !accepted {
                 if let Some(fresh) =
-                    refresh_delivery_device(identity, &mut guard, handle, &entry.slot)
+                    refresh_delivery_device(identity, &mut guard, handle, user_id, &entry.slot)
                 {
                     drop(guard);
                     accepted = client::direct_push(network, &fresh, &entry.id, &entry.item);
@@ -720,16 +725,19 @@ fn flush_outbox_with_network(
     }
     let now = OsPlatform.now_unix_secs();
     let (delivered, remaining) = outbox::flush_pass(entries, now, |entry| {
+        let Ok(user_id) = UserId::new(entry.recipient_user_id.clone()) else {
+            return outbox::Attempt::Drop;
+        };
         let Ok(handle) = Handle::new(entry.recipient.clone()) else {
             return outbox::Attempt::Drop;
         };
-        let mut record = match peerbook::get(fs, &handle) {
+        let mut record = match peerbook::get_by_user_id(fs, &user_id) {
             Ok(record) => record,
             Err(_) => return outbox::Attempt::Retry,
         };
         if record.is_none() {
             let _ = import_from_configured_dht(identity, fs, &handle);
-            record = match peerbook::get(fs, &handle) {
+            record = match peerbook::get_by_user_id(fs, &user_id) {
                 Ok(record) => record,
                 Err(_) => return outbox::Attempt::Retry,
             };
@@ -746,7 +754,9 @@ fn flush_outbox_with_network(
         }
         if client::deliver_direct(fs, network, device, &entry.id, &entry.item, now).is_delivered() {
             outbox::Attempt::Delivered
-        } else if let Some(device) = refresh_delivery_device(identity, fs, &handle, &entry.slot) {
+        } else if let Some(device) =
+            refresh_delivery_device(identity, fs, &handle, &user_id, &entry.slot)
+        {
             if client::deliver_direct(fs, network, &device, &entry.id, &entry.item, now)
                 .is_delivered()
             {
@@ -768,11 +778,20 @@ fn deliver_or_park(
     store: &mut FileStore,
     network: &DirectNetwork,
     recipient: &Handle,
+    recipient_record: &SignedRecord,
     device: &Device,
     item: MailItem,
     now: u64,
 ) -> DeliveryPath {
-    client::deliver_or_park(store, network, recipient, device, item, now)
+    client::deliver_or_park(
+        store,
+        network,
+        recipient,
+        recipient_record,
+        device,
+        item,
+        now,
+    )
 }
 
 fn request_discovery_from_device(
@@ -934,6 +953,7 @@ impl flow::FlowSink for CliSink {
                 from,
                 message_id,
                 read,
+                ..
             } => {
                 let mark = if read { "read" } else { "delivered" };
                 println!("ok {from} {mark} your message #{message_id}");
@@ -957,7 +977,7 @@ pub fn group_create(name: &str, members: &[String], whoami: &str) -> Result<()> 
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let my_record = own_record(&fs, &me)?;
+    let my_record = own_record(&fs, &identity, &me)?;
 
     let mut all = Vec::new();
     for member in members {
@@ -987,7 +1007,7 @@ pub fn group_add(group: &str, member: &str, whoami: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let my_record = own_record(&fs, &me)?;
+    let my_record = own_record(&fs, &identity, &me)?;
     let member = Handle::new(member.to_string()).map_err(|_| anyhow!("invalid member handle"))?;
 
     let stored = client::group_with_added_member(&fs, group, &member)?;
@@ -1024,13 +1044,14 @@ pub fn group_send(
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let mut deliver =
-        |store: &mut FileStore,
-         handle: &Handle,
-         _record: &SignedRecord,
-         device: &Device,
-         item: MailItem|
-         -> DeliveryPath { deliver_or_park(store, &network, handle, device, item, now) };
+    let mut deliver = |store: &mut FileStore,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        deliver_or_park(store, &network, handle, record, device, item, now)
+    };
 
     let out = client::send_group(&identity, &mut fs, &me, &mut stored, &app, &mut deliver)?;
     print_group_delivery_summary(&stored.name, &out.id, out.direct, out.outboxed, out.failed);
@@ -1104,17 +1125,17 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let my_record = own_record(&fs, &me)?;
+    let my_record = own_record(&fs, &identity, &me)?;
     let stored = client::resolve_group(&fs, group)?;
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
     let now = OsPlatform.now_unix_secs();
     let network = DirectNetwork::new(identity.device_secret());
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
-                       _record: &SignedRecord,
+                       record: &SignedRecord,
                        device: &Device,
                        item: MailItem| {
-        let _ = deliver_or_park(store, &network, handle, device, item, now);
+        let _ = deliver_or_park(store, &network, handle, record, device, item, now);
     };
     client::leave_group(
         &identity,
@@ -1158,10 +1179,10 @@ fn distribute_group_key_direct(
     let network = DirectNetwork::new(identity.device_secret());
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
-                       _record: &SignedRecord,
+                       record: &SignedRecord,
                        device: &Device,
                        item: MailItem| {
-        let _ = deliver_or_park(store, &network, handle, device, item, now);
+        let _ = deliver_or_park(store, &network, handle, record, device, item, now);
     };
     let _ = client::distribute_group_key(
         identity,
@@ -1263,8 +1284,8 @@ pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, Signe
     }
 }
 
-fn own_record(fs: &FileStore, me: &Handle) -> Result<SignedRecord> {
-    client::require_own_record(fs, me)
+fn own_record(fs: &FileStore, identity: &Identity, me: &Handle) -> Result<SignedRecord> {
+    client::require_own_record_for_identity(fs, identity, me)
 }
 
 fn effective_bootstrap(extra: &[String]) -> Result<Vec<libp2p_net::P2pMultiaddr>> {
@@ -1376,12 +1397,17 @@ fn refresh_delivery_device(
     identity: &Identity,
     fs: &mut FileStore,
     handle: &Handle,
+    user_id: &UserId,
     slot: &str,
 ) -> Option<Device> {
     if !import_from_configured_dht(identity, fs, handle).ok()? {
         return None;
     }
-    let device = peerbook::get(fs, handle).ok().flatten()?.record.device;
+    let device = peerbook::get_by_user_id(fs, user_id)
+        .ok()
+        .flatten()?
+        .record
+        .device;
     (device_slot(&device.device_key) == slot).then_some(device)
 }
 
@@ -1833,7 +1859,8 @@ mod tests {
         );
 
         assert_eq!(writer.0.len(), 1, "ACK is emitted after commit");
-        assert_eq!(history::load(&store, "alice").unwrap().len(), 1);
+        let alice_user_id = alice_record.record.user_id.as_str();
+        assert_eq!(history::load(&store, alice_user_id).unwrap().len(), 1);
         assert_eq!(
             inbox::seen(&store, &delivery_id, &digest).unwrap(),
             inbox::Seen::Duplicate
@@ -1852,10 +1879,10 @@ mod tests {
             item,
         );
         assert_eq!(writer.0.len(), 2);
-        assert_eq!(history::load(&store, "alice").unwrap().len(), 1);
+        assert_eq!(history::load(&store, alice_user_id).unwrap().len(), 1);
         drop(store);
         let reopened = FileStore::open(dir.clone(), [7; 32]).unwrap();
-        assert_eq!(history::load(&reopened, "alice").unwrap().len(), 1);
+        assert_eq!(history::load(&reopened, alice_user_id).unwrap().len(), 1);
         assert_eq!(
             inbox::seen(&reopened, &delivery_id, &digest).unwrap(),
             inbox::Seen::Duplicate
@@ -1924,7 +1951,11 @@ mod tests {
         );
 
         assert!(writer.0.is_empty(), "changed identity is not ACKed");
-        assert!(history::load(&store, "alice").unwrap().is_empty());
+        assert!(
+            history::load(&store, mallory_record.record.user_id.as_str())
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             inbox::seen(&store, "delivery-changed", &digest).unwrap(),
             inbox::Seen::New

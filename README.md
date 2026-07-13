@@ -12,8 +12,9 @@ self-authenticating records, dial each other directly, and keep undelivered
 messages in the sender's encrypted local outbox.
 
 The workspace also contains an optional account registry. It exists for account
-UX: login identities, encrypted account backups, and publishing signed public
-records. It does not store, queue, relay, or route messages.
+UX: login identities, encrypted identity recovery, account backups, and
+publishing signed public records. It does not store, queue, relay, or route
+messages.
 
 ## Workspace
 
@@ -116,10 +117,11 @@ cargo run -p mycellium-cli -- --config alice.json outbox retry
 cargo run -p mycellium-cli -- --config alice.json outbox cancel <id>
 ```
 
-To switch the account's active device, explicitly move the wallet secret to a
-fresh profile, import the current signed record, then register the new device.
-Profiles with configured DHT bootstrap peers publish the updated record
-automatically:
+The CLI has no registry login UI. To switch devices through the CLI, explicitly
+move the wallet secret to a fresh profile, import the current signed record,
+then register the new device. The native Linux app performs account recovery
+after email login instead. Profiles with configured DHT bootstrap peers publish
+the updated record automatically:
 
 ```sh
 cargo run -p mycellium-cli -- --config alice.json identity-export-wallet --yes
@@ -134,10 +136,17 @@ The native Linux client can be launched with:
 cargo run -p mycellium-linux
 ```
 
-It is a local client shell for identity unlock/create, contacts, signed records,
-conversation history, and sender-owned outbox state. Message transport still
-uses the same direct-delivery runtime as the CLI: a message is accepted by the
-recipient's active device, or it remains pending locally.
+The app is organized around Messages, People, and This device. It restores the
+local profile and listener on unlock, exchanges signed identities as connection
+cards, exposes safety-number verification with each person, and keeps offline
+delivery status out of the normal chat flow. Conversations and pending delivery
+targets use stable user IDs internally; handles remain display names. A message
+is accepted by the recipient's active device or remains pending on the sender's
+device. New installs verify an email before creating or recovering an identity.
+Switching devices keeps the same protocol identity, creates fresh device keys,
+and leaves old local message history where it was created. The bearer session
+is kept inside the device's encrypted local store, never in a plaintext config
+file.
 
 ## Optional Registry
 
@@ -146,6 +155,8 @@ Run the development registry:
 ```sh
 MYCELLIUM_REGISTRY_BIND=127.0.0.1:8787 \
 MYCELLIUM_REGISTRY_DATA_DIR=.mycellium-registry \
+MYCELLIUM_REGISTRY_RECOVERY_KEY=<64 hexadecimal characters> \
+MYCELLIUM_REGISTRY_EMAIL_TRANSPORT=log \
 cargo run -p mycellium-registry
 ```
 
@@ -154,6 +165,43 @@ Defaults:
 ```text
 MYCELLIUM_REGISTRY_BIND=127.0.0.1:8787
 MYCELLIUM_REGISTRY_DATA_DIR=.mycellium-registry
+MYCELLIUM_REGISTRY_RECOVERY_KEY=<64 hexadecimal characters>
+```
+
+The registry binary requires an explicit email transport:
+
+```text
+MYCELLIUM_REGISTRY_EMAIL_TRANSPORT=log
+```
+
+or:
+
+```text
+MYCELLIUM_REGISTRY_EMAIL_TRANSPORT=brevo
+MYCELLIUM_REGISTRY_EMAIL_FROM=Mycellium <login@example.com>
+MYCELLIUM_REGISTRY_BREVO_API_KEY=<brevo api key>
+```
+
+or:
+
+```text
+MYCELLIUM_REGISTRY_EMAIL_TRANSPORT=smtp
+MYCELLIUM_REGISTRY_EMAIL_FROM=Mycellium <login@example.com>
+MYCELLIUM_REGISTRY_SMTP_HOST=smtp-relay.brevo.com
+MYCELLIUM_REGISTRY_SMTP_PORT=587
+MYCELLIUM_REGISTRY_SMTP_USERNAME=<smtp username>
+MYCELLIUM_REGISTRY_SMTP_PASSWORD=<smtp password>
+```
+
+Brevo uses the HTTPS transactional email API, so it does not require outbound
+SMTP ports to be opened by the host.
+
+Optional:
+
+```text
+MYCELLIUM_REGISTRY_EMAIL_SUBJECT=Your Mycellium login code
+MYCELLIUM_REGISTRY_LOGIN_URL_TEMPLATE=mycellium://login?token={token}
+MYCELLIUM_REGISTRY_BREVO_ENDPOINT=https://api.brevo.com/v3/smtp/email
 ```
 
 Current API:
@@ -163,6 +211,8 @@ POST /login/email/request
 POST /login/confirm
 PUT  /accounts/{account_id}/backup
 GET  /accounts/{account_id}/backup
+PUT  /accounts/{account_id}/recovery
+GET  /accounts/{account_id}/recovery
 PUT  /accounts/{account_id}/record
 GET  /accounts/{account_id}/record
 ```
@@ -184,9 +234,11 @@ backup: 16 MiB
 public record: 1 MiB
 ```
 
-The registry stores metadata in `redb` and opaque encrypted account bytes in
-filesystem blobs. Public records are still signed records; clients must verify
-them locally.
+The registry stores metadata in `redb` and account bytes in filesystem blobs.
+The dedicated recovery endpoint accepts only the 32-byte wallet root, encrypts
+it before storage with `MYCELLIUM_REGISTRY_RECOVERY_KEY`, and will not replace
+it with another identity. Public records remain signed records and must match
+that recovery identity.
 
 ## Commands
 

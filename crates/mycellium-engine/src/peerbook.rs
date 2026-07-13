@@ -41,10 +41,15 @@ fn save<S: Storage>(store: &mut S, records: Vec<PeerRecord>) -> Result<(), S::Er
 }
 
 pub fn get<S: Storage>(store: &S, handle: &Handle) -> Result<Option<SignedRecord>, S::Error> {
-    Ok(load(store)?
+    let mut matches = load(store)?
         .into_iter()
-        .find(|entry| entry.handle == handle.as_str() && entry.record.record.handle == *handle)
-        .map(|entry| entry.record))
+        .filter(|entry| entry.handle == handle.as_str() && entry.record.record.handle == *handle);
+    let first = matches.next().map(|entry| entry.record);
+    Ok(if matches.next().is_some() {
+        None
+    } else {
+        first
+    })
 }
 
 pub fn get_by_user_id<S: Storage>(
@@ -96,6 +101,14 @@ where
 
 pub fn remove<S: Storage>(store: &mut S, handle: &Handle) -> Result<bool, S::Error> {
     let mut records = load(store)?;
+    if records
+        .iter()
+        .filter(|entry| entry.handle == handle.as_str())
+        .count()
+        != 1
+    {
+        return Ok(false);
+    }
     let before = records.len();
     records
         .retain(|entry| entry.handle != handle.as_str() || entry.record.record.handle != *handle);
@@ -382,6 +395,7 @@ mod tests {
 
         let records = load(&store).unwrap();
         assert_eq!(records.len(), 2);
+        assert!(get(&store, &alice).unwrap().is_none());
         assert!(get_by_user_id(&store, &first_id).unwrap().is_some());
         assert!(get_by_user_id(&store, &second_id).unwrap().is_some());
     }

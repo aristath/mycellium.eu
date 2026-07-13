@@ -15,7 +15,9 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod email;
 pub mod http;
+pub mod recovery;
 mod redb_store;
 
 pub use redb_store::RedbRegistryStore;
@@ -231,6 +233,8 @@ pub struct RateLimitBucket {
 pub enum AccountBlobKind {
     /// Encrypted wallet/account backup.
     Backup,
+    /// Registry-sealed 32-byte protocol identity root.
+    Recovery,
     /// Latest signed public record.
     PublicRecord,
 }
@@ -239,6 +243,7 @@ impl AccountBlobKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Backup => "backup",
+            Self::Recovery => "recovery",
             Self::PublicRecord => "public_record",
         }
     }

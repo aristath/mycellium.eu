@@ -5,6 +5,7 @@
 //! runtime shared by native shells. Shells still decide how to prompt, print,
 //! configure discovery, and schedule background work.
 
+pub mod registry;
 mod runtime;
 
 use anyhow::{anyhow, bail, Result};
@@ -16,7 +17,7 @@ use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::storage::Storage;
-use mycellium_core::userid::UserId;
+use mycellium_core::userid::{user_id, UserId};
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
 use mycellium_engine::groups::{self, DiscoveryRecord, MailItem, StoredGroup};
@@ -50,6 +51,14 @@ pub fn identity_info(identity: &Identity) -> IdentityInfo {
     }
 }
 
+/// Whether a verified public record names this identity and this exact device.
+pub fn is_current_device(identity: &Identity, record: &SignedRecord) -> bool {
+    record.verify().is_ok()
+        && record.record.user_id == user_id(&identity.wallet_public())
+        && record.record.wallet == identity.wallet_public()
+        && record.record.device.device_key == identity.device_public()
+}
+
 pub fn create_identity(platform: &mut impl Platform) -> Result<Identity> {
     Ok(Identity::generate(platform)?)
 }
@@ -76,7 +85,12 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
-    let existing = reusable_own_record(identity, handle, peerbook::get(store, handle)?)?;
+    let own_user_id = user_id(&identity.wallet_public());
+    let existing = reusable_own_record(
+        identity,
+        handle,
+        peerbook::get_by_user_id(store, &own_user_id)?,
+    )?;
     let now = platform.now_unix_secs();
     let active_device = match existing.as_ref() {
         Some(record) if record.record.device.device_key == identity.device_public() => {
@@ -162,6 +176,27 @@ where
     })
 }
 
+pub fn require_own_record_for_identity<S: Storage>(
+    store: &S,
+    identity: &Identity,
+    handle: &Handle,
+) -> Result<SignedRecord>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let user_id = user_id(&identity.wallet_public());
+    let record = peerbook::get_by_user_id(store, &user_id)?.ok_or_else(|| {
+        anyhow!(
+            "no local signed record for '{}' — register this device first",
+            handle.as_str()
+        )
+    })?;
+    if record.record.handle != *handle || record.record.wallet != identity.wallet_public() {
+        bail!("the active local record does not match this account");
+    }
+    Ok(record)
+}
+
 pub fn import_record<S: Storage>(store: &mut S, handle: &Handle, record: SignedRecord) -> Result<()>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -180,11 +215,11 @@ pub fn remove_record<S: Storage>(store: &mut S, handle: &Handle) -> Result<bool>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    let wallet = peerbook::get(store, handle)?.map(|record| record.record.wallet);
+    let record = peerbook::get(store, handle)?;
     let removed = peerbook::remove(store, handle)?;
     if removed {
-        if let Some(wallet) = wallet {
-            antirollback::clear(store, handle.as_str(), &wallet)?;
+        if let Some(record) = record {
+            antirollback::clear(store, record.record.user_id.as_str(), &record.record.wallet)?;
         }
     }
     Ok(removed)
@@ -241,11 +276,19 @@ impl LocalNet {
 
 impl flow::FlowNet for LocalNet {
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
-        self.records
+        let matches: Vec<_> = self
+            .records
             .iter()
-            .find(|entry| entry.handle == handle.as_str())
-            .map(|entry| entry.record.clone())
-            .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))
+            .filter(|entry| entry.handle == handle.as_str())
+            .collect();
+        match matches.as_slice() {
+            [entry] => Ok(entry.record.clone()),
+            [] => bail!("no local record for '{}'", handle.as_str()),
+            _ => bail!(
+                "more than one person uses '{}'; choose a saved contact",
+                handle.as_str()
+            ),
+        }
     }
 }
 
@@ -260,6 +303,9 @@ pub fn resolve_local_record<S: Storage>(
     store: &mut S,
     input: &str,
 ) -> std::result::Result<(Handle, SignedRecord), TrustError> {
+    if let Ok(user_id) = UserId::new(input.to_string()) {
+        return resolve_user_record(store, user_id.as_str());
+    }
     if let Ok(Some(contact)) = contacts::load(store, input) {
         if !contact.user_id.is_empty() {
             return resolve_user_record(store, &contact.user_id);
@@ -310,9 +356,45 @@ where
 {
     let record = require_record(store, handle)
         .map_err(|_| anyhow!("import a signed record for '{}' first", handle.as_str()))?;
+    save_contact_for_record(store, nickname, &record)
+}
+
+/// Import an exact signed identity and pin it as a contact.
+///
+/// This is the unambiguous contact path for user interfaces: handles are display
+/// names and may be shared by multiple people.
+pub fn add_contact_from_record<S: Storage>(
+    store: &mut S,
+    nickname: &str,
+    record: SignedRecord,
+) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let handle = record.record.handle.clone();
+    peerbook::put(store, &handle, record.clone())?;
+    save_contact_for_record(store, nickname, &record)
+}
+
+fn save_contact_for_record<S: Storage>(
+    store: &mut S,
+    nickname: &str,
+    record: &SignedRecord,
+) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if nickname.trim().is_empty() {
+        bail!("enter a name for this contact");
+    }
+    if let Some(existing) = contacts::load(store, nickname)? {
+        if existing.user_id != record.record.user_id.as_str() {
+            bail!("the name '{nickname}' is already used by another person");
+        }
+    }
     let contact = Contact {
         nickname: nickname.to_string(),
-        handle: handle.as_str().to_string(),
+        handle: record.record.handle.as_str().to_string(),
         user_id: record.record.user_id.as_str().to_string(),
         wallet: record.record.wallet,
     };
@@ -426,23 +508,71 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationPreview {
+    pub user_id: String,
     pub peer: String,
+    pub display_name: String,
     pub from_me: bool,
     pub text: String,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
+    pub user_id: String,
     pub peer: String,
+    pub display_name: String,
     pub from_me: bool,
     pub text: String,
+}
+
+fn conversation_user_id<S: Storage>(store: &S, input: &str) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let input = input.trim();
+    if let Ok(user_id) = UserId::new(input.to_string()) {
+        return Ok(user_id.as_str().to_string());
+    }
+    if let Some(contact) = contacts::load(store, input)? {
+        if !contact.user_id.is_empty() {
+            return Ok(contact.user_id);
+        }
+    }
+    let matches: Vec<_> = peerbook::load(store)?
+        .into_iter()
+        .filter(|entry| entry.handle == input)
+        .collect();
+    match matches.as_slice() {
+        [record] => Ok(record.user_id.clone()),
+        [] => bail!("no signed record for '{input}'"),
+        _ => bail!("more than one person uses '{input}'; choose a saved contact"),
+    }
+}
+
+fn conversation_label<S: Storage>(store: &S, user_id: &str) -> Result<(String, String)>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if let Some(contact) = contacts::by_user_id(store, user_id)? {
+        return Ok((contact.handle, contact.nickname));
+    }
+    let user_id_value =
+        UserId::new(user_id.to_string()).map_err(|_| anyhow!("invalid conversation identity"))?;
+    let record = peerbook::get_by_user_id(store, &user_id_value)?
+        .ok_or_else(|| anyhow!("missing signed record for conversation"))?;
+    let display_name = if record.record.name.trim().is_empty() {
+        record.record.handle.as_str().to_string()
+    } else {
+        record.record.name.clone()
+    };
+    Ok((record.record.handle.as_str().to_string(), display_name))
 }
 
 pub fn clear_history<S: Storage>(store: &mut S, input: &str) -> Result<String>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    let key = resolve_name(store, input)?;
+    let key = conversation_user_id(store, input)?;
     history::clear(store, &key)?;
     Ok(key)
 }
@@ -455,7 +585,7 @@ pub fn history_with<S: Storage>(
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    let key = resolve_name(store, input)?;
+    let key = conversation_user_id(store, input)?;
     let messages = history::load_active(store, &key, now)?;
     Ok((key, messages))
 }
@@ -465,15 +595,20 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut out = Vec::new();
-    for peer in history::peers(store)? {
-        if let Some(last) = history::load_active(store, &peer, now)?.last() {
+    for user_id in history::peers(store)? {
+        if let Some(last) = history::load_active(store, &user_id, now)?.last() {
+            let (peer, display_name) = conversation_label(store, &user_id)?;
             out.push(ConversationPreview {
+                user_id,
                 peer,
+                display_name,
                 from_me: last.from_me,
                 text: last.text.clone(),
+                timestamp: last.timestamp,
             });
         }
     }
+    out.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
     Ok(out)
 }
 
@@ -483,11 +618,14 @@ where
 {
     let needle = query.to_lowercase();
     let mut hits = Vec::new();
-    for peer in history::peers(store)? {
-        for message in history::load_active(store, &peer, now)? {
+    for user_id in history::peers(store)? {
+        let (peer, display_name) = conversation_label(store, &user_id)?;
+        for message in history::load_active(store, &user_id, now)? {
             if message.text.to_lowercase().contains(&needle) {
                 hits.push(SearchHit {
+                    user_id: user_id.clone(),
                     peer: peer.clone(),
+                    display_name: display_name.clone(),
                     from_me: message.from_me,
                     text: message.text,
                 });
@@ -587,7 +725,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
-    let my_record = require_own_record(store, me)?;
+    let my_record = require_own_record_for_identity(store, identity, me)?;
     let net = LocalNet::load(store);
     let mut self_deliver = |_: &mut S, _: &Handle, _: &Device, _: MailItem| {};
     Ok(flow::send_app(
@@ -838,6 +976,7 @@ pub fn park_outbox<S: Storage>(
     store: &mut S,
     delivery_id: String,
     recipient: &Handle,
+    recipient_record: &SignedRecord,
     device: &Device,
     item: MailItem,
     now: u64,
@@ -846,7 +985,15 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let slot = wireops::device_slot(&device.device_key);
-    outbox::enqueue(store, delivery_id, recipient.as_str(), &slot, item, now)?;
+    outbox::enqueue(
+        store,
+        delivery_id,
+        recipient_record.record.user_id.as_str(),
+        recipient.as_str(),
+        &slot,
+        item,
+        now,
+    )?;
     Ok(())
 }
 
@@ -1018,10 +1165,12 @@ mod tests {
                 .device_key,
             second.device_public()
         );
+        assert!(!is_current_device(&first, &second_record));
+        assert!(is_current_device(&second, &second_record));
     }
 
     #[test]
-    fn publishing_rejects_a_foreign_wallet_record() {
+    fn publishing_coexists_with_a_foreign_same_handle_record() {
         let handle = Handle::new("alice").unwrap();
         let mut mine_platform = SeededPlatform(1);
         let mut foreign_platform = SeededPlatform(99);
@@ -1037,7 +1186,7 @@ mod tests {
         );
         peerbook::put(&mut store, &handle, foreign_record).unwrap();
 
-        let err = publish_active_device_record(
+        let mine_record = publish_active_device_record(
             &mut store,
             &mut mine_platform,
             &mine,
@@ -1045,9 +1194,18 @@ mod tests {
             "Alice",
             "127.0.0.1:2",
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("different wallet"));
+        assert_ne!(mine_record.record.wallet, foreign.wallet_public());
+        assert_eq!(list_records(&store).unwrap().len(), 2);
+        assert_eq!(
+            peerbook::get_by_user_id(&store, &mine_record.record.user_id)
+                .unwrap()
+                .unwrap()
+                .record
+                .wallet,
+            mine.wallet_public()
+        );
     }
 
     #[test]
@@ -1172,6 +1330,7 @@ mod tests {
         outbox::enqueue(
             &mut store,
             "delivery-123".to_string(),
+            &"a".repeat(64),
             "bob",
             "device-slot",
             item,
@@ -1229,11 +1388,12 @@ mod tests {
         let mut store = MemStore::default();
         let record =
             peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        let user_id = record.record.user_id.as_str().to_string();
         import_record(&mut store, &handle, record).unwrap();
         add_contact(&mut store, "a", &handle).unwrap();
         history::append(
             &mut store,
-            "alice",
+            &user_id,
             StoredMessage {
                 id: "m1".to_string(),
                 from_me: false,
@@ -1245,12 +1405,12 @@ mod tests {
         .unwrap();
 
         let (key, messages) = history_with(&mut store, "a", 2).unwrap();
-        assert_eq!(key, "alice");
+        assert_eq!(key, user_id);
         assert_eq!(messages.len(), 1);
         assert_eq!(conversations(&mut store, 2).unwrap()[0].peer, "alice");
         assert_eq!(search_history(&mut store, "alice", 2).unwrap().len(), 1);
 
-        assert_eq!(clear_history(&mut store, "a").unwrap(), "alice");
+        assert_eq!(clear_history(&mut store, "a").unwrap(), key);
         assert!(history_with(&mut store, "a", 2).unwrap().1.is_empty());
     }
 
@@ -1270,7 +1430,7 @@ mod tests {
             "Alice",
             "127.0.0.1:1",
         );
-        import_record(&mut store, &handle, old_record).unwrap();
+        import_record(&mut store, &handle, old_record.clone()).unwrap();
         add_contact(&mut store, "a", &handle).unwrap();
         let new_record = peerbook::build_record(
             &mut new_platform,
@@ -1281,7 +1441,7 @@ mod tests {
         );
         import_record(&mut store, &handle, new_record).unwrap();
 
-        let info = verification_info(&store, &me, &handle).unwrap();
+        let info = verification_info_for_record(&store, &me, &handle, &old_record).unwrap();
         assert_eq!(info.level, verified::TrustLevel::Pinned);
         assert!(!list_contacts(&store).unwrap()[0].verified);
         assert_eq!(list_records(&store).unwrap().len(), 2);
@@ -1340,10 +1500,72 @@ mod tests {
 
         assert_eq!(delivered, 1);
         assert_eq!(out.delivered, 1);
-        let transcript = history::load(&store, "bob").unwrap();
+        let transcript = history::load(&store, bob_record.record.user_id.as_str()).unwrap();
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].text, "hello");
         assert!(transcript[0].from_me);
+    }
+
+    #[test]
+    fn duplicate_handle_transcripts_stay_separate() {
+        let me_handle = Handle::new("me").unwrap();
+        let shared_handle = Handle::new("alex").unwrap();
+        let mut platform = SeededPlatform(61);
+        let me = Identity::generate(&mut platform).unwrap();
+        let first = Identity::generate(&mut platform).unwrap();
+        let second = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        publish_active_device_record(
+            &mut store,
+            &mut platform,
+            &me,
+            &me_handle,
+            "Me",
+            "127.0.0.1:1",
+        )
+        .unwrap();
+        let first_record =
+            peerbook::build_record(&mut platform, &first, &shared_handle, "Alex One", "a:1");
+        let second_record =
+            peerbook::build_record(&mut platform, &second, &shared_handle, "Alex Two", "b:2");
+        import_record(&mut store, &shared_handle, first_record.clone()).unwrap();
+        import_record(&mut store, &shared_handle, second_record.clone()).unwrap();
+
+        let mut deliver =
+            |_: &mut MemStore, _: &Handle, _: &SignedRecord, _: &Device, _: MailItem| {
+                DeliveryPath::Direct
+            };
+        for (record, id, text) in [
+            (&first_record, "first", "hello one"),
+            (&second_record, "second", "hello two"),
+        ] {
+            send_direct(
+                &me,
+                &mut store,
+                &mut platform,
+                &me_handle,
+                &shared_handle,
+                record,
+                &AppMessage {
+                    id: id.to_string(),
+                    timestamp: 1,
+                    expires_at: None,
+                    body: mycellium_core::message::Body::Text(text.to_string()),
+                },
+                &mut deliver,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            history::load(&store, first_record.record.user_id.as_str()).unwrap()[0].text,
+            "hello one"
+        );
+        assert_eq!(
+            history::load(&store, second_record.record.user_id.as_str()).unwrap()[0].text,
+            "hello two"
+        );
+        assert_eq!(conversations(&mut store, 2).unwrap().len(), 2);
     }
 
     #[test]

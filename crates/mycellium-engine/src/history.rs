@@ -1,4 +1,4 @@
-//! Per-peer chat transcripts, persisted through the [`Storage`] trait.
+//! Per-user chat transcripts, persisted through the [`Storage`] trait.
 //!
 //! Generic over `Storage`, so it's exercised in tests with an in-memory store
 //! and in production with the encrypted the encrypted `FileStore`.
@@ -246,19 +246,19 @@ pub fn group_append<S: Storage>(
     Ok(true)
 }
 
-/// Load a peer's transcript (empty if none / unreadable).
-pub fn load<S: Storage>(store: &S, peer: &str) -> Result<Vec<StoredMessage>, S::Error> {
-    load_segments(store, HIST, peer, "1:1 transcript")
+/// Load a stable user ID's transcript (empty if none / unreadable).
+pub fn load<S: Storage>(store: &S, user_id: &str) -> Result<Vec<StoredMessage>, S::Error> {
+    load_segments(store, HIST, user_id, "1:1 transcript")
 }
 
 const PEER_INDEX: &[u8] = b"history:peers";
 
-/// The set of peers we have 1:1 history with.
+/// The stable user IDs we have 1:1 history with.
 pub fn peers<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
     Ok(crate::decode_or_warn(store.get(PEER_INDEX)?, "peer index"))
 }
 
-/// Append one message to a peer's transcript (and index the peer).
+/// Append one message to a user's transcript (and index the user ID).
 pub fn append<S: Storage>(
     store: &mut S,
     peer: &str,

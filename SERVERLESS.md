@@ -294,13 +294,26 @@ publishing a new signed record that replaces the previous active device.
 
 A handle is not unique and is not identity. It is display metadata.
 
-The registry may authenticate access to an account and store an encrypted wallet
-backup. It must not store raw keys. Key material should be created or decrypted
-by the client, with the user never needing to see it.
+Clients must therefore key contacts, conversations, trust decisions, and
+pending delivery targets by stable user identity. A handle may label those
+records for people, but must never select or merge them internally.
+
+The registry may authenticate access to an account and hold the protocol
+identity root needed for account recovery. The identity root is created by the
+client, sent only through authenticated HTTPS, encrypted before persistent
+storage with a registry master key, and never shown to the user. It is
+write-once for an account: device switching recovers it but cannot replace it.
 
 On a new device, the user proves account access through any supported login
-identity, downloads the encrypted backup, decrypts it locally, creates fresh
-device keys, and publishes an updated signed record.
+identity, recovers the same protocol identity root, creates fresh device keys,
+and publishes an updated signed record. Old device keys, message keys, local
+history, and pending messages are not copied.
+
+This is an explicit account-UX trust boundary. Control of a login identity can
+recover the protocol identity through the registry. Compromise of the running
+registry or its recovery master key can also recover identities. Theft of the
+database and blobs without that master key cannot. None of these expose past
+messages because the registry never has message history or device message keys.
 
 ### 6.2 Registry Storage Shape
 
@@ -314,6 +327,7 @@ The registry needs searchable indexes for:
 - login token hash to login attempt and expiry
 - `account_id` to current signed public record pointer
 - `account_id` to encrypted wallet backup pointer
+- `account_id` to registry-sealed recovery identity pointer
 - rate-limit keys to counters and expiry
 
 Opaque per-user data may live outside the metadata store as one account bundle
@@ -370,13 +384,15 @@ The registry code must still depend on a small `RegistryStore` interface, not on
 
 ### 6.4 Current Registry Surface
 
-The current development registry exposes only account UX:
+The current registry exposes only account UX:
 
 ```text
 POST /login/email/request
 POST /login/confirm
 PUT  /accounts/{account_id}/backup
 GET  /accounts/{account_id}/backup
+PUT  /accounts/{account_id}/recovery
+GET  /accounts/{account_id}/recovery
 PUT  /accounts/{account_id}/record
 GET  /accounts/{account_id}/record
 ```
@@ -403,7 +419,35 @@ The registry binary is configured by:
 ```text
 MYCELLIUM_REGISTRY_BIND
 MYCELLIUM_REGISTRY_DATA_DIR
+MYCELLIUM_REGISTRY_RECOVERY_KEY
+MYCELLIUM_REGISTRY_EMAIL_TRANSPORT
+MYCELLIUM_REGISTRY_EMAIL_FROM
+MYCELLIUM_REGISTRY_BREVO_API_KEY
+MYCELLIUM_REGISTRY_BREVO_ENDPOINT
+MYCELLIUM_REGISTRY_SMTP_HOST
+MYCELLIUM_REGISTRY_SMTP_PORT
+MYCELLIUM_REGISTRY_SMTP_USERNAME
+MYCELLIUM_REGISTRY_SMTP_PASSWORD
+MYCELLIUM_REGISTRY_EMAIL_SUBJECT
+MYCELLIUM_REGISTRY_LOGIN_URL_TEMPLATE
 ```
+
+`MYCELLIUM_REGISTRY_RECOVERY_KEY` is a required 32-byte key encoded as 64
+hexadecimal characters. It must be stored separately from the registry data and
+backed up: losing it makes account recovery blobs unreadable.
+
+The Linux client logs in before creating or recovering an identity. It checks
+the account's signed public record on startup and every minute. If another
+device is active, it keeps local history visible but disables sending,
+receiving, and outbox retries until the user logs in and intentionally makes
+the local device active again. Its bearer session is stored only inside the
+device's encrypted local store and is unavailable before local unlock.
+
+`MYCELLIUM_REGISTRY_EMAIL_TRANSPORT` must be explicit. `log` is for local
+development. `smtp` sends through a generic SMTP server. `brevo` sends through
+Brevo's HTTPS transactional email API, which is useful on hosts that block
+outbound SMTP ports. Email delivery remains registry account UX, not protocol
+message delivery.
 
 This HTTP surface does not change the delivery law. It publishes and retrieves
 account data and signed records. It does not store, queue, relay, or route

@@ -12,10 +12,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{post, put};
 use axum::{Json, Router};
+use mycellium_core::identity::Identity;
 use mycellium_core::record::SignedRecord;
 use mycellium_core::wire;
 use serde::{Deserialize, Serialize};
 
+use crate::recovery::RecoveryCipher;
 use crate::{
     AccountBlobKind, AccountId, FileBlobStore, LoginIdentityHash, RedbRegistryStore, Registry,
     RegistryError, RegistryStore, Result,
@@ -26,12 +28,14 @@ const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 const EMAIL_LOGIN_LIMIT: u64 = 5;
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PUBLIC_RECORD_BYTES: usize = 1024 * 1024;
+const RECOVERY_SECRET_BYTES: usize = 32;
 
 /// HTTP app state.
 pub struct AppState<S> {
     registry: Arc<Registry<S>>,
     blobs: FileBlobStore,
     email_sender: Arc<dyn EmailLoginSender>,
+    recovery_cipher: RecoveryCipher,
 }
 
 impl<S> Clone for AppState<S> {
@@ -40,6 +44,7 @@ impl<S> Clone for AppState<S> {
             registry: Arc::clone(&self.registry),
             blobs: self.blobs.clone(),
             email_sender: Arc::clone(&self.email_sender),
+            recovery_cipher: self.recovery_cipher.clone(),
         }
     }
 }
@@ -61,8 +66,12 @@ impl EmailLoginSender for NoopEmailLoginSender {
 
 impl<S: RegistryStore> AppState<S> {
     /// Build app state from a registry and blob store.
-    pub fn new(registry: Registry<S>, blobs: FileBlobStore) -> Self {
-        Self::with_email_sender(registry, blobs, NoopEmailLoginSender)
+    pub fn new(
+        registry: Registry<S>,
+        blobs: FileBlobStore,
+        recovery_cipher: RecoveryCipher,
+    ) -> Self {
+        Self::with_email_sender(registry, blobs, NoopEmailLoginSender, recovery_cipher)
     }
 
     /// Build app state with a concrete email sender.
@@ -70,11 +79,13 @@ impl<S: RegistryStore> AppState<S> {
         registry: Registry<S>,
         blobs: FileBlobStore,
         sender: impl EmailLoginSender,
+        recovery_cipher: RecoveryCipher,
     ) -> Self {
         Self {
             registry: Arc::new(registry),
             blobs,
             email_sender: Arc::new(sender),
+            recovery_cipher,
         }
     }
 }
@@ -92,6 +103,10 @@ where
             put(put_backup::<S>).get(get_backup::<S>),
         )
         .route(
+            "/accounts/{account_id}/recovery",
+            put(put_recovery::<S>).get(get_recovery::<S>),
+        )
+        .route(
             "/accounts/{account_id}/record",
             put(put_public_record::<S>).get(get_public_record::<S>),
         )
@@ -100,11 +115,28 @@ where
 }
 
 /// Build a router using the default redb/file stores.
-pub fn redb_router(data_dir: impl Into<std::path::PathBuf>) -> Result<Router> {
+pub fn redb_router(
+    data_dir: impl Into<std::path::PathBuf>,
+    recovery_cipher: RecoveryCipher,
+) -> Result<Router> {
+    redb_router_with_email_sender(data_dir, NoopEmailLoginSender, recovery_cipher)
+}
+
+/// Build a router using the default redb/file stores and a configured email sender.
+pub fn redb_router_with_email_sender(
+    data_dir: impl Into<std::path::PathBuf>,
+    sender: impl EmailLoginSender,
+    recovery_cipher: RecoveryCipher,
+) -> Result<Router> {
     let data_dir = data_dir.into();
     let store = RedbRegistryStore::open(data_dir.join("registry.redb"))?;
     let blobs = FileBlobStore::new(data_dir.join("blobs"));
-    Ok(router(AppState::new(Registry::new(store), blobs)))
+    Ok(router(AppState::with_email_sender(
+        Registry::new(store),
+        blobs,
+        sender,
+        recovery_cipher,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +257,83 @@ where
     Ok((StatusCode::OK, bytes).into_response())
 }
 
+async fn put_recovery<S>(
+    State(state): State<AppState<S>>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> ApiResult<Json<BlobResponse>>
+where
+    S: RegistryStore + Send + Sync + 'static,
+{
+    let account_id = parse_account_id(&account_id)?;
+    authorize(&state, &headers, &account_id)?;
+    if bytes.len() != RECOVERY_SECRET_BYTES {
+        return Err(ApiError::bad_request(
+            "recovery material must be exactly 32 bytes",
+        ));
+    }
+    let wallet_secret: [u8; RECOVERY_SECRET_BYTES] = bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| ApiError::bad_request("invalid recovery material"))?;
+    Identity::from_wallet_secret(wallet_secret, [0u8; 32])
+        .map_err(|_| ApiError::bad_request("recovery material is not a valid wallet key"))?;
+    if let Some(current_ref) = state
+        .registry
+        .store()
+        .blob_ref(&account_id, AccountBlobKind::Recovery)?
+    {
+        let current_sealed = state
+            .blobs
+            .get(&account_id, &current_ref)?
+            .ok_or_else(|| ApiError::not_found("recovery blob not found"))?;
+        let current = state.recovery_cipher.open(&account_id, &current_sealed)?;
+        if current != bytes.as_ref() {
+            return Err(ApiError::conflict(
+                "account recovery identity cannot be replaced",
+            ));
+        }
+        return Ok(Json(BlobResponse::from(current_ref)));
+    }
+    let sealed = state.recovery_cipher.seal(&account_id, &bytes)?;
+    let blob = state
+        .blobs
+        .put(&account_id, AccountBlobKind::Recovery, &sealed)?;
+    state
+        .registry
+        .store()
+        .put_blob_ref(&account_id, AccountBlobKind::Recovery, &blob)?;
+    Ok(Json(BlobResponse::from(blob)))
+}
+
+async fn get_recovery<S>(
+    State(state): State<AppState<S>>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response>
+where
+    S: RegistryStore + Send + Sync + 'static,
+{
+    let account_id = parse_account_id(&account_id)?;
+    authorize(&state, &headers, &account_id)?;
+    let Some(blob) = state
+        .registry
+        .store()
+        .blob_ref(&account_id, AccountBlobKind::Recovery)?
+    else {
+        return Err(ApiError::not_found("recovery material not found"));
+    };
+    let Some(sealed) = state.blobs.get(&account_id, &blob)? else {
+        return Err(ApiError::not_found("recovery blob not found"));
+    };
+    let secret = state.recovery_cipher.open(&account_id, &sealed)?;
+    if secret.len() != RECOVERY_SECRET_BYTES {
+        return Err(ApiError::bad_request("stored recovery material is invalid"));
+    }
+    Ok((StatusCode::OK, secret).into_response())
+}
+
 async fn put_public_record<S>(
     State(state): State<AppState<S>>,
     Path(account_id): Path<String>,
@@ -296,6 +405,13 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
     fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -413,6 +529,26 @@ fn enforce_public_record_update<S: RegistryStore>(
     next: &SignedRecord,
     next_bytes: &[u8],
 ) -> ApiResult<()> {
+    let recovery_ref = state
+        .registry
+        .store()
+        .blob_ref(account_id, AccountBlobKind::Recovery)?
+        .ok_or_else(|| ApiError::conflict("store account recovery before publishing a record"))?;
+    let recovery_sealed = state
+        .blobs
+        .get(account_id, &recovery_ref)?
+        .ok_or_else(|| ApiError::not_found("recovery blob not found"))?;
+    let recovery = state.recovery_cipher.open(account_id, &recovery_sealed)?;
+    let wallet_secret: [u8; RECOVERY_SECRET_BYTES] = recovery
+        .try_into()
+        .map_err(|_| ApiError::bad_request("stored recovery material is invalid"))?;
+    let identity = Identity::from_wallet_secret(wallet_secret, [0u8; 32])
+        .map_err(|_| ApiError::bad_request("stored recovery material is invalid"))?;
+    if next.record.wallet != identity.wallet_public() {
+        return Err(ApiError::conflict(
+            "public record does not belong to the account recovery identity",
+        ));
+    }
     let Some(current_ref) = state
         .registry
         .store()
@@ -512,6 +648,7 @@ mod tests {
             Registry::new(store),
             FileBlobStore::new(dir.join("blobs")),
             sender.clone(),
+            RecoveryCipher::new([7; 32]),
         ));
         (app, sender)
     }
@@ -596,12 +733,38 @@ mod tests {
         )
     }
 
+    async fn store_recovery(
+        app: &Router,
+        account_id: &str,
+        session_token: &str,
+        identity: &Identity,
+    ) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/accounts/{account_id}/recovery"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(identity.wallet_secret().to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
     #[tokio::test]
     async fn login_upload_and_lookup_public_record() {
         let (app, sender) = app_with_mail("flow");
 
         let (account_id, session_token) = login_session(&app, &sender).await;
-        let public_record = signed_public_record_bytes(1);
+        let mut platform = TestPlatform(1);
+        let identity = Identity::generate(&mut platform).unwrap();
+        assert_eq!(
+            store_recovery(&app, &account_id, &session_token, &identity).await,
+            StatusCode::OK
+        );
+        let public_record = signed_public_record_bytes_for(&identity, 1);
 
         let response = app
             .clone()
@@ -636,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn backup_requires_session() {
-        let app = redb_router(tmpdir("auth")).unwrap();
+        let app = redb_router(tmpdir("auth"), RecoveryCipher::new([7; 32])).unwrap();
         let account_id = AccountId::generate().unwrap();
         let response = app
             .oneshot(
@@ -730,6 +893,10 @@ mod tests {
         let (account_id, session_token) = login_session(&app, &sender).await;
         let mut platform = TestPlatform(10);
         let identity = Identity::generate(&mut platform).unwrap();
+        assert_eq!(
+            store_recovery(&app, &account_id, &session_token, &identity).await,
+            StatusCode::OK
+        );
         let current = signed_public_record_bytes_for(&identity, 3);
         let stale = signed_public_record_bytes_for(&identity, 2);
         let other = signed_public_record_bytes(4);
@@ -775,6 +942,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn recovery_secret_is_sealed_at_rest_and_requires_its_session() {
+        let (app, sender) = app_with_mail("recovery");
+        let (account_id, session_token) = login_session(&app, &sender).await;
+        let secret = [19u8; RECOVERY_SECRET_BYTES];
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/accounts/{account_id}/recovery"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(secret.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/accounts/{account_id}/recovery"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &secret);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/accounts/{account_id}/recovery"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_recovery_identity_is_write_once() {
+        let (app, sender) = app_with_mail("recovery-write-once");
+        let (account_id, session_token) = login_session(&app, &sender).await;
+        let mut first_platform = TestPlatform(1);
+        let first = Identity::generate(&mut first_platform).unwrap();
+        let mut second_platform = TestPlatform(99);
+        let second = Identity::generate(&mut second_platform).unwrap();
+
+        assert_eq!(
+            store_recovery(&app, &account_id, &session_token, &first).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            store_recovery(&app, &account_id, &session_token, &first).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            store_recovery(&app, &account_id, &session_token, &second).await,
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]

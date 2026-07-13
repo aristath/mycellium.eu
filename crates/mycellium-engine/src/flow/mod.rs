@@ -70,6 +70,8 @@ pub enum ItemOutcome {
 pub enum FlowEvent {
     /// A decrypted 1:1 message from `from`.
     DirectMessage {
+        /// The sender's stable protocol identity.
+        user_id: String,
         /// The authenticated sender's handle.
         from: String,
         /// The message id (empty only for an undecodable raw payload).
@@ -115,6 +117,8 @@ pub enum FlowEvent {
     },
     /// An incoming delivery/read receipt for a message we sent.
     Receipt {
+        /// The sender's stable protocol identity.
+        user_id: String,
         /// Who acknowledged it.
         from: String,
         /// The id of the message they acknowledged.
@@ -199,7 +203,7 @@ where
     }
     // Anti-rollback: refuse (and never pin) a record older than one we've already
     // seen for this handle — a downgrade the wallet-change guard cannot see (HIGH).
-    if !antirollback::check_and_pin(store, handle.as_str(), &record)
+    if !antirollback::check_and_pin(store, record.record.user_id.as_str(), &record)
         .map_err(|_| TrustError::StaleRecord)?
     {
         return Err(TrustError::StaleRecord);
@@ -303,16 +307,16 @@ where
     // what we sent (edits/deletes apply to it; other kinds append).
     match &app.body {
         Body::Edit { to, text } => {
-            history::edit(store, peer.as_str(), to, text, true)?;
+            history::edit(store, peer_record.record.user_id.as_str(), to, text, true)?;
         }
         Body::Delete { to } => {
-            history::delete(store, peer.as_str(), to, true)?;
+            history::delete(store, peer_record.record.user_id.as_str(), to, true)?;
         }
         Body::Receipt { .. } => {}
         _ => {
             history::append(
                 store,
-                peer.as_str(),
+                peer_record.record.user_id.as_str(),
                 StoredMessage {
                     id: app.id.clone(),
                     from_me: true,
@@ -609,18 +613,20 @@ where
     // Learn the sender's self-set name (from their signed record); a saved contact
     // still wins downstream.
     let _ = names::note(store, from.as_str(), &env.sender_record.record.name);
+    let sender_user_id = env.sender_record.record.user_id.as_str();
 
     match AppMessage::decode(&bytes) {
         Ok(app) => match &app.body {
             // A receipt: surface the status; never receipt a receipt (no loops).
             Body::Receipt { message_id, read } => sink.emit(FlowEvent::Receipt {
+                user_id: sender_user_id.to_string(),
                 from: from.as_str().to_string(),
                 message_id: message_id.clone(),
                 read: *read,
             }),
             // An edit or deletion of an earlier message: apply to the transcript.
             Body::Edit { to, text } => {
-                if history::edit(store, from.as_str(), to, text, false).is_err() {
+                if history::edit(store, sender_user_id, to, text, false).is_err() {
                     return ItemOutcome::Retry;
                 }
                 sink.emit(FlowEvent::Edited {
@@ -631,7 +637,7 @@ where
                 });
             }
             Body::Delete { to } => {
-                if history::delete(store, from.as_str(), to, false).is_err() {
+                if history::delete(store, sender_user_id, to, false).is_err() {
                     return ItemOutcome::Retry;
                 }
                 sink.emit(FlowEvent::Deleted {
@@ -651,7 +657,7 @@ where
                     timestamp: platform.now_unix_secs(),
                     expires_at: app.expires_at,
                 };
-                let inserted = match history::append(store, from.as_str(), entry) {
+                let inserted = match history::append(store, sender_user_id, entry) {
                     Ok(inserted) => inserted,
                     Err(_) => return ItemOutcome::Retry,
                 };
@@ -667,6 +673,7 @@ where
                     });
                 }
                 sink.emit(FlowEvent::DirectMessage {
+                    user_id: sender_user_id.to_string(),
                     from: from.as_str().to_string(),
                     id: app.id.clone(),
                     text: app.summary(),

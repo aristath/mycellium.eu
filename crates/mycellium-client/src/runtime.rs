@@ -15,6 +15,7 @@ use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
+use mycellium_core::userid::UserId;
 use mycellium_core::wire;
 use mycellium_engine::flow;
 use mycellium_engine::groups::{MailItem, PeerFrame};
@@ -178,12 +179,12 @@ where
     let now = platform.now_unix_secs();
     let mut deliver = |store: &mut mycellium_storage::filestore::FileTransaction<'_>,
                        handle: &Handle,
-                       _record: &SignedRecord,
+                       record: &SignedRecord,
                        device: &Device,
                        item: MailItem|
      -> DeliveryPath {
         let delivery_id = delivery_id_for_item(&item);
-        match park_outbox(store, delivery_id, handle, device, item, now) {
+        match park_outbox(store, delivery_id, handle, record, device, item, now) {
             Ok(()) => DeliveryPath::Outbox,
             Err(_) => DeliveryPath::Failed,
         }
@@ -291,6 +292,7 @@ pub fn deliver_or_park<S: Storage>(
     store: &mut S,
     network: &DirectNetwork,
     recipient: &Handle,
+    recipient_record: &SignedRecord,
     device: &Device,
     item: MailItem,
     now: u64,
@@ -303,6 +305,7 @@ where
         store,
         delivery_id.clone(),
         recipient,
+        recipient_record,
         device,
         item.clone(),
         now,
@@ -346,10 +349,10 @@ where
     }
 
     let (delivered, remaining) = outbox::flush_pass(entries, now, |entry| {
-        let Ok(handle) = Handle::new(entry.recipient.clone()) else {
+        let Ok(user_id) = UserId::new(entry.recipient_user_id.clone()) else {
             return outbox::Attempt::Drop;
         };
-        let record = match peerbook::get(store, &handle) {
+        let record = match peerbook::get_by_user_id(store, &user_id) {
             Ok(Some(record)) => record,
             Ok(None) | Err(_) => return outbox::Attempt::Retry,
         };

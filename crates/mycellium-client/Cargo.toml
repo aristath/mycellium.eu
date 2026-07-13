@@ -13,6 +13,9 @@ mycellium-engine = { path = "../mycellium-engine" }
 mycellium-storage = { path = "../mycellium-storage" }
 mycellium-transport = { path = "../mycellium-transport" }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+ureq = { version = "3", features = ["json"] }
+zeroize = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

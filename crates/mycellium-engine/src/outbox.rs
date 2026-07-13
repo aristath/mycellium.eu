@@ -34,7 +34,9 @@ pub enum OutboxStatus {
 pub struct OutboxEntry {
     /// Stable delivery id for this exact sealed item.
     pub id: String,
-    /// The recipient handle to re-resolve on retry.
+    /// Stable recipient identity used to re-resolve the exact person on retry.
+    pub recipient_user_id: String,
+    /// Human-readable recipient handle for display only.
     pub recipient: String,
     /// The recipient's device slot this copy was sealed for.
     pub slot: String,
@@ -146,12 +148,21 @@ pub fn save<S: Storage>(store: &mut S, entries: &[OutboxEntry]) -> Result<(), S:
 pub fn enqueue<S: Storage>(
     store: &mut S,
     id: String,
+    recipient_user_id: &str,
     recipient: &str,
     slot: &str,
     item: MailItem,
     now: u64,
 ) -> Result<(), S::Error> {
-    enqueue_at(store, id, recipient, slot, item, now, 0)
+    enqueue_at(
+        store,
+        id,
+        (recipient_user_id, recipient),
+        slot,
+        item,
+        now,
+        0,
+    )
 }
 
 /// Park a sealed item that may not be deposited before `send_after` (unix
@@ -159,15 +170,17 @@ pub fn enqueue<S: Storage>(
 pub fn enqueue_at<S: Storage>(
     store: &mut S,
     id: String,
-    recipient: &str,
+    recipient: (&str, &str),
     slot: &str,
     item: MailItem,
     now: u64,
     send_after: u64,
 ) -> Result<(), S::Error> {
+    let (recipient_user_id, recipient) = recipient;
     let mut entries = load(store)?;
     entries.push(OutboxEntry {
         id,
+        recipient_user_id: recipient_user_id.to_string(),
         recipient: recipient.to_string(),
         slot: slot.to_string(),
         item,
@@ -289,6 +302,7 @@ mod tests {
     fn sample(id: &str) -> OutboxEntry {
         OutboxEntry {
             id: id.to_string(),
+            recipient_user_id: "a".repeat(64),
             recipient: "mary".into(),
             slot: "abcd".into(),
             item: MailItem::GroupText {
@@ -316,6 +330,7 @@ mod tests {
         enqueue(
             &mut store,
             e.id.clone(),
+            &e.recipient_user_id,
             &e.recipient,
             &e.slot,
             e.item.clone(),
@@ -340,6 +355,7 @@ mod tests {
         enqueue(
             &mut store,
             "1".into(),
+            &"a".repeat(64),
             "mary",
             "abcd",
             sample("1").item,
@@ -359,7 +375,7 @@ mod tests {
         enqueue_at(
             &mut store,
             "1".into(),
-            "mary",
+            (&"a".repeat(64), "mary"),
             "abcd",
             sample("1").item,
             100,
