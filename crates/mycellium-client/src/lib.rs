@@ -15,7 +15,7 @@ use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
-use mycellium_engine::groups::{self, MailItem, StoredGroup};
+use mycellium_engine::groups::{self, DiscoveryRecord, MailItem, StoredGroup};
 use mycellium_engine::history::{self, GroupStoredMessage, StoredMessage};
 use mycellium_engine::outbox::{self, OutboxEntry};
 use mycellium_engine::peerbook::{self, PeerRecord};
@@ -179,6 +179,42 @@ where
         }
     }
     Ok(removed)
+}
+
+pub fn encode_record(record: &SignedRecord) -> String {
+    peerbook::encode(record)
+}
+
+pub fn decode_record(encoded: &str) -> Result<SignedRecord> {
+    peerbook::decode(encoded)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordImportReport {
+    pub imported: usize,
+    pub skipped: Vec<(String, String)>,
+}
+
+pub fn import_discovery_records<S>(
+    store: &mut S,
+    records: impl IntoIterator<Item = DiscoveryRecord>,
+) -> RecordImportReport
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let report = peerbook::import_records(store, records);
+    RecordImportReport {
+        imported: report.imported,
+        skipped: report.skipped,
+    }
+}
+
+pub fn discovery_records<S: Storage>(store: &S, want: &[String]) -> Result<Vec<DiscoveryRecord>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(peerbook::pack(store, want)?)
 }
 
 #[derive(Clone)]
@@ -964,7 +1000,20 @@ mod tests {
         let mut store = MemStore::default();
         let record =
             peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
-        import_record(&mut store, &handle, record).unwrap();
+        let encoded = encode_record(&record);
+        let decoded = decode_record(&encoded).unwrap();
+        import_record(&mut store, &handle, decoded.clone()).unwrap();
+
+        let mut imported = MemStore::default();
+        let report = import_discovery_records(
+            &mut imported,
+            [DiscoveryRecord {
+                handle: "alice".to_string(),
+                record: decoded,
+            }],
+        );
+        assert_eq!(report.imported, 1);
+        assert_eq!(discovery_records(&imported, &[]).unwrap().len(), 1);
 
         add_contact(&mut store, "a", &handle).unwrap();
         let list = list_contacts(&store).unwrap();

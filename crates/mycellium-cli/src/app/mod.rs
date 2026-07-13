@@ -108,7 +108,7 @@ pub fn register(handle: &str, addr: &str, libp2p: bool) -> Result<()> {
         &location,
     )?;
     println!("registered '{}' locally at {}", handle.as_str(), location);
-    println!("record: {}", peerbook::encode(&signed));
+    println!("record: {}", client::encode_record(&signed));
     report_configured_dht_publish(&identity, &handle, &signed);
     Ok(())
 }
@@ -123,7 +123,7 @@ pub fn record_export(handle: &str) -> Result<()> {
             handle.as_str()
         )
     })?;
-    println!("{}", peerbook::encode(&record));
+    println!("{}", client::encode_record(&record));
     Ok(())
 }
 
@@ -131,7 +131,7 @@ pub fn record_import(handle: &str, encoded: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let record = peerbook::decode(encoded)?;
+    let record = client::decode_record(encoded)?;
     client::import_record(&mut fs, &handle, record)?;
     println!("imported signed record for '{}'", handle.as_str());
     Ok(())
@@ -191,7 +191,7 @@ pub fn discover(peer: &str, want: &[String]) -> Result<()> {
     let device = &peer_record.record.device;
     let detail = match request_discovery_from_device(&network, device, want) {
         Ok(records) => {
-            let report = peerbook::import_records(&mut fs, records);
+            let report = client::import_discovery_records(&mut fs, records);
             println!(
                 "discovered through '{}' — imported {} record(s), skipped {}",
                 peer_handle.as_str(),
@@ -1055,7 +1055,7 @@ fn handle_discovery_frame<W: FrameWriter>(
 ) -> bool {
     match frame {
         PeerFrame::DiscoveryRequest { want } => {
-            let records = match peerbook::pack(fs, want) {
+            let records = match client::discovery_records(fs, want) {
                 Ok(records) => records,
                 Err(err) => {
                     eprintln!("(could not build discovery response: {err})");
@@ -1067,7 +1067,7 @@ fn handle_discovery_frame<W: FrameWriter>(
             true
         }
         PeerFrame::DiscoveryResponse { records } => {
-            let report = peerbook::import_records(fs, records.clone());
+            let report = client::import_discovery_records(fs, records.clone());
             if report.imported > 0 || !report.skipped.is_empty() {
                 println!(
                     "discovery imported {} record(s), skipped {}",
