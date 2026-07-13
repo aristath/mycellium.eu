@@ -17,6 +17,7 @@ use crate::blocklist;
 use crate::groups::{self, GroupInvitePayload, GroupLeavePayload, MailItem, StoredGroup};
 use crate::history::{self, GroupStoredMessage, StoredMessage};
 use crate::names;
+use crate::peerbook;
 use crate::reachability::DeliveryPath;
 use crate::verified;
 use crate::wireops;
@@ -168,7 +169,7 @@ pub trait FlowSink {
 /// The **shared trust chokepoint** for every outbound path (1:1 send, forward,
 /// broadcast, chat, and the group paths): resolve `handle`, look it up through
 /// the injected [`FlowNet`], check the record's self-signature, fail closed on a
-/// changed pinned wallet ([`verified::level`]), and refuse a rolled-back record
+/// changed pinned user identity ([`verified::level`]), and refuse a rolled-back record
 /// ([`antirollback::check_and_pin`], which pins every component version).
 ///
 /// Contacts-nickname resolution is host-specific (the native CLI resolves a
@@ -189,9 +190,11 @@ where
     // Resolution does not verify records; check the self-signature before we
     // trust the record's device keys.
     record.verify().map_err(|_| TrustError::Unverified)?;
-    // Fail closed if the current wallet doesn't match a pinned/verified one: the
-    // peer re-registered, or someone is impersonating them (core review).
-    if verified::level(store, handle.as_str(), &record.record.wallet) == TrustLevel::Changed {
+    // Fail closed if the wallet doesn't match this stable user id's
+    // pinned/verified wallet.
+    if verified::level(store, record.record.user_id.as_str(), &record.record.wallet)
+        == TrustLevel::Changed
+    {
         return Err(TrustError::IdentityChanged);
     }
     // Anti-rollback: refuse (and never pin) a record older than one we've already
@@ -202,6 +205,28 @@ where
         return Err(TrustError::StaleRecord);
     }
     Ok((handle, record))
+}
+
+fn resolve_group_target<S, N>(
+    identity: &Identity,
+    store: &mut S,
+    net: &N,
+    handle: &str,
+) -> Option<(Handle, SignedRecord)>
+where
+    S: Storage,
+    N: FlowNet,
+{
+    let Ok((handle, record)) = resolve_record(store, net, handle) else {
+        return None;
+    };
+    let trust = verified::level(store, record.record.user_id.as_str(), &record.record.wallet);
+    if record.record.wallet != identity.wallet_public()
+        && matches!(trust, TrustLevel::Changed | TrustLevel::Unverified)
+    {
+        return None;
+    }
+    Some((handle, record))
 }
 
 /// The tally of one 1:1 active-device send, returned by [`send_app`].
@@ -307,7 +332,7 @@ where
 /// wallet has changed.
 ///
 /// The flow owns the shared logic — lookup, `verify()`, the TOFU pin check
-/// ([`verified::level`] against `store`), and active-device sealing ([`wireops::seal_to`]).
+/// ([`verified::level`] against the stable user id), and active-device sealing ([`wireops::seal_to`]).
 /// `deliver` performs the client-specific active-device delivery. The store is
 /// threaded through `deliver` rather than captured by it so the pin check and
 /// local retry writes share the one handle.
@@ -345,29 +370,9 @@ pub fn distribute_key<S, P, N>(
     };
 
     for target in targets {
-        let Ok(handle) = Handle::new(target.clone()) else {
+        let Some((handle, record)) = resolve_group_target(identity, store, net, target) else {
             continue;
         };
-        let Ok(record) = net.lookup(&handle) else {
-            continue;
-        };
-        // Never seal our group sender key to an unverifiable record.
-        if record.verify().is_err() {
-            continue;
-        }
-        // Fail closed if the member's wallet no longer matches the pinned or
-        // verified one — a resolver that swaps a member's wallet must
-        // not trick us into sealing our group sender key to the impostor (the
-        // same fail-closed check 1:1 sends make; core review).
-        let trust = verified::level(store, handle.as_str(), &record.record.wallet);
-        if record.record.wallet != identity.wallet_public()
-            && matches!(
-                trust,
-                verified::TrustLevel::Changed | verified::TrustLevel::Unverified
-            )
-        {
-            continue;
-        }
         let device = &record.record.device;
         if device.device_key == identity.device_public() {
             continue;
@@ -437,25 +442,9 @@ where
         message: gm,
     };
     for member in &group.members {
-        let Ok(handle) = Handle::new(member.clone()) else {
+        let Some((handle, record)) = resolve_group_target(identity, store, net, member) else {
             continue;
         };
-        let Ok(record) = net.lookup(&handle) else {
-            continue;
-        };
-        // Never deposit to an unverifiable member record.
-        if record.verify().is_err() {
-            continue;
-        }
-        let trust = verified::level(store, handle.as_str(), &record.record.wallet);
-        if record.record.wallet != identity.wallet_public()
-            && matches!(
-                trust,
-                verified::TrustLevel::Changed | verified::TrustLevel::Unverified
-            )
-        {
-            continue;
-        }
         let device = &record.record.device;
         if device.device_key == identity.device_public() {
             continue; // never to this device itself
@@ -520,16 +509,9 @@ pub fn group_leave<S, P, N>(
         if member == me.as_str() {
             continue; // our own departure isn't announced to ourselves
         }
-        let Ok(handle) = Handle::new(member.clone()) else {
+        let Some((handle, record)) = resolve_group_target(identity, store, net, member) else {
             continue;
         };
-        let Ok(record) = net.lookup(&handle) else {
-            continue;
-        };
-        // Never seal to an unverifiable member record.
-        if record.verify().is_err() {
-            continue;
-        }
         let device = &record.record.device;
         if device.device_key == identity.device_public() {
             continue;
@@ -824,6 +806,15 @@ where
         .handle_of(&message.sender)
         .map(str::to_string)
         .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
+    if let Ok(handle) = Handle::new(sender.clone()) {
+        if let Ok(Some(record)) = peerbook::get(store, &handle) {
+            if record.verify().is_ok()
+                && record.record.device.device_key.0.as_slice() != message.sender.as_slice()
+            {
+                return ItemOutcome::Rejected;
+            }
+        }
+    }
     if blocklist::is_blocked(r.blocked, &sender) {
         return ItemOutcome::Rejected; // drop group messages from blocked members
     }

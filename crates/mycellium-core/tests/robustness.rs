@@ -10,6 +10,7 @@ use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::ratchet::{Ratchet, RatchetMessage};
 use mycellium_core::record::{Device, Record, SignedRecord};
+use mycellium_core::userid::user_id;
 use mycellium_core::wire;
 use mycellium_core::x3dh::{self, HandshakeInit};
 
@@ -46,6 +47,7 @@ impl Platform for SeededPlatform {
 fn valid_signed_record(p: &mut SeededPlatform) -> SignedRecord {
     let id = Identity::generate(p).unwrap();
     let record = Record {
+        user_id: user_id(&id.wallet_public()),
         handle: Handle::new("ari").unwrap(),
         name: String::new(),
         wallet: id.wallet_public(),

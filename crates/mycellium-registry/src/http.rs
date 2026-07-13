@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{post, put};
 use axum::{Json, Router};
+use mycellium_core::record::SignedRecord;
+use mycellium_core::wire;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -29,6 +31,7 @@ const MAX_PUBLIC_RECORD_BYTES: usize = 1024 * 1024;
 pub struct AppState<S> {
     registry: Arc<Registry<S>>,
     blobs: FileBlobStore,
+    email_sender: Arc<dyn EmailLoginSender>,
 }
 
 impl<S> Clone for AppState<S> {
@@ -36,16 +39,42 @@ impl<S> Clone for AppState<S> {
         Self {
             registry: Arc::clone(&self.registry),
             blobs: self.blobs.clone(),
+            email_sender: Arc::clone(&self.email_sender),
         }
+    }
+}
+
+/// Sends a verified email-login token over the selected email provider.
+pub trait EmailLoginSender: Send + Sync + 'static {
+    /// Deliver the token to `email`.
+    fn send_login_token(&self, email: &str, token: &str, expires_at: i64) -> Result<()>;
+}
+
+#[derive(Clone, Debug, Default)]
+struct NoopEmailLoginSender;
+
+impl EmailLoginSender for NoopEmailLoginSender {
+    fn send_login_token(&self, _email: &str, _token: &str, _expires_at: i64) -> Result<()> {
+        Ok(())
     }
 }
 
 impl<S: RegistryStore> AppState<S> {
     /// Build app state from a registry and blob store.
     pub fn new(registry: Registry<S>, blobs: FileBlobStore) -> Self {
+        Self::with_email_sender(registry, blobs, NoopEmailLoginSender)
+    }
+
+    /// Build app state with a concrete email sender.
+    pub fn with_email_sender(
+        registry: Registry<S>,
+        blobs: FileBlobStore,
+        sender: impl EmailLoginSender,
+    ) -> Self {
         Self {
             registry: Arc::new(registry),
             blobs,
+            email_sender: Arc::new(sender),
         }
     }
 }
@@ -66,6 +95,7 @@ where
             "/accounts/{account_id}/record",
             put(put_public_record::<S>).get(get_public_record::<S>),
         )
+        .layer(DefaultBodyLimit::max(MAX_BACKUP_BYTES))
         .with_state(state)
 }
 
@@ -85,14 +115,12 @@ struct EmailLoginRequest {
 #[derive(Debug, Serialize)]
 struct EmailLoginResponse {
     expires_at: i64,
-    /// Development placeholder until a real email sender is wired in.
-    dev_token: String,
 }
 
 async fn request_email_login<S>(
     State(state): State<AppState<S>>,
     Json(body): Json<EmailLoginRequest>,
-) -> ApiResult<Json<EmailLoginResponse>>
+) -> ApiResult<(StatusCode, Json<EmailLoginResponse>)>
 where
     S: RegistryStore + Send + Sync + 'static,
 {
@@ -109,10 +137,15 @@ where
     let challenge = state
         .registry
         .request_email_login(&body.email, now(), LOGIN_TTL_SECS)?;
-    Ok(Json(EmailLoginResponse {
-        expires_at: challenge.expires_at,
-        dev_token: challenge.token,
-    }))
+    state
+        .email_sender
+        .send_login_token(&body.email, &challenge.token, challenge.expires_at)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EmailLoginResponse {
+            expires_at: challenge.expires_at,
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +237,8 @@ where
     let account_id = parse_account_id(&account_id)?;
     authorize(&state, &headers, &account_id)?;
     require_size_at_most(bytes.len(), MAX_PUBLIC_RECORD_BYTES)?;
+    let record = decode_signed_public_record(&bytes)?;
+    enforce_public_record_update(&state, &account_id, &record, &bytes)?;
     let blob = state
         .blobs
         .put(&account_id, AccountBlobKind::PublicRecord, &bytes)?;
@@ -295,6 +330,13 @@ impl ApiError {
             message: "payload too large".into(),
         }
     }
+
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<RegistryError> for ApiError {
@@ -353,6 +395,48 @@ fn require_size_at_most(size: usize, max: usize) -> ApiResult<()> {
     Ok(())
 }
 
+fn decode_signed_public_record(bytes: &[u8]) -> ApiResult<SignedRecord> {
+    let record: SignedRecord = wire::decode(bytes).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "bad signed public record".into(),
+    })?;
+    record.verify().map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "public record failed verification".into(),
+    })?;
+    Ok(record)
+}
+
+fn enforce_public_record_update<S: RegistryStore>(
+    state: &AppState<S>,
+    account_id: &AccountId,
+    next: &SignedRecord,
+    next_bytes: &[u8],
+) -> ApiResult<()> {
+    let Some(current_ref) = state
+        .registry
+        .store()
+        .blob_ref(account_id, AccountBlobKind::PublicRecord)?
+    else {
+        return Ok(());
+    };
+    let Some(current_bytes) = state.blobs.get(account_id, &current_ref)? else {
+        return Err(ApiError::not_found("current public record blob not found"));
+    };
+    let current = decode_signed_public_record(&current_bytes)?;
+    if current.record.user_id != next.record.user_id {
+        return Err(ApiError::conflict(
+            "public record belongs to a different user",
+        ));
+    }
+    if next.freshness() < current.freshness()
+        || (next.freshness() == current.freshness() && next_bytes != current_bytes.as_slice())
+    {
+        return Err(ApiError::conflict("stale public record"));
+    }
+    Ok(())
+}
+
 fn check_rate_limit<S: RegistryStore>(
     state: &AppState<S>,
     key: &str,
@@ -381,7 +465,12 @@ fn now() -> i64 {
 mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
+    use mycellium_core::identity::{Handle, Identity, PeerId};
+    use mycellium_core::platform::Platform;
+    use mycellium_core::record::{Device, Record};
+    use mycellium_core::userid::user_id;
     use serde_json::Value;
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
     use super::*;
@@ -397,19 +486,71 @@ mod tests {
         path
     }
 
-    async fn response_json(response: Response) -> Value {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+    #[derive(Clone, Default)]
+    struct CaptureEmailSender {
+        tokens: Arc<Mutex<Vec<String>>>,
     }
 
-    #[tokio::test]
-    async fn login_upload_and_lookup_public_record() {
-        let app = redb_router(tmpdir("flow")).unwrap();
+    impl CaptureEmailSender {
+        fn take_token(&self) -> String {
+            self.tokens.lock().unwrap().pop().unwrap()
+        }
+    }
 
+    impl EmailLoginSender for CaptureEmailSender {
+        fn send_login_token(&self, _email: &str, token: &str, _expires_at: i64) -> Result<()> {
+            self.tokens.lock().unwrap().push(token.to_string());
+            Ok(())
+        }
+    }
+
+    fn app_with_mail(name: &str) -> (Router, CaptureEmailSender) {
+        let dir = tmpdir(name);
+        let store = RedbRegistryStore::open(dir.join("registry.redb")).unwrap();
+        let sender = CaptureEmailSender::default();
+        let app = router(AppState::with_email_sender(
+            Registry::new(store),
+            FileBlobStore::new(dir.join("blobs")),
+            sender.clone(),
+        ));
+        (app, sender)
+    }
+
+    struct TestPlatform(u8);
+
+    impl Platform for TestPlatform {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            for b in buf {
+                *b = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+        }
+
+        fn now_unix_secs(&self) -> u64 {
+            100
+        }
+    }
+
+    fn signed_public_record_bytes(seq: u64) -> Vec<u8> {
+        let mut platform = TestPlatform(1);
+        let identity = Identity::generate(&mut platform).unwrap();
+        signed_public_record_bytes_for(&identity, seq)
+    }
+
+    fn signed_public_record_bytes_for(identity: &Identity, seq: u64) -> Vec<u8> {
+        let record = Record {
+            user_id: user_id(&identity.wallet_public()),
+            handle: Handle::new("alice").unwrap(),
+            name: "Alice".into(),
+            wallet: identity.wallet_public(),
+            device: Device::create(identity, PeerId(b"127.0.0.1:1".to_vec()), seq),
+            seq,
+        };
+        wire::encode(&SignedRecord::sign(record, identity))
+    }
+
+    async fn request_login(app: Router, sender: &CaptureEmailSender) -> String {
         let response = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -420,10 +561,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response_json(response).await;
-        let login_token = body["dev_token"].as_str().unwrap();
+        assert!(body.get("dev_token").is_none());
+        sender.take_token()
+    }
 
+    async fn response_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn login_session(app: &Router, sender: &CaptureEmailSender) -> (String, String) {
+        let login_token = request_login(app.clone(), sender).await;
         let response = app
             .clone()
             .oneshot(
@@ -438,8 +590,18 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        let account_id = body["account_id"].as_str().unwrap();
-        let session_token = body["session_token"].as_str().unwrap();
+        (
+            body["account_id"].as_str().unwrap().to_string(),
+            body["session_token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn login_upload_and_lookup_public_record() {
+        let (app, sender) = app_with_mail("flow");
+
+        let (account_id, session_token) = login_session(&app, &sender).await;
+        let public_record = signed_public_record_bytes(1);
 
         let response = app
             .clone()
@@ -448,7 +610,7 @@ mod tests {
                     .method(Method::PUT)
                     .uri(format!("/accounts/{account_id}/record"))
                     .header("authorization", format!("Bearer {session_token}"))
-                    .body(Body::from("signed-public-record"))
+                    .body(Body::from(public_record.clone()))
                     .unwrap(),
             )
             .await
@@ -469,7 +631,7 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&bytes[..], b"signed-public-record");
+        assert_eq!(&bytes[..], &public_record[..]);
     }
 
     #[tokio::test]
@@ -491,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn email_login_is_rate_limited() {
-        let app = redb_router(tmpdir("rate")).unwrap();
+        let (app, _sender) = app_with_mail("rate");
 
         for _ in 0..EMAIL_LOGIN_LIMIT {
             let response = app
@@ -506,7 +668,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
         }
 
         let response = app
@@ -525,38 +687,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_upload_is_size_limited() {
-        let app = redb_router(tmpdir("size")).unwrap();
+        let (app, sender) = app_with_mail("size");
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/login/email/request")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"email":"ari@example.com"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = response_json(response).await;
-        let login_token = body["dev_token"].as_str().unwrap();
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/login/confirm")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(r#"{{"token":"{login_token}"}}"#)))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = response_json(response).await;
-        let account_id = body["account_id"].as_str().unwrap();
-        let session_token = body["session_token"].as_str().unwrap();
+        let (account_id, session_token) = login_session(&app, &sender).await;
 
         let response = app
             .oneshot(
@@ -570,6 +703,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn public_record_must_be_a_verified_signed_record() {
+        let (app, sender) = app_with_mail("record-verify");
+        let (account_id, session_token) = login_session(&app, &sender).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/accounts/{account_id}/record"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from("not-a-signed-record"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn public_record_update_rejects_other_user_and_rollback() {
+        let (app, sender) = app_with_mail("record-update");
+        let (account_id, session_token) = login_session(&app, &sender).await;
+        let mut platform = TestPlatform(10);
+        let identity = Identity::generate(&mut platform).unwrap();
+        let current = signed_public_record_bytes_for(&identity, 3);
+        let stale = signed_public_record_bytes_for(&identity, 2);
+        let other = signed_public_record_bytes(4);
+
+        let upload = |bytes: Vec<u8>| {
+            let app = app.clone();
+            let account_id = account_id.clone();
+            let session_token = session_token.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri(format!("/accounts/{account_id}/record"))
+                        .header("authorization", format!("Bearer {session_token}"))
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(upload(current).await, StatusCode::OK);
+        assert_eq!(upload(stale).await, StatusCode::CONFLICT);
+        assert_eq!(upload(other).await, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn backup_upload_uses_the_configured_16mib_body_limit() {
+        let (app, sender) = app_with_mail("backup-limit");
+        let (account_id, session_token) = login_session(&app, &sender).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/accounts/{account_id}/backup"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(vec![0u8; 3 * 1024 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::storage::Storage;
+use mycellium_core::userid::UserId;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
 use mycellium_engine::groups::{self, DiscoveryRecord, MailItem, StoredGroup};
@@ -29,8 +30,8 @@ use mycellium_engine::{antirollback, blocklist};
 use mycellium_engine::{draft, expiry};
 
 pub use runtime::{
-    deliver_direct, deliver_or_park, direct_push, exchange_delivery, flush_due_outbox,
-    DirectNetwork, OutboxFlush,
+    accept_delivery, deliver_direct, deliver_or_park, delivery_id_for_item, direct_push,
+    exchange_delivery, flush_due_outbox, DirectNetwork, OutboxFlush,
 };
 
 /// Public identity material useful for display.
@@ -257,16 +258,49 @@ where
 
 pub fn resolve_local_record<S: Storage>(
     store: &mut S,
-    resolved: &str,
+    input: &str,
 ) -> std::result::Result<(Handle, SignedRecord), TrustError> {
+    if let Ok(Some(contact)) = contacts::load(store, input) {
+        if !contact.user_id.is_empty() {
+            return resolve_user_record(store, &contact.user_id);
+        }
+        let net = LocalNet::load(store);
+        return flow::resolve_record(store, &net, &contact.handle);
+    }
     let net = LocalNet::load(store);
-    flow::resolve_record(store, &net, resolved)
+    flow::resolve_record(store, &net, input)
+}
+
+fn resolve_user_record<S: Storage>(
+    store: &mut S,
+    user_id: &str,
+) -> std::result::Result<(Handle, SignedRecord), TrustError> {
+    let user_id = UserId::new(user_id.to_string()).map_err(|_| TrustError::BadHandle)?;
+    let record = peerbook::get_by_user_id(store, &user_id)
+        .map_err(|_| TrustError::BadHandle)?
+        .ok_or(TrustError::BadHandle)?;
+    record.verify().map_err(|_| TrustError::Unverified)?;
+    if record.record.user_id != user_id {
+        return Err(TrustError::Unverified);
+    }
+    if verified::level(store, record.record.user_id.as_str(), &record.record.wallet)
+        == verified::TrustLevel::Changed
+    {
+        return Err(TrustError::IdentityChanged);
+    }
+    if !antirollback::check_and_pin(store, record.record.user_id.as_str(), &record)
+        .map_err(|_| TrustError::StaleRecord)?
+    {
+        return Err(TrustError::StaleRecord);
+    }
+    Ok((record.record.handle.clone(), record))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContactEntry {
     pub nickname: String,
     pub handle: String,
+    pub user_id: String,
     pub verified: bool,
 }
 
@@ -279,6 +313,7 @@ where
     let contact = Contact {
         nickname: nickname.to_string(),
         handle: handle.as_str().to_string(),
+        user_id: record.record.user_id.as_str().to_string(),
         wallet: record.record.wallet,
     };
     contacts::save(store, &contact)?;
@@ -293,7 +328,7 @@ where
     Ok(contacts
         .into_iter()
         .map(|contact| {
-            let verified = verified::get(store, &contact.handle)
+            let verified = verified::get(store, &contact.user_id)
                 .ok()
                 .flatten()
                 .as_ref()
@@ -301,6 +336,7 @@ where
             ContactEntry {
                 nickname: contact.nickname,
                 handle: contact.handle,
+                user_id: contact.user_id,
                 verified,
             }
         })
@@ -463,6 +499,7 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationInfo {
+    pub user_id: String,
     pub handle: String,
     pub wallet: WalletPublicKey,
     pub safety_number: String,
@@ -481,12 +518,25 @@ where
     record
         .verify()
         .map_err(|_| anyhow!("peer record failed verification"))?;
+    verification_info_for_record(store, identity, handle, &record)
+}
+
+pub fn verification_info_for_record<S: Storage>(
+    store: &S,
+    identity: &Identity,
+    handle: &Handle,
+    record: &SignedRecord,
+) -> Result<VerificationInfo>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let wallet = record.record.wallet;
     Ok(VerificationInfo {
+        user_id: record.record.user_id.as_str().to_string(),
         handle: handle.as_str().to_string(),
         wallet,
         safety_number: safety::safety_number(&identity.wallet_public(), &wallet),
-        level: verified::level(store, handle.as_str(), &wallet),
+        level: verified::level(store, record.record.user_id.as_str(), &wallet),
     })
 }
 
@@ -500,7 +550,7 @@ where
             info.handle
         );
     }
-    verified::mark(store, &info.handle, &info.wallet)?;
+    verified::mark(store, &info.user_id, &info.wallet)?;
     Ok(())
 }
 
@@ -511,9 +561,9 @@ where
     if info.level != verified::TrustLevel::Changed {
         bail!("'{}' has no changed identity to accept", info.handle);
     }
-    verified::mark(store, &info.handle, &info.wallet)?;
+    verified::mark(store, &info.user_id, &info.wallet)?;
     for mut contact in contacts::list(store)? {
-        if contact.handle == info.handle {
+        if contact.user_id == info.user_id {
             contact.wallet = info.wallet;
             contacts::save(store, &contact)?;
         }
@@ -1016,6 +1066,7 @@ mod tests {
         let report = import_discovery_records(
             &mut imported,
             [DiscoveryRecord {
+                user_id: decoded.record.user_id.as_str().to_string(),
                 handle: "alice".to_string(),
                 record: decoded,
             }],
@@ -1033,6 +1084,68 @@ mod tests {
 
         remove_contact(&mut store, "a").unwrap();
         assert!(list_contacts(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_handle_contacts_resolve_by_user_id() {
+        let handle = Handle::new("alex").unwrap();
+        let mut platform = SeededPlatform(17);
+        let first = Identity::generate(&mut platform).unwrap();
+        let second = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        let first_record =
+            peerbook::build_record(&mut platform, &first, &handle, "Alex One", "127.0.0.1:1");
+        let second_record =
+            peerbook::build_record(&mut platform, &second, &handle, "Alex Two", "127.0.0.1:2");
+        import_record(&mut store, &handle, first_record.clone()).unwrap();
+        import_record(&mut store, &handle, second_record.clone()).unwrap();
+        contacts::save(
+            &mut store,
+            &Contact {
+                nickname: "one".into(),
+                handle: "alex".into(),
+                user_id: first_record.record.user_id.as_str().to_string(),
+                wallet: first_record.record.wallet,
+            },
+        )
+        .unwrap();
+        contacts::save(
+            &mut store,
+            &Contact {
+                nickname: "two".into(),
+                handle: "alex".into(),
+                user_id: second_record.record.user_id.as_str().to_string(),
+                wallet: second_record.record.wallet,
+            },
+        )
+        .unwrap();
+
+        let (resolved, record) = resolve_local_record(&mut store, "two").unwrap();
+
+        assert_eq!(resolved, handle);
+        assert_eq!(record.record.user_id, second_record.record.user_id);
+
+        verified::mark(
+            &mut store,
+            second_record.record.user_id.as_str(),
+            &second_record.record.wallet,
+        )
+        .unwrap();
+        let contacts = list_contacts(&store).unwrap();
+        assert!(
+            !contacts
+                .iter()
+                .find(|c| c.nickname == "one")
+                .unwrap()
+                .verified
+        );
+        assert!(
+            contacts
+                .iter()
+                .find(|c| c.nickname == "two")
+                .unwrap()
+                .verified
+        );
     }
 
     #[test]
@@ -1142,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn accepting_changed_identity_updates_contact_pin() {
+    fn duplicate_handle_import_does_not_rewrite_contact_identity() {
         let handle = Handle::new("alice").unwrap();
         let me = Identity::generate(&mut SeededPlatform(3)).unwrap();
         let mut old_platform = SeededPlatform(31);
@@ -1169,12 +1282,9 @@ mod tests {
         import_record(&mut store, &handle, new_record).unwrap();
 
         let info = verification_info(&store, &me, &handle).unwrap();
-        assert_eq!(info.level, verified::TrustLevel::Changed);
-
-        accept_identity_change(&mut store, &info).unwrap();
-        let info = verification_info(&store, &me, &handle).unwrap();
-        assert_eq!(info.level, verified::TrustLevel::Verified);
-        assert!(list_contacts(&store).unwrap()[0].verified);
+        assert_eq!(info.level, verified::TrustLevel::Pinned);
+        assert!(!list_contacts(&store).unwrap()[0].verified);
+        assert_eq!(list_records(&store).unwrap().len(), 2);
     }
 
     #[test]
@@ -1299,7 +1409,12 @@ mod tests {
         let bob_record =
             peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
         import_record(&mut store, &bob_handle, bob_record.clone()).unwrap();
-        verified::mark(&mut store, bob_handle.as_str(), &bob_record.record.wallet).unwrap();
+        verified::mark(
+            &mut store,
+            bob_record.record.user_id.as_str(),
+            &bob_record.record.wallet,
+        )
+        .unwrap();
 
         let group = mycellium_core::group::Group::new(&mut platform, b"alice-device".to_vec());
         let mut stored = StoredGroup {

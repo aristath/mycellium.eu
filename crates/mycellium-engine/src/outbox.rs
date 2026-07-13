@@ -32,7 +32,7 @@ pub enum OutboxStatus {
 /// One sender-owned delivery item.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxEntry {
-    /// Random id, used to remove the entry once delivered.
+    /// Stable delivery id for this exact sealed item.
     pub id: String,
     /// The recipient handle to re-resolve on retry.
     pub recipient: String,

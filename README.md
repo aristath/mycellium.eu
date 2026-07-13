@@ -116,7 +116,7 @@ cargo run -p mycellium-cli -- --config alice.json outbox retry
 cargo run -p mycellium-cli -- --config alice.json outbox cancel <id>
 ```
 
-To add another device to the same account, explicitly move the wallet secret to a
+To switch the account's active device, explicitly move the wallet secret to a
 fresh profile, import the current signed record, then register the new device.
 Profiles with configured DHT bootstrap peers publish the updated record
 automatically:
@@ -173,8 +173,9 @@ Protected endpoints use:
 Authorization: Bearer <session_token>
 ```
 
-`/login/email/request` currently returns `dev_token` directly. That is a
-development placeholder until a real email sender is wired in.
+`/login/email/request` returns `202 Accepted` and sends the one-time token
+through the configured email sender. The token is not returned in the HTTP
+response.
 
 Current upload limits:
 

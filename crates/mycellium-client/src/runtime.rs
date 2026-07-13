@@ -9,20 +9,34 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use mycellium_core::identity::{DevicePublicKey, Handle};
-use mycellium_core::record::Device;
+use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity};
+use mycellium_core::offline::Envelope;
+use mycellium_core::platform::Platform;
+use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
 use mycellium_core::wire;
+use mycellium_engine::flow;
 use mycellium_engine::groups::{MailItem, PeerFrame};
+use mycellium_engine::inbox;
 use mycellium_engine::outbox;
 use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
+use mycellium_engine::verified;
 use mycellium_engine::wireops::device_slot;
+use mycellium_storage::filestore::FileStore;
 use mycellium_transport::libp2p_net;
 use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_transport::net;
 
 use crate::{mark_outbox_delivered, park_outbox};
+
+/// Stable delivery id for the exact sealed item bytes.
+pub fn delivery_id_for_item(item: &MailItem) -> String {
+    hex(&mycellium_core::delivery::payload_digest(&wire::encode(
+        item,
+    )))
+}
 
 /// Process-local direct-network actor.
 ///
@@ -119,6 +133,136 @@ where
     ack.verify(delivery_id, payload, recipient).is_ok()
 }
 
+/// Accept one inbound delivery frame atomically, then ACK only after commit.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_delivery<W, P>(
+    identity: &Identity,
+    me: &Handle,
+    my_record: &SignedRecord,
+    blocked: &[String],
+    platform: &mut P,
+    store: &mut FileStore,
+    writer: &mut W,
+    delivery_id: String,
+    item: MailItem,
+    sink: &mut dyn flow::FlowSink,
+) -> bool
+where
+    W: FrameWriter,
+    P: Platform,
+{
+    if delivery_id.is_empty()
+        || delivery_id.len() > MAX_DELIVERY_ID_LEN
+        || delivery_id != delivery_id_for_item(&item)
+    {
+        return false;
+    }
+    let payload = wire::encode(&item);
+    let digest = payload_digest(&payload);
+    match inbox::seen(store, &delivery_id, &digest) {
+        Ok(inbox::Seen::Duplicate) => {
+            send_delivery_ack(identity, writer, delivery_id, &payload);
+            return true;
+        }
+        Ok(inbox::Seen::Collision) | Err(_) => return false,
+        Ok(inbox::Seen::New) => {}
+    }
+    if sender_identity_changed(store, &item) {
+        return false;
+    }
+
+    let mut tx = store.transaction();
+    if !remember_sender(&mut tx, &item) {
+        return false;
+    }
+    let now = platform.now_unix_secs();
+    let mut deliver = |store: &mut mycellium_storage::filestore::FileTransaction<'_>,
+                       handle: &Handle,
+                       _record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem|
+     -> DeliveryPath {
+        let delivery_id = delivery_id_for_item(&item);
+        match park_outbox(store, delivery_id, handle, device, item, now) {
+            Ok(()) => DeliveryPath::Outbox,
+            Err(_) => DeliveryPath::Failed,
+        }
+    };
+    let mut buffered = BufferedSink::default();
+    if crate::process_item(
+        identity,
+        &mut tx,
+        platform,
+        me,
+        my_record,
+        blocked,
+        item,
+        &mut buffered,
+        &mut deliver,
+    ) != flow::ItemOutcome::Accepted
+    {
+        return false;
+    }
+    if inbox::record(&mut tx, delivery_id.clone(), digest, now).is_err() {
+        return false;
+    }
+    if tx.commit().is_err() {
+        return false;
+    }
+    for event in buffered.0 {
+        sink.emit(event);
+    }
+    send_delivery_ack(identity, writer, delivery_id, &payload);
+    true
+}
+
+fn send_delivery_ack<W: FrameWriter>(
+    identity: &Identity,
+    writer: &mut W,
+    delivery_id: String,
+    payload: &[u8],
+) {
+    let frame = PeerFrame::Ack(DeliveryAck::accepted(identity, delivery_id, payload));
+    let _ = writer.send_frame(&wire::encode(&frame));
+}
+
+fn sender_identity_changed<S: Storage>(store: &S, item: &MailItem) -> bool {
+    let Some(env) = envelope_sender(item) else {
+        return false;
+    };
+    verified::level(
+        store,
+        env.sender_record.record.user_id.as_str(),
+        &env.sender_record.record.wallet,
+    ) == verified::TrustLevel::Changed
+}
+
+fn remember_sender<S: Storage>(store: &mut S, item: &MailItem) -> bool
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    match envelope_sender(item) {
+        Some(env) => peerbook::put(store, &env.from, env.sender_record.clone()).is_ok(),
+        None => true,
+    }
+}
+
+fn envelope_sender(item: &MailItem) -> Option<&Envelope> {
+    match item {
+        MailItem::Direct(env) | MailItem::GroupInvite(env) | MailItem::GroupLeave(env) => Some(env),
+        MailItem::GroupText { .. } => None,
+    }
+}
+
+#[derive(Default)]
+struct BufferedSink(Vec<flow::FlowEvent>);
+
+impl flow::FlowSink for BufferedSink {
+    fn emit(&mut self, event: flow::FlowEvent) {
+        self.0.push(event);
+    }
+}
+
 /// Try live direct delivery and record reachability evidence locally.
 pub fn deliver_direct<S: Storage>(
     store: &mut S,
@@ -148,13 +292,13 @@ pub fn deliver_or_park<S: Storage>(
     network: &DirectNetwork,
     recipient: &Handle,
     device: &Device,
-    delivery_id: String,
     item: MailItem,
     now: u64,
 ) -> DeliveryPath
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
+    let delivery_id = delivery_id_for_item(&item);
     if park_outbox(
         store,
         delivery_id.clone(),
@@ -241,4 +385,14 @@ fn direct_transport(peer_id: &[u8]) -> DirectTransport {
         Ok(_) => DirectTransport::Tcp,
         Err(_) => DirectTransport::None,
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use mycellium_core::identity::{Handle, Identity};
 use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::storage::Storage;
-use mycellium_core::userid::user_id;
+use mycellium_core::userid::{user_id, UserId};
 use mycellium_core::wire;
 
 use crate::antirollback;
@@ -19,6 +19,7 @@ const KEY: &[u8] = b"peerbook";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRecord {
+    pub user_id: String,
     pub handle: String,
     pub record: SignedRecord,
 }
@@ -42,7 +43,17 @@ fn save<S: Storage>(store: &mut S, records: Vec<PeerRecord>) -> Result<(), S::Er
 pub fn get<S: Storage>(store: &S, handle: &Handle) -> Result<Option<SignedRecord>, S::Error> {
     Ok(load(store)?
         .into_iter()
-        .find(|entry| entry.handle == handle.as_str())
+        .find(|entry| entry.handle == handle.as_str() && entry.record.record.handle == *handle)
+        .map(|entry| entry.record))
+}
+
+pub fn get_by_user_id<S: Storage>(
+    store: &S,
+    user_id: &UserId,
+) -> Result<Option<SignedRecord>, S::Error> {
+    Ok(load(store)?
+        .into_iter()
+        .find(|entry| entry.user_id == user_id.as_str())
         .map(|entry| entry.record))
 }
 
@@ -60,17 +71,21 @@ where
             handle.as_str()
         );
     }
-    if !antirollback::check_and_pin(store, handle.as_str(), &record)? {
+    if !antirollback::check_and_pin(store, record.record.user_id.as_str(), &record)? {
         anyhow::bail!("stale record for '{}'", handle.as_str());
     }
 
     let mut records = load(store)?;
     match records
         .iter_mut()
-        .find(|entry| entry.handle == handle.as_str())
+        .find(|entry| entry.user_id == record.record.user_id.as_str())
     {
-        Some(entry) => entry.record = record,
+        Some(entry) => {
+            entry.handle = handle.as_str().to_string();
+            entry.record = record;
+        }
         None => records.push(PeerRecord {
+            user_id: record.record.user_id.as_str().to_string(),
             handle: handle.as_str().to_string(),
             record,
         }),
@@ -82,7 +97,8 @@ where
 pub fn remove<S: Storage>(store: &mut S, handle: &Handle) -> Result<bool, S::Error> {
     let mut records = load(store)?;
     let before = records.len();
-    records.retain(|entry| entry.handle != handle.as_str());
+    records
+        .retain(|entry| entry.handle != handle.as_str() || entry.record.record.handle != *handle);
     let removed = before != records.len();
     save(store, records)?;
     Ok(removed)
@@ -94,6 +110,7 @@ pub fn pack<S: Storage>(store: &S, want: &[String]) -> Result<Vec<DiscoveryRecor
         return Ok(records
             .into_iter()
             .map(|entry| DiscoveryRecord {
+                user_id: entry.user_id,
                 handle: entry.handle,
                 record: entry.record,
             })
@@ -103,6 +120,7 @@ pub fn pack<S: Storage>(store: &S, want: &[String]) -> Result<Vec<DiscoveryRecor
         .into_iter()
         .filter(|entry| want.iter().any(|handle| handle == &entry.handle))
         .map(|entry| DiscoveryRecord {
+            user_id: entry.user_id,
             handle: entry.handle,
             record: entry.record,
         })
@@ -124,6 +142,12 @@ where
 {
     let mut report = ImportReport::default();
     for entry in records {
+        if entry.user_id != entry.record.record.user_id.as_str() {
+            report
+                .skipped
+                .push((entry.handle, "record user id mismatch".to_string()));
+            continue;
+        }
         let handle = match Handle::new(entry.handle.clone()) {
             Ok(handle) => handle,
             Err(_) => {
@@ -151,7 +175,8 @@ pub fn build_record(
     addr: &str,
 ) -> SignedRecord {
     let record = Record {
-        handle: user_id(handle.as_str()),
+        user_id: user_id(&identity.wallet_public()),
+        handle: handle.clone(),
         name: name.to_string(),
         wallet: identity.wallet_public(),
         device: crate::wireops::this_device(identity, addr, platform.now_unix_secs()),
@@ -169,7 +194,8 @@ pub fn with_device(
     prev_seq: u64,
 ) -> SignedRecord {
     let record = Record {
-        handle: user_id(handle.as_str()),
+        user_id: user_id(&identity.wallet_public()),
+        handle: handle.clone(),
         name: name.to_string(),
         wallet: identity.wallet_public(),
         device,
@@ -192,7 +218,7 @@ pub fn decode(s: &str) -> anyhow::Result<SignedRecord> {
 }
 
 fn verify_handle(handle: &Handle, record: &SignedRecord) -> anyhow::Result<()> {
-    if record.record.handle != user_id(handle.as_str()) {
+    if record.record.user_id != user_id(&record.record.wallet) || record.record.handle != *handle {
         anyhow::bail!("record does not belong to '{}'", handle.as_str());
     }
     Ok(())
@@ -307,10 +333,12 @@ mod tests {
             &mut store,
             [
                 DiscoveryRecord {
+                    user_id: record.record.user_id.as_str().to_string(),
                     handle: "alice".to_string(),
                     record: record.clone(),
                 },
                 DiscoveryRecord {
+                    user_id: record.record.user_id.as_str().to_string(),
                     handle: "not a handle".to_string(),
                     record,
                 },
@@ -320,5 +348,41 @@ mod tests {
         assert_eq!(report.imported, 1);
         assert_eq!(report.skipped.len(), 1);
         assert!(get(&store, &alice).unwrap().is_some());
+    }
+
+    #[test]
+    fn duplicate_handles_do_not_overwrite_distinct_users() {
+        struct Seeded(u8);
+        impl Platform for Seeded {
+            fn fill_random(&mut self, buf: &mut [u8]) {
+                for byte in buf {
+                    *byte = self.0;
+                    self.0 = self.0.wrapping_add(1);
+                }
+            }
+
+            fn now_unix_secs(&self) -> u64 {
+                20
+            }
+        }
+
+        let mut platform = Seeded(1);
+        let alice = Handle::new("alice").unwrap();
+        let first = Identity::generate(&mut platform).unwrap();
+        let second = Identity::generate(&mut platform).unwrap();
+        let first_record = build_record(&mut platform, &first, &alice, "Alice One", "127.0.0.1:1");
+        let second_record =
+            build_record(&mut platform, &second, &alice, "Alice Two", "127.0.0.1:2");
+        let first_id = first_record.record.user_id.clone();
+        let second_id = second_record.record.user_id.clone();
+        let mut store = MemStore::default();
+
+        put(&mut store, &alice, first_record).unwrap();
+        put(&mut store, &alice, second_record).unwrap();
+
+        let records = load(&store).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(get_by_user_id(&store, &first_id).unwrap().is_some());
+        assert!(get_by_user_id(&store, &second_id).unwrap().is_some());
     }
 }

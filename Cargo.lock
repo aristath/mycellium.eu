@@ -2984,6 +2984,7 @@ dependencies = [
  "anyhow",
  "mycellium-core",
  "mycellium-engine",
+ "mycellium-storage",
  "mycellium-transport",
 ]
 
@@ -3027,6 +3028,7 @@ dependencies = [
  "mycellium-core",
  "mycellium-engine",
  "mycellium-storage",
+ "mycellium-transport",
  "zeroize",
 ]
 
@@ -3036,6 +3038,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "getrandom 0.2.17",
+ "mycellium-core",
  "redb",
  "serde",
  "serde_json",

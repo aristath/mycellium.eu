@@ -12,9 +12,6 @@ use mycellium_core::wire;
 
 const KEY: &[u8] = b"accepted-deliveries";
 
-/// Keep duplicate-suppression state for a bounded local window.
-pub const RETENTION_SECS: u64 = 8 * 86_400;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedDelivery {
     pub id: String,
@@ -59,7 +56,6 @@ pub fn record<S: Storage>(
     now: u64,
 ) -> Result<(), S::Error> {
     let mut accepted = load(store)?;
-    accepted.retain(|entry| now.saturating_sub(entry.accepted_at) < RETENTION_SECS);
     if let Some(existing) = accepted.iter().find(|entry| entry.id == id) {
         if existing.payload_digest == payload_digest {
             return Ok(());
@@ -110,11 +106,11 @@ mod tests {
     }
 
     #[test]
-    fn expired_receipts_are_pruned_on_next_acceptance() {
+    fn accepted_deliveries_are_retained_without_time_expiry() {
         let mut store = Mem::default();
         record(&mut store, "old".into(), [1; 32], 1).unwrap();
-        record(&mut store, "new".into(), [2; 32], RETENTION_SECS + 2).unwrap();
-        assert_eq!(seen(&store, "old", &[1; 32]).unwrap(), Seen::New);
+        record(&mut store, "new".into(), [2; 32], 100 * 86_400).unwrap();
+        assert_eq!(seen(&store, "old", &[1; 32]).unwrap(), Seen::Duplicate);
         assert_eq!(seen(&store, "new", &[2; 32]).unwrap(), Seen::Duplicate);
     }
 }

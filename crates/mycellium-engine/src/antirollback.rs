@@ -12,11 +12,9 @@ use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
 use mycellium_core::wire;
 
-fn key(handle: &str, wallet: &WalletPublicKey) -> Vec<u8> {
-    let mut key = b"record-versions-v1:".to_vec();
-    key.extend_from_slice(handle.as_bytes());
-    key.push(b':');
-    key.extend_from_slice(&wallet.0);
+fn key(user_id: &str, _wallet: &WalletPublicKey) -> Vec<u8> {
+    let mut key = b"record-versions-v2:".to_vec();
+    key.extend_from_slice(user_id.as_bytes());
     key
 }
 
@@ -139,6 +137,7 @@ mod tests {
     use mycellium_core::identity::{Handle, Identity, PeerId};
     use mycellium_core::platform::Platform;
     use mycellium_core::record::{Device, Record, SignedRecord};
+    use mycellium_core::userid::user_id;
     use std::collections::HashMap;
     use std::convert::Infallible;
 
@@ -179,6 +178,7 @@ mod tests {
     ) -> SignedRecord {
         SignedRecord::sign(
             Record {
+                user_id: user_id(&identity.wallet_public()),
                 handle: Handle::new("bob").unwrap(),
                 name: "Bob".into(),
                 wallet: identity.wallet_public(),

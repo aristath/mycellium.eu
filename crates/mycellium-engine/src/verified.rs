@@ -1,4 +1,4 @@
-//! Out-of-band **verification** records: `handle → the wallet you confirmed`
+//! Out-of-band **verification** records: `user id → the wallet you confirmed`
 //! matches its safety number.
 //!
 //! This is deliberately separate from the address book ([`crate::contacts`]):
@@ -6,7 +6,7 @@
 //! number, and comparing it out of band is a stronger, explicit act. Keeping the
 //! "I verified this" record apart from "I have a contact for this" lets the UI
 //! show three honest states — unverified, pinned, verified — and flag a wallet
-//! that has *changed* since either (issue #57).
+//! that no longer matches the stable user id's pinned wallet.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,34 +40,34 @@ impl TrustLevel {
     }
 }
 
-fn key(handle: &str) -> Vec<u8> {
+fn key(user_id: &str) -> Vec<u8> {
     let mut k = b"verified:".to_vec();
-    k.extend_from_slice(handle.as_bytes());
+    k.extend_from_slice(user_id.as_bytes());
     k
 }
 
-/// Record that `handle` was verified out of band as owning `wallet`.
+/// Record that `user_id` was verified out of band as owning `wallet`.
 pub fn mark<S: Storage>(
     store: &mut S,
-    handle: &str,
+    user_id: &str,
     wallet: &WalletPublicKey,
 ) -> Result<(), S::Error> {
-    store.put(&key(handle), &wire::encode(wallet))
+    store.put(&key(user_id), &wire::encode(wallet))
 }
 
-/// The wallet last verified for `handle`, if any.
-pub fn get<S: Storage>(store: &S, handle: &str) -> Result<Option<WalletPublicKey>, S::Error> {
+/// The wallet last verified for `user_id`, if any.
+pub fn get<S: Storage>(store: &S, user_id: &str) -> Result<Option<WalletPublicKey>, S::Error> {
     Ok(crate::load_opt(
-        store.get(&key(handle))?,
+        store.get(&key(user_id))?,
         "verification record",
     ))
 }
 
-/// Classify how much `current` (the wallet just looked up for `handle`) is
+/// Classify how much `current` (the wallet just looked up for `user_id`) is
 /// trusted, given the out-of-band verification record and the address-book pin.
-pub fn level<S: Storage>(store: &S, handle: &str, current: &WalletPublicKey) -> TrustLevel {
+pub fn level<S: Storage>(store: &S, user_id: &str, current: &WalletPublicKey) -> TrustLevel {
     // An explicit out-of-band verification is the strongest signal.
-    if let Ok(Some(v)) = get(store, handle) {
+    if let Ok(Some(v)) = get(store, user_id) {
         return if &v == current {
             TrustLevel::Verified
         } else {
@@ -75,7 +75,7 @@ pub fn level<S: Storage>(store: &S, handle: &str, current: &WalletPublicKey) -> 
         };
     }
     // Else fall back to the TOFU pin held in the address book, if any.
-    if let Ok(Some(c)) = crate::contacts::by_handle(store, handle) {
+    if let Ok(Some(c)) = crate::contacts::by_user_id(store, user_id) {
         return if &c.wallet == current {
             TrustLevel::Pinned
         } else {
@@ -115,8 +115,10 @@ mod tests {
     #[test]
     fn trust_levels_reflect_pin_and_verification() {
         let mut s = Mem::default();
+        let user_id = "a".repeat(64);
+
         // Nobody known → unverified first contact.
-        assert_eq!(level(&s, "bob", &w(1)), TrustLevel::Unverified);
+        assert_eq!(level(&s, &user_id, &w(1)), TrustLevel::Unverified);
 
         // Pin bob via a contact (TOFU) → pinned, and a different wallet → changed.
         crate::contacts::save(
@@ -124,16 +126,17 @@ mod tests {
             &crate::contacts::Contact {
                 nickname: "bob".into(),
                 handle: "bob".into(),
+                user_id: user_id.clone(),
                 wallet: w(1),
             },
         )
         .unwrap();
-        assert_eq!(level(&s, "bob", &w(1)), TrustLevel::Pinned);
-        assert_eq!(level(&s, "bob", &w(2)), TrustLevel::Changed);
+        assert_eq!(level(&s, &user_id, &w(1)), TrustLevel::Pinned);
+        assert_eq!(level(&s, &user_id, &w(2)), TrustLevel::Changed);
 
         // Verify bob out of band → verified; a later different wallet → changed.
-        mark(&mut s, "bob", &w(1)).unwrap();
-        assert_eq!(level(&s, "bob", &w(1)), TrustLevel::Verified);
-        assert_eq!(level(&s, "bob", &w(2)), TrustLevel::Changed);
+        mark(&mut s, &user_id, &w(1)).unwrap();
+        assert_eq!(level(&s, &user_id, &w(1)), TrustLevel::Verified);
+        assert_eq!(level(&s, &user_id, &w(2)), TrustLevel::Changed);
     }
 }

@@ -11,15 +11,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 
 use mycellium_client::{self as client, DirectNetwork};
-use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
+#[cfg(test)]
+use mycellium_core::delivery::{payload_digest, DeliveryAck};
 use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
-use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
-use mycellium_core::storage::Storage;
 use mycellium_core::transport::Transport;
-use mycellium_core::userid::user_id;
 use mycellium_core::wire;
 
 use mycellium_storage::filestore::FileStore;
@@ -29,15 +27,18 @@ use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_transport::net::{self, TcpTransport};
 
 use crate::platform::OsPlatform;
+#[cfg(test)]
 use mycellium_engine::contacts;
 use mycellium_engine::groups::{DiscoveryRecord, MailItem, PeerFrame, StoredGroup};
 #[cfg(test)]
 use mycellium_engine::history;
+#[cfg(test)]
+use mycellium_engine::inbox;
 use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
 use mycellium_engine::wireops;
-use mycellium_engine::{expiry, flow, inbox, outbox, verified};
+use mycellium_engine::{expiry, flow, outbox, verified};
 
 mod backup;
 mod util;
@@ -488,7 +489,7 @@ fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>, networ
 
 fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &DirectNetwork) {
     enum Target {
-        Device(Handle, Device),
+        Device(Handle, Box<Device>),
         Retry,
         Drop,
     }
@@ -515,7 +516,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
                     Ok(Some(record)) => {
                         let device = record.record.device;
                         if device_slot(&device.device_key) == entry.slot {
-                            Target::Device(handle, device)
+                            Target::Device(handle, Box::new(device))
                         } else {
                             Target::Drop
                         }
@@ -771,28 +772,7 @@ fn deliver_or_park(
     item: MailItem,
     now: u64,
 ) -> DeliveryPath {
-    let delivery_id = random_id();
-    client::deliver_or_park(store, network, recipient, device, delivery_id, item, now)
-}
-
-/// Persist a follow-up generated while accepting inbound mail. The acceptance
-/// ACK must not wait on more network I/O; the background retry worker delivers
-/// this item after the receive transaction releases local state.
-fn park_delivery<S: Storage>(
-    store: &mut S,
-    recipient: &Handle,
-    device: &Device,
-    item: MailItem,
-    now: u64,
-) -> DeliveryPath
-where
-    S::Error: std::error::Error + Send + Sync + 'static,
-{
-    let delivery_id = random_id();
-    match client::park_outbox(store, delivery_id, recipient, device, item, now) {
-        Ok(()) => DeliveryPath::Outbox,
-        Err(_) => DeliveryPath::Failed,
-    }
+    client::deliver_or_park(store, network, recipient, device, item, now)
 }
 
 fn request_discovery_from_device(
@@ -846,67 +826,19 @@ fn handle_delivery_frame<W: FrameWriter>(
     delivery_id: String,
     item: MailItem,
 ) {
-    if delivery_id.is_empty() || delivery_id.len() > MAX_DELIVERY_ID_LEN {
-        return;
-    }
-    let payload = wire::encode(&item);
-    let digest = payload_digest(&payload);
-    match inbox::seen(fs, &delivery_id, &digest) {
-        Ok(inbox::Seen::Duplicate) => {
-            send_delivery_ack(identity, writer, delivery_id, &payload);
-            return;
-        }
-        Ok(inbox::Seen::Collision) | Err(_) => return,
-        Ok(inbox::Seen::New) => {}
-    }
-    if sender_identity_changed(fs, &item) {
-        return;
-    }
-
-    let mut tx = fs.transaction();
-    remember_sender(&mut tx, &item);
-    let mut sink = BufferedSink::default();
-    if process_item_with_sink(
-        identity, me, my_record, blocked, platform, &mut tx, item, &mut sink,
-    ) != flow::ItemOutcome::Accepted
-    {
-        return;
-    }
-    if inbox::record(
-        &mut tx,
-        delivery_id.clone(),
-        digest,
-        platform.now_unix_secs(),
-    )
-    .is_err()
-    {
-        return;
-    }
-    if tx.commit().is_ok() {
-        let mut cli = CliSink;
-        for event in sink.0 {
-            flow::FlowSink::emit(&mut cli, event);
-        }
-        send_delivery_ack(identity, writer, delivery_id, &payload);
-    }
-}
-
-fn send_delivery_ack<W: FrameWriter>(
-    identity: &Identity,
-    writer: &mut W,
-    delivery_id: String,
-    payload: &[u8],
-) {
-    let frame = PeerFrame::Ack(DeliveryAck::accepted(identity, delivery_id, payload));
-    let _ = writer.send_frame(&wire::encode(&frame));
-}
-
-fn sender_identity_changed<S: Storage>(fs: &S, item: &MailItem) -> bool {
-    let Some(env) = envelope_sender(item) else {
-        return false;
-    };
-    verified::level(fs, env.from.as_str(), &env.sender_record.record.wallet)
-        == verified::TrustLevel::Changed
+    let mut sink = CliSink;
+    let _ = client::accept_delivery(
+        identity,
+        me,
+        my_record,
+        blocked,
+        platform,
+        fs,
+        writer,
+        delivery_id,
+        item,
+        &mut sink,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -955,23 +887,6 @@ fn handle_discovery_frame<W: FrameWriter>(
             true
         }
         _ => false,
-    }
-}
-
-fn remember_sender<S: Storage>(fs: &mut S, item: &MailItem)
-where
-    S::Error: std::error::Error + Send + Sync + 'static,
-{
-    let env = envelope_sender(item);
-    if let Some(env) = env {
-        let _ = peerbook::put(fs, &env.from, env.sender_record.clone());
-    }
-}
-
-fn envelope_sender(item: &MailItem) -> Option<&Envelope> {
-    match item {
-        MailItem::Direct(env) | MailItem::GroupInvite(env) | MailItem::GroupLeave(env) => Some(env),
-        MailItem::GroupText { .. } => None,
     }
 }
 
@@ -1034,49 +949,6 @@ impl flow::FlowSink for CliSink {
             Warn(msg) => eprintln!("({msg})"),
         }
     }
-}
-
-#[derive(Default)]
-struct BufferedSink(Vec<flow::FlowEvent>);
-
-impl flow::FlowSink for BufferedSink {
-    fn emit(&mut self, event: flow::FlowEvent) {
-        self.0.push(event);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_item_with_sink<S: Storage>(
-    identity: &Identity,
-    me: &Handle,
-    my_record: &SignedRecord,
-    blocked: &[String],
-    platform: &mut OsPlatform,
-    fs: &mut S,
-    item: MailItem,
-    sink: &mut dyn flow::FlowSink,
-) -> flow::ItemOutcome
-where
-    S::Error: std::error::Error + Send + Sync + 'static,
-{
-    let now = platform.now_unix_secs();
-    let mut deliver = |store: &mut S,
-                       handle: &Handle,
-                       _record: &SignedRecord,
-                       device: &Device,
-                       item: MailItem|
-     -> DeliveryPath { park_delivery(store, handle, device, item, now) };
-    client::process_item(
-        identity,
-        fs,
-        platform,
-        me,
-        my_record,
-        blocked,
-        item,
-        sink,
-        &mut deliver,
-    )
 }
 
 // ---- groups -----------------------------------------------------------------
@@ -1319,7 +1191,7 @@ fn ensure_peer_records(identity: &Identity, fs: &mut FileStore, handles: &[Strin
         let record = peerbook::get(fs, &handle)?.expect("record checked above");
         if record.record.wallet != identity.wallet_public()
             && matches!(
-                verified::level(fs, handle.as_str(), &record.record.wallet),
+                verified::level(fs, record.record.user_id.as_str(), &record.record.wallet),
                 verified::TrustLevel::Unverified | verified::TrustLevel::Changed
             )
         {
@@ -1335,16 +1207,16 @@ fn ensure_peer_records(identity: &Identity, fs: &mut FileStore, handles: &[Strin
 // ---- trust / contacts -------------------------------------------------------
 
 pub fn resolve_record(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
-    let resolved = client::resolve_name(fs, input)?;
-    match client::resolve_local_record(fs, &resolved) {
+    match client::resolve_local_record(fs, input) {
         Ok(pair) => Ok(pair),
         Err(flow::TrustError::BadHandle) => {
-            let handle =
-                Handle::new(resolved.clone()).map_err(|_| anyhow!("invalid handle '{resolved}'"))?;
+            let resolved = client::resolve_name(fs, input)?;
+            let handle = Handle::new(resolved.clone())
+                .map_err(|_| anyhow!("invalid handle '{resolved}'"))?;
             let identity = store::load_identity()?;
             match import_from_configured_dht(&identity, fs, &handle) {
                 Ok(true) => {
-                    client::resolve_local_record(fs, &resolved).map_err(|err| match err {
+                    client::resolve_local_record(fs, input).map_err(|err| match err {
                         flow::TrustError::BadHandle => {
                             anyhow!("no signed record for '{resolved}'")
                         }
@@ -1365,10 +1237,10 @@ pub fn resolve_record(fs: &mut FileStore, input: &str) -> Result<(Handle, Signed
         }
         Err(flow::TrustError::Unverified) => Err(anyhow!("peer record failed verification")),
         Err(flow::TrustError::IdentityChanged) => bail!(
-            "IDENTITY CHANGED for '{resolved}'. Refusing until you verify the new record out of band."
+            "IDENTITY CHANGED for '{input}'. Refusing until you verify the new record out of band."
         ),
         Err(flow::TrustError::StaleRecord) => {
-            bail!("STALE RECORD for '{resolved}'. Refusing rollback.")
+            bail!("STALE RECORD for '{input}'. Refusing rollback.")
         }
     }
 }
@@ -1377,7 +1249,7 @@ pub fn resolve_record(fs: &mut FileStore, input: &str) -> Result<(Handle, Signed
 /// verification before message or group-secret delivery.
 pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
     let (handle, record) = resolve_record(fs, input)?;
-    match verified::level(fs, handle.as_str(), &record.record.wallet) {
+    match verified::level(fs, record.record.user_id.as_str(), &record.record.wallet) {
         verified::TrustLevel::Pinned | verified::TrustLevel::Verified => Ok((handle, record)),
         verified::TrustLevel::Changed => bail!(
             "IDENTITY CHANGED for '{}'. Refusing until you verify the new record out of band.",
@@ -1412,7 +1284,7 @@ fn decode_dht_record_candidate(handle: &Handle, bytes: &[u8]) -> Result<SignedRe
         bail!("DHT record is too large");
     }
     let record: SignedRecord = wire::decode(bytes).map_err(|_| anyhow!("bad DHT record"))?;
-    if record.record.handle != user_id(handle.as_str()) {
+    if record.record.handle != *handle {
         bail!("DHT record belongs to a different handle");
     }
     record
@@ -1467,7 +1339,7 @@ fn trusted_wallet(fs: &FileStore, handle: &Handle) -> Result<Option<WalletPublic
         return Ok(None);
     };
     Ok(
-        match verified::level(fs, handle.as_str(), &record.record.wallet) {
+        match verified::level(fs, record.record.user_id.as_str(), &record.record.wallet) {
             verified::TrustLevel::Pinned | verified::TrustLevel::Verified => {
                 Some(record.record.wallet)
             }
@@ -1553,13 +1425,8 @@ fn dht_record_key(handle: &Handle) -> Vec<u8> {
 pub fn verify(peer: &str, confirm: bool, accept_change: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let resolved = contacts::resolve(&fs, peer)?;
-    let peer_handle =
-        Handle::new(resolved.clone()).map_err(|_| anyhow!("invalid handle '{resolved}'"))?;
-    if peerbook::get(&fs, &peer_handle)?.is_none() {
-        let _ = import_from_configured_dht(&identity, &mut fs, &peer_handle);
-    }
-    let info = client::verification_info(&fs, &identity, &peer_handle)?;
+    let (peer_handle, record) = resolve_record(&mut fs, peer)?;
+    let info = client::verification_info_for_record(&fs, &identity, &peer_handle, &record)?;
     println!("'{}' - {}", info.handle, info.level.label());
     println!("safety number: {}", info.safety_number);
     if accept_change {
@@ -1942,6 +1809,7 @@ mod tests {
         )
         .unwrap();
         let item = MailItem::Direct(envelope);
+        let delivery_id = client::delivery_id_for_item(&item);
         let payload = wire::encode(&item);
         let digest = payload_digest(&payload);
         let dir = std::env::temp_dir().join(format!(
@@ -1960,14 +1828,14 @@ mod tests {
             &mut OsPlatform,
             &mut store,
             &mut writer,
-            "delivery-atomic".into(),
+            delivery_id.clone(),
             item.clone(),
         );
 
         assert_eq!(writer.0.len(), 1, "ACK is emitted after commit");
         assert_eq!(history::load(&store, "alice").unwrap().len(), 1);
         assert_eq!(
-            inbox::seen(&store, "delivery-atomic", &digest).unwrap(),
+            inbox::seen(&store, &delivery_id, &digest).unwrap(),
             inbox::Seen::Duplicate
         );
         // Model a lost first ACK: the sender retries the exact delivery. The
@@ -1980,7 +1848,7 @@ mod tests {
             &mut OsPlatform,
             &mut store,
             &mut writer,
-            "delivery-atomic".into(),
+            delivery_id.clone(),
             item,
         );
         assert_eq!(writer.0.len(), 2);
@@ -1989,7 +1857,7 @@ mod tests {
         let reopened = FileStore::open(dir.clone(), [7; 32]).unwrap();
         assert_eq!(history::load(&reopened, "alice").unwrap().len(), 1);
         assert_eq!(
-            inbox::seen(&reopened, "delivery-atomic", &digest).unwrap(),
+            inbox::seen(&reopened, &delivery_id, &digest).unwrap(),
             inbox::Seen::Duplicate
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -2036,6 +1904,7 @@ mod tests {
             &Contact {
                 nickname: "alice".into(),
                 handle: "alice".into(),
+                user_id: alice_record.record.user_id.as_str().to_string(),
                 wallet: alice_record.record.wallet,
             },
         )
@@ -2070,7 +1939,7 @@ mod tests {
         let record = signed_record(&handle);
         let decoded = decode_dht_record_candidate(&handle, &wire::encode(&record)).unwrap();
 
-        assert_eq!(decoded.record.handle, user_id("alice"));
+        assert_eq!(decoded.record.handle, handle);
     }
 
     #[test]

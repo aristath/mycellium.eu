@@ -387,10 +387,11 @@ Protected endpoints use a bearer session:
 Authorization: Bearer <session_token>
 ```
 
-`/login/email/request` currently returns a `dev_token` directly. That is a
-development placeholder until a real email sender exists.
+`/login/email/request` returns `202 Accepted` and sends the one-time token
+through the configured email sender. The token is not returned in the HTTP
+response.
 
-Current upload limits are deliberately small:
+Current upload limits are abuse guards:
 
 ```text
 backup: 16 MiB

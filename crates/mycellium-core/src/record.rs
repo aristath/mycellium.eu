@@ -15,6 +15,7 @@ use crate::error::Error;
 use crate::identity::{
     DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId, Signature, WalletPublicKey,
 };
+use crate::userid::{user_id, UserId};
 
 /// Max display-name length (bytes) allowed in a record.
 pub const MAX_NAME_LEN: usize = 128;
@@ -166,7 +167,9 @@ impl Device {
 /// The unsigned body of a peer record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// The account's stable id, typically `user_id(handle)`.
+    /// Stable protocol id derived from `wallet`.
+    pub user_id: UserId,
+    /// Non-unique human-readable handle.
     pub handle: Handle,
     /// Free-form display name. Non-unique.
     pub name: String,
@@ -193,6 +196,7 @@ impl Record {
     pub fn signing_bytes(&self) -> Vec<u8> {
         #[derive(Serialize)]
         struct IdentityClaim<'a> {
+            user_id: &'a UserId,
             handle: &'a Handle,
             name: &'a str,
             wallet: WalletPublicKey,
@@ -200,6 +204,7 @@ impl Record {
             seq: u64,
         }
         let canon = crate::wire::canonical(&IdentityClaim {
+            user_id: &self.user_id,
             handle: &self.handle,
             name: &self.name,
             wallet: self.wallet,
@@ -269,6 +274,9 @@ impl SignedRecord {
         let wallet = &self.record.wallet;
         wallet.verify(&self.record.signing_bytes(), &self.signature)?;
         let r = &self.record;
+        if r.user_id != user_id(wallet) {
+            return Err(Error::Malformed);
+        }
         if r.name.len() > MAX_NAME_LEN {
             return Err(Error::Malformed);
         }
@@ -323,6 +331,7 @@ mod tests {
 
     fn record_for(id: &Identity, seq: u64) -> Record {
         Record {
+            user_id: user_id(&id.wallet_public()),
             handle: Handle::new("ari").unwrap(),
             name: "Ari".to_string(),
             wallet: id.wallet_public(),

@@ -36,9 +36,9 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// A short random message id, from the platform RNG.
+/// A random 128-bit message id, from the platform RNG.
 pub fn random_id<P: Platform>(platform: &mut P) -> String {
-    let mut bytes = [0u8; 6];
+    let mut bytes = [0u8; 16];
     platform.fill_random(&mut bytes);
     hex(&bytes)
 }
@@ -90,9 +90,8 @@ pub fn build_record<P: Platform>(
     addr: &str,
 ) -> SignedRecord {
     let record = Record {
-        // The record binds `user_id(handle)`, so discovery can carry the record
-        // without becoming naming authority.
-        handle: user_id(handle.as_str()),
+        user_id: user_id(&identity.wallet_public()),
+        handle: handle.clone(),
         name: name.to_string(),
         wallet: identity.wallet_public(),
         device: this_device(identity, addr, platform.now_unix_secs()),
@@ -166,10 +165,11 @@ pub fn open_envelope<P: Platform>(
     env.sender_record
         .verify()
         .map_err(|_| anyhow!("sender record failed verification"))?;
-    // The envelope carries the sender's plaintext name for display; it's
-    // self-verifying — its id must equal the id in the wallet-signed record.
-    if user_id(env.from.as_str()) != env.sender_record.record.handle {
-        bail!("sender name does not match its record");
+    if env.sender_record.record.user_id != user_id(&env.sender_record.record.wallet) {
+        bail!("sender record user id does not match its wallet");
+    }
+    if env.from != env.sender_record.record.handle {
+        bail!("sender handle does not match its record");
     }
     if env.sender_record.record.device.id_key != env.init.initiator_ik {
         bail!("handshake is not bound to the sender's identity");

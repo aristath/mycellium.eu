@@ -55,6 +55,7 @@ pub enum PeerFrame {
 /// One signed peer record carried by discovery gossip.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveryRecord {
+    pub user_id: String,
     pub handle: String,
     pub record: SignedRecord,
 }

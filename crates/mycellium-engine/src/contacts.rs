@@ -17,8 +17,11 @@ use mycellium_core::wire;
 pub struct Contact {
     /// Local nickname.
     pub nickname: String,
-    /// The peer's handle.
+    /// The peer's current human-readable handle.
     pub handle: String,
+    /// Stable protocol identity for this contact. Handles are not unique.
+    #[serde(default)]
+    pub user_id: String,
     /// The peer's wallet, pinned when the contact was added.
     pub wallet: WalletPublicKey,
 }
@@ -102,6 +105,18 @@ pub fn by_handle<S: Storage>(store: &S, handle: &str) -> Result<Option<Contact>,
     Ok(None)
 }
 
+/// Find a contact by stable user id.
+pub fn by_user_id<S: Storage>(store: &S, user_id: &str) -> Result<Option<Contact>, S::Error> {
+    for name in list_names(store)? {
+        if let Some(c) = load(store, &name)? {
+            if c.user_id == user_id {
+                return Ok(Some(c));
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +144,7 @@ mod tests {
         Contact {
             nickname: nick.into(),
             handle: handle.into(),
+            user_id: format!("user-{nick}"),
             wallet: WalletPublicKey([wallet_byte; 33]),
         }
     }

@@ -41,6 +41,7 @@ mod tests {
     use crate::platform::Platform;
     use crate::ratchet::Ratchet;
     use crate::record::{Device, Record};
+    use crate::userid::user_id;
     use crate::x3dh;
 
     struct SeededPlatform(u8);
@@ -58,6 +59,7 @@ mod tests {
 
     fn record_for(id: &Identity, handle: &str) -> SignedRecord {
         let record = Record {
+            user_id: user_id(&id.wallet_public()),
             handle: Handle::new(handle).unwrap(),
             name: String::new(),
             wallet: id.wallet_public(),

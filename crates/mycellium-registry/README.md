@@ -46,8 +46,9 @@ Protected endpoints require:
 Authorization: Bearer <session_token>
 ```
 
-`POST /login/email/request` returns `dev_token` for now. That is temporary. The
-real version should send that token through the configured email provider.
+`POST /login/email/request` returns `202 Accepted` and sends the one-time token
+through the configured email sender. The token is not returned in the HTTP
+response.
 
 Current upload limits:
 
