@@ -334,9 +334,6 @@ pub fn send(
     let expires_at = resolve_expiry(&fs, peer_handle.as_str(), expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let my_record = own_record(&fs, &me)?;
-    let net = client::LocalNet::load(&fs);
-
     let mut deliver =
         |store: &mut FileStore,
          handle: &Handle,
@@ -344,23 +341,16 @@ pub fn send(
          device: &Device,
          item: MailItem|
          -> DeliveryPath { deliver_or_park(store, &network, handle, device, item, now) };
-    let mut self_deliver =
-        |store: &mut FileStore, handle: &Handle, device: &Device, item: MailItem| {
-            let _ = deliver_or_park(store, &network, handle, device, item, now);
-        };
 
-    let out = flow::send_app(
+    let out = client::send_direct(
         &identity,
         &mut fs,
         &mut OsPlatform,
-        &net,
         &me,
-        &my_record,
         &peer_handle,
         &peer_record,
         &app,
         &mut deliver,
-        &mut self_deliver,
     )?;
 
     let total = out.delivered + out.outboxed + out.failed;

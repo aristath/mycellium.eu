@@ -7,14 +7,17 @@
 use anyhow::{anyhow, bail, Result};
 
 use mycellium_core::identity::{Handle, Identity, PeerId, WalletPublicKey};
+use mycellium_core::message::AppMessage;
 use mycellium_core::platform::Platform;
-use mycellium_core::record::SignedRecord;
+use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
+use mycellium_engine::groups::MailItem;
 use mycellium_engine::history::{self, StoredMessage};
 use mycellium_engine::peerbook::{self, PeerRecord};
+use mycellium_engine::reachability::DeliveryPath;
 use mycellium_engine::verified;
 use mycellium_engine::wireops;
 use mycellium_engine::{antirollback, blocklist};
@@ -472,6 +475,40 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn send_direct<S, P>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    me: &Handle,
+    peer: &Handle,
+    peer_record: &SignedRecord,
+    app: &AppMessage,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+) -> Result<flow::SendOutcome>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Platform,
+{
+    let my_record = require_own_record(store, me)?;
+    let net = LocalNet::load(store);
+    let mut self_deliver = |_: &mut S, _: &Handle, _: &Device, _: MailItem| {};
+    Ok(flow::send_app(
+        identity,
+        store,
+        platform,
+        &net,
+        me,
+        &my_record,
+        peer,
+        peer_record,
+        app,
+        deliver,
+        &mut self_deliver,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +755,64 @@ mod tests {
         let info = verification_info(&store, &me, &handle).unwrap();
         assert_eq!(info.level, verified::TrustLevel::Verified);
         assert!(list_contacts(&store).unwrap()[0].verified);
+    }
+
+    #[test]
+    fn send_direct_records_local_transcript_and_uses_delivery_hook() {
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_handle = Handle::new("bob").unwrap();
+        let mut platform = SeededPlatform(41);
+        let alice = Identity::generate(&mut platform).unwrap();
+        let bob = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        publish_active_device_record(
+            &mut store,
+            &mut platform,
+            &alice,
+            &alice_handle,
+            "Alice",
+            "127.0.0.1:1",
+        )
+        .unwrap();
+        let bob_record =
+            peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        import_record(&mut store, &bob_handle, bob_record.clone()).unwrap();
+        let app = AppMessage {
+            id: "m1".to_string(),
+            timestamp: 10,
+            expires_at: None,
+            body: mycellium_core::message::Body::Text("hello".to_string()),
+        };
+        let mut delivered = 0;
+        let mut deliver = |_: &mut MemStore,
+                           handle: &Handle,
+                           _: &SignedRecord,
+                           _: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            assert_eq!(handle.as_str(), "bob");
+            assert!(matches!(item, MailItem::Direct(_)));
+            delivered += 1;
+            DeliveryPath::Direct
+        };
+
+        let out = send_direct(
+            &alice,
+            &mut store,
+            &mut platform,
+            &alice_handle,
+            &bob_handle,
+            &bob_record,
+            &app,
+            &mut deliver,
+        )
+        .unwrap();
+
+        assert_eq!(delivered, 1);
+        assert_eq!(out.delivered, 1);
+        let transcript = history::load(&store, "bob").unwrap();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "hello");
+        assert!(transcript[0].from_me);
     }
 }
