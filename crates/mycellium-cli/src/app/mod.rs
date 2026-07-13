@@ -35,7 +35,7 @@ use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
 use mycellium_engine::wireops;
-use mycellium_engine::{blocklist, expiry, flow, history, inbox, outbox, verified};
+use mycellium_engine::{expiry, flow, history, inbox, outbox, verified};
 
 mod backup;
 mod util;
@@ -263,7 +263,7 @@ pub fn dht_lookup(handle: &str, listen: Option<&str>, bootstrap: &[String]) -> R
     let Some(record) = best else {
         bail!("no DHT record found for '{}'", handle.as_str());
     };
-    peerbook::put(&mut fs, &handle, record)?;
+    client::import_record(&mut fs, &handle, record)?;
     if skipped > 0 {
         println!(
             "imported signed DHT record for '{}' (skipped {skipped} invalid candidate(s))",
@@ -405,7 +405,7 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let fs = open_history(&identity)?;
-    let blocked = blocklist::load(&fs)?;
+    let blocked = client::list_blocked(&fs)?;
     let my_record = own_record(&fs, &me)?;
     let identity = Arc::new(identity);
     let me = Arc::new(me);
