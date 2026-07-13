@@ -2038,12 +2038,22 @@ dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.2.17",
+ "mycellium-client",
  "mycellium-core",
  "mycellium-engine",
  "mycellium-storage",
  "mycellium-transport",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mycellium-client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "mycellium-core",
+ "mycellium-engine",
 ]
 
 [[package]]

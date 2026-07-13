@@ -10,9 +10,10 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use mycellium_client as client;
 use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
 use mycellium_core::group::Group;
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity, PeerId, WalletPublicKey};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
@@ -36,9 +37,7 @@ use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
 use mycellium_engine::wireops;
-use mycellium_engine::{
-    antirollback, blocklist, draft, expiry, flow, history, inbox, outbox, verified,
-};
+use mycellium_engine::{blocklist, draft, expiry, flow, history, inbox, outbox, verified};
 
 mod backup;
 mod util;
@@ -75,7 +74,7 @@ pub fn identity_new() -> Result<()> {
     if store::exists() {
         bail!("an identity already exists at {}", store::path().display());
     }
-    let identity = Identity::generate(&mut OsPlatform)?;
+    let identity = client::create_identity(&mut OsPlatform)?;
     store::save_identity(&identity)?;
     println!("New identity created.");
     println!("wallet: {}", hex(&identity.wallet_public().0));
@@ -106,7 +105,7 @@ pub fn identity_adopt(wallet_secret: &str) -> Result<()> {
         bail!("an identity already exists at {}", store::path().display());
     }
     let wallet_secret = hex_32(wallet_secret)?;
-    let identity = Identity::adopt(&mut OsPlatform, wallet_secret)?;
+    let identity = client::adopt_identity(&mut OsPlatform, wallet_secret)?;
     store::save_identity(&identity)?;
     println!("Adopted wallet on a fresh device.");
     println!("wallet: {}", hex(&identity.wallet_public().0));
@@ -124,80 +123,26 @@ pub fn register(handle: &str, addr: &str, libp2p: bool) -> Result<()> {
     };
 
     let mut fs = open_history(&identity)?;
-    let existing = reusable_own_record(&identity, &handle, peerbook::get(&fs, &handle)?)?;
-    let now = OsPlatform.now_unix_secs();
-    let active_device = match existing.as_ref() {
-        Some(record) if record.record.device.device_key == identity.device_public() => {
-            let device = &record.record.device;
-            let reachability_seq = now.max(device.reachability.record.seq.saturating_add(1));
-            device
-                .refresh_reachability(
-                    &identity,
-                    PeerId(location.as_bytes().to_vec()),
-                    reachability_seq,
-                )
-                .map_err(|_| anyhow!("could not sign refreshed reachability"))?
-        }
-        _ => this_device(&identity, &location, now),
-    };
-    let active_device_changed = existing
-        .as_ref()
-        .map(|record| record.record.device.device_key != active_device.device_key)
-        .unwrap_or(true);
     let name = display_name_for(&handle);
-    let signed = match existing {
-        Some(mut record) if !active_device_changed && record.record.name == name => {
-            // The wallet-signed identity and stable device records remain
-            // byte-for-byte unchanged for a pure address refresh.
-            record.record.device = active_device;
-            record
-        }
-        existing => peerbook::with_device(
-            &mut OsPlatform,
-            &identity,
-            &handle,
-            &name,
-            active_device,
-            existing.as_ref().map(|r| r.record.seq).unwrap_or(0),
-        ),
-    };
-    peerbook::put(&mut fs, &handle, signed.clone())?;
+    let signed = client::publish_active_device_record(
+        &mut fs,
+        &mut OsPlatform,
+        &identity,
+        &handle,
+        &name,
+        &location,
+    )?;
     println!("registered '{}' locally at {}", handle.as_str(), location);
     println!("record: {}", peerbook::encode(&signed));
     report_configured_dht_publish(&identity, &handle, &signed);
     Ok(())
 }
 
-fn reusable_own_record(
-    identity: &Identity,
-    handle: &Handle,
-    existing: Option<SignedRecord>,
-) -> Result<Option<SignedRecord>> {
-    let Some(record) = existing else {
-        return Ok(None);
-    };
-    record.verify().map_err(|_| {
-        anyhow!(
-            "local record for '{}' failed verification; run `record remove {}` before registering it here",
-            handle.as_str(),
-            handle.as_str()
-        )
-    })?;
-    if record.record.wallet != identity.wallet_public() {
-        bail!(
-            "local record for '{}' belongs to a different wallet; run `record remove {}` before registering it here",
-            handle.as_str(),
-            handle.as_str()
-        );
-    }
-    Ok(Some(record))
-}
-
 pub fn record_export(handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let record = peerbook::get(&fs, &handle)?.ok_or_else(|| {
+    let record = client::require_record(&fs, &handle).map_err(|_| {
         anyhow!(
             "no local record for '{}' — run `register` or `record import`",
             handle.as_str()
@@ -212,7 +157,7 @@ pub fn record_import(handle: &str, encoded: &str) -> Result<()> {
     let mut fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
     let record = peerbook::decode(encoded)?;
-    peerbook::put(&mut fs, &handle, record)?;
+    client::import_record(&mut fs, &handle, record)?;
     println!("imported signed record for '{}'", handle.as_str());
     Ok(())
 }
@@ -220,7 +165,7 @@ pub fn record_import(handle: &str, encoded: &str) -> Result<()> {
 pub fn records_list() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let records = peerbook::load(&fs)?;
+    let records = client::list_records(&fs)?;
     if records.is_empty() {
         println!("no local peer records");
         return Ok(());
@@ -240,8 +185,7 @@ pub fn list_device(handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let record = peerbook::get(&fs, &handle)?
-        .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))?;
+    let record = client::require_record(&fs, &handle)?;
     let d = &record.record.device;
     println!("active device for '{}':", handle.as_str());
     println!(
@@ -256,11 +200,7 @@ pub fn remove_record(handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let wallet = peerbook::get(&fs, &handle)?.map(|record| record.record.wallet);
-    if peerbook::remove(&mut fs, &handle)? {
-        if let Some(wallet) = wallet {
-            antirollback::clear(&mut fs, handle.as_str(), &wallet)?;
-        }
+    if client::remove_record(&mut fs, &handle)? {
         println!("removed local record for '{}'", handle.as_str());
     } else {
         println!("no local record for '{}'", handle.as_str());
@@ -1705,13 +1645,7 @@ pub fn lookup_verified(fs: &mut FileStore, input: &str) -> Result<(Handle, Signe
 }
 
 fn own_record(fs: &FileStore, me: &Handle) -> Result<SignedRecord> {
-    peerbook::get(fs, me)?.ok_or_else(|| {
-        anyhow!(
-            "no local signed record for '{}' — run `register {} --addr <host:port>` first",
-            me.as_str(),
-            me.as_str()
-        )
-    })
+    client::require_own_record(fs, me)
 }
 
 fn effective_bootstrap(extra: &[String]) -> Result<Vec<libp2p_net::P2pMultiaddr>> {
@@ -2136,7 +2070,7 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-pub use mycellium_engine::wireops::{device_slot, my_group_id, this_device};
+pub use mycellium_engine::wireops::{device_slot, my_group_id};
 
 #[cfg(test)]
 mod tests {
@@ -2506,7 +2440,7 @@ mod tests {
         let record =
             peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
 
-        let reusable = reusable_own_record(&identity, &handle, Some(record)).unwrap();
+        let reusable = client::reusable_own_record(&identity, &handle, Some(record)).unwrap();
 
         assert!(reusable.is_some());
     }
@@ -2526,7 +2460,8 @@ mod tests {
             "127.0.0.1:1",
         );
 
-        let err = reusable_own_record(&identity, &handle, Some(foreign_record)).unwrap_err();
+        let err =
+            client::reusable_own_record(&identity, &handle, Some(foreign_record)).unwrap_err();
 
         assert!(err.to_string().contains("different wallet"));
     }

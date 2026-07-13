@@ -21,6 +21,8 @@ records. It does not store, queue, relay, or route messages.
   groups, and storage/transport traits.
 - `crates/mycellium-engine`: hard-serverless orchestration, local peer records,
   direct delivery, outbox, history, contacts, and verification.
+- `crates/mycellium-client`: reusable headless client API for account/device
+  records and local client state mutations.
 - `crates/mycellium-storage`: encrypted local identity and history storage.
 - `crates/mycellium-transport`: direct TCP and direct libp2p transports.
 - `crates/mycellium-registry`: optional account registry using `redb` metadata
