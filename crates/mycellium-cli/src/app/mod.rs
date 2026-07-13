@@ -1292,7 +1292,7 @@ pub fn group_add(group: &str, member: &str, whoami: &str) -> Result<()> {
     let my_record = own_record(&fs, &me)?;
     let member = Handle::new(member.to_string()).map_err(|_| anyhow!("invalid member handle"))?;
 
-    let mut stored = resolve_group(&fs, group)?;
+    let mut stored = client::resolve_group(&fs, group)?;
     if stored.members.iter().any(|m| m == member.as_str()) {
         bail!("'{}' is already in '{}'", member.as_str(), stored.name);
     }
@@ -1327,7 +1327,7 @@ pub fn group_send(
     let mut fs = open_history(&identity)?;
     let network = DirectNetwork::new(identity.device_secret());
     let _ = flush_outbox_with_network(&identity, &mut fs, &network);
-    let mut stored = resolve_group(&fs, group)?;
+    let mut stored = client::resolve_group(&fs, group)?;
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
 
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
@@ -1397,9 +1397,8 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 pub fn group_history(group: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let stored = resolve_group(&fs, group)?;
     let now = OsPlatform.now_unix_secs();
-    let transcript = history::group_load_active(&mut fs, &stored.id, now)?;
+    let (stored, transcript) = client::group_history(&mut fs, group, now)?;
     if transcript.is_empty() {
         println!("no messages in '{}'", stored.name);
         return Ok(());
@@ -1413,7 +1412,7 @@ pub fn group_history(group: &str) -> Result<()> {
 pub fn group_info(group: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let stored = resolve_group(&fs, group)?;
+    let stored = client::resolve_group(&fs, group)?;
     println!("{} ({})", stored.name, stored.id);
     println!("members: {}", stored.members.join(", "));
     Ok(())
@@ -1424,7 +1423,7 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
     let my_record = own_record(&fs, &me)?;
-    let stored = resolve_group(&fs, group)?;
+    let stored = client::resolve_group(&fs, group)?;
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
     let now = OsPlatform.now_unix_secs();
     let network = DirectNetwork::new(identity.device_secret());
@@ -1453,15 +1452,16 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
 pub fn group_list() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let ids = groups::list(&fs)?;
-    if ids.is_empty() {
+    let groups = client::list_groups(&fs)?;
+    if groups.is_empty() {
         println!("no groups");
         return Ok(());
     }
-    for id in ids {
-        if let Some(g) = groups::load(&fs, &id)? {
-            println!("{} ({}) — {} members", g.name, g.id, g.members.len());
-        }
+    for group in groups {
+        println!(
+            "{} ({}) — {} members",
+            group.name, group.id, group.member_count
+        );
     }
     Ok(())
 }
@@ -1528,25 +1528,6 @@ fn ensure_peer_records(identity: &Identity, fs: &mut FileStore, handles: &[Strin
         }
     }
     Ok(())
-}
-
-pub fn resolve_group(fs: &FileStore, key: &str) -> Result<StoredGroup> {
-    if let Some(g) = groups::load(fs, key)? {
-        return Ok(g);
-    }
-    let mut matches = Vec::new();
-    for id in groups::list(fs)? {
-        if let Some(g) = groups::load(fs, &id)? {
-            if g.name == key {
-                matches.push(g);
-            }
-        }
-    }
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => bail!("no such group '{key}'"),
-        _ => bail!("group name '{key}' is ambiguous; use the group id"),
-    }
 }
 
 // ---- trust / contacts -------------------------------------------------------

@@ -14,8 +14,8 @@ use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
-use mycellium_engine::groups::MailItem;
-use mycellium_engine::history::{self, StoredMessage};
+use mycellium_engine::groups::{self, MailItem, StoredGroup};
+use mycellium_engine::history::{self, GroupStoredMessage, StoredMessage};
 use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::reachability::DeliveryPath;
 use mycellium_engine::verified;
@@ -509,6 +509,67 @@ where
     )?)
 }
 
+pub fn resolve_group<S: Storage>(store: &S, key: &str) -> Result<StoredGroup>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if let Some(group) = groups::load(store, key)? {
+        return Ok(group);
+    }
+
+    let mut matches = Vec::new();
+    for id in groups::list(store)? {
+        if let Some(group) = groups::load(store, &id)? {
+            if group.name == key {
+                matches.push(group);
+            }
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => bail!("no such group '{key}'"),
+        _ => bail!("group name '{key}' is ambiguous; use the group id"),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSummary {
+    pub id: String,
+    pub name: String,
+    pub member_count: usize,
+}
+
+pub fn list_groups<S: Storage>(store: &S) -> Result<Vec<GroupSummary>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut out = Vec::new();
+    for id in groups::list(store)? {
+        if let Some(group) = groups::load(store, &id)? {
+            out.push(GroupSummary {
+                id: group.id,
+                name: group.name,
+                member_count: group.members.len(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn group_history<S: Storage>(
+    store: &mut S,
+    key: &str,
+    now: u64,
+) -> Result<(StoredGroup, Vec<GroupStoredMessage>)>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let group = resolve_group(store, key)?;
+    let messages = history::group_load_active(store, &group.id, now)?;
+    Ok((group, messages))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +875,42 @@ mod tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].text, "hello");
         assert!(transcript[0].from_me);
+    }
+
+    #[test]
+    fn group_read_views_resolve_by_id_or_name() {
+        let mut platform = SeededPlatform(51);
+        let group = mycellium_core::group::Group::new(&mut platform, b"me-device".to_vec());
+        let stored = StoredGroup {
+            id: "g1".to_string(),
+            name: "team".to_string(),
+            members: vec!["alice".to_string(), "bob".to_string()],
+            me: "alice".to_string(),
+            sender_handles: Vec::new(),
+            state: group.export(),
+        };
+        let mut store = MemStore::default();
+        groups::save(&mut store, &stored).unwrap();
+        history::group_append(
+            &mut store,
+            "g1",
+            GroupStoredMessage {
+                id: "m1".to_string(),
+                sender: "alice".to_string(),
+                text: "hello team".to_string(),
+                timestamp: 1,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolve_group(&store, "g1").unwrap().name, "team");
+        assert_eq!(resolve_group(&store, "team").unwrap().id, "g1");
+        assert_eq!(list_groups(&store).unwrap()[0].member_count, 2);
+
+        let (group, messages) = group_history(&mut store, "team", 2).unwrap();
+        assert_eq!(group.id, "g1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "hello team");
     }
 }
