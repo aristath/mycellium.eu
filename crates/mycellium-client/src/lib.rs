@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, bail, Result};
 
+use mycellium_core::group::Group;
 use mycellium_core::identity::{Handle, Identity, PeerId, WalletPublicKey};
 use mycellium_core::message::AppMessage;
 use mycellium_core::platform::Platform;
@@ -568,6 +569,68 @@ where
     let group = resolve_group(store, key)?;
     let messages = history::group_load_active(store, &group.id, now)?;
     Ok((group, messages))
+}
+
+pub fn create_group<S, P>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    me: &Handle,
+    name: &str,
+    members: Vec<String>,
+) -> Result<StoredGroup>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Platform,
+{
+    let group = Group::new(platform, wireops::my_group_id(identity));
+    let mut stored = StoredGroup {
+        id: wireops::random_id(platform),
+        name: name.to_string(),
+        members,
+        me: me.as_str().to_string(),
+        sender_handles: Vec::new(),
+        state: group.export(),
+    };
+    stored.note_sender(wireops::my_group_id(identity), me.as_str());
+    groups::save(store, &stored)?;
+    Ok(stored)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn distribute_group_key<S, P>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    me: &Handle,
+    my_record: &SignedRecord,
+    group: &StoredGroup,
+    targets: &[String],
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
+) -> Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Platform,
+{
+    let session = Group::import(group.state.clone()).map_err(|_| anyhow!("bad group state"))?;
+    let net = LocalNet::load(store);
+    flow::distribute_key(
+        identity,
+        store,
+        platform,
+        &net,
+        me,
+        my_record,
+        &group.id,
+        &group.name,
+        &session.distribution(),
+        &group.members,
+        targets,
+        deliver,
+    );
+    Ok(())
 }
 
 pub fn send_group<S: Storage>(

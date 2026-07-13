@@ -12,7 +12,6 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use mycellium_client as client;
 use mycellium_core::delivery::{payload_digest, DeliveryAck, MAX_DELIVERY_ID_LEN};
-use mycellium_core::group::Group;
 use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
@@ -1264,22 +1263,12 @@ pub fn group_create(name: &str, members: &[String], whoami: &str) -> Result<()> 
     ensure_peer_records(&identity, &mut fs, &all)?;
 
     let mut platform = OsPlatform;
-    let group_id = random_id();
-    let group = Group::new(&mut platform, my_group_id(&identity));
-    let mut stored = StoredGroup {
-        id: group_id.clone(),
-        name: name.to_string(),
-        members: all.clone(),
-        me: me.as_str().to_string(),
-        sender_handles: Vec::new(),
-        state: group.export(),
-    };
-    stored.note_sender(my_group_id(&identity), me.as_str());
-    groups::save(&mut fs, &stored)?;
+    let stored = client::create_group(&identity, &mut fs, &mut platform, &me, name, all.clone())?;
 
-    distribute_group_key_direct(&identity, &me, &my_record, &stored, &group, &all, &mut fs);
+    distribute_group_key_direct(&identity, &me, &my_record, &stored, &all, &mut fs);
     println!(
-        "created group '{name}' ({group_id}) with {} members",
+        "created group '{name}' ({}) with {} members",
+        stored.id,
         all.len()
     );
     Ok(())
@@ -1300,11 +1289,8 @@ pub fn group_add(group: &str, member: &str, whoami: &str) -> Result<()> {
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
     groups::save(&mut fs, &stored)?;
 
-    let session = Group::import(stored.state.clone()).map_err(|_| anyhow!("bad group state"))?;
     let targets = stored.members.clone();
-    distribute_group_key_direct(
-        &identity, &me, &my_record, &stored, &session, &targets, &mut fs,
-    );
+    distribute_group_key_direct(&identity, &me, &my_record, &stored, &targets, &mut fs);
     println!("invited '{}' to '{}'", member.as_str(), stored.name);
     Ok(())
 }
@@ -1460,13 +1446,11 @@ fn distribute_group_key_direct(
     me: &Handle,
     my_record: &SignedRecord,
     stored: &StoredGroup,
-    group: &Group,
     targets: &[String],
     fs: &mut FileStore,
 ) {
     let now = OsPlatform.now_unix_secs();
     let network = DirectNetwork::new(identity.device_secret());
-    let net = client::LocalNet::load(fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
@@ -1474,17 +1458,13 @@ fn distribute_group_key_direct(
                        item: MailItem| {
         let _ = deliver_or_park(store, &network, handle, device, item, now);
     };
-    flow::distribute_key(
+    let _ = client::distribute_group_key(
         identity,
         fs,
         &mut OsPlatform,
-        &net,
         me,
         my_record,
-        &stored.id,
-        &stored.name,
-        &group.distribution(),
-        &stored.members,
+        stored,
         targets,
         &mut deliver,
     );
@@ -1962,7 +1942,7 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-pub use mycellium_engine::wireops::{device_slot, my_group_id};
+pub use mycellium_engine::wireops::device_slot;
 
 #[cfg(test)]
 mod tests {
