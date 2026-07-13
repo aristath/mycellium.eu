@@ -18,7 +18,6 @@ use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
-use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_core::transport::Transport;
 use mycellium_core::userid::user_id;
@@ -1787,43 +1786,15 @@ pub fn verify(peer: &str, confirm: bool, accept_change: bool) -> Result<()> {
     if peerbook::get(&fs, &peer_handle)?.is_none() {
         let _ = import_from_configured_dht(&identity, &mut fs, &peer_handle);
     }
-    let peer_record = peerbook::get(&fs, &peer_handle)?
-        .ok_or_else(|| anyhow!("no signed record for '{}'", peer_handle.as_str()))?;
-    peer_record
-        .verify()
-        .map_err(|_| anyhow!("peer record failed verification"))?;
-    let wallet = peer_record.record.wallet;
-    let sn = safety::safety_number(&identity.wallet_public(), &wallet);
-    let level = verified::level(&fs, peer_handle.as_str(), &wallet);
-    println!("'{}' - {}", peer_handle.as_str(), level.label());
-    println!("safety number: {sn}");
+    let info = client::verification_info(&fs, &identity, &peer_handle)?;
+    println!("'{}' - {}", info.handle, info.level.label());
+    println!("safety number: {}", info.safety_number);
     if accept_change {
-        if level != verified::TrustLevel::Changed {
-            bail!(
-                "'{}' has no changed identity to accept",
-                peer_handle.as_str()
-            );
-        }
-        verified::mark(&mut fs, peer_handle.as_str(), &wallet)?;
-        for mut contact in contacts::list(&fs)? {
-            if contact.handle == peer_handle.as_str() {
-                contact.wallet = wallet;
-                contacts::save(&mut fs, &contact)?;
-            }
-        }
-        println!(
-            "accepted the new verified identity for '{}'",
-            peer_handle.as_str()
-        );
+        client::accept_identity_change(&mut fs, &info)?;
+        println!("accepted the new verified identity for '{}'", info.handle);
     } else if confirm {
-        if level == verified::TrustLevel::Changed {
-            bail!(
-                "identity changed for '{}'; compare the new safety number and use --accept-change explicitly",
-                peer_handle.as_str()
-            );
-        }
-        verified::mark(&mut fs, peer_handle.as_str(), &wallet)?;
-        println!("marked '{}' as verified", peer_handle.as_str());
+        client::mark_verified(&mut fs, &info)?;
+        println!("marked '{}' as verified", info.handle);
     }
     Ok(())
 }
@@ -1891,8 +1862,7 @@ pub fn list_blocked() -> Result<()> {
 pub fn clear_history(peer: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, peer)?;
-    history::clear(&mut fs, &key)?;
+    let key = client::clear_history(&mut fs, peer)?;
     println!("cleared history with '{key}'");
     Ok(())
 }
@@ -1900,9 +1870,8 @@ pub fn clear_history(peer: &str) -> Result<()> {
 pub fn show_history(peer: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, peer)?;
     let now = OsPlatform.now_unix_secs();
-    let transcript = history::load_active(&mut fs, &key, now)?;
+    let (key, transcript) = client::history_with(&mut fs, peer, now)?;
     if transcript.is_empty() {
         println!("no stored history with '{key}'");
         return Ok(());
@@ -1918,17 +1887,22 @@ pub fn conversations() -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let now = OsPlatform.now_unix_secs();
-    let mut any = false;
-    for peer in history::peers(&fs)? {
-        let msgs = history::load_active(&mut fs, &peer, now)?;
-        if let Some(last) = msgs.last() {
-            let who = if last.from_me { "you" } else { peer.as_str() };
-            println!("{peer:16} {who}: {}", preview(&last.text));
-            any = true;
-        }
-    }
-    if !any {
+    let conversations = client::conversations(&mut fs, now)?;
+    if conversations.is_empty() {
         println!("no conversations yet");
+        return Ok(());
+    }
+    for conversation in conversations {
+        let who = if conversation.from_me {
+            "you"
+        } else {
+            conversation.peer.as_str()
+        };
+        println!(
+            "{:16} {who}: {}",
+            conversation.peer,
+            preview(&conversation.text)
+        );
     }
     Ok(())
 }
@@ -1937,22 +1911,20 @@ pub fn search(query: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let now = OsPlatform.now_unix_secs();
-    let needle = query.to_lowercase();
-    let mut hits = 0usize;
-    for peer in history::peers(&fs)? {
-        for m in history::load_active(&mut fs, &peer, now)? {
-            if m.text.to_lowercase().contains(&needle) {
-                let who = if m.from_me { "you" } else { peer.as_str() };
-                println!("[{peer}] {who}: {}", m.text);
-                hits += 1;
-            }
-        }
-    }
-    if hits == 0 {
+    let hits = client::search_history(&mut fs, query, now)?;
+    if hits.is_empty() {
         println!("no matches for '{query}'");
-    } else {
-        println!("{hits} match(es)");
+        return Ok(());
     }
+    for hit in &hits {
+        let who = if hit.from_me {
+            "you"
+        } else {
+            hit.peer.as_str()
+        };
+        println!("[{}] {who}: {}", hit.peer, hit.text);
+    }
+    println!("{} match(es)", hits.len());
     Ok(())
 }
 

@@ -6,12 +6,14 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use mycellium_core::identity::{Handle, Identity, PeerId};
+use mycellium_core::identity::{Handle, Identity, PeerId, WalletPublicKey};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::SignedRecord;
+use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
+use mycellium_engine::history::{self, StoredMessage};
 use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::verified;
 use mycellium_engine::wireops;
@@ -337,6 +339,139 @@ where
     Ok(key)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationPreview {
+    pub peer: String,
+    pub from_me: bool,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub peer: String,
+    pub from_me: bool,
+    pub text: String,
+}
+
+pub fn clear_history<S: Storage>(store: &mut S, input: &str) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    history::clear(store, &key)?;
+    Ok(key)
+}
+
+pub fn history_with<S: Storage>(
+    store: &mut S,
+    input: &str,
+    now: u64,
+) -> Result<(String, Vec<StoredMessage>)>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    let messages = history::load_active(store, &key, now)?;
+    Ok((key, messages))
+}
+
+pub fn conversations<S: Storage>(store: &mut S, now: u64) -> Result<Vec<ConversationPreview>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut out = Vec::new();
+    for peer in history::peers(store)? {
+        if let Some(last) = history::load_active(store, &peer, now)?.last() {
+            out.push(ConversationPreview {
+                peer,
+                from_me: last.from_me,
+                text: last.text.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn search_history<S: Storage>(store: &mut S, query: &str, now: u64) -> Result<Vec<SearchHit>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let needle = query.to_lowercase();
+    let mut hits = Vec::new();
+    for peer in history::peers(store)? {
+        for message in history::load_active(store, &peer, now)? {
+            if message.text.to_lowercase().contains(&needle) {
+                hits.push(SearchHit {
+                    peer: peer.clone(),
+                    from_me: message.from_me,
+                    text: message.text,
+                });
+            }
+        }
+    }
+    Ok(hits)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationInfo {
+    pub handle: String,
+    pub wallet: WalletPublicKey,
+    pub safety_number: String,
+    pub level: verified::TrustLevel,
+}
+
+pub fn verification_info<S: Storage>(
+    store: &S,
+    identity: &Identity,
+    handle: &Handle,
+) -> Result<VerificationInfo>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let record = require_record(store, handle)?;
+    record
+        .verify()
+        .map_err(|_| anyhow!("peer record failed verification"))?;
+    let wallet = record.record.wallet;
+    Ok(VerificationInfo {
+        handle: handle.as_str().to_string(),
+        wallet,
+        safety_number: safety::safety_number(&identity.wallet_public(), &wallet),
+        level: verified::level(store, handle.as_str(), &wallet),
+    })
+}
+
+pub fn mark_verified<S: Storage>(store: &mut S, info: &VerificationInfo) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if info.level == verified::TrustLevel::Changed {
+        bail!(
+            "identity changed for '{}'; compare the new safety number and use --accept-change explicitly",
+            info.handle
+        );
+    }
+    verified::mark(store, &info.handle, &info.wallet)?;
+    Ok(())
+}
+
+pub fn accept_identity_change<S: Storage>(store: &mut S, info: &VerificationInfo) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if info.level != verified::TrustLevel::Changed {
+        bail!("'{}' has no changed identity to accept", info.handle);
+    }
+    verified::mark(store, &info.handle, &info.wallet)?;
+    for mut contact in contacts::list(store)? {
+        if contact.handle == info.handle {
+            contact.wallet = info.wallet;
+            contacts::save(store, &contact)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +649,74 @@ mod tests {
             get_expiry(&store, "a").unwrap(),
             ("alice".to_string(), None)
         );
+    }
+
+    #[test]
+    fn history_views_resolve_contacts_and_search() {
+        let handle = Handle::new("alice").unwrap();
+        let mut platform = SeededPlatform(21);
+        let identity = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        let record =
+            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        import_record(&mut store, &handle, record).unwrap();
+        add_contact(&mut store, "a", &handle).unwrap();
+        history::append(
+            &mut store,
+            "alice",
+            StoredMessage {
+                id: "m1".to_string(),
+                from_me: false,
+                text: "hello from alice".to_string(),
+                timestamp: 1,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+
+        let (key, messages) = history_with(&mut store, "a", 2).unwrap();
+        assert_eq!(key, "alice");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(conversations(&mut store, 2).unwrap()[0].peer, "alice");
+        assert_eq!(search_history(&mut store, "alice", 2).unwrap().len(), 1);
+
+        assert_eq!(clear_history(&mut store, "a").unwrap(), "alice");
+        assert!(history_with(&mut store, "a", 2).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn accepting_changed_identity_updates_contact_pin() {
+        let handle = Handle::new("alice").unwrap();
+        let me = Identity::generate(&mut SeededPlatform(3)).unwrap();
+        let mut old_platform = SeededPlatform(31);
+        let mut new_platform = SeededPlatform(91);
+        let old_identity = Identity::generate(&mut old_platform).unwrap();
+        let new_identity = Identity::generate(&mut new_platform).unwrap();
+        let mut store = MemStore::default();
+        let old_record = peerbook::build_record(
+            &mut old_platform,
+            &old_identity,
+            &handle,
+            "Alice",
+            "127.0.0.1:1",
+        );
+        import_record(&mut store, &handle, old_record).unwrap();
+        add_contact(&mut store, "a", &handle).unwrap();
+        let new_record = peerbook::build_record(
+            &mut new_platform,
+            &new_identity,
+            &handle,
+            "Alice",
+            "127.0.0.1:2",
+        );
+        import_record(&mut store, &handle, new_record).unwrap();
+
+        let info = verification_info(&store, &me, &handle).unwrap();
+        assert_eq!(info.level, verified::TrustLevel::Changed);
+
+        accept_identity_change(&mut store, &info).unwrap();
+        let info = verification_info(&store, &me, &handle).unwrap();
+        assert_eq!(info.level, verified::TrustLevel::Verified);
+        assert!(list_contacts(&store).unwrap()[0].verified);
     }
 }
