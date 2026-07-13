@@ -706,6 +706,58 @@ where
     Ok(())
 }
 
+pub fn due_outbox_entries<S: Storage>(store: &S, now: u64) -> Result<Vec<OutboxEntry>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(outbox::load(store)?
+        .into_iter()
+        .filter(|entry| entry.is_due(now))
+        .collect())
+}
+
+pub fn park_outbox<S: Storage>(
+    store: &mut S,
+    delivery_id: String,
+    recipient: &Handle,
+    device: &Device,
+    item: MailItem,
+    now: u64,
+) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let slot = wireops::device_slot(&device.device_key);
+    outbox::enqueue(store, delivery_id, recipient.as_str(), &slot, item, now)?;
+    Ok(())
+}
+
+pub fn mark_outbox_delivered<S: Storage>(store: &mut S, delivery_id: &str) -> Result<bool>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(outbox::mark_delivered(store, delivery_id)?)
+}
+
+pub fn mark_outbox_failed<S: Storage>(store: &mut S, delivery_id: &str) -> Result<bool>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(outbox::mark_failed(store, delivery_id)?)
+}
+
+pub fn record_outbox_attempt<S: Storage>(
+    store: &mut S,
+    delivery_id: &str,
+    now: u64,
+    accepted: bool,
+) -> Result<bool>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(outbox::record_attempt(store, delivery_id, now, accepted)?)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutboxCancel {
     Empty,

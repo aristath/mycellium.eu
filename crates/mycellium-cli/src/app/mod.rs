@@ -529,11 +529,8 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
         let Ok(fs) = fs.lock() else {
             return;
         };
-        match outbox::load(&*fs) {
-            Ok(entries) => entries
-                .into_iter()
-                .filter(|entry| entry.is_due(now))
-                .collect(),
+        match client::due_outbox_entries(&*fs, now) {
+            Ok(entries) => entries,
             Err(_) => return,
         }
     };
@@ -561,7 +558,7 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
 
         if matches!(target, Target::Drop) {
             if let Ok(mut fs) = fs.lock() {
-                let _ = outbox::mark_failed(&mut *fs, &entry.id);
+                let _ = client::mark_outbox_failed(&mut *fs, &entry.id);
             }
             continue;
         }
@@ -599,12 +596,12 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
                         accepted,
                         now,
                     );
-                    let _ = outbox::record_attempt(&mut *reopened, &entry.id, now, accepted);
+                    let _ = client::record_outbox_attempt(&mut *reopened, &entry.id, now, accepted);
                     continue;
                 }
             }
         }
-        let _ = outbox::record_attempt(&mut *guard, &entry.id, now, accepted);
+        let _ = client::record_outbox_attempt(&mut *guard, &entry.id, now, accepted);
     }
 }
 
@@ -878,12 +875,11 @@ fn deliver_or_park(
     now: u64,
 ) -> DeliveryPath {
     let delivery_id = random_id();
-    let slot = device_slot(&device.device_key);
-    if outbox::enqueue(
+    if client::park_outbox(
         store,
         delivery_id.clone(),
-        recipient.as_str(),
-        &slot,
+        recipient,
+        device,
         item.clone(),
         now,
     )
@@ -895,7 +891,7 @@ fn deliver_or_park(
     if deliver_direct(store, network, device, &delivery_id, &item, now).is_delivered() {
         // Acceptance is already proven. If cleanup fails, leaving the entry is
         // safe: the recipient deduplicates the retry and returns the ACK again.
-        let _ = outbox::mark_delivered(store, &delivery_id);
+        let _ = client::mark_outbox_delivered(store, &delivery_id);
         DeliveryPath::Direct
     } else {
         DeliveryPath::Outbox
@@ -911,10 +907,12 @@ fn park_delivery<S: Storage>(
     device: &Device,
     item: MailItem,
     now: u64,
-) -> DeliveryPath {
+) -> DeliveryPath
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let delivery_id = random_id();
-    let slot = device_slot(&device.device_key);
-    match outbox::enqueue(store, delivery_id, recipient.as_str(), &slot, item, now) {
+    match client::park_outbox(store, delivery_id, recipient, device, item, now) {
         Ok(()) => DeliveryPath::Outbox,
         Err(_) => DeliveryPath::Failed,
     }
