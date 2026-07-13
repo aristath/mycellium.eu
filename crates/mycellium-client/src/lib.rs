@@ -11,6 +11,8 @@ use mycellium_core::platform::Platform;
 use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
 use mycellium_engine::antirollback;
+use mycellium_engine::contacts;
+use mycellium_engine::flow::{self, TrustError};
 use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::wireops;
 
@@ -168,6 +170,44 @@ where
         }
     }
     Ok(removed)
+}
+
+#[derive(Clone)]
+pub struct LocalNet {
+    records: Vec<PeerRecord>,
+}
+
+impl LocalNet {
+    pub fn load(store: &impl Storage) -> Self {
+        Self {
+            records: peerbook::load(store).unwrap_or_default(),
+        }
+    }
+}
+
+impl flow::FlowNet for LocalNet {
+    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
+        self.records
+            .iter()
+            .find(|entry| entry.handle == handle.as_str())
+            .map(|entry| entry.record.clone())
+            .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))
+    }
+}
+
+pub fn resolve_name<S: Storage>(store: &S, input: &str) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(contacts::resolve(store, input)?)
+}
+
+pub fn resolve_local_record<S: Storage>(
+    store: &mut S,
+    resolved: &str,
+) -> std::result::Result<(Handle, SignedRecord), TrustError> {
+    let net = LocalNet::load(store);
+    flow::resolve_record(store, &net, resolved)
 }
 
 #[cfg(test)]

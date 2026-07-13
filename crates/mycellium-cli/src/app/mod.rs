@@ -33,7 +33,7 @@ use mycellium_transport::net::{self, TcpTransport};
 use crate::platform::OsPlatform;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::groups::{self, MailItem, PeerFrame, StoredGroup};
-use mycellium_engine::peerbook::{self, PeerRecord};
+use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
 use mycellium_engine::wireops;
@@ -44,29 +44,6 @@ mod util;
 
 pub use backup::*;
 pub use util::*;
-
-#[derive(Clone)]
-struct LocalNet {
-    records: Vec<PeerRecord>,
-}
-
-impl LocalNet {
-    fn load(store: &impl Storage) -> Self {
-        Self {
-            records: peerbook::load(store).unwrap_or_default(),
-        }
-    }
-}
-
-impl flow::FlowNet for LocalNet {
-    fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord> {
-        self.records
-            .iter()
-            .find(|entry| entry.handle == handle.as_str())
-            .map(|entry| entry.record.clone())
-            .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))
-    }
-}
 
 // ---- identity / records -----------------------------------------------------
 
@@ -359,7 +336,7 @@ pub fn send(
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
     let my_record = own_record(&fs, &me)?;
-    let net = LocalNet::load(&fs);
+    let net = client::LocalNet::load(&fs);
 
     let mut deliver =
         |store: &mut FileStore,
@@ -1256,7 +1233,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let now = platform.now_unix_secs();
-    let net = LocalNet::load(fs);
+    let net = client::LocalNet::load(fs);
     let mut deliver = |store: &mut S,
                        handle: &Handle,
                        _record: &SignedRecord,
@@ -1367,7 +1344,7 @@ pub fn group_send(
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let net = LocalNet::load(&fs);
+    let net = client::LocalNet::load(&fs);
     let mut deliver =
         |store: &mut FileStore,
          handle: &Handle,
@@ -1462,7 +1439,7 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
     let now = OsPlatform.now_unix_secs();
     let network = DirectNetwork::new(identity.device_secret());
-    let net = LocalNet::load(&fs);
+    let net = client::LocalNet::load(&fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
@@ -1511,7 +1488,7 @@ fn distribute_group_key_direct(
 ) {
     let now = OsPlatform.now_unix_secs();
     let network = DirectNetwork::new(identity.device_secret());
-    let net = LocalNet::load(fs);
+    let net = client::LocalNet::load(fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
@@ -1586,9 +1563,8 @@ pub fn resolve_group(fs: &FileStore, key: &str) -> Result<StoredGroup> {
 // ---- trust / contacts -------------------------------------------------------
 
 pub fn resolve_record(fs: &mut FileStore, input: &str) -> Result<(Handle, SignedRecord)> {
-    let resolved = contacts::resolve(fs, input)?;
-    let net = LocalNet::load(fs);
-    match flow::resolve_record(fs, &net, &resolved) {
+    let resolved = client::resolve_name(fs, input)?;
+    match client::resolve_local_record(fs, &resolved) {
         Ok(pair) => Ok(pair),
         Err(flow::TrustError::BadHandle) => {
             let handle =
@@ -1596,8 +1572,7 @@ pub fn resolve_record(fs: &mut FileStore, input: &str) -> Result<(Handle, Signed
             let identity = store::load_identity()?;
             match import_from_configured_dht(&identity, fs, &handle) {
                 Ok(true) => {
-                    let net = LocalNet::load(fs);
-                    flow::resolve_record(fs, &net, &resolved).map_err(|err| match err {
+                    client::resolve_local_record(fs, &resolved).map_err(|err| match err {
                         flow::TrustError::BadHandle => {
                             anyhow!("no signed record for '{resolved}'")
                         }
