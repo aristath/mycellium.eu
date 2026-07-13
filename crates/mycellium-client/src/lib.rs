@@ -570,6 +570,41 @@ where
     Ok((group, messages))
 }
 
+pub fn send_group<S: Storage>(
+    identity: &Identity,
+    store: &mut S,
+    me: &Handle,
+    group: &mut StoredGroup,
+    app: &AppMessage,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+) -> Result<flow::SendOutcome>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let net = LocalNet::load(store);
+    Ok(flow::group_send(
+        identity, store, &net, me, group, app, deliver,
+    )?)
+}
+
+pub fn leave_group<S, P>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    me: &Handle,
+    my_record: &SignedRecord,
+    group: &StoredGroup,
+    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
+) where
+    S: Storage,
+    P: Platform,
+{
+    let net = LocalNet::load(store);
+    flow::group_leave(
+        identity, store, platform, &net, me, my_record, group, deliver,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +947,74 @@ mod tests {
         assert_eq!(group.id, "g1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "hello team");
+    }
+
+    #[test]
+    fn send_group_records_local_transcript_and_uses_delivery_hook() {
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_handle = Handle::new("bob").unwrap();
+        let mut platform = SeededPlatform(61);
+        let alice = Identity::generate(&mut platform).unwrap();
+        let bob = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        publish_active_device_record(
+            &mut store,
+            &mut platform,
+            &alice,
+            &alice_handle,
+            "Alice",
+            "127.0.0.1:1",
+        )
+        .unwrap();
+        let bob_record =
+            peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        import_record(&mut store, &bob_handle, bob_record.clone()).unwrap();
+        verified::mark(&mut store, bob_handle.as_str(), &bob_record.record.wallet).unwrap();
+
+        let group = mycellium_core::group::Group::new(&mut platform, b"alice-device".to_vec());
+        let mut stored = StoredGroup {
+            id: "g1".to_string(),
+            name: "team".to_string(),
+            members: vec!["alice".to_string(), "bob".to_string()],
+            me: "alice".to_string(),
+            sender_handles: Vec::new(),
+            state: group.export(),
+        };
+        groups::save(&mut store, &stored).unwrap();
+        let app = AppMessage {
+            id: "m1".to_string(),
+            timestamp: 10,
+            expires_at: None,
+            body: mycellium_core::message::Body::Text("hello group".to_string()),
+        };
+        let mut delivered = 0;
+        let mut deliver = |_: &mut MemStore,
+                           handle: &Handle,
+                           _: &SignedRecord,
+                           _: &Device,
+                           item: MailItem|
+         -> DeliveryPath {
+            assert_eq!(handle.as_str(), "bob");
+            assert!(matches!(item, MailItem::GroupText { .. }));
+            delivered += 1;
+            DeliveryPath::Direct
+        };
+
+        let out = send_group(
+            &alice,
+            &mut store,
+            &alice_handle,
+            &mut stored,
+            &app,
+            &mut deliver,
+        )
+        .unwrap();
+
+        assert_eq!(delivered, 1);
+        assert_eq!(out.delivered, 1);
+        let transcript = history::group_load(&store, "g1").unwrap();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "hello group");
+        assert_eq!(transcript[0].sender, "alice");
     }
 }

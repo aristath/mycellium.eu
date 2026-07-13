@@ -1333,7 +1333,6 @@ pub fn group_send(
     let expires_at = resolve_expiry(&fs, &stored.id, expire)?;
     let app = build_message(message, reply_to, react, to, file, edit, delete, expires_at)?;
     let now = OsPlatform.now_unix_secs();
-    let net = client::LocalNet::load(&fs);
     let mut deliver =
         |store: &mut FileStore,
          handle: &Handle,
@@ -1342,15 +1341,7 @@ pub fn group_send(
          item: MailItem|
          -> DeliveryPath { deliver_or_park(store, &network, handle, device, item, now) };
 
-    let out = flow::group_send(
-        &identity,
-        &mut fs,
-        &net,
-        &me,
-        &mut stored,
-        &app,
-        &mut deliver,
-    )?;
+    let out = client::send_group(&identity, &mut fs, &me, &mut stored, &app, &mut deliver)?;
     print_group_delivery_summary(&stored.name, &out.id, out.direct, out.outboxed, out.failed);
     Ok(())
 }
@@ -1427,7 +1418,6 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
     let now = OsPlatform.now_unix_secs();
     let network = DirectNetwork::new(identity.device_secret());
-    let net = client::LocalNet::load(&fs);
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        _record: &SignedRecord,
@@ -1435,11 +1425,10 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
                        item: MailItem| {
         let _ = deliver_or_park(store, &network, handle, device, item, now);
     };
-    flow::group_leave(
+    client::leave_group(
         &identity,
         &mut fs,
         &mut OsPlatform,
-        &net,
         &me,
         &my_record,
         &stored,
