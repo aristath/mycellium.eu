@@ -67,7 +67,8 @@ pub fn check_and_pin<S: Storage>(
     {
         return Ok(false);
     }
-    for device in &record.record.devices {
+    {
+        let device = &record.record.device;
         let stable_digest = digest(&device.signed.record);
         let reachability_digest = digest(&device.reachability.record);
         if let Some(known) = pins
@@ -91,7 +92,8 @@ pub fn check_and_pin<S: Storage>(
         pins.identity = record.record.seq;
         pins.identity_digest = identity_digest;
     }
-    for device in &record.record.devices {
+    {
+        let device = &record.record.device;
         let stable_digest = digest(&device.signed.record);
         let reachability_digest = digest(&device.reachability.record);
         match pins
@@ -180,11 +182,7 @@ mod tests {
                 handle: Handle::new("bob").unwrap(),
                 name: "Bob".into(),
                 wallet: identity.wallet_public(),
-                devices: vec![Device::create(
-                    identity,
-                    PeerId(address.to_vec()),
-                    component_seq,
-                )],
+                device: Device::create(identity, PeerId(address.to_vec()), component_seq),
                 seq: identity_seq,
             },
             identity,

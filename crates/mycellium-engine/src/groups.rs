@@ -17,19 +17,6 @@ use mycellium_core::wire;
 pub enum MailItem {
     /// A one-to-one offline message.
     Direct(Envelope),
-    /// A mirror of a message *you* sent, for your own other devices (Layer 11).
-    /// The envelope (sealed device→device) carries the message; `peer` is the
-    /// conversation it belongs to.
-    SelfSync {
-        /// The handle the original message was addressed to.
-        peer: String,
-        /// The message, sealed from the sending device to this one.
-        envelope: Envelope,
-    },
-    /// Bootstrap a sibling device into an existing group (Layer 11): the envelope
-    /// (sealed device→device) decrypts to a [`GroupSyncPayload`] of every sender
-    /// key this cluster holds — enough for the new device to *receive*.
-    GroupSync(Envelope),
     /// A group invite / sender-key share (its envelope decrypts to a
     /// [`GroupInvitePayload`]).
     GroupInvite(Envelope),
@@ -98,23 +85,6 @@ pub struct GroupInvitePayload {
     pub distribution: SenderKeyDistribution,
 }
 
-/// Handed to a sibling device to bootstrap it into an existing group (Layer 11):
-/// the roster plus every sender key the cluster already holds, so the new device
-/// can decrypt current members' messages. Receive-only (no private signing key).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GroupSyncPayload {
-    /// Stable group identifier.
-    pub group_id: String,
-    /// Human-readable group name.
-    pub name: String,
-    /// All member handles.
-    pub members: Vec<String>,
-    /// Every sender key the cluster holds: `(sender id, distribution)`.
-    pub keys: Vec<(Vec<u8>, SenderKeyDistribution)>,
-    /// Each sender's device id → handle, for display on the new device.
-    pub sender_handles: Vec<(Vec<u8>, String)>,
-}
-
 /// A member's persisted view of one group.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredGroup {
@@ -126,9 +96,7 @@ pub struct StoredGroup {
     pub members: Vec<String>,
     /// This device's own handle in the group.
     pub me: String,
-    /// Each sender's device id → their handle, for display and block checks
-    /// (Layer 11: senders are keyed by *device*, so two devices of one handle
-    /// don't collide).
+    /// Each sender's device id → their handle, for display and block checks.
     #[serde(default)]
     pub sender_handles: Vec<(Vec<u8>, String)>,
     /// The serialized core group session (secret — stored encrypted).

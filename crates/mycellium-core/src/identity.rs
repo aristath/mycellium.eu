@@ -168,9 +168,9 @@ impl Identity {
         Self::build(wallet_secret, device_seed)
     }
 
-    /// Adopt an **existing** account wallet on a **new device**: a fresh device
-    /// seed is drawn, so the new device joins the cluster with its own message
-    /// keys and never inherits another device's traffic keys.
+    /// Adopt an **existing** account wallet on a **new active device**: a fresh
+    /// device seed is drawn, so the new device gets its own message keys and
+    /// never inherits another device's traffic keys.
     pub fn adopt<P: Platform>(platform: &mut P, wallet_secret: [u8; 32]) -> Result<Self, Error> {
         let mut device_seed = [0u8; 32];
         platform.fill_random(&mut device_seed);

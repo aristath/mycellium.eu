@@ -54,12 +54,7 @@ where
     record
         .verify()
         .map_err(|_| anyhow::anyhow!("record failed verification"))?;
-    if record
-        .record
-        .devices
-        .iter()
-        .any(|d| d.peer_id().0.is_empty())
-    {
+    if record.record.device.peer_id().0.is_empty() {
         anyhow::bail!(
             "record for '{}' has an empty device address",
             handle.as_str()
@@ -159,29 +154,25 @@ pub fn build_record(
         handle: user_id(handle.as_str()),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        devices: vec![crate::wireops::this_device(
-            identity,
-            addr,
-            platform.now_unix_secs(),
-        )],
+        device: crate::wireops::this_device(identity, addr, platform.now_unix_secs()),
         seq: platform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)
 }
 
-pub fn with_devices(
+pub fn with_device(
     platform: &mut impl mycellium_core::platform::Platform,
     identity: &Identity,
     handle: &Handle,
     name: &str,
-    devices: Vec<Device>,
+    device: Device,
     prev_seq: u64,
 ) -> SignedRecord {
     let record = Record {
         handle: user_id(handle.as_str()),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        devices,
+        device,
         seq: prev_seq.saturating_add(1).max(platform.now_unix_secs()),
     };
     SignedRecord::sign(record, identity)

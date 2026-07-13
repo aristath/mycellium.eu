@@ -64,7 +64,7 @@ pub fn device_slot(key: &DevicePublicKey) -> String {
 }
 
 /// This device's unique sender id inside any group (Layer 11): its device key,
-/// so two devices of one account are distinct senders and don't collide.
+/// so sender-key ids stay distinct from wallet/account ids.
 pub fn my_group_id(identity: &Identity) -> Vec<u8> {
     identity.device_public().0.to_vec()
 }
@@ -95,7 +95,7 @@ pub fn build_record<P: Platform>(
         handle: user_id(handle.as_str()),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        devices: vec![this_device(identity, addr, platform.now_unix_secs())],
+        device: this_device(identity, addr, platform.now_unix_secs()),
         seq: platform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)
@@ -104,14 +104,13 @@ pub fn build_record<P: Platform>(
 /// Asynchronously X3DH-seal `plaintext` for one recipient `device` (offline,
 /// one-shot session), embedding an already-built sender self-record.
 ///
-/// This is the hot-loop entry point for the send fan-out: the sender's
+/// This is the hot-loop entry point for direct delivery: the sender's
 /// [`SignedRecord`] costs two secp256k1 ECDSA signs to build (record signature +
-/// signed-pre-key signature), yet it is *identical* for every recipient device of
-/// one send. Callers that fan out over many devices build it **once** (via
-/// [`build_record`]) and pass it here per device, instead of re-signing it N
-/// times. One-shot callers use [`seal_to`], which builds the record then calls
-/// this. The embedded record is byte-for-byte what [`seal_to`] would embed, so the
-/// receiver's per-message re-verification ([`open_envelope`]) is unchanged.
+/// signed-pre-key signature). Callers that already have the record pass it here
+/// instead of re-signing. One-shot callers use [`seal_to`], which builds the
+/// record then calls this. The embedded record is byte-for-byte what [`seal_to`]
+/// would embed, so the receiver's per-message re-verification ([`open_envelope`])
+/// is unchanged.
 pub fn seal_to_with_record<P: Platform>(
     platform: &mut P,
     identity: &Identity,
@@ -172,13 +171,7 @@ pub fn open_envelope<P: Platform>(
     if user_id(env.from.as_str()) != env.sender_record.record.handle {
         bail!("sender name does not match its record");
     }
-    if !env
-        .sender_record
-        .record
-        .devices
-        .iter()
-        .any(|device| device.id_key == env.init.initiator_ik)
-    {
+    if env.sender_record.record.device.id_key != env.init.initiator_ik {
         bail!("handshake is not bound to the sender's identity");
     }
     let shared = x3dh::respond(identity, &env.init).map_err(|e| anyhow!("{e}"))?;
@@ -234,25 +227,6 @@ fn unpad_bucket(padded: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod pad_tests {
     use super::*;
-    use mycellium_core::identity::{Handle, Identity, PeerId};
-    use mycellium_core::platform::Platform;
-    use mycellium_core::record::{Device, Record, SignedRecord};
-    use mycellium_core::userid::user_id;
-
-    struct SeededPlatform(u8);
-
-    impl Platform for SeededPlatform {
-        fn fill_random(&mut self, buf: &mut [u8]) {
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = self.0.wrapping_add((i as u8).wrapping_mul(31));
-            }
-            self.0 = self.0.wrapping_add(1);
-        }
-
-        fn now_unix_secs(&self) -> u64 {
-            42
-        }
-    }
 
     #[test]
     fn round_trips_and_lands_on_a_bucket() {
@@ -286,43 +260,5 @@ mod pad_tests {
         let mut bad = 999u32.to_le_bytes().to_vec();
         bad.extend_from_slice(&[0u8; 10]);
         assert!(unpad_bucket(&bad).is_err());
-    }
-
-    #[test]
-    fn envelope_from_authorized_secondary_device_opens() {
-        let mut platform = SeededPlatform(7);
-        let alice_primary = Identity::generate(&mut platform).unwrap();
-        let alice_secondary =
-            Identity::adopt(&mut platform, alice_primary.wallet_secret()).unwrap();
-        let bob = Identity::generate(&mut platform).unwrap();
-        let alice_handle = Handle::new("alice").unwrap();
-        let bob_device = Device::create(&bob, PeerId(b"127.0.0.1:2".to_vec()), 1);
-        let alice_record = SignedRecord::sign(
-            Record {
-                handle: user_id(alice_handle.as_str()),
-                name: "Alice".into(),
-                wallet: alice_primary.wallet_public(),
-                devices: vec![
-                    Device::create(&alice_primary, PeerId(b"127.0.0.1:1".to_vec()), 1),
-                    Device::create(&alice_secondary, PeerId(b"127.0.0.1:3".to_vec()), 1),
-                ],
-                seq: 1,
-            },
-            &alice_secondary,
-        );
-        let envelope = seal_to_with_record(
-            &mut platform,
-            &alice_secondary,
-            &alice_handle,
-            &alice_record,
-            &bob_device,
-            b"hello",
-        )
-        .unwrap();
-
-        let (from, plaintext) = open_envelope(&mut platform, &bob, &envelope).unwrap();
-
-        assert_eq!(from.as_str(), "alice");
-        assert_eq!(plaintext, b"hello");
     }
 }

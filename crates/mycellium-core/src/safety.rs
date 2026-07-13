@@ -2,7 +2,7 @@
 //!
 //! Signed records tell you which wallet a handle currently maps to. To verify
 //! that mapping out of band, two peers compare a short code derived from **both
-//! their wallet identity keys**. It's the same on both devices (the inputs are
+//! their wallet identity keys**. It's the same for both peers (the inputs are
 //! sorted, so it's independent of who computes it), and it changes completely if
 //! either identity differs from what you expect. Read it aloud or scan it in
 //! person.

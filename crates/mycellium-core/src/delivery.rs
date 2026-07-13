@@ -52,7 +52,7 @@ fn signing_bytes(
 /// Proof that one recipient device durably accepted one exact delivery.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryAck {
-    /// Stable sender-generated id of the per-device delivery.
+    /// Stable sender-generated id of the active-device delivery.
     pub delivery_id: String,
     /// Hash of the encoded application payload. The core intentionally does not
     /// know the engine's payload type; it binds the bytes supplied by the caller.

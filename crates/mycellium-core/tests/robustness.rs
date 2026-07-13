@@ -49,7 +49,7 @@ fn valid_signed_record(p: &mut SeededPlatform) -> SignedRecord {
         handle: Handle::new("ari").unwrap(),
         name: String::new(),
         wallet: id.wallet_public(),
-        devices: vec![Device::create(&id, PeerId(vec![1, 2, 3, 4]), 1)],
+        device: Device::create(&id, PeerId(vec![1, 2, 3, 4]), 1),
         seq: 1,
     };
     SignedRecord::sign(record, &id)

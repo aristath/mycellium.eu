@@ -59,11 +59,7 @@ mod tests {
             handle: Handle::new(handle).unwrap(),
             name: String::new(),
             wallet: id.wallet_public(),
-            devices: alloc::vec![Device::create(
-                id,
-                crate::identity::PeerId(alloc::vec![]),
-                1,
-            )],
+            device: Device::create(id, crate::identity::PeerId(alloc::vec![]), 1),
             seq: 1,
         };
         SignedRecord::sign(record, id)

@@ -31,11 +31,13 @@ use mycellium_transport::net::{self, TcpTransport};
 
 use crate::platform::OsPlatform;
 use mycellium_engine::contacts::{self, Contact};
-use mycellium_engine::groups::{self, GroupSyncPayload, MailItem, PeerFrame, StoredGroup};
+use mycellium_engine::groups::{self, MailItem, PeerFrame, StoredGroup};
 use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::reachability::{self, DeliveryPath};
+#[cfg(test)]
+use mycellium_engine::wireops;
 use mycellium_engine::{
-    antirollback, blocklist, draft, expiry, flow, history, inbox, outbox, verified, wireops,
+    antirollback, blocklist, draft, expiry, flow, history, inbox, outbox, verified,
 };
 
 mod backup;
@@ -123,45 +125,39 @@ pub fn register(handle: &str, addr: &str, libp2p: bool) -> Result<()> {
 
     let mut fs = open_history(&identity)?;
     let existing = reusable_own_record(&identity, &handle, peerbook::get(&fs, &handle)?)?;
-    let mut devices = existing
-        .as_ref()
-        .map(|r| r.record.devices.clone())
-        .unwrap_or_default();
     let now = OsPlatform.now_unix_secs();
-    let mut membership_changed = false;
-    match devices
-        .iter_mut()
-        .find(|device| device.device_key == identity.device_public())
-    {
-        Some(device) => {
+    let active_device = match existing.as_ref() {
+        Some(record) if record.record.device.device_key == identity.device_public() => {
+            let device = &record.record.device;
             let reachability_seq = now.max(device.reachability.record.seq.saturating_add(1));
-            *device = device
+            device
                 .refresh_reachability(
                     &identity,
                     PeerId(location.as_bytes().to_vec()),
                     reachability_seq,
                 )
-                .map_err(|_| anyhow!("could not sign refreshed reachability"))?;
+                .map_err(|_| anyhow!("could not sign refreshed reachability"))?
         }
-        None => {
-            devices.push(this_device(&identity, &location, now));
-            membership_changed = true;
-        }
-    }
+        _ => this_device(&identity, &location, now),
+    };
+    let active_device_changed = existing
+        .as_ref()
+        .map(|record| record.record.device.device_key != active_device.device_key)
+        .unwrap_or(true);
     let name = display_name_for(&handle);
     let signed = match existing {
-        Some(mut record) if !membership_changed && record.record.name == name => {
+        Some(mut record) if !active_device_changed && record.record.name == name => {
             // The wallet-signed identity and stable device records remain
             // byte-for-byte unchanged for a pure address refresh.
-            record.record.devices = devices;
+            record.record.device = active_device;
             record
         }
-        existing => peerbook::with_devices(
+        existing => peerbook::with_device(
             &mut OsPlatform,
             &identity,
             &handle,
             &name,
-            devices,
+            active_device,
             existing.as_ref().map(|r| r.record.seq).unwrap_or(0),
         ),
     };
@@ -231,78 +227,28 @@ pub fn records_list() -> Result<()> {
     }
     for entry in records {
         println!(
-            "{}  wallet={}  devices={}",
+            "{}  wallet={}  active_device={}",
             entry.handle,
             hex(&entry.record.record.wallet.0),
-            entry.record.record.devices.len()
+            short_device_id(&entry.record.record.device.device_key)
         );
     }
     Ok(())
 }
 
-pub fn list_devices(handle: &str) -> Result<()> {
+pub fn list_device(handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
     let record = peerbook::get(&fs, &handle)?
         .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))?;
-    println!("devices for '{}':", handle.as_str());
-    for d in &record.record.devices {
-        println!(
-            "  {}  {}",
-            short_device_id(&d.device_key),
-            String::from_utf8_lossy(&d.peer_id().0)
-        );
-    }
-    Ok(())
-}
-
-pub fn revoke_device(handle: &str, device_id: &str) -> Result<()> {
-    let identity = store::load_identity()?;
-    let mut fs = open_history(&identity)?;
-    let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let record = peerbook::get(&fs, &handle)?
-        .ok_or_else(|| anyhow!("no local record for '{}'", handle.as_str()))?;
-    if record.record.wallet != identity.wallet_public() {
-        bail!(
-            "cannot edit '{}' because its record is signed by a different wallet",
-            handle.as_str()
-        );
-    }
-    let matches = record
-        .record
-        .devices
-        .iter()
-        .filter(|device| short_device_id(&device.device_key) == device_id)
-        .count();
-    if matches == 0 {
-        bail!("no device '{device_id}' in '{}'", handle.as_str());
-    }
-    if matches > 1 {
-        bail!("device id '{device_id}' is ambiguous; use a fresh record export");
-    }
-    let devices: Vec<Device> = record
-        .record
-        .devices
-        .iter()
-        .filter(|device| short_device_id(&device.device_key) != device_id)
-        .cloned()
-        .collect();
-    if devices.is_empty() {
-        bail!("refusing to publish a record with no devices");
-    }
-    let signed = peerbook::with_devices(
-        &mut OsPlatform,
-        &identity,
-        &handle,
-        &display_name_for(&handle),
-        devices,
-        record.record.seq,
+    let d = &record.record.device;
+    println!("active device for '{}':", handle.as_str());
+    println!(
+        "  {}  {}",
+        short_device_id(&d.device_key),
+        String::from_utf8_lossy(&d.peer_id().0)
     );
-    peerbook::put(&mut fs, &handle, signed.clone())?;
-    println!("revoked device '{device_id}' from '{}'", handle.as_str());
-    println!("record: {}", peerbook::encode(&signed));
-    report_configured_dht_publish(&identity, &handle, &signed);
     Ok(())
 }
 
@@ -327,30 +273,23 @@ pub fn discover(peer: &str, want: &[String]) -> Result<()> {
     let mut fs = open_history(&identity)?;
     let (peer_handle, peer_record) = resolve_record(&mut fs, peer)?;
     let network = DirectNetwork::new(identity.device_secret());
-    let mut last_error = None;
-
-    for device in &peer_record.record.devices {
-        match request_discovery_from_device(&network, device, want) {
-            Ok(records) => {
-                let report = peerbook::import_records(&mut fs, records);
-                println!(
-                    "discovered through '{}' — imported {} record(s), skipped {}",
-                    peer_handle.as_str(),
-                    report.imported,
-                    report.skipped.len()
-                );
-                for (handle, reason) in report.skipped {
-                    eprintln!("skipped {handle}: {reason}");
-                }
-                return Ok(());
+    let device = &peer_record.record.device;
+    let detail = match request_discovery_from_device(&network, device, want) {
+        Ok(records) => {
+            let report = peerbook::import_records(&mut fs, records);
+            println!(
+                "discovered through '{}' — imported {} record(s), skipped {}",
+                peer_handle.as_str(),
+                report.imported,
+                report.skipped.len()
+            );
+            for (handle, reason) in report.skipped {
+                eprintln!("skipped {handle}: {reason}");
             }
-            Err(err) => last_error = Some(err),
+            return Ok(());
         }
-    }
-
-    let detail = last_error
-        .map(|err| err.to_string())
-        .unwrap_or_else(|| "peer has no devices".to_string());
+        Err(err) => err.to_string(),
+    };
     bail!(
         "could not discover through '{}': {detail}",
         peer_handle.as_str()
@@ -542,20 +481,17 @@ fn delivery_summary(
     failed: u32,
     total: u32,
 ) -> String {
-    let delivered_devices = plural(delivered as usize, "device", "devices");
-    let total_devices = plural(total as usize, "device", "devices");
-    let pending_devices = plural(pending as usize, "device", "devices");
     if failed > 0 {
         format!(
             "delivery to '{peer}' incomplete — {delivered} accepted, {pending} pending locally, {failed} not saved (#{id})"
         )
     } else if pending == 0 {
-        format!("delivered to '{peer}' — {delivered}/{total} {total_devices} (#{id})")
+        format!("delivered to '{peer}' — {delivered}/{total} active device (#{id})")
     } else if delivered == 0 {
-        format!("saved for '{peer}' — waiting for direct delivery to {pending} {pending_devices} (#{id})")
+        format!("saved for '{peer}' — waiting for direct delivery to active device (#{id})")
     } else {
         format!(
-            "partially delivered to '{peer}' — {delivered} {delivered_devices} accepted, {pending} pending locally (#{id})"
+            "partially delivered to '{peer}' — {delivered} accepted, {pending} pending locally (#{id})"
         )
     }
 }
@@ -678,7 +614,7 @@ fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>, networ
 
 fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &DirectNetwork) {
     enum Target {
-        Device(Handle, Box<Device>),
+        Device(Handle, Device),
         Retry,
         Drop,
     }
@@ -705,14 +641,14 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
             match Handle::new(entry.recipient.clone()) {
                 Err(_) => Target::Drop,
                 Ok(handle) => match peerbook::get(&*fs, &handle) {
-                    Ok(Some(record)) => record
-                        .record
-                        .devices
-                        .iter()
-                        .find(|device| device_slot(&device.device_key) == entry.slot)
-                        .cloned()
-                        .map(|device| Target::Device(handle, Box::new(device)))
-                        .unwrap_or(Target::Drop),
+                    Ok(Some(record)) => {
+                        let device = record.record.device;
+                        if device_slot(&device.device_key) == entry.slot {
+                            Target::Device(handle, device)
+                        } else {
+                            Target::Drop
+                        }
+                    }
                     Ok(None) | Err(_) => Target::Retry,
                 },
             }
@@ -966,14 +902,10 @@ fn flush_outbox_with_network(
         if record.verify().is_err() {
             return outbox::Attempt::Retry;
         }
-        let Some(device) = record
-            .record
-            .devices
-            .iter()
-            .find(|d| device_slot(&d.device_key) == entry.slot)
-        else {
+        let device = &record.record.device;
+        if device_slot(&device.device_key) != entry.slot {
             return outbox::Attempt::Drop;
-        };
+        }
         if deliver_direct(fs, network, device, &entry.id, &entry.item, now).is_delivered() {
             outbox::Attempt::Delivered
         } else if let Some(device) = refresh_delivery_device(identity, fs, &handle, &entry.slot) {
@@ -1294,11 +1226,7 @@ where
 
 fn envelope_sender(item: &MailItem) -> Option<&Envelope> {
     match item {
-        MailItem::Direct(env)
-        | MailItem::SelfSync { envelope: env, .. }
-        | MailItem::GroupSync(env)
-        | MailItem::GroupInvite(env)
-        | MailItem::GroupLeave(env) => Some(env),
+        MailItem::Direct(env) | MailItem::GroupInvite(env) | MailItem::GroupLeave(env) => Some(env),
         MailItem::GroupText { .. } => None,
     }
 }
@@ -1318,7 +1246,6 @@ impl flow::FlowSink for CliSink {
                     println!("from {from}: {text}  (#{id})");
                 }
             }
-            SelfMirror { peer, id, text } => println!("-> {peer}: {text}  (#{id})"),
             GroupMessage {
                 name,
                 sender,
@@ -1356,7 +1283,6 @@ impl flow::FlowSink for CliSink {
                 println!("joined group '{name}' (invited by {inviter})")
             }
             GroupLeft { name, member, .. } => println!("'{member}' left '{name}'"),
-            GroupBootstrapped { name, .. } => println!("bootstrapped into group '{name}'"),
             Attachment { name, data, .. } => match save_attachment(&name, &data) {
                 Ok(path) => println!("(saved attachment to {})", path.display()),
                 Err(err) => eprintln!("(could not save attachment: {err})"),
@@ -1615,71 +1541,6 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
         &mut deliver,
     );
     println!("left group '{}'", stored.name);
-    Ok(())
-}
-
-pub fn group_sync(whoami: &str) -> Result<()> {
-    let identity = store::load_identity()?;
-    let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
-    let mut fs = open_history(&identity)?;
-    let my_record = own_record(&fs, &me)?;
-    let my_key = identity.device_public();
-    let siblings: Vec<Device> = my_record
-        .record
-        .devices
-        .iter()
-        .filter(|d| d.device_key != my_key)
-        .cloned()
-        .collect();
-    if siblings.is_empty() {
-        println!("no other devices to sync to");
-        return Ok(());
-    }
-
-    let now = OsPlatform.now_unix_secs();
-    let network = DirectNetwork::new(identity.device_secret());
-    let mut synced = 0usize;
-    for id in groups::list(&fs)? {
-        let Some(stored) = groups::load(&fs, &id)? else {
-            continue;
-        };
-        let Ok(group) = Group::import(stored.state.clone()) else {
-            continue;
-        };
-        let mut keys = group.known_keys();
-        keys.push((my_group_id(&identity), group.distribution()));
-        let payload = GroupSyncPayload {
-            group_id: stored.id.clone(),
-            name: stored.name.clone(),
-            members: stored.members.clone(),
-            keys,
-            sender_handles: stored.sender_handles.clone(),
-        };
-        let Ok(plaintext) = serde_json::to_vec(&payload) else {
-            continue;
-        };
-        for device in &siblings {
-            let Ok(env) = wireops::seal_to_with_record(
-                &mut OsPlatform,
-                &identity,
-                &me,
-                &my_record,
-                device,
-                &plaintext,
-            ) else {
-                continue;
-            };
-            let item = MailItem::GroupSync(env);
-            let _ = deliver_or_park(&mut fs, &network, &me, device, item, now);
-        }
-        synced += 1;
-    }
-    println!(
-        "synced {synced} {} to {} other {}",
-        plural(synced, "group", "groups"),
-        siblings.len(),
-        plural(siblings.len(), "device", "devices")
-    );
     Ok(())
 }
 
@@ -1967,13 +1828,8 @@ fn refresh_delivery_device(
     if !import_from_configured_dht(identity, fs, handle).ok()? {
         return None;
     }
-    peerbook::get(fs, handle)
-        .ok()
-        .flatten()?
-        .record
-        .devices
-        .into_iter()
-        .find(|device| device_slot(&device.device_key) == slot)
+    let device = peerbook::get(fs, handle).ok().flatten()?.record.device;
+    (device_slot(&device.device_key) == slot).then_some(device)
 }
 
 fn publish_to_configured_dht(
@@ -2374,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_delivery_requires_the_recipient_devices_acceptance_ack() {
+    fn direct_delivery_requires_the_recipient_active_device_acceptance_ack() {
         let mut platform = SeededPlatform(30);
         let bob = Identity::generate(&mut platform).unwrap();
         let device = wireops::this_device(&bob, "127.0.0.1:1", 1);
@@ -2679,15 +2535,15 @@ mod tests {
     fn delivery_summaries_do_not_fake_sent_state() {
         assert_eq!(
             delivery_summary("bob", "abc123", 1, 0, 0, 1),
-            "delivered to 'bob' — 1/1 device (#abc123)"
+            "delivered to 'bob' — 1/1 active device (#abc123)"
         );
         assert_eq!(
-            delivery_summary("bob", "abc123", 0, 2, 0, 2),
-            "saved for 'bob' — waiting for direct delivery to 2 devices (#abc123)"
+            delivery_summary("bob", "abc123", 0, 1, 0, 1),
+            "saved for 'bob' — waiting for direct delivery to active device (#abc123)"
         );
         assert_eq!(
             delivery_summary("bob", "abc123", 1, 1, 0, 2),
-            "partially delivered to 'bob' — 1 device accepted, 1 pending locally (#abc123)"
+            "partially delivered to 'bob' — 1 accepted, 1 pending locally (#abc123)"
         );
         assert_eq!(
             delivery_summary("bob", "abc123", 0, 1, 1, 2),

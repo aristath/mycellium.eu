@@ -1,7 +1,7 @@
 //! The Mycellium engine: the headless peer logic that a front-end drives.
 //!
 //! It owns platform-neutral messaging behaviour over core capabilities:
-//! conversations and history, peer records, multi-device fan-out, contacts,
+//! conversations and history, peer records, active-device delivery, contacts,
 //! trust, and blocking.
 //! It carries no argument parsing and no terminal UI — those live in a shell
 //! crate (e.g. `mycellium-cli`), so the same engine can back a GUI or mobile app.

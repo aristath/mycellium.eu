@@ -145,12 +145,13 @@ self-authenticating records, not messages.
 
 ### 3.3 Sender Responsibility
 
-The sender's device owns pending delivery.
+The sender's active device owns pending delivery.
 
-If Alice turns off every device before Bob is reachable, delivery waits. If Alice
-has multiple devices, those devices may sync pending outbox state with each
-other only through user-controlled, end-to-end-protected mechanisms. The core
-protocol must not assume a third-party pending-message host.
+If Alice turns off her active device before Bob is reachable, delivery waits.
+Switching devices replaces the active device. Pending delivery does not move to
+the new device unless Alice explicitly imports local state through a
+user-controlled, end-to-end-protected backup or transfer. The core protocol must
+not assume a third-party pending-message host.
 
 ### 3.4 Local Outbox
 
@@ -277,7 +278,8 @@ A registry account has:
 - `login_identities`: ways to prove account access, such as email magic links,
   phone OTP, passkeys, biometrics, or future platform auth
 - `protocol_identity`: the Mycellium cryptographic identity root
-- `devices`: installed apps/devices authorized under that protocol identity
+- `active_device`: the one installed app/device currently authorized under that
+  protocol identity
 - `handles`: non-unique user-readable display names
 
 Email is only the first login surface. It is not essential to the model and must
@@ -286,6 +288,9 @@ not be baked into record validity.
 A user account may have multiple login identities. Adding phone, passkeys,
 biometrics, or future authentication methods should not change the protocol
 identity model.
+
+A user account has one active device at a time. Device switching is supported by
+publishing a new signed record that replaces the previous active device.
 
 A handle is not unique and is not identity. It is display metadata.
 
@@ -412,7 +417,7 @@ messages.
 | Threat | Hard Model Response |
 |--------|---------------------|
 | Server seizure | No required message server exists. |
-| Message custody demands | Messages wait on sender devices, not infrastructure. |
+| Message custody demands | Messages wait on the sender's active device, not infrastructure. |
 | Central message metadata | There is no central message path. |
 | Central service outage | Discovery may degrade, but existing peer knowledge remains useful. |
 | Server-side account control | Discovery records must be self-authenticating. |
@@ -422,7 +427,7 @@ messages.
 | Problem | Reality |
 |---------|---------|
 | Offline recipient | Delivery waits until sender and recipient can meet. |
-| Sleeping sender | Pending delivery stops when all sender devices are offline. |
+| Sleeping sender | Pending delivery stops when the sender's active device is offline. |
 | Sybil attacks | DHT participation needs local trust, rate limits, and record validation. |
 | Metadata leakage | Peers and discovery nodes may observe addresses and timing. |
 | Browser limitations | Browser peers need browser-native P2P mechanisms or remain constrained. |

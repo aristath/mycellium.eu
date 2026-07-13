@@ -1,8 +1,8 @@
 //! `engine::flow` — the shared, platform-generic messaging orchestration.
 //!
 //! This module owns platform-generic messaging orchestration: trust checks,
-//! fan-out, receive handling, history writes, and group state transitions. Hosts
-//! inject a [`FlowNet`] that resolves signed peer records and a per-device
+//! delivery, receive handling, history writes, and group state transitions. Hosts
+//! inject a [`FlowNet`] that resolves signed peer records and an active-device
 //! delivery closure that performs direct transport and local retry.
 
 use mycellium_core::group::{Group, GroupMessage, SenderKeyDistribution};
@@ -14,9 +14,7 @@ use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
 
 use crate::blocklist;
-use crate::groups::{
-    self, GroupInvitePayload, GroupLeavePayload, GroupSyncPayload, MailItem, StoredGroup,
-};
+use crate::groups::{self, GroupInvitePayload, GroupLeavePayload, MailItem, StoredGroup};
 use crate::history::{self, GroupStoredMessage, StoredMessage};
 use crate::names;
 use crate::reachability::DeliveryPath;
@@ -57,7 +55,7 @@ pub enum ItemOutcome {
     Accepted,
     /// Permanently rejected. Do not acknowledge acceptance.
     Rejected,
-    /// Not handled yet (undecryptable, or for a group whose invite/sync hasn't
+    /// Not handled yet (undecryptable, or for a group whose invite hasn't
     /// arrived) — the host may keep it for a later direct retry.
     Retry,
 }
@@ -69,7 +67,7 @@ pub enum ItemOutcome {
 /// attachment persistence details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowEvent {
-    /// A decrypted 1:1 message from `from` (never our own — see [`FlowEvent::SelfMirror`]).
+    /// A decrypted 1:1 message from `from`.
     DirectMessage {
         /// The authenticated sender's handle.
         from: String,
@@ -79,16 +77,6 @@ pub enum FlowEvent {
         text: String,
         /// Always `false` on the receive path; present for symmetry with DTOs.
         from_me: bool,
-    },
-    /// A mirror of a message *this account* sent from another device (Layer 11
-    /// self-sync). Already recorded in `peer`'s transcript as our own outgoing.
-    SelfMirror {
-        /// The peer the mirrored message was addressed to.
-        peer: String,
-        /// The mirrored message id.
-        id: String,
-        /// The mirrored message's display text.
-        text: String,
     },
     /// A decrypted group message (already appended to the group transcript).
     GroupMessage {
@@ -151,14 +139,6 @@ pub enum FlowEvent {
         name: String,
         /// The member who left.
         member: String,
-    },
-    /// This device was bootstrapped into a group from a sibling's group-sync
-    /// (state saved; our own key distributed so we can also send).
-    GroupBootstrapped {
-        /// The group's id.
-        group_id: String,
-        /// The group's display name.
-        name: String,
     },
     /// An inbound attachment the host must persist however it renders.
     Attachment {
@@ -224,28 +204,26 @@ where
     Ok((handle, record))
 }
 
-/// The tally of one 1:1 send device fan-out, returned by [`send_app`].
+/// The tally of one 1:1 active-device send, returned by [`send_app`].
 #[derive(Debug, Clone, Default)]
 pub struct SendOutcome {
     /// The sent message's id (`AppMessage::id`).
     pub id: String,
-    /// Devices the copy reached directly.
+    /// Active-device copies accepted.
     pub delivered: u32,
-    /// Devices reached by a live direct push.
+    /// Active-device copies reached by a live direct push.
     pub direct: u32,
-    /// Devices we couldn't reach (parked in the outbox for retry).
+    /// Active-device copies we couldn't reach (parked in the outbox for retry).
     pub outboxed: u32,
-    /// Device copies that could not be sealed or persisted locally and therefore
-    /// were not transmitted.
+    /// Copies that could not be sealed or persisted locally and therefore were
+    /// not transmitted.
     pub failed: u32,
 }
 
-/// The **shared 1:1 send fan-out**, generic over the [`Storage`]/[`Platform`]
-/// ports and the injected [`FlowNet`]. For each of the peer's devices (Layer 11)
-/// it X3DH-seals one copy ([`wireops::seal_to`]) into a [`MailItem::Direct`] and
-/// hands it to `deliver`, tallying by the returned [`DeliveryPath`]; then it
-/// records our own transcript copy; then it self-syncs the send to our *own*
-/// other devices via `self_deliver`.
+/// The shared 1:1 send path, generic over the [`Storage`]/[`Platform`] ports and
+/// the injected [`FlowNet`]. It X3DH-seals one copy ([`wireops::seal_to`]) to the
+/// peer's active device and hands it to `deliver`, tallying by the returned
+/// [`DeliveryPath`]; then it records our own transcript copy.
 ///
 /// The two closures own the client-specific transport + retry policy: direct
 /// TCP/libp2p with an outbox fallback. The store is threaded *through* the
@@ -260,14 +238,14 @@ pub fn send_app<S, P, N>(
     identity: &Identity,
     store: &mut S,
     platform: &mut P,
-    net: &N,
+    _net: &N,
     me: &Handle,
     sender_record: &SignedRecord,
     peer: &Handle,
     peer_record: &SignedRecord,
     app: &AppMessage,
     deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
-    self_deliver: &mut dyn FnMut(&mut S, &Handle, &Device, MailItem),
+    _self_deliver: &mut dyn FnMut(&mut S, &Handle, &Device, MailItem),
 ) -> Result<SendOutcome, S::Error>
 where
     S: Storage,
@@ -280,23 +258,20 @@ where
         ..Default::default()
     };
 
-    // Fan out one sealed copy per recipient device (Layer 11) — each device has
-    // its own keys. A device we can't reach is parked by the `deliver` closure.
-    for device in &peer_record.record.devices {
-        let Ok(env) =
-            wireops::seal_to_with_record(platform, identity, me, sender_record, device, &encoded)
-        else {
-            out.failed += 1;
-            continue;
-        };
-        match deliver(store, peer, peer_record, device, MailItem::Direct(env)) {
-            DeliveryPath::Direct => {
-                out.direct += 1;
-                out.delivered += 1;
-            }
-            DeliveryPath::Outbox => out.outboxed += 1,
-            DeliveryPath::Failed => out.failed += 1,
+    let device = &peer_record.record.device;
+    let Ok(env) =
+        wireops::seal_to_with_record(platform, identity, me, sender_record, device, &encoded)
+    else {
+        out.failed += 1;
+        return Ok(out);
+    };
+    match deliver(store, peer, peer_record, device, MailItem::Direct(env)) {
+        DeliveryPath::Direct => {
+            out.direct += 1;
+            out.delivered += 1;
         }
+        DeliveryPath::Outbox => out.outboxed += 1,
+        DeliveryPath::Failed => out.failed += 1,
     }
 
     // Record our own copy in this device's transcript, so the conversation shows
@@ -324,32 +299,6 @@ where
         }
     }
 
-    // Self-sync: mirror this message to our own other devices (Layer 11), so a
-    // sibling device shows what we sent from here. Never to this device itself.
-    if let Ok(my_record) = net.lookup(me) {
-        let my_key = identity.device_public();
-        for device in &my_record.record.devices {
-            if device.device_key == my_key {
-                continue;
-            }
-            let Ok(env) = wireops::seal_to_with_record(
-                platform,
-                identity,
-                me,
-                sender_record,
-                device,
-                &encoded,
-            ) else {
-                continue;
-            };
-            let sync = MailItem::SelfSync {
-                peer: peer.as_str().to_string(),
-                envelope: env,
-            };
-            self_deliver(store, me, device, sync);
-        }
-    }
-
     Ok(out)
 }
 
@@ -358,8 +307,8 @@ where
 /// wallet has changed.
 ///
 /// The flow owns the shared logic — lookup, `verify()`, the TOFU pin check
-/// ([`verified::level`] against `store`), and per-device sealing ([`wireops::seal_to`]).
-/// `deliver` performs the client-specific per-device delivery. The store is
+/// ([`verified::level`] against `store`), and active-device sealing ([`wireops::seal_to`]).
+/// `deliver` performs the client-specific active-device delivery. The store is
 /// threaded through `deliver` rather than captured by it so the pin check and
 /// local retry writes share the one handle.
 ///
@@ -419,36 +368,26 @@ pub fn distribute_key<S, P, N>(
         {
             continue;
         }
-        // Seal the sender key to every device in the member's cluster (Layer 11) —
-        // including our *own* siblings, but never this device itself.
-        for device in &record.record.devices {
-            if device.device_key == identity.device_public() {
-                continue;
-            }
-            let Ok(env) = wireops::seal_to_with_record(
-                platform,
-                identity,
-                me,
-                sender_record,
-                device,
-                &plaintext,
-            ) else {
-                continue;
-            };
-            deliver(store, &handle, &record, device, MailItem::GroupInvite(env));
+        let device = &record.record.device;
+        if device.device_key == identity.device_public() {
+            continue;
         }
+        let Ok(env) =
+            wireops::seal_to_with_record(platform, identity, me, sender_record, device, &plaintext)
+        else {
+            continue;
+        };
+        deliver(store, &handle, &record, device, MailItem::GroupInvite(env));
     }
 }
 
-/// The **shared group-send fan-out**, generic over the [`Storage`] port and the
+/// The **shared group-send path**, generic over the [`Storage`] port and the
 /// injected [`FlowNet`]. It encrypts `app` under the group's sender-key ratchet
 /// (advancing + persisting the ratchet state — it must never rewind, or members
 /// can't decrypt), builds one [`MailItem::GroupText`], and fans that single
-/// ciphertext to every member's devices (Layer 11) via `net.lookup` + `deliver`,
-/// tallying by the returned [`DeliveryPath`]. Our **own** sibling devices are just
-/// more targets (they hold our key from a group sync), so the send mirrors across
-/// our cluster; only this exact device is skipped. Finally it records our own
-/// group-transcript copy (an edit/delete is applied in place instead).
+/// ciphertext to every member's active device via `net.lookup` + `deliver`,
+/// tallying by the returned [`DeliveryPath`]. Finally it records our own
+/// group-transcript copy locally (an edit/delete is applied in place instead).
 ///
 /// `deliver` owns the client-specific transport + retry policy. The store is
 /// threaded *through* it so the seal loop and the closure's own writes share one
@@ -492,8 +431,7 @@ where
     group.state = session.export();
     groups::save(store, group)?;
 
-    // Fan the one ciphertext out to every member's devices — including our own
-    // siblings, but never this device itself.
+    // Fan the one ciphertext out to every member's active device.
     let item = MailItem::GroupText {
         group_id: group.id.clone(),
         message: gm,
@@ -518,18 +456,17 @@ where
         {
             continue;
         }
-        for device in &record.record.devices {
-            if device.device_key == identity.device_public() {
-                continue; // never to this device itself
+        let device = &record.record.device;
+        if device.device_key == identity.device_public() {
+            continue; // never to this device itself
+        }
+        match deliver(store, &handle, &record, device, item.clone()) {
+            DeliveryPath::Direct => {
+                out.direct += 1;
+                out.delivered += 1;
             }
-            match deliver(store, &handle, &record, device, item.clone()) {
-                DeliveryPath::Direct => {
-                    out.direct += 1;
-                    out.delivered += 1;
-                }
-                DeliveryPath::Outbox => out.outboxed += 1,
-                DeliveryPath::Failed => out.failed += 1,
-            }
+            DeliveryPath::Outbox => out.outboxed += 1,
+            DeliveryPath::Failed => out.failed += 1,
         }
     }
 
@@ -549,11 +486,11 @@ where
     Ok(out)
 }
 
-/// The **shared group-leave fan-out**, generic over the [`Storage`]/[`Platform`]
+/// The **shared group-leave path**, generic over the [`Storage`]/[`Platform`]
 /// ports and the injected [`FlowNet`]. It seals an **authenticated**
 /// [`MailItem::GroupLeave`] (X3DH — [`wireops::seal_to`], so members can prove the
 /// departure is genuinely ours and no one can forge someone else leaving) to every
-/// OTHER member's devices via `net.lookup` + `deliver`, so they drop us and re-key;
+/// OTHER member's active device via `net.lookup` + `deliver`, so they drop us and re-key;
 /// then it removes the group locally.
 ///
 /// `deliver` owns the client-specific transport + retry policy; the store is
@@ -593,22 +530,16 @@ pub fn group_leave<S, P, N>(
         if record.verify().is_err() {
             continue;
         }
-        for device in &record.record.devices {
-            if device.device_key == identity.device_public() {
-                continue;
-            }
-            let Ok(env) = wireops::seal_to_with_record(
-                platform,
-                identity,
-                me,
-                sender_record,
-                device,
-                &plaintext,
-            ) else {
-                continue;
-            };
-            deliver(store, &handle, &record, device, MailItem::GroupLeave(env));
+        let device = &record.record.device;
+        if device.device_key == identity.device_public() {
+            continue;
         }
+        let Ok(env) =
+            wireops::seal_to_with_record(platform, identity, me, sender_record, device, &plaintext)
+        else {
+            continue;
+        };
+        deliver(store, &handle, &record, device, MailItem::GroupLeave(env));
     }
     // Drop our local group state last, so a mid-send failure still leaves us able
     // to retry (the state is what the seal loop reads from).
@@ -632,7 +563,7 @@ struct Recv<'a> {
 /// (such as a group-key redistribution) *inside* the flow. Returns whether the
 /// item was accepted, rejected, or must be kept for [`ItemOutcome::Retry`].
 ///
-/// `deliver` is the same client-specific per-device delivery closure
+/// `deliver` is the same client-specific active-device delivery closure
 /// [`send_app`] and [`distribute_key`] take, threaded so follow-up sends reuse
 /// the host's durable retry policy; the store is passed through it, never
 /// captured.
@@ -662,16 +593,12 @@ where
     };
     match item {
         MailItem::Direct(env) => recv_direct(r, store, platform, sink, &env),
-        MailItem::SelfSync { peer, envelope } => {
-            recv_self_sync(r, store, platform, sink, &peer, &envelope)
-        }
         MailItem::GroupInvite(env) => {
             recv_group_invite(r, store, platform, net, sink, &env, deliver)
         }
         MailItem::GroupText { group_id, message } => {
             recv_group_text(r, store, platform, sink, &group_id, &message)
         }
-        MailItem::GroupSync(env) => recv_group_sync(r, store, platform, net, sink, &env, deliver),
         MailItem::GroupLeave(env) => recv_group_leave(r, store, platform, net, sink, &env, deliver),
     }
 }
@@ -766,70 +693,6 @@ where
             }
         },
         Err(_) => return ItemOutcome::Rejected,
-    }
-    ItemOutcome::Accepted
-}
-
-/// Process a mirror of a message *this account* sent from another device: record
-/// it in the peer's transcript as our own outgoing message (Layer 11 self-sync).
-fn recv_self_sync<S, P>(
-    r: Recv,
-    store: &mut S,
-    platform: &mut P,
-    sink: &mut dyn FlowSink,
-    peer: &str,
-    env: &Envelope,
-) -> ItemOutcome
-where
-    S: Storage,
-    P: Platform,
-{
-    let Ok((_from, bytes)) = wireops::open_envelope(platform, r.identity, env) else {
-        return ItemOutcome::Retry;
-    };
-    // A self-sync mirror must come from our OWN cluster: the envelope's sender
-    // record has to be signed by our own wallet. Otherwise any peer who can seal a
-    // valid envelope to us could forge a `SelfSync` and inject (`from_me:true`) or
-    // edit/delete (`by_me:true`) our real outgoing transcript. Fail closed.
-    if env.sender_record.record.wallet != r.identity.wallet_public() {
-        return ItemOutcome::Rejected;
-    }
-    let Ok(app) = AppMessage::decode(&bytes) else {
-        return ItemOutcome::Rejected;
-    };
-    match &app.body {
-        Body::Edit { to, text } => {
-            if history::edit(store, peer, to, text, true).is_err() {
-                return ItemOutcome::Retry;
-            }
-        }
-        Body::Delete { to } => {
-            if history::delete(store, peer, to, true).is_err() {
-                return ItemOutcome::Retry;
-            }
-        }
-        Body::Receipt { .. } => {} // receipts aren't mirrored
-        _ => {
-            let entry = StoredMessage {
-                id: app.id.clone(),
-                from_me: true,
-                text: app.summary(),
-                timestamp: platform.now_unix_secs(),
-                expires_at: app.expires_at,
-            };
-            let inserted = match history::append(store, peer, entry) {
-                Ok(inserted) => inserted,
-                Err(_) => return ItemOutcome::Retry,
-            };
-            if !inserted {
-                return ItemOutcome::Accepted;
-            }
-            sink.emit(FlowEvent::SelfMirror {
-                peer: peer.to_string(),
-                id: app.id.clone(),
-                text: app.summary(),
-            });
-        }
     }
     ItemOutcome::Accepted
 }
@@ -937,7 +800,7 @@ where
 }
 
 /// Decrypt a received group message and store it. Returns [`ItemOutcome::Retry`]
-/// when we don't have the group / sender key yet (its invite/sync hasn't arrived).
+/// when we don't have the group / sender key yet (its invite hasn't arrived).
 fn recv_group_text<S, P>(
     r: Recv,
     store: &mut S,
@@ -952,7 +815,7 @@ where
 {
     let mut stored = match groups::load(store, group_id) {
         Ok(Some(s)) => s,
-        // Unknown group (its invite/sync hasn't been processed) or a store error:
+        // Unknown group (its invite hasn't been processed) or a store error:
         // keep the item so it retries once we know the group.
         _ => return ItemOutcome::Retry,
     };
@@ -1049,68 +912,6 @@ where
         sender,
         id,
         text: display,
-    });
-    ItemOutcome::Accepted
-}
-
-/// Bootstrap this device into a group from a sibling's [`GroupSyncPayload`], then
-/// announce our own key to the members so this device can also *send*.
-#[allow(clippy::too_many_arguments)]
-fn recv_group_sync<S, P, N>(
-    r: Recv,
-    store: &mut S,
-    platform: &mut P,
-    net: &N,
-    sink: &mut dyn FlowSink,
-    env: &Envelope,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
-) -> ItemOutcome
-where
-    S: Storage,
-    P: Platform,
-    N: FlowNet,
-{
-    let Ok((_from, bytes)) = wireops::open_envelope(platform, r.identity, env) else {
-        return ItemOutcome::Retry;
-    };
-    // A group-sync bootstrap must come from our OWN cluster — otherwise any peer
-    // who can seal an envelope to us could hand us an attacker-chosen group
-    // (roster, keys, sender→handle map) and make us distribute our sender key to
-    // members of their choosing. Fail closed on a foreign sender.
-    if env.sender_record.record.wallet != r.identity.wallet_public() {
-        return ItemOutcome::Rejected;
-    }
-    let Ok(payload) = serde_json::from_slice::<GroupSyncPayload>(&bytes) else {
-        return ItemOutcome::Retry;
-    };
-    match groups::load(store, &payload.group_id) {
-        Ok(Some(_)) => return ItemOutcome::Accepted, // already have this group
-        Ok(None) => {}
-        Err(_) => return ItemOutcome::Retry,
-    }
-    // A fresh own sender key (this device signs under its device id); import every
-    // sender key the cluster shared so we can decrypt current members.
-    let mut group = Group::new(platform, wireops::my_group_id(r.identity));
-    for (id, dist) in &payload.keys {
-        let _ = group.add_member(id.clone(), dist);
-    }
-    let mut stored = StoredGroup {
-        id: payload.group_id.clone(),
-        name: payload.name.clone(),
-        members: payload.members.clone(),
-        me: r.me.as_str().to_string(),
-        sender_handles: payload.sender_handles.clone(),
-        state: group.export(),
-    };
-    stored.note_sender(wireops::my_group_id(r.identity), r.me.as_str());
-    if groups::save(store, &stored).is_err() {
-        return ItemOutcome::Retry;
-    }
-    let targets = stored.members.clone();
-    distribute_group_key(r, store, platform, net, &stored, &group, &targets, deliver);
-    sink.emit(FlowEvent::GroupBootstrapped {
-        group_id: stored.id.clone(),
-        name: stored.name.clone(),
     });
     ItemOutcome::Accepted
 }
@@ -1298,46 +1099,8 @@ mod recv_tests {
         )
     }
 
-    // A forged `SelfSync` from a FOREIGN identity must not touch our transcript:
-    // the mirror's sender record must be signed by our OWN wallet, else any peer
-    // who can seal an envelope to us could inject (or edit/delete) our outgoing
-    // history (core review, HIGH). This guard now lives once, in the flow.
-    #[test]
-    fn self_sync_rejects_a_forged_mirror_from_a_foreign_identity() {
-        let mut p = TestPlatform;
-        let victim = Identity::generate(&mut p).unwrap();
-        let attacker = Identity::generate(&mut p).unwrap();
-        let vh = Handle::new("victimhandle").unwrap();
-        let ah = Handle::new("attackerhandle").unwrap();
-        let vrec = wireops::build_record(&mut p, &victim, &vh, "", "");
-        let vdev = vrec.record.primary();
-
-        // ATTACK: a foreign identity seals a mirror to the victim, wrapped SelfSync.
-        let forged = wireops::text_message(&mut p, "forged outgoing").encode();
-        let env = wireops::seal_to(&mut p, &attacker, &ah, "", vdev, &forged).unwrap();
-
-        let mut store = MemStore::default();
-        let mut sink = CollectSink::default();
-        let outcome = run(
-            &victim,
-            &vh,
-            &mut store,
-            MailItem::SelfSync {
-                peer: "someone".to_string(),
-                envelope: env,
-            },
-            &mut sink,
-        );
-        assert_eq!(outcome, ItemOutcome::Rejected);
-        assert!(
-            history::load(&store, "someone").unwrap().is_empty(),
-            "a forged self-sync from a foreign identity must NOT touch our history",
-        );
-        assert!(sink.0.is_empty(), "a rejected forgery emits nothing");
-    }
-
     // A group message for a group we don't have yet must be KEPT for retry (its
-    // invite/sync hasn't been processed), not dropped as handled (issue #46).
+    // invite hasn't been processed), not dropped as handled (issue #46).
     #[test]
     fn group_text_for_unknown_group_is_kept_for_retry() {
         let mut p = TestPlatform;

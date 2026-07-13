@@ -1,6 +1,6 @@
 //! Self-certifying identity, device, and reachability records.
 //!
-//! A discovery bundle answers *"given a handle, who, which devices, and where?"*
+//! A discovery bundle answers *"given a handle, who, which active device, and where?"*
 //! without giving discovery authority: the wallet signs identity and stable
 //! device claims, while each device signs its own independently versioned
 //! address. A carrier can withhold or replay claims, but cannot forge them.
@@ -20,9 +20,6 @@ use crate::identity::{
 pub const MAX_NAME_LEN: usize = 128;
 /// Max peer-id length (bytes) per device (a `host:port` or a multiaddr).
 pub const MAX_PEER_ID_LEN: usize = 256;
-/// Max devices in one account's record.
-pub const MAX_DEVICES: usize = 32;
-
 /// A medium-term messaging key, signed by the wallet, that lets a peer start a
 /// one-shot X3DH session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +42,7 @@ impl SignedPreKey {
 /// record or require the wallet key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRecord {
-    /// This device's Ed25519 key, its stable identifier within the cluster.
+    /// This device's Ed25519 key, its stable identifier.
     pub device_key: DevicePublicKey,
     /// Long-term messaging key for X3DH.
     pub id_key: MessagingPublicKey,
@@ -175,21 +172,21 @@ pub struct Record {
     pub name: String,
     /// Root identity: the wallet that signs this record.
     pub wallet: WalletPublicKey,
-    /// Devices that can receive direct messages for this account.
-    pub devices: Vec<Device>,
+    /// The only active device that can receive direct messages for this account.
+    pub device: Device,
     /// Monotonic sequence number for freshness and anti-rollback.
     pub seq: u64,
 }
 
 impl Record {
-    /// The account's first device. Valid records always carry at least one.
+    /// The account's active device.
     pub fn primary(&self) -> &Device {
-        &self.devices[0]
+        &self.device
     }
 
-    /// Find a device in the cluster by its key.
+    /// Return the active device if its key matches.
     pub fn device(&self, key: &DevicePublicKey) -> Option<&Device> {
-        self.devices.iter().find(|d| &d.device_key == key)
+        (&self.device.device_key == key).then_some(&self.device)
     }
 
     /// The canonical byte encoding that is signed and verified.
@@ -199,14 +196,14 @@ impl Record {
             handle: &'a Handle,
             name: &'a str,
             wallet: WalletPublicKey,
-            devices: Vec<DevicePublicKey>,
+            device: DevicePublicKey,
             seq: u64,
         }
         let canon = crate::wire::canonical(&IdentityClaim {
             handle: &self.handle,
             name: &self.name,
             wallet: self.wallet,
-            devices: self.devices.iter().map(|d| d.device_key).collect(),
+            device: self.device.device_key,
             seq: self.seq,
         });
         let mut out = Vec::with_capacity(RECORD_DOMAIN.len() + canon.len());
@@ -272,34 +269,27 @@ impl SignedRecord {
         let wallet = &self.record.wallet;
         wallet.verify(&self.record.signing_bytes(), &self.signature)?;
         let r = &self.record;
-        if r.devices.is_empty() || r.devices.len() > MAX_DEVICES {
-            return Err(Error::Malformed);
-        }
         if r.name.len() > MAX_NAME_LEN {
             return Err(Error::Malformed);
         }
-        let mut seen = Vec::with_capacity(r.devices.len());
-        for device in &r.devices {
-            if device.peer_id().0.len() > MAX_PEER_ID_LEN
-                || device.reachability.record.device_key != device.device_key
-                || seen.contains(&device.device_key)
-            {
-                return Err(Error::Malformed);
-            }
-            seen.push(device.device_key);
-            wallet.verify(
-                &device_signing_bytes(wallet, &device.signed.record),
-                &device.signed.signature,
-            )?;
-            wallet.verify(
-                &prekey_signing_bytes(&device.signed_pre_key.public),
-                &device.signed_pre_key.signature,
-            )?;
-            device.device_key.verify(
-                &reachability_signing_bytes(&device.reachability.record),
-                &device.reachability.signature,
-            )?;
+        let device = &r.device;
+        if device.peer_id().0.len() > MAX_PEER_ID_LEN
+            || device.reachability.record.device_key != device.device_key
+        {
+            return Err(Error::Malformed);
         }
+        wallet.verify(
+            &device_signing_bytes(wallet, &device.signed.record),
+            &device.signed.signature,
+        )?;
+        wallet.verify(
+            &prekey_signing_bytes(&device.signed_pre_key.public),
+            &device.signed_pre_key.signature,
+        )?;
+        device.device_key.verify(
+            &reachability_signing_bytes(&device.reachability.record),
+            &device.reachability.signature,
+        )?;
         Ok(())
     }
 
@@ -307,20 +297,8 @@ impl SignedRecord {
     /// is compared first so a revoked device cannot make an older membership
     /// claim win merely by publishing a very large address sequence.
     pub fn freshness(&self) -> (u64, u64, u64) {
-        let stable = self
-            .record
-            .devices
-            .iter()
-            .map(|device| device.signed.record.seq)
-            .max()
-            .unwrap_or(0);
-        let reachability = self
-            .record
-            .devices
-            .iter()
-            .map(|device| device.reachability.record.seq)
-            .max()
-            .unwrap_or(0);
+        let stable = self.record.device.signed.record.seq;
+        let reachability = self.record.device.reachability.record.seq;
         (self.record.seq, stable, reachability)
     }
 }
@@ -348,7 +326,7 @@ mod tests {
             handle: Handle::new("ari").unwrap(),
             name: "Ari".to_string(),
             wallet: id.wallet_public(),
-            devices: alloc::vec![Device::create(id, PeerId(b"127.0.0.1:9001".to_vec()), seq,)],
+            device: Device::create(id, PeerId(b"127.0.0.1:9001".to_vec()), seq),
             seq,
         }
     }
@@ -365,11 +343,11 @@ mod tests {
         assert!(tampered.verify().is_err());
 
         let mut tampered_device = signed.clone();
-        tampered_device.record.devices[0].signed.record.seq += 1;
+        tampered_device.record.device.signed.record.seq += 1;
         assert!(tampered_device.verify().is_err());
 
         let mut tampered_address = signed;
-        tampered_address.record.devices[0].reachability.record.seq += 1;
+        tampered_address.record.device.reachability.record.seq += 1;
         assert!(tampered_address.verify().is_err());
     }
 
@@ -378,32 +356,34 @@ mod tests {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let original = SignedRecord::sign(record_for(&identity, 7), &identity);
-        let stable = original.record.devices[0].signed.clone();
+        let stable = original.record.device.signed.clone();
         let mut refreshed = original.clone();
-        refreshed.record.devices[0] = original.record.devices[0]
+        refreshed.record.device = original
+            .record
+            .device
             .refresh_reachability(&identity, PeerId(b"127.0.0.1:9999".to_vec()), 8)
             .unwrap();
 
         assert_eq!(refreshed.signature, original.signature);
-        assert_eq!(refreshed.record.devices[0].signed, stable);
-        assert_eq!(refreshed.record.devices[0].peer_id().0, b"127.0.0.1:9999");
+        assert_eq!(refreshed.record.device.signed, stable);
+        assert_eq!(refreshed.record.device.peer_id().0, b"127.0.0.1:9999");
         assert!(refreshed.verify().is_ok());
     }
 
     #[test]
-    fn identity_freshness_outranks_an_old_devices_large_address_sequence() {
+    fn identity_freshness_outranks_an_old_device_large_address_sequence() {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let older = SignedRecord::sign(
             Record {
-                devices: alloc::vec![Device::create(&identity, PeerId(b"old".to_vec()), 10_000,)],
+                device: Device::create(&identity, PeerId(b"old".to_vec()), 10_000),
                 ..record_for(&identity, 7)
             },
             &identity,
         );
         let newer = SignedRecord::sign(
             Record {
-                devices: alloc::vec![Device::create(&identity, PeerId(b"new".to_vec()), 8,)],
+                device: Device::create(&identity, PeerId(b"new".to_vec()), 8),
                 ..record_for(&identity, 8)
             },
             &identity,
@@ -422,21 +402,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_oversized_device_sets_are_rejected() {
+    fn malformed_active_device_is_rejected() {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
 
-        let mut empty = record_for(&id, 1);
-        empty.devices.clear();
+        let oversized_peer_id = Record {
+            device: Device::create(&id, PeerId(vec![b'x'; MAX_PEER_ID_LEN + 1]), 1),
+            ..record_for(&id, 1)
+        };
         assert_eq!(
-            SignedRecord::sign(empty, &id).verify(),
-            Err(Error::Malformed)
-        );
-
-        let mut many = record_for(&id, 1);
-        many.devices = alloc::vec![many.devices[0].clone(); MAX_DEVICES + 1];
-        assert_eq!(
-            SignedRecord::sign(many, &id).verify(),
+            SignedRecord::sign(oversized_peer_id, &id).verify(),
             Err(Error::Malformed)
         );
     }

@@ -89,9 +89,9 @@ cargo run -p mycellium-cli -- --config bob.json dht lookup alice --bootstrap /ip
 
 Profiles may keep bootstrap peers in `dht_bootstrap`. Normal send, chat, and
 group flows try the local peerbook first, then import a signed record from the
-configured DHT before failing. `register` and `revoke-device` automatically
-publish the updated signed record when configured bootstrap peers exist; `dht
-publish` is still available as an explicit retry.
+configured DHT before failing. `register` automatically publishes the updated
+signed record when configured bootstrap peers exist; `dht publish` is still
+available as an explicit retry.
 
 Run Bob's receiver:
 
@@ -190,8 +190,7 @@ mycellium discover <known-peer> [--want alice,bob]
 mycellium dht serve --addr <host:port> [--bootstrap <multiaddr>...]
 mycellium dht publish <handle> [--bootstrap <multiaddr>...] [--listen <host:port>]
 mycellium dht lookup <handle> [--bootstrap <multiaddr>...] [--listen <host:port>]
-mycellium devices <handle>
-mycellium revoke-device <handle> <device-id>
+mycellium device <handle>
 mycellium send <peer> --as <me> --message <text>
 mycellium serve --as <me> --addr <host:port> [--libp2p]
 mycellium outbox list
@@ -205,7 +204,6 @@ mycellium group add <group> --as <me> --member <handle>
 mycellium group history <group>
 mycellium group info <group>
 mycellium group leave <group> --as <me>
-mycellium group sync --as <me>
 mycellium group list
 mycellium-registry
 ```

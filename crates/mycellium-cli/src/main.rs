@@ -61,12 +61,8 @@ enum Command {
         #[command(subcommand)]
         action: DhtAction,
     },
-    Devices {
+    Device {
         handle: String,
-    },
-    RevokeDevice {
-        handle: String,
-        device_id: String,
     },
     Send {
         peer: String,
@@ -252,10 +248,6 @@ enum GroupAction {
         #[arg(long = "as")]
         whoami: String,
     },
-    Sync {
-        #[arg(long = "as")]
-        whoami: String,
-    },
     List,
 }
 
@@ -306,8 +298,7 @@ fn main() -> Result<()> {
                 listen,
             } => dht_lookup(&handle, listen.as_deref(), &bootstrap),
         },
-        Command::Devices { handle } => list_devices(&handle),
-        Command::RevokeDevice { handle, device_id } => revoke_device(&handle, &device_id),
+        Command::Device { handle } => list_device(&handle),
         Command::Send {
             peer,
             whoami,
@@ -382,7 +373,6 @@ fn main() -> Result<()> {
             GroupAction::History { group } => group_history(&group),
             GroupAction::Info { group } => group_info(&group),
             GroupAction::Leave { group, whoami } => group_leave(&group, &whoami),
-            GroupAction::Sync { whoami } => group_sync(&whoami),
             GroupAction::List => group_list(),
         },
         Command::Contact { action } => match action {
