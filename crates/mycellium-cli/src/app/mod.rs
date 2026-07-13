@@ -31,13 +31,13 @@ use mycellium_transport::link::{FrameReader, FrameWriter};
 use mycellium_transport::net::{self, TcpTransport};
 
 use crate::platform::OsPlatform;
-use mycellium_engine::contacts::{self, Contact};
+use mycellium_engine::contacts;
 use mycellium_engine::groups::{self, MailItem, PeerFrame, StoredGroup};
 use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
 use mycellium_engine::wireops;
-use mycellium_engine::{blocklist, draft, expiry, flow, history, inbox, outbox, verified};
+use mycellium_engine::{blocklist, expiry, flow, history, inbox, outbox, verified};
 
 mod backup;
 mod util;
@@ -1959,15 +1959,14 @@ pub fn search(query: &str) -> Result<()> {
 pub fn draft_cmd(peer: &str, text: Option<&str>) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, peer)?;
     match text {
         Some(t) => {
-            draft::set(&mut fs, &key, t)?;
+            let key = client::set_draft(&mut fs, peer, t)?;
             println!("draft saved for '{key}'");
         }
-        None => match draft::get(&fs, &key)? {
-            Some(d) => println!("draft for '{key}': {d}"),
-            None => println!("no draft for '{key}'"),
+        None => match client::get_draft(&fs, peer)? {
+            (key, Some(d)) => println!("draft for '{key}': {d}"),
+            (key, None) => println!("no draft for '{key}'"),
         },
     }
     Ok(())
@@ -1976,8 +1975,7 @@ pub fn draft_cmd(peer: &str, text: Option<&str>) -> Result<()> {
 pub fn draft_clear(peer: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, peer)?;
-    draft::clear(&mut fs, &key)?;
+    let key = client::clear_draft(&mut fs, peer)?;
     println!("cleared draft for '{key}'");
     Ok(())
 }
@@ -1986,8 +1984,7 @@ pub fn expire_set(target: &str, duration: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let secs = parse_duration(duration)?;
     let mut fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, target)?;
-    expiry::set(&mut fs, &key, secs)?;
+    let key = client::set_expiry(&mut fs, target, secs)?;
     println!("messages to '{key}' now disappear after {duration}");
     Ok(())
 }
@@ -1995,8 +1992,7 @@ pub fn expire_set(target: &str, duration: &str) -> Result<()> {
 pub fn expire_clear(target: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, target)?;
-    expiry::clear(&mut fs, &key)?;
+    let key = client::clear_expiry(&mut fs, target)?;
     println!("cleared disappearing-message timer for '{key}'");
     Ok(())
 }
@@ -2004,10 +2000,9 @@ pub fn expire_clear(target: &str) -> Result<()> {
 pub fn expire_show(target: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let key = contacts::resolve(&fs, target)?;
-    match expiry::get(&fs, &key)? {
-        Some(secs) => println!("'{key}': messages disappear after {secs}s"),
-        None => println!("'{key}': no disappearing-message timer"),
+    match client::get_expiry(&fs, target)? {
+        (key, Some(secs)) => println!("'{key}': messages disappear after {secs}s"),
+        (key, None) => println!("'{key}': no disappearing-message timer"),
     }
     Ok(())
 }
@@ -2041,6 +2036,7 @@ pub use mycellium_engine::wireops::{device_slot, my_group_id};
 mod tests {
     use super::*;
     use mycellium_core::group::GroupMessage;
+    use mycellium_engine::contacts::Contact;
 
     struct TestPlatform;
 

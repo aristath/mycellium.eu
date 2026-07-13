@@ -16,6 +16,7 @@ use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::verified;
 use mycellium_engine::wireops;
 use mycellium_engine::{antirollback, blocklist};
+use mycellium_engine::{draft, expiry};
 
 /// Public identity material useful for display.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,6 +283,60 @@ where
     Ok(blocklist::load(store)?)
 }
 
+pub fn set_draft<S: Storage>(store: &mut S, input: &str, text: &str) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    draft::set(store, &key, text)?;
+    Ok(key)
+}
+
+pub fn get_draft<S: Storage>(store: &S, input: &str) -> Result<(String, Option<String>)>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    let value = draft::get(store, &key)?;
+    Ok((key, value))
+}
+
+pub fn clear_draft<S: Storage>(store: &mut S, input: &str) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    draft::clear(store, &key)?;
+    Ok(key)
+}
+
+pub fn set_expiry<S: Storage>(store: &mut S, input: &str, ttl_secs: u64) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    expiry::set(store, &key, ttl_secs)?;
+    Ok(key)
+}
+
+pub fn get_expiry<S: Storage>(store: &S, input: &str) -> Result<(String, Option<u64>)>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    let value = expiry::get(store, &key)?;
+    Ok((key, value))
+}
+
+pub fn clear_expiry<S: Storage>(store: &mut S, input: &str) -> Result<String>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let key = resolve_name(store, input)?;
+    expiry::clear(store, &key)?;
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +483,36 @@ mod tests {
 
         set_blocked(&mut store, "alice", false).unwrap();
         assert!(list_blocked(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn draft_and_expiry_resolve_contact_names() {
+        let handle = Handle::new("alice").unwrap();
+        let mut platform = SeededPlatform(11);
+        let identity = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        let record =
+            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        import_record(&mut store, &handle, record).unwrap();
+        add_contact(&mut store, "a", &handle).unwrap();
+
+        assert_eq!(set_draft(&mut store, "a", "hello").unwrap(), "alice");
+        assert_eq!(
+            get_draft(&store, "alice").unwrap(),
+            ("alice".to_string(), Some("hello".to_string()))
+        );
+        assert_eq!(clear_draft(&mut store, "a").unwrap(), "alice");
+        assert_eq!(get_draft(&store, "a").unwrap(), ("alice".to_string(), None));
+
+        assert_eq!(set_expiry(&mut store, "a", 60).unwrap(), "alice");
+        assert_eq!(
+            get_expiry(&store, "alice").unwrap(),
+            ("alice".to_string(), Some(60))
+        );
+        assert_eq!(clear_expiry(&mut store, "a").unwrap(), "alice");
+        assert_eq!(
+            get_expiry(&store, "a").unwrap(),
+            ("alice".to_string(), None)
+        );
     }
 }
