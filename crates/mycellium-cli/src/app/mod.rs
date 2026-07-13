@@ -1865,11 +1865,10 @@ pub fn contact_remove(nickname: &str) -> Result<()> {
 pub fn set_blocked(handle: &str, blocked: bool) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
+    client::set_blocked(&mut fs, handle, blocked)?;
     if blocked {
-        blocklist::block(&mut fs, handle)?;
         println!("blocked '{handle}'");
     } else {
-        blocklist::unblock(&mut fs, handle)?;
         println!("unblocked '{handle}'");
     }
     Ok(())
@@ -1878,7 +1877,7 @@ pub fn set_blocked(handle: &str, blocked: bool) -> Result<()> {
 pub fn list_blocked() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let list = blocklist::load(&fs)?;
+    let list = client::list_blocked(&fs)?;
     if list.is_empty() {
         println!("no blocked handles");
     } else {

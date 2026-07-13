@@ -10,12 +10,12 @@ use mycellium_core::identity::{Handle, Identity, PeerId};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
-use mycellium_engine::antirollback;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
 use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::verified;
 use mycellium_engine::wireops;
+use mycellium_engine::{antirollback, blocklist};
 
 /// Public identity material useful for display.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +263,25 @@ where
     Ok(())
 }
 
+pub fn set_blocked<S: Storage>(store: &mut S, handle: &str, blocked: bool) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if blocked {
+        blocklist::block(store, handle)?;
+    } else {
+        blocklist::unblock(store, handle)?;
+    }
+    Ok(())
+}
+
+pub fn list_blocked<S: Storage>(store: &S) -> Result<Vec<String>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(blocklist::load(store)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +416,17 @@ mod tests {
 
         remove_contact(&mut store, "a").unwrap();
         assert!(list_contacts(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocklist_round_trips() {
+        let mut store = MemStore::default();
+
+        set_blocked(&mut store, "alice", true).unwrap();
+        set_blocked(&mut store, "alice", true).unwrap();
+        assert_eq!(list_blocked(&store).unwrap(), vec!["alice".to_string()]);
+
+        set_blocked(&mut store, "alice", false).unwrap();
+        assert!(list_blocked(&store).unwrap().is_empty());
     }
 }
