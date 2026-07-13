@@ -30,7 +30,7 @@ use mycellium_transport::net::{self, TcpTransport};
 
 use crate::platform::OsPlatform;
 use mycellium_engine::contacts;
-use mycellium_engine::groups::{self, MailItem, PeerFrame, StoredGroup};
+use mycellium_engine::groups::{DiscoveryRecord, MailItem, PeerFrame, StoredGroup};
 use mycellium_engine::peerbook;
 use mycellium_engine::reachability::{self, DeliveryPath};
 #[cfg(test)]
@@ -922,7 +922,7 @@ fn request_discovery_from_device(
     network: &DirectNetwork,
     device: &Device,
     want: &[String],
-) -> Result<Vec<groups::DiscoveryRecord>> {
+) -> Result<Vec<DiscoveryRecord>> {
     let request = PeerFrame::DiscoveryRequest {
         want: want.to_vec(),
     };
@@ -950,7 +950,7 @@ fn request_discovery_from_device(
     }
 }
 
-fn decode_discovery_response(frame: &[u8]) -> Result<Vec<groups::DiscoveryRecord>> {
+fn decode_discovery_response(frame: &[u8]) -> Result<Vec<DiscoveryRecord>> {
     match wire::decode::<PeerFrame>(frame)? {
         PeerFrame::DiscoveryResponse { records } => Ok(records),
         _ => bail!("peer returned a non-discovery frame"),
@@ -1241,13 +1241,9 @@ pub fn group_add(group: &str, member: &str, whoami: &str) -> Result<()> {
     let my_record = own_record(&fs, &me)?;
     let member = Handle::new(member.to_string()).map_err(|_| anyhow!("invalid member handle"))?;
 
-    let mut stored = client::resolve_group(&fs, group)?;
-    if stored.members.iter().any(|m| m == member.as_str()) {
-        bail!("'{}' is already in '{}'", member.as_str(), stored.name);
-    }
-    stored.members.push(member.as_str().to_string());
+    let stored = client::group_with_added_member(&fs, group, &member)?;
     ensure_peer_records(&identity, &mut fs, &stored.members)?;
-    groups::save(&mut fs, &stored)?;
+    client::save_group(&mut fs, &stored)?;
 
     let targets = stored.members.clone();
     distribute_group_key_direct(&identity, &me, &my_record, &stored, &targets, &mut fs);

@@ -599,6 +599,30 @@ where
     Ok(stored)
 }
 
+pub fn group_with_added_member<S: Storage>(
+    store: &S,
+    group: &str,
+    member: &Handle,
+) -> Result<StoredGroup>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut stored = resolve_group(store, group)?;
+    if stored.members.iter().any(|m| m == member.as_str()) {
+        bail!("'{}' is already in '{}'", member.as_str(), stored.name);
+    }
+    stored.members.push(member.as_str().to_string());
+    Ok(stored)
+}
+
+pub fn save_group<S: Storage>(store: &mut S, group: &StoredGroup) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    groups::save(store, group)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn distribute_group_key<S, P>(
     identity: &Identity,
@@ -1185,6 +1209,12 @@ mod tests {
         assert_eq!(resolve_group(&store, "g1").unwrap().name, "team");
         assert_eq!(resolve_group(&store, "team").unwrap().id, "g1");
         assert_eq!(list_groups(&store).unwrap()[0].member_count, 2);
+
+        let carol = Handle::new("carol").unwrap();
+        let updated = group_with_added_member(&store, "team", &carol).unwrap();
+        assert!(updated.members.iter().any(|member| member == "carol"));
+        save_group(&mut store, &updated).unwrap();
+        assert_eq!(resolve_group(&store, "g1").unwrap().members.len(), 3);
 
         let (group, messages) = group_history(&mut store, "team", 2).unwrap();
         assert_eq!(group.id, "g1");
