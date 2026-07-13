@@ -17,6 +17,7 @@ use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
 use mycellium_engine::groups::{self, MailItem, StoredGroup};
 use mycellium_engine::history::{self, GroupStoredMessage, StoredMessage};
+use mycellium_engine::outbox::{self, OutboxEntry};
 use mycellium_engine::peerbook::{self, PeerRecord};
 use mycellium_engine::reachability::DeliveryPath;
 use mycellium_engine::verified;
@@ -690,6 +691,81 @@ where
     )
 }
 
+pub fn list_outbox<S: Storage>(store: &S) -> Result<Vec<OutboxEntry>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    Ok(outbox::load(store)?)
+}
+
+pub fn make_outbox_due<S: Storage>(store: &mut S) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    outbox::make_all_due(store)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutboxCancel {
+    Empty,
+    All { removed: usize },
+    One { id: String, recipient: String },
+}
+
+pub fn cancel_outbox<S: Storage>(store: &mut S, id: &str) -> Result<OutboxCancel>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut entries = outbox::load(store)?;
+    if entries.is_empty() {
+        return Ok(OutboxCancel::Empty);
+    }
+
+    if id == "all" {
+        let mut removed = 0usize;
+        for entry in entries.iter_mut().filter(|entry| entry.is_pending()) {
+            entry.status = outbox::OutboxStatus::Cancelled;
+            entry.send_after = 0;
+            removed += 1;
+        }
+        outbox::save(store, &entries)?;
+        return Ok(OutboxCancel::All { removed });
+    }
+
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| entry.id.starts_with(id).then_some(index))
+        .collect();
+    match matches.len() {
+        0 => bail!("no pending local delivery item matches '{id}'"),
+        1 => {
+            let entry = &mut entries[matches[0]];
+            if !entry.is_pending() {
+                bail!(
+                    "local delivery {} is already {:?}",
+                    short_outbox_id(&entry.id),
+                    entry.status
+                );
+            }
+            entry.status = outbox::OutboxStatus::Cancelled;
+            entry.send_after = 0;
+            let cancelled = OutboxCancel::One {
+                id: entry.id.clone(),
+                recipient: entry.recipient.clone(),
+            };
+            outbox::save(store, &entries)?;
+            Ok(cancelled)
+        }
+        n => bail!("'{id}' matches {n} pending items; use a longer id prefix"),
+    }
+}
+
+fn short_outbox_id(id: &str) -> &str {
+    &id[..12.min(id.len())]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +912,36 @@ mod tests {
 
         set_blocked(&mut store, "alice", false).unwrap();
         assert!(list_blocked(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_cancel_keeps_cli_policy_out_of_the_shell() {
+        let mut platform = SeededPlatform(9);
+        let mut group = mycellium_core::group::Group::new(&mut platform, b"me-device".to_vec());
+        let item = MailItem::GroupText {
+            group_id: "g1".to_string(),
+            message: group.encrypt(b"hello", b"group:g1"),
+        };
+        let mut store = MemStore::default();
+        outbox::enqueue(
+            &mut store,
+            "delivery-123".to_string(),
+            "bob",
+            "device-slot",
+            item,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(list_outbox(&store).unwrap().len(), 1);
+        assert_eq!(
+            cancel_outbox(&mut store, "delivery").unwrap(),
+            OutboxCancel::One {
+                id: "delivery-123".to_string(),
+                recipient: "bob".to_string(),
+            }
+        );
+        assert!(!list_outbox(&store).unwrap()[0].is_pending());
     }
 
     #[test]

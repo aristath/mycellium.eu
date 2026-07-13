@@ -650,7 +650,7 @@ fn serve_connection<C>(
 pub fn outbox_list() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let entries = outbox::load(&fs)?;
+    let entries = client::list_outbox(&fs)?;
     print_outbox_entries(&entries);
     Ok(())
 }
@@ -658,7 +658,7 @@ pub fn outbox_list() -> Result<()> {
 pub fn outbox_retry() -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    outbox::make_all_due(&mut fs)?;
+    client::make_outbox_due(&mut fs)?;
     let (delivered, _) = flush_outbox(&identity, &mut fs)?;
     if delivered > 0 {
         println!(
@@ -666,7 +666,7 @@ pub fn outbox_retry() -> Result<()> {
             plural(delivered, "message", "messages")
         );
     }
-    let entries = outbox::load(&fs)?;
+    let entries = client::list_outbox(&fs)?;
     print_outbox_entries(&entries);
     Ok(())
 }
@@ -674,55 +674,19 @@ pub fn outbox_retry() -> Result<()> {
 pub fn outbox_cancel(id: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    let mut entries = outbox::load(&fs)?;
-    if entries.is_empty() {
-        println!("outbox empty");
-        return Ok(());
-    }
-
-    if id == "all" {
-        let mut removed = 0usize;
-        for entry in entries.iter_mut().filter(|entry| entry.is_pending()) {
-            entry.status = outbox::OutboxStatus::Cancelled;
-            entry.send_after = 0;
-            removed += 1;
-        }
-        outbox::save(&mut fs, &entries)?;
-        println!(
+    match client::cancel_outbox(&mut fs, id)? {
+        client::OutboxCancel::Empty => println!("outbox empty"),
+        client::OutboxCancel::All { removed } => println!(
             "cancelled {removed} pending local delivery {}",
             plural(removed, "item", "items")
-        );
-        return Ok(());
-    }
-
-    let matches: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| entry.id.starts_with(id).then_some(index))
-        .collect();
-    match matches.len() {
-        0 => bail!("no pending local delivery item matches '{id}'"),
-        1 => {
-            let entry = &mut entries[matches[0]];
-            if !entry.is_pending() {
-                bail!(
-                    "local delivery {} is already {:?}",
-                    short_outbox_id(&entry.id),
-                    entry.status
-                );
-            }
-            entry.status = outbox::OutboxStatus::Cancelled;
-            entry.send_after = 0;
-            let removed_id = entry.id.clone();
-            let removed_recipient = entry.recipient.clone();
-            outbox::save(&mut fs, &entries)?;
+        ),
+        client::OutboxCancel::One { id, recipient } => {
             println!(
                 "cancelled pending local delivery {} for '{}'",
-                short_outbox_id(&removed_id),
-                removed_recipient
+                short_outbox_id(&id),
+                recipient
             );
         }
-        n => bail!("'{id}' matches {n} pending items; use a longer id prefix"),
     }
     Ok(())
 }
