@@ -11,9 +11,10 @@ use mycellium_core::platform::Platform;
 use mycellium_core::record::SignedRecord;
 use mycellium_core::storage::Storage;
 use mycellium_engine::antirollback;
-use mycellium_engine::contacts;
+use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
 use mycellium_engine::peerbook::{self, PeerRecord};
+use mycellium_engine::verified;
 use mycellium_engine::wireops;
 
 /// Public identity material useful for display.
@@ -210,6 +211,58 @@ pub fn resolve_local_record<S: Storage>(
     flow::resolve_record(store, &net, resolved)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactEntry {
+    pub nickname: String,
+    pub handle: String,
+    pub verified: bool,
+}
+
+pub fn add_contact<S: Storage>(store: &mut S, nickname: &str, handle: &Handle) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let record = require_record(store, handle)
+        .map_err(|_| anyhow!("import a signed record for '{}' first", handle.as_str()))?;
+    let contact = Contact {
+        nickname: nickname.to_string(),
+        handle: handle.as_str().to_string(),
+        wallet: record.record.wallet,
+    };
+    contacts::save(store, &contact)?;
+    Ok(())
+}
+
+pub fn list_contacts<S: Storage>(store: &S) -> Result<Vec<ContactEntry>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let contacts = contacts::list(store)?;
+    Ok(contacts
+        .into_iter()
+        .map(|contact| {
+            let verified = verified::get(store, &contact.handle)
+                .ok()
+                .flatten()
+                .as_ref()
+                == Some(&contact.wallet);
+            ContactEntry {
+                nickname: contact.nickname,
+                handle: contact.handle,
+                verified,
+            }
+        })
+        .collect())
+}
+
+pub fn remove_contact<S: Storage>(store: &mut S, nickname: &str) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    contacts::remove(store, nickname)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +375,27 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("different wallet"));
+    }
+
+    #[test]
+    fn contacts_pin_an_imported_record_wallet() {
+        let handle = Handle::new("alice").unwrap();
+        let mut platform = SeededPlatform(7);
+        let identity = Identity::generate(&mut platform).unwrap();
+        let mut store = MemStore::default();
+        let record =
+            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        import_record(&mut store, &handle, record).unwrap();
+
+        add_contact(&mut store, "a", &handle).unwrap();
+        let list = list_contacts(&store).unwrap();
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].nickname, "a");
+        assert_eq!(list[0].handle, "alice");
+        assert!(!list[0].verified);
+
+        remove_contact(&mut store, "a").unwrap();
+        assert!(list_contacts(&store).unwrap().is_empty());
     }
 }

@@ -1832,14 +1832,7 @@ pub fn contact_add(nickname: &str, handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
-    let record = peerbook::get(&fs, &handle)?
-        .ok_or_else(|| anyhow!("import a signed record for '{}' first", handle.as_str()))?;
-    let contact = Contact {
-        nickname: nickname.to_string(),
-        handle: handle.as_str().to_string(),
-        wallet: record.record.wallet,
-    };
-    contacts::save(&mut fs, &contact)?;
+    client::add_contact(&mut fs, nickname, &handle)?;
     println!("added '{}' -> {}", nickname, handle.as_str());
     Ok(())
 }
@@ -1847,15 +1840,13 @@ pub fn contact_add(nickname: &str, handle: &str) -> Result<()> {
 pub fn contact_list() -> Result<()> {
     let identity = store::load_identity()?;
     let fs = open_history(&identity)?;
-    let list = contacts::list(&fs)?;
+    let list = client::list_contacts(&fs)?;
     if list.is_empty() {
         println!("no contacts");
         return Ok(());
     }
     for c in list {
-        let verified_here =
-            verified::get(&fs, &c.handle).ok().flatten().as_ref() == Some(&c.wallet);
-        let mark = if verified_here { "verified" } else { "pinned" };
+        let mark = if c.verified { "verified" } else { "pinned" };
         println!("{} -> {}   [{mark}]", c.nickname, c.handle);
     }
     Ok(())
@@ -1864,7 +1855,7 @@ pub fn contact_list() -> Result<()> {
 pub fn contact_remove(nickname: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
-    contacts::remove(&mut fs, nickname)?;
+    client::remove_contact(&mut fs, nickname)?;
     println!("removed '{nickname}'");
     Ok(())
 }
