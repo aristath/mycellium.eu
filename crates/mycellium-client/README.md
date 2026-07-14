@@ -2,30 +2,27 @@
 
 Reusable headless orchestration shared by native applications.
 
-This crate composes `mycellium-core`, `mycellium-engine`, encrypted storage, and
-the direct transport. It provides:
+This crate composes `mycellium-core`, `mycellium-engine`, encrypted storage, the
+registry client, and the Reticulum delivery runtime.
 
-- email login and registry sessions
-- identity creation and device-switch recovery
-- current signed-record publication and refresh by stable user id
-- one active device per account
-- authenticated direct QUIC delivery and recipient-device ACK verification
-- sender-local pending delivery and outbox retries
+It provides:
 
-`DirectNetwork` reuses one libp2p QUIC swarm and UDP socket for authenticated
-registry presence, simultaneous hole punching, and direct peer streams. The
-registry only introduces live devices. When introduction or direct connection
-fails, `deliver_or_park` keeps the delivery in the encrypted local outbox.
+- email login and registry sessions;
+- identity creation and device-switch recovery;
+- current signed-record publication and refresh by stable user id;
+- one active device per account;
+- Reticulum delivery and recipient-device ACK verification;
+- sender-local pending delivery and outbox retries.
+
+`DirectNetwork` reuses one Reticulum node for outbound and inbound delivery.
+The registry is used only to refresh signed records. When delivery cannot reach
+the recipient's signed Reticulum destination, `deliver_or_park` keeps the item
+in the encrypted local outbox.
+
 Pairwise entries retain encrypted sender-local resealing material only while
-pending, allowing the same user's replacement active device to receive them;
-that material is erased on every final state. Group sender keys are shared once
-per active member device and re-shared before the first group message after a
-device switch.
+pending, allowing the same user's replacement active device to receive them.
+That material is erased on every final state.
 
 A connection card is the lowercase hexadecimal form of a wire-encoded
 `SignedRecord`. Import verifies the record signature and identity binding before
 it can become a contact.
-
-The production registry default is `https://registry.mycellium.eu`. UI,
-platform lifecycle, and OS secure-secret storage remain the responsibility of
-the native shell.

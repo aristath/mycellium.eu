@@ -1,15 +1,10 @@
-//! A libp2p-based transport: the production "direct line" (Layers 7, 10).
+//! Optional libp2p-based adapter code.
 //!
-//! QUIC, with the node's PeerId derived from the **device key**, and a
-//! `/mycellium/1.0` byte-stream protocol carrying the E2E payload directly
-//! between devices. A registry control stream can introduce two live peers for
-//! simultaneous UDP hole punching, but it never carries application payloads.
-//!
-use std::collections::HashSet;
+//! This module is retained for explicit legacy diagnostics and DHT peer-record
+//! discovery. Native Mycellium delivery uses the Reticulum adapter.
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -17,7 +12,6 @@ use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 #[cfg(feature = "dht")]
 use libp2p::kad::{self, store::MemoryStore, GetRecordOk, QueryResult, Quorum, Record, RecordKey};
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identity, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 #[cfg(feature = "dht")]
@@ -27,12 +21,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use mycellium_core::identity::DevicePublicKey;
-use mycellium_core::rendezvous::{self, ClientMessage, PunchRole, ServerMessage};
 use mycellium_core::transport::Connection;
-use mycellium_core::userid::UserId;
 
 const PROTOCOL: StreamProtocol = StreamProtocol::new("/mycellium/1.0");
-const RENDEZVOUS_PROTOCOL: StreamProtocol = StreamProtocol::new(rendezvous::PROTOCOL);
 #[cfg(feature = "dht")]
 const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/mycellium/kad/1.0");
 
@@ -61,11 +52,6 @@ struct DhtBehaviour {
 /// Commands the blocking bridge sends to the background swarm task.
 enum Command {
     Dial(Multiaddr),
-    Punch {
-        peer: PeerId,
-        address: Multiaddr,
-        role: PunchRole,
-    },
     Shutdown,
 }
 
@@ -93,11 +79,6 @@ pub struct Libp2pDialer {
     rt: Arc<Runtime>,
     control: stream::Control,
     cmd_tx: mpsc::Sender<Command>,
-    rendezvous_tx: Arc<Mutex<Option<mpsc::Sender<ClientMessage>>>>,
-    rendezvous_connected: Arc<AtomicBool>,
-    rendezvous_epoch: Arc<AtomicU64>,
-    rendezvous_registering: Arc<Mutex<()>>,
-    rendezvous_unavailable: Arc<Mutex<HashSet<DevicePublicKey>>>,
 }
 
 impl Libp2pNode {
@@ -153,15 +134,6 @@ impl Libp2pNode {
                         },
                         Some(cmd) = cmd_rx.recv() => match cmd {
                             Command::Dial(addr) => { let _ = swarm.dial(addr); }
-                            Command::Punch { peer, address, role } => {
-                                let mut options = DialOpts::peer_id(peer)
-                                    .condition(PeerCondition::Always)
-                                    .addresses(vec![address]);
-                                if role == PunchRole::Listener {
-                                    options = options.override_role();
-                                }
-                                let _ = swarm.dial(options.build());
-                            }
                             Command::Shutdown => break,
                         }
                     }
@@ -175,11 +147,6 @@ impl Libp2pNode {
             rt,
             control,
             cmd_tx,
-            rendezvous_tx: Arc::new(Mutex::new(None)),
-            rendezvous_connected: Arc::new(AtomicBool::new(false)),
-            rendezvous_epoch: Arc::new(AtomicU64::new(0)),
-            rendezvous_registering: Arc::new(Mutex::new(())),
-            rendezvous_unavailable: Arc::new(Mutex::new(HashSet::new())),
         };
         Ok(Libp2pNode {
             dialer,
@@ -279,6 +246,7 @@ impl Libp2pDialer {
 
     /// Dial a peer through the shared swarm.
     pub fn dial(&self, target: &Multiaddr) -> Result<Libp2pConnection> {
+        ensure_no_ipv4(target)?;
         let peer = peer_from_multiaddr(target)
             .ok_or_else(|| anyhow!("multiaddr is missing a /p2p/<peer-id> component"))?;
         let mut control = self.control.clone();
@@ -314,218 +282,10 @@ impl Libp2pDialer {
         })
     }
 
-    /// Authenticate this device's long-lived registry control stream.
-    ///
-    /// The stream receives only introduction instructions. The same swarm and
-    /// QUIC listener are retained for the resulting direct peer connection.
-    pub fn register_rendezvous(
-        &self,
-        target: &str,
-        user_id: &UserId,
-        device: DevicePublicKey,
-    ) -> Result<()> {
-        let _registration = self
-            .rendezvous_registering
-            .lock()
-            .map_err(|_| anyhow!("rendezvous state is unavailable"))?;
-        if self.rendezvous_connected.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        let address: Multiaddr = target
-            .parse()
-            .map_err(|_| anyhow!("registry returned an invalid rendezvous address"))?;
-        let registry_peer = peer_from_multiaddr(&address)
-            .ok_or_else(|| anyhow!("rendezvous address is missing its peer identity"))?;
-        self.cmd_tx
-            .try_send(Command::Dial(address))
-            .map_err(|_| anyhow!("libp2p swarm stopped"))?;
-
-        let mut control = self.control.clone();
-        let user_id = user_id.clone();
-        let rendezvous_stream = self.rt.block_on(async move {
-            let mut stream = None;
-            for _ in 0..200 {
-                if let Ok(opened) = control
-                    .open_stream(registry_peer, RENDEZVOUS_PROTOCOL)
-                    .await
-                {
-                    stream = Some(opened);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let mut stream =
-                stream.ok_or_else(|| anyhow!("could not reach the registry rendezvous"))?;
-            write_control(&mut stream, &ClientMessage::Register { user_id, device }).await?;
-            match tokio::time::timeout(IO_TIMEOUT, read_server_control(&mut stream)).await {
-                Ok(Ok(ServerMessage::Registered)) => Ok(stream),
-                Ok(Ok(ServerMessage::Rejected)) => bail!("registry rejected this active device"),
-                Ok(Ok(_)) => bail!("registry sent an invalid registration response"),
-                Ok(Err(error)) => Err(error),
-                Err(_) => bail!("registry rendezvous registration timed out"),
-            }
-        })?;
-
-        let (mut read, mut write) = rendezvous_stream.split();
-        let (tx, mut rx) = mpsc::channel::<ClientMessage>(64);
-        *self
-            .rendezvous_tx
-            .lock()
-            .map_err(|_| anyhow!("rendezvous state is unavailable"))? = Some(tx);
-        self.rendezvous_connected.store(true, Ordering::Release);
-        let epoch = self.rendezvous_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let connected = Arc::clone(&self.rendezvous_connected);
-        let current_epoch = Arc::clone(&self.rendezvous_epoch);
-        let unavailable = Arc::clone(&self.rendezvous_unavailable);
-        let cmd_tx = self.cmd_tx.clone();
-        self.rt.spawn(async move {
-            let writer = tokio::spawn(async move {
-                while let Some(message) = rx.recv().await {
-                    if write_control(&mut write, &message).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            loop {
-                let message = match read_server_control(&mut read).await {
-                    Ok(message) => message,
-                    Err(_) => break,
-                };
-                match message {
-                    ServerMessage::Connect {
-                        device,
-                        address,
-                        role,
-                    } => {
-                        let Ok(mut unavailable) = unavailable.lock() else {
-                            break;
-                        };
-                        unavailable.remove(&device);
-                        drop(unavailable);
-                        let Ok(peer) = peer_id_for_device(&device) else {
-                            continue;
-                        };
-                        let Ok(address) = Multiaddr::try_from(address) else {
-                            continue;
-                        };
-                        let _ = cmd_tx.try_send(Command::Punch {
-                            peer,
-                            address,
-                            role,
-                        });
-                    }
-                    ServerMessage::Unavailable { device } => {
-                        let Ok(mut unavailable) = unavailable.lock() else {
-                            break;
-                        };
-                        unavailable.insert(device);
-                    }
-                    ServerMessage::Registered => {}
-                    ServerMessage::Rejected => break,
-                }
-            }
-            writer.abort();
-            if current_epoch.load(Ordering::Acquire) == epoch {
-                connected.store(false, Ordering::Release);
-            }
-        });
-        Ok(())
-    }
-
-    /// Ask the registry for a live introduction, then open the direct
-    /// application stream to the authenticated device peer.
-    pub fn introduce_and_dial(&self, device: &DevicePublicKey) -> Result<Libp2pConnection> {
-        let peer = peer_id_for_device(device)?;
-        let mut control = self.control.clone();
-        if let Ok(stream) = self.rt.block_on(control.open_stream(peer, PROTOCOL)) {
-            return Ok(Libp2pConnection {
-                handle: self.rt.handle().clone(),
-                peer,
-                stream,
-            });
-        }
-        if !self.rendezvous_connected.load(Ordering::Acquire) {
-            bail!("registry rendezvous is not connected");
-        }
-        self.rendezvous_unavailable
-            .lock()
-            .map_err(|_| anyhow!("rendezvous state is unavailable"))?
-            .remove(device);
-        self.rendezvous_tx
-            .lock()
-            .map_err(|_| anyhow!("rendezvous state is unavailable"))?
-            .as_ref()
-            .ok_or_else(|| anyhow!("registry rendezvous is not connected"))?
-            .try_send(ClientMessage::Introduce { device: *device })
-            .map_err(|_| anyhow!("registry rendezvous is not connected"))?;
-
-        let stream = self.rt.block_on(async move {
-            for _ in 0..300 {
-                if self
-                    .rendezvous_unavailable
-                    .lock()
-                    .map_err(|_| anyhow!("rendezvous state is unavailable"))?
-                    .remove(device)
-                {
-                    bail!("the recipient device is not currently available");
-                }
-                if let Ok(stream) = control.open_stream(peer, PROTOCOL).await {
-                    return Ok(stream);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(anyhow!("could not establish a direct connection to {peer}"))
-        })?;
-        Ok(Libp2pConnection {
-            handle: self.rt.handle().clone(),
-            peer,
-            stream,
-        })
-    }
-
-    /// Whether the authenticated registry control stream is currently live.
-    pub fn rendezvous_connected(&self) -> bool {
-        self.rendezvous_connected.load(Ordering::Acquire)
-    }
-
-    /// Stop the shared swarm and close its rendezvous control stream.
+    /// Stop the shared swarm.
     pub fn shutdown(&self) {
-        self.rendezvous_connected.store(false, Ordering::Release);
-        if let Ok(mut sender) = self.rendezvous_tx.lock() {
-            sender.take();
-        }
         let _ = self.cmd_tx.try_send(Command::Shutdown);
     }
-}
-
-async fn write_control<W>(writer: &mut W, message: &ClientMessage) -> Result<()>
-where
-    W: futures::AsyncWrite + Unpin,
-{
-    let bytes = mycellium_core::wire::encode(message);
-    if bytes.len() > rendezvous::MAX_FRAME_BYTES {
-        bail!("rendezvous control frame is too large");
-    }
-    writer
-        .write_all(&crate::link::frame_header(bytes.len())?)
-        .await?;
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn read_server_control<R>(reader: &mut R) -> Result<ServerMessage>
-where
-    R: futures::AsyncRead + Unpin,
-{
-    let mut header = [0u8; 4];
-    reader.read_exact(&mut header).await?;
-    let len = crate::link::frame_len(header)?;
-    let mut bytes = vec![0u8; len];
-    reader.read_exact(&mut bytes).await?;
-    mycellium_core::wire::decode(&bytes).map_err(|_| anyhow!("invalid rendezvous control frame"))
 }
 
 /// Run a Kademlia peer-record discovery node forever.
@@ -884,22 +644,25 @@ pub fn peer_id_for_device(device: &DevicePublicKey) -> Result<PeerId> {
     Ok(public.to_peer_id())
 }
 
-/// A listen multiaddr (`/ip4/…/tcp/…`) from a `host:port` string.
+/// A listen multiaddr (`/ip6/…/tcp/…`) from an IPv6 `host:port` string.
 pub fn listen_multiaddr(addr: &str) -> Result<Multiaddr> {
     let socket: SocketAddr = addr
         .parse()
-        .map_err(|_| anyhow!("address must be host:port, e.g. 127.0.0.1:9001"))?;
+        .map_err(|_| anyhow!("address must be IPv6 host:port, e.g. [::1]:9001"))?;
+    if socket.is_ipv4() {
+        bail!("IPv4 is not a Mycellium transport address");
+    }
     Ok(socket_to_multiaddr(socket))
 }
 
-/// A QUIC listen multiaddr (`/ip4/…/udp/…/quic-v1`) from `host:port`.
+/// A QUIC listen multiaddr (`/ip6/…/udp/…/quic-v1`) from an IPv6 `host:port`.
 pub fn quic_listen_multiaddr(addr: &str) -> Result<Multiaddr> {
     let socket: SocketAddr = addr
         .parse()
-        .map_err(|_| anyhow!("address must be host:port, e.g. 0.0.0.0:0"))?;
+        .map_err(|_| anyhow!("address must be IPv6 host:port, e.g. [::]:0"))?;
     let mut address = Multiaddr::empty();
     match socket.ip() {
-        IpAddr::V4(ip) => address.push(Protocol::Ip4(ip)),
+        IpAddr::V4(_) => bail!("IPv4 is not a Mycellium transport address"),
         IpAddr::V6(ip) => address.push(Protocol::Ip6(ip)),
     }
     address.push(Protocol::Udp(socket.port()));
@@ -909,8 +672,11 @@ pub fn quic_listen_multiaddr(addr: &str) -> Result<Multiaddr> {
 
 /// Parse a full libp2p multiaddr.
 pub fn parse_multiaddr(addr: &str) -> Result<Multiaddr> {
-    addr.parse()
-        .map_err(|_| anyhow!("'{addr}' is not a valid multiaddr"))
+    let parsed = addr
+        .parse()
+        .map_err(|_| anyhow!("'{addr}' is not a valid multiaddr"))?;
+    ensure_no_ipv4(&parsed)?;
+    Ok(parsed)
 }
 
 /// Parse a list of full libp2p multiaddrs.
@@ -930,11 +696,23 @@ pub fn parse_multiaddrs(addrs: &[String]) -> Result<Vec<Multiaddr>> {
 fn socket_to_multiaddr(socket: SocketAddr) -> Multiaddr {
     let mut addr = Multiaddr::empty();
     match socket.ip() {
-        IpAddr::V4(ip) => addr.push(Protocol::Ip4(ip)),
+        IpAddr::V4(_) => unreachable!("IPv4 socket addresses are rejected before conversion"),
         IpAddr::V6(ip) => addr.push(Protocol::Ip6(ip)),
     }
     addr.push(Protocol::Tcp(socket.port()));
     addr
+}
+
+fn ensure_no_ipv4(address: &Multiaddr) -> Result<()> {
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::Ip4(_) | Protocol::Dns4(_) => {
+                bail!("IPv4 is not a Mycellium transport address")
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn peer_and_base_multiaddr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
@@ -962,9 +740,7 @@ mod tests {
     use super::*;
 
     fn listen_addr(port: u16) -> Multiaddr {
-        format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
-            .parse()
-            .unwrap()
+        format!("/ip6/::1/udp/{port}/quic-v1").parse().unwrap()
     }
 
     #[test]
@@ -1008,9 +784,16 @@ mod tests {
 
     #[test]
     fn dht_bootstrap_addrs_must_include_peer_id() {
-        let addrs = vec!["/ip4/127.0.0.1/tcp/41001".to_string()];
+        let addrs = vec!["/ip6/::1/tcp/41001".to_string()];
 
         assert!(parse_multiaddrs(&addrs).is_err());
+    }
+
+    #[test]
+    fn ipv4_multiaddrs_are_rejected() {
+        assert!(parse_multiaddr("/ip4/127.0.0.1/udp/4001/quic-v1").is_err());
+        assert!(quic_listen_multiaddr("0.0.0.0:0").is_err());
+        assert!(listen_multiaddr("127.0.0.1:9001").is_err());
     }
 
     #[test]

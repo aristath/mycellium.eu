@@ -1,13 +1,12 @@
 //! Shared direct-delivery runtime primitives.
 //!
 //! This is intentionally small: it knows how to push one already-sealed item to
-//! the stable active device reached through a registry introduction, verify the
-//! device ACK, and update local sender-owned outbox state. Shells still own UI,
-//! config, discovery policy, and scheduling.
+//! the stable active Reticulum destination, verify the device ACK, and update
+//! local sender-owned outbox state. Shells still own UI, discovery policy, and
+//! scheduling.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -30,8 +29,8 @@ use mycellium_engine::reachability::{self, DeliveryPath};
 use mycellium_engine::verified;
 use mycellium_engine::wireops::{device_slot, seal_to_with_record};
 use mycellium_storage::filestore::FileStore;
-use mycellium_transport::libp2p_net;
 use mycellium_transport::link::{FrameReader, FrameWriter};
+use mycellium_transport::reticulum_net::{ReticulumConfig, ReticulumNode};
 
 use crate::registry::RegistryClient;
 use crate::{mark_outbox_delivered, park_outbox, park_pairwise_outbox};
@@ -45,119 +44,78 @@ pub fn delivery_id_for_item(item: &MailItem) -> String {
 
 /// Process-local direct-network actor.
 ///
-/// One libp2p QUIC swarm is reused for the registry control stream and every
-/// direct device connection made by this process.
+/// One Reticulum node is reused for every direct device delivery made by this
+/// process. The registry is only used to refresh signed identity records.
 #[derive(Clone)]
 pub struct DirectNetwork {
-    device_secret: [u8; 32],
-    libp2p: Arc<Mutex<Option<libp2p_net::Libp2pDialer>>>,
+    reticulum_private: [u8; 64],
+    reticulum: Arc<Mutex<Option<ReticulumNode>>>,
     registry: Arc<Mutex<Option<RegistryPresence>>>,
-    rendezvous_worker_started: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 struct RegistryPresence {
     registry_url: String,
-    user_id: UserId,
 }
 
 impl DirectNetwork {
-    pub fn new(device_secret: [u8; 32]) -> Self {
+    pub fn new(reticulum_private: [u8; 64]) -> Self {
         Self {
-            device_secret,
-            libp2p: Arc::new(Mutex::new(None)),
+            reticulum_private,
+            reticulum: Arc::new(Mutex::new(None)),
             registry: Arc::new(Mutex::new(None)),
-            rendezvous_worker_started: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    pub fn with_libp2p(device_secret: [u8; 32], dialer: libp2p_net::Libp2pDialer) -> Self {
+    pub fn with_reticulum(reticulum_private: [u8; 64], node: ReticulumNode) -> Self {
         Self {
-            device_secret,
-            libp2p: Arc::new(Mutex::new(Some(dialer))),
+            reticulum_private,
+            reticulum: Arc::new(Mutex::new(Some(node))),
             registry: Arc::new(Mutex::new(None)),
-            rendezvous_worker_started: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    pub fn set_libp2p(&self, dialer: libp2p_net::Libp2pDialer) {
+    pub fn set_reticulum(&self, node: ReticulumNode) {
         if !self.running.load(Ordering::Acquire) {
-            dialer.shutdown();
+            node.shutdown();
             return;
         }
-        if let Ok(mut current) = self.libp2p.lock() {
-            *current = Some(dialer);
+        if let Ok(mut current) = self.reticulum.lock() {
+            *current = Some(node);
         }
     }
 
-    pub fn libp2p(&self) -> Option<libp2p_net::Libp2pDialer> {
+    pub fn reticulum(&self) -> Option<ReticulumNode> {
         if !self.running.load(Ordering::Acquire) {
             return None;
         }
-        let mut dialer = self.libp2p.lock().ok()?;
-        if dialer.is_none() {
-            *dialer = libp2p_net::Libp2pDialer::new(self.device_secret).ok();
+        let mut node = self.reticulum.lock().ok()?;
+        if node.is_none() {
+            *node = ReticulumNode::new(self.reticulum_private, ReticulumConfig::from_env()).ok();
         }
-        dialer.clone()
+        node.clone()
     }
 
-    /// Keep this device present on its registry's introduction service.
-    pub fn use_registry(&self, registry_url: impl Into<String>, user_id: UserId) {
+    /// Remember the registry used for signed-record refreshes.
+    pub fn use_registry(&self, registry_url: impl Into<String>, _user_id: UserId) {
         if let Ok(mut current) = self.registry.lock() {
             *current = Some(RegistryPresence {
                 registry_url: registry_url.into(),
-                user_id,
             });
         }
-        if self.rendezvous_worker_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let network = self.clone();
-        thread::spawn(move || {
-            while network.running.load(Ordering::Acquire) {
-                let _ = network.ensure_rendezvous();
-                for _ in 0..5 {
-                    if !network.running.load(Ordering::Acquire) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-            network
-                .rendezvous_worker_started
-                .store(false, Ordering::Release);
-        });
     }
 
-    /// Reconnect the registry control stream if needed. Native lifecycle hooks
-    /// may call this when an app returns to the foreground.
-    pub fn ensure_rendezvous(&self) -> Result<()> {
+    /// Ensure the Reticulum node exists.
+    pub fn ensure_reticulum(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             anyhow::bail!("direct network is stopped");
         }
-        let presence = self
-            .registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("registry state is unavailable"))?
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("no registry session is configured"))?;
-        let dialer = self
-            .libp2p()
-            .ok_or_else(|| anyhow::anyhow!("direct network is unavailable"))?;
-        if dialer.rendezvous_connected() {
-            return Ok(());
-        }
-        let registry = RegistryClient::new(&presence.registry_url)?;
-        let address = registry.rendezvous_address()?;
-        dialer.register_rendezvous(
-            &address,
-            &presence.user_id,
-            // The transport itself proves this key by its authenticated PeerId.
-            libp2p_net::device_key_for_secret(self.device_secret)?,
-        )
+        self.reticulum()
+            .ok_or_else(|| anyhow::anyhow!("Reticulum network is unavailable"))
+            .map(|_| ())
     }
 
     /// Fetch the registry's current self-signed record for a user. The record
@@ -179,13 +137,13 @@ impl DirectNetwork {
         self.running.load(Ordering::Acquire)
     }
 
-    /// Stop reconnect workers and the shared transport swarm.
+    /// Stop the shared Reticulum node.
     pub fn shutdown(&self) {
         if !self.running.swap(false, Ordering::AcqRel) {
             return;
         }
-        if let Some(dialer) = self.libp2p.lock().ok().and_then(|dialer| dialer.clone()) {
-            dialer.shutdown();
+        if let Some(node) = self.reticulum.lock().ok().and_then(|node| node.clone()) {
+            node.shutdown();
         }
     }
 }
@@ -203,22 +161,14 @@ pub fn direct_push(
         item: Box::new(item.clone()),
     };
     let frame = wire::encode(&frame);
-    let Some(dialer) = network.libp2p() else {
+    let Some(node) = network.reticulum() else {
         return false;
     };
-    let connection = match dialer.introduce_and_dial(&device.device_key) {
-        Ok(connection) => Ok(connection),
-        Err(_) if !dialer.rendezvous_connected() => network
-            .ensure_rendezvous()
-            .and_then(|()| dialer.introduce_and_dial(&device.device_key)),
-        Err(error) => Err(error),
+    let bytes = match node.send_and_wait(device.reticulum(), &frame, Duration::from_secs(30)) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
     };
-    match connection {
-        Ok(mut conn) => {
-            exchange_delivery(&mut conn, &frame, delivery_id, &payload, &device.device_key)
-        }
-        Err(_) => false,
-    }
+    verify_delivery_ack(&bytes, delivery_id, &payload, &device.device_key)
 }
 
 /// Send a delivery frame and accept only an ACK signed by the target device for
@@ -240,6 +190,18 @@ where
         return false;
     };
     let Ok(PeerFrame::Ack(ack)) = wire::decode::<PeerFrame>(&bytes) else {
+        return false;
+    };
+    ack.verify(delivery_id, payload, recipient).is_ok()
+}
+
+pub fn verify_delivery_ack(
+    bytes: &[u8],
+    delivery_id: &str,
+    payload: &[u8],
+    recipient: &DevicePublicKey,
+) -> bool {
+    let Ok(PeerFrame::Ack(ack)) = wire::decode::<PeerFrame>(bytes) else {
         return false;
     };
     ack.verify(delivery_id, payload, recipient).is_ok()
@@ -379,8 +341,7 @@ fn envelope_sender(item: &MailItem) -> Option<&Envelope> {
 }
 
 /// Device identity authenticated by the application envelope or group sender
-/// key. Native libp2p listeners bind this to the remote QUIC PeerId before
-/// accepting any delivery.
+/// key.
 pub fn mail_item_sender_device(item: &MailItem) -> Option<DevicePublicKey> {
     match item {
         MailItem::Direct(env) | MailItem::GroupInvite(env) | MailItem::GroupLeave(env) => {

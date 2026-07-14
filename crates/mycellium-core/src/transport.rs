@@ -1,8 +1,7 @@
 //! The **Transport** capability: opening a direct line to a peer.
 //!
-//! The core never speaks a wire protocol itself. On rich devices the host
-//! implements this with rust-libp2p or direct TCP; on constrained devices with a
-//! minimal Noise-over-TCP/UDP. Either way the core only sees "give me a
+//! The core never speaks a wire protocol itself. Hosts adapt their transport
+//! stack outside this crate. Either way the core only sees "give me a
 //! byte-stream connection to this peer".
 //!
 //! These traits are deliberately synchronous and buffer-oriented so they fit a

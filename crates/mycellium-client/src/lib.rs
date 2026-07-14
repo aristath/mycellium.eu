@@ -81,7 +81,8 @@ pub fn adopt_identity(platform: &mut impl Platform, wallet_secret: [u8; 32]) -> 
 
 /// Build and store this account's current public record.
 ///
-/// A legacy record that stored a route is migrated to the stable libp2p PeerId.
+/// A stored record is refreshed if its signed Reticulum destination does not
+/// match this active device.
 /// If the record belongs to another device, this publishes the current device
 /// as the account's one active device.
 pub fn publish_active_device_record<S, P>(
@@ -106,13 +107,13 @@ where
     let active_device = match existing.as_ref() {
         Some(record) if record.record.device.device_key == identity.device_public() => {
             let device = &record.record.device;
-            if device.peer_id() == &identity.peer_id() {
+            if device.reticulum() == &identity.reticulum_public() {
                 device.clone()
             } else {
                 let claim_seq = now.max(device.reachability.record.seq.saturating_add(1));
                 device
-                    .refresh_peer_id(identity, claim_seq)
-                    .map_err(|_| anyhow!("could not sign stable peer identity"))?
+                    .refresh_reticulum(identity, claim_seq)
+                    .map_err(|_| anyhow!("could not sign Reticulum destination"))?
             }
         }
         _ => wireops::this_device(identity, now),

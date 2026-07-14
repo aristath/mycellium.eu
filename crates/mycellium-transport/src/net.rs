@@ -23,7 +23,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 fn dial_timed(addr: &str) -> io::Result<TcpStream> {
     let sockaddr = addr
         .to_socket_addrs()?
-        .next()
+        .find(|candidate| candidate.is_ipv6())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address"))?;
     let stream = TcpStream::connect_timeout(&sockaddr, CONNECT_TIMEOUT)?;
     set_timeouts(&stream)?;
@@ -86,8 +86,17 @@ impl TcpTransport {
 
     /// A transport bound to `addr`, able to accept inbound connections.
     pub fn listening(addr: &str) -> io::Result<Self> {
+        let sockaddr = addr
+            .to_socket_addrs()?
+            .find(|candidate| candidate.is_ipv6())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IPv4 is not a Mycellium transport address",
+                )
+            })?;
         Ok(TcpTransport {
-            listener: Some(TcpListener::bind(addr)?),
+            listener: Some(TcpListener::bind(sockaddr)?),
         })
     }
 }
@@ -120,7 +129,7 @@ mod tests {
 
     #[test]
     fn recv_times_out_on_a_stalled_peer() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("[::1]:0").unwrap();
         let addr = listener.local_addr().unwrap();
         // A peer that sends a partial frame (length says 8, sends 2) then stalls.
         let peer = std::thread::spawn(move || {

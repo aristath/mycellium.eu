@@ -214,28 +214,6 @@ impl RegistryClient {
         Ok(Some(record))
     }
 
-    /// Fetch the registry's self-authenticating QUIC introduction address.
-    pub fn rendezvous_address(&self) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Response {
-            address: String,
-        }
-
-        let mut response = self
-            .agent
-            .get(format!("{}/rendezvous", self.base_url))
-            .call()
-            .map_err(|error| registry_error("find the registry rendezvous", error))?;
-        let body: Response = response
-            .body_mut()
-            .read_json()
-            .context("registry returned an invalid rendezvous response")?;
-        if body.address.trim().is_empty() {
-            bail!("registry returned an empty rendezvous address");
-        }
-        Ok(body.address)
-    }
-
     fn account_url(&self, session: &RegistrySession, suffix: &str) -> Result<String> {
         if session.registry_url.trim_end_matches('/') != self.base_url {
             bail!("registry session belongs to a different registry");

@@ -1,16 +1,20 @@
 [package]
 name = "mycellium-transport"
 version = "0.0.0"
-description = "Direct QUIC transport and optional diagnostic adapters for Mycellium"
+description = "Reticulum transport adapter and optional diagnostic adapters for Mycellium"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
 [features]
-# Native clients ship only the protocol's direct QUIC path. The CLI explicitly
-# enables the old raw-TCP diagnostic adapter and optional DHT commands.
-default = ["quic"]
+# Native clients ship the Reticulum delivery path. The CLI explicitly enables
+# old diagnostic adapters when needed.
+default = ["reticulum"]
+reticulum = [
+    "dep:rns_transport",
+    "dep:tokio",
+]
 quic = [
     "dep:libp2p",
     "dep:libp2p-stream",
@@ -33,13 +37,14 @@ dht = [
 [dependencies]
 mycellium-core = { path = "../mycellium-core" }
 anyhow = "1"
-# libp2p transport (production direct line): authenticated QUIC streams.
+# Optional libp2p adapter code used by legacy diagnostics and DHT discovery.
 # Disable libp2p's broad default feature set so unused DNS/mDNS/UPnP
 # dependencies are not pulled into the native build/audit surface.
 libp2p = { version = "0.56", default-features = false, optional = true }
 libp2p-stream = { version = "0.4.0-alpha", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"], optional = true }
 futures = { version = "0.3", optional = true }
+rns_transport = { package = "reticulum-rs-transport", version = "0.9.0", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

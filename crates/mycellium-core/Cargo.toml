@@ -26,7 +26,7 @@ std = [
 [dependencies]
 # secp256k1 wallet key: the account root and record signature key.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
-# Ed25519 device key — basis of the libp2p PeerId / transport.
+# Ed25519 device key — active-device signing key.
 ed25519-dalek = { version = "2", default-features = false }
 # X25519 messaging key — X3DH.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }

@@ -30,8 +30,8 @@ const LOCK_FILE: &str = ".process-lock-v1";
 pub struct FileStore {
     dir: PathBuf,
     key: [u8; 32],
-    // Keeping the handle alive keeps the exclusive OS lock alive. This is an
-    // actual cross-process lock, not a sentinel file that can become stale.
+    // Keeping the handle alive keeps the exclusive OS lock alive on platforms
+    // that support std file locks.
     _process_lock: fs::File,
 }
 
@@ -48,13 +48,17 @@ impl FileStore {
             .truncate(false)
             .open(&lock_path)?;
         crate::perms::restrict_file(&lock_path);
-        process_lock.try_lock().map_err(|error| match error {
-            fs::TryLockError::WouldBlock => io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "this local store is already open in another app instance",
-            ),
-            fs::TryLockError::Error(error) => error,
-        })?;
+        match process_lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "this local store is already open in another app instance",
+                ));
+            }
+            Err(fs::TryLockError::Error(error)) if error.kind() == io::ErrorKind::Unsupported => {}
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
         let mut store = FileStore {
             dir,
             key,

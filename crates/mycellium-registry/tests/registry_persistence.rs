@@ -89,7 +89,6 @@ fn registry_authentication_and_state_survive_a_clean_restart() {
     );
 
     let first_account;
-    let first_rendezvous_peer;
     {
         let server = TestRegistry::start(&data_dir, recovery_key);
         let registry = RegistryClient::new(&server.base_url).expect("registry client");
@@ -108,13 +107,6 @@ fn registry_authentication_and_state_survive_a_clean_restart() {
                 .expect("resolve by user id"),
             Some(record.clone())
         );
-        first_rendezvous_peer = registry
-            .rendezvous_address()
-            .expect("rendezvous address")
-            .split("/p2p/")
-            .nth(1)
-            .expect("rendezvous PeerId")
-            .to_string();
 
         let (_, intruder) = request_and_confirm(&server, "intruder@example.test");
         let agent = Agent::new_with_defaults();
@@ -154,17 +146,6 @@ fn registry_authentication_and_state_survive_a_clean_restart() {
             .expect("public record lookup");
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(data_dir.join("rendezvous.key"))
-            .expect("rendezvous identity metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "rendezvous secret must be owner-only");
-    }
-
     // Neither the login identity nor the recovery root may be recoverable by
     // scanning persistent registry files.
     assert_tree_does_not_contain(&data_dir, email.as_bytes());
@@ -194,13 +175,5 @@ fn registry_authentication_and_state_survive_a_clean_restart() {
                 .expect("resolve restarted record by user id"),
             Some(record)
         );
-        let restarted_peer = registry
-            .rendezvous_address()
-            .expect("restarted rendezvous address")
-            .split("/p2p/")
-            .nth(1)
-            .expect("restarted rendezvous PeerId")
-            .to_string();
-        assert_eq!(restarted_peer, first_rendezvous_peer);
     }
 }

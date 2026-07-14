@@ -29,8 +29,7 @@ use mycellium_engine::groups::{MailItem, PeerFrame};
 use mycellium_engine::verified::TrustLevel;
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
-use mycellium_transport::libp2p_net;
-use mycellium_transport::link::{FrameReader, FrameWriter};
+use mycellium_transport::reticulum_net::InboundFrame;
 use zeroize::{Zeroize, Zeroizing};
 
 const CANVAS: egui::Color32 = egui::Color32::from_rgb(14, 18, 25);
@@ -462,7 +461,7 @@ impl LinuxClient {
             .find(|entry| entry.record.record.wallet == identity.wallet_public())
             .map(|entry| entry.record);
         let identity = Arc::new(identity);
-        let network = client::DirectNetwork::new(identity.device_secret());
+        let network = client::DirectNetwork::new(identity.reticulum_private_bytes());
         let store = Arc::new(Mutex::new(store));
         let current = Arc::new(AtomicBool::new(true));
         self.session = Some(Session {
@@ -566,7 +565,7 @@ impl LinuxClient {
                 Arc::clone(&session.device_current),
             )
         };
-        let node = self.listener_or_start(&identity)?;
+        let start_listener = self.listener_or_start(&identity)?;
         let record = {
             let mut store_guard = store
                 .lock()
@@ -598,7 +597,7 @@ impl LinuxClient {
         *own_record
             .lock()
             .map_err(|_| anyhow!("local profile lock poisoned"))? = Some(record);
-        self.start_listener(node)?;
+        self.start_listener(start_listener)?;
         if let Some(account) = account {
             self.session_mut()?
                 .network
@@ -870,30 +869,26 @@ impl LinuxClient {
         )
     }
 
-    fn listener_or_start(&self, identity: &Identity) -> Result<Option<libp2p_net::Libp2pNode>> {
+    fn listener_or_start(&self, _identity: &Identity) -> Result<bool> {
         if self
             .session
             .as_ref()
             .is_some_and(|session| session.listener_active)
         {
-            return Ok(None);
+            return Ok(false);
         }
-        let listen_addr = libp2p_net::quic_listen_multiaddr("0.0.0.0:0")
-            .map_err(|error| anyhow!("could not create libp2p listen address: {error}"))?;
-        let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
-            .map_err(|error| anyhow!("could not start libp2p node: {error}"))?;
-        node.listen_addr()
-            .map_err(|error| anyhow!("could not open a libp2p listener: {error}"))?;
-        Ok(Some(node))
+        Ok(true)
     }
 
-    fn start_listener(&mut self, node: Option<libp2p_net::Libp2pNode>) -> Result<()> {
+    fn start_listener(&mut self, start: bool) -> Result<()> {
         let session = self.session_mut()?;
-        if session.listener_active {
+        if session.listener_active || !start {
             return Ok(());
         }
-        let mut node = node.ok_or_else(|| anyhow!("libp2p listener was not started"))?;
-        session.network.set_libp2p(node.dialer());
+        let node = session
+            .network
+            .reticulum()
+            .ok_or_else(|| anyhow!("could not start Reticulum node"))?;
         session.listener_active = true;
         let identity = Arc::clone(&session.identity);
         let store = Arc::clone(&session.store);
@@ -902,51 +897,10 @@ impl LinuxClient {
         let network = session.network.clone();
         let events = self.events_tx.clone();
         let ctx = self.ctx.clone();
-        let worker_count = thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(2)
-            .max(2);
-        let (connections, receiver) = mpsc::sync_channel(worker_count * 4);
-        let receiver = Arc::new(Mutex::new(receiver));
-        for _ in 0..worker_count {
-            let receiver = Arc::clone(&receiver);
-            let identity = Arc::clone(&identity);
-            let store = Arc::clone(&store);
-            let own_record = Arc::clone(&own_record);
-            let events = events.clone();
-            let ctx = ctx.clone();
-            let device_current = Arc::clone(&device_current);
-            let worker_network = network.clone();
-            thread::spawn(move || {
-                while worker_network.is_running() {
-                    let connection = {
-                        let Ok(receiver) = receiver.lock() else {
-                            return;
-                        };
-                        match receiver.recv_timeout(Duration::from_secs(1)) {
-                            Ok(connection) => connection,
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        }
-                    };
-                    serve_linux_connection(
-                        connection,
-                        &identity,
-                        &store,
-                        &own_record,
-                        &device_current,
-                        &worker_network,
-                        &events,
-                        &ctx,
-                    );
-                }
-            });
-        }
-
         thread::spawn(move || {
             while network.is_running() {
-                let connection = match node.accept_timeout(Duration::from_secs(1)) {
-                    Ok(Some(connection)) => connection,
+                let frame = match node.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Some(frame)) => frame,
                     Ok(None) => continue,
                     Err(error) => {
                         if !network.is_running() {
@@ -959,10 +913,16 @@ impl LinuxClient {
                         return;
                     }
                 };
-                match connections.try_send(connection) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Disconnected(_)) => return,
-                }
+                serve_linux_connection(
+                    frame,
+                    &identity,
+                    &store,
+                    &own_record,
+                    &device_current,
+                    &network,
+                    &events,
+                    &ctx,
+                );
             }
         });
         Ok(())
@@ -1515,8 +1475,11 @@ impl LinuxClient {
                     ui.add_space(10.0);
                     let filter = self.conversation_filter.to_lowercase();
                     let mut selected = None;
+                    let list_height = ui.available_height();
                     egui::ScrollArea::vertical()
+                        .id_salt("conversation-list")
                         .auto_shrink([false, false])
+                        .max_height(list_height)
                         .show(ui, |ui| {
                             for conversation in conversations.iter().filter(|conversation| {
                                 filter.is_empty()
@@ -1629,8 +1592,8 @@ impl LinuxClient {
         let messages = self.history(&selected);
         let scroll_height = (ui.available_height() - 86.0).max(180.0);
         egui::ScrollArea::vertical()
+            .id_salt(("message-history", selected.as_str()))
             .auto_shrink([false, false])
-            .stick_to_bottom(true)
             .max_height(scroll_height)
             .show(ui, |ui| {
                 ui.add_space(12.0);
@@ -1722,18 +1685,24 @@ impl LinuxClient {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     let mut selected = None;
-                    for contact in &contacts {
-                        if contact_row(
-                            ui,
-                            contact,
-                            self.selected_contact_user_id == contact.user_id,
-                        )
-                        .clicked()
-                        {
-                            selected = Some(contact.user_id.clone());
-                        }
-                        ui.add_space(6.0);
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("people-list")
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height())
+                        .show(ui, |ui| {
+                            for contact in &contacts {
+                                if contact_row(
+                                    ui,
+                                    contact,
+                                    self.selected_contact_user_id == contact.user_id,
+                                )
+                                .clicked()
+                                {
+                                    selected = Some(contact.user_id.clone());
+                                }
+                                ui.add_space(6.0);
+                            }
+                        });
                     if let Some(user_id) = selected {
                         self.selected_contact_user_id = user_id;
                     }
@@ -1743,7 +1712,14 @@ impl LinuxClient {
             ui.allocate_ui_with_layout(
                 ui.available_size(),
                 egui::Layout::top_down(egui::Align::Min),
-                |ui| self.person_detail(ui, &contacts),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("person-detail")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.person_detail(ui, &contacts);
+                        });
+                },
             );
         });
     }
@@ -1772,8 +1748,7 @@ impl LinuxClient {
                     );
                     ui.add_sized(
                         [(ui.available_width() - 112.0).max(220.0), 40.0],
-                        singleline_input(&mut self.contact_card)
-                            .hint_text("Paste connection card"),
+                        singleline_input(&mut self.contact_card).hint_text("Paste connection card"),
                     );
                     if primary_button(ui, "Add", 86.0).clicked() {
                         self.add_person();
@@ -1909,6 +1884,13 @@ impl LinuxClient {
     }
 
     fn device_view(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("device-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.device_view_contents(ui));
+    }
+
+    fn device_view_contents(&mut self, ui: &mut egui::Ui) {
         page_heading(
             ui,
             "This device",
@@ -2508,7 +2490,7 @@ fn save_account_session(
 
 #[allow(clippy::too_many_arguments)]
 fn serve_linux_connection(
-    mut connection: libp2p_net::Libp2pConnection,
+    inbound: InboundFrame,
     identity: &Identity,
     store: &Arc<Mutex<FileStore>>,
     own_record: &Arc<Mutex<Option<SignedRecord>>>,
@@ -2522,52 +2504,41 @@ fn serve_linux_connection(
         sender: events.clone(),
         ctx: ctx.clone(),
     };
-    while network.is_running() {
-        let Ok(bytes) = connection.recv_frame() else {
-            return;
-        };
-        if !device_current.load(Ordering::Acquire) {
-            return;
-        }
-        let Ok(PeerFrame::Delivery { delivery_id, item }) = wire::decode::<PeerFrame>(&bytes)
-        else {
-            continue;
-        };
-        let Some(sender_device) = client::mail_item_sender_device(&item) else {
-            continue;
-        };
-        let Ok(sender_peer) = libp2p_net::peer_id_for_device(&sender_device) else {
-            continue;
-        };
-        if sender_peer != connection.peer_id() {
-            continue;
-        }
-        let Some(record) = own_record.lock().ok().and_then(|record| record.clone()) else {
-            continue;
-        };
-        let me = record.record.handle.clone();
-        let acknowledgement = {
-            let Ok(mut store) = store.lock() else {
-                let _ = events.send(RuntimeEvent::Error("local store is unavailable".into()));
-                ctx.request_repaint();
-                return;
-            };
-            client::accept_delivery(
-                identity,
-                &me,
-                &record,
-                &mut platform,
-                &mut store,
-                delivery_id,
-                *item,
-                &mut sink,
-            )
-        };
-        if let Some(frame) = acknowledgement {
-            let _ = connection.send_frame(&frame);
-            let _ = events.send(RuntimeEvent::Notice("New message received".into()));
+    if !network.is_running() || !device_current.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(PeerFrame::Delivery { delivery_id, item }) = wire::decode::<PeerFrame>(inbound.bytes())
+    else {
+        return;
+    };
+    if client::mail_item_sender_device(&item).is_none() {
+        return;
+    }
+    let Some(record) = own_record.lock().ok().and_then(|record| record.clone()) else {
+        return;
+    };
+    let me = record.record.handle.clone();
+    let acknowledgement = {
+        let Ok(mut store) = store.lock() else {
+            let _ = events.send(RuntimeEvent::Error("local store is unavailable".into()));
             ctx.request_repaint();
-        }
+            return;
+        };
+        client::accept_delivery(
+            identity,
+            &me,
+            &record,
+            &mut platform,
+            &mut store,
+            delivery_id,
+            *item,
+            &mut sink,
+        )
+    };
+    if let Some(reply) = acknowledgement {
+        let _ = inbound.reply(&reply);
+        let _ = events.send(RuntimeEvent::Notice("New message received".into()));
+        ctx.request_repaint();
     }
 }
 

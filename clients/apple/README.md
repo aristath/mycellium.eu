@@ -49,11 +49,10 @@ The opaque 64-byte identity is stored as a
 history lives under `Application Support/Mycellium`, and that directory is
 excluded from iCloud and device backups.
 
-The app uses `https://registry.mycellium.eu`, opens QUIC on an OS-selected UDP
-port, and is identified by its device-key-derived PeerId, never an IP address.
-The registry supplies temporary observed mappings only for simultaneous direct
-dialing. Message payloads and ACKs never pass through it.
+The app uses `https://registry.mycellium.eu` for login and signed-record
+refresh. Message payloads and ACKs use the active device's signed Reticulum
+destination and never pass through the registry.
 
-Returning to the foreground refreshes live presence and active-device status. A
+Returning to the foreground refreshes connectivity and active-device status. A
 background monitor also checks for replacement. When iOS suspends ordinary
 networking, senders retain pending messages locally.

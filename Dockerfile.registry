@@ -19,5 +19,5 @@ COPY --from=build /app/target/release/mycellium-registry /usr/local/bin/mycelliu
 ENV MYCELLIUM_REGISTRY_DATA_DIR=/var/lib/mycellium-registry
 USER 10001:10001
 
-EXPOSE 8787/tcp 8788/udp
+EXPOSE 8787/tcp
 CMD ["mycellium-registry"]

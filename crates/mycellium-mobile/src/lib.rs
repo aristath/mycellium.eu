@@ -8,7 +8,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,8 +25,7 @@ use mycellium_engine::flow::{self, FlowEvent};
 use mycellium_engine::groups::{MailItem, PeerFrame};
 use mycellium_engine::verified::TrustLevel;
 use mycellium_storage::filestore::FileStore;
-use mycellium_transport::libp2p_net;
-use mycellium_transport::link::{FrameReader, FrameWriter};
+use mycellium_transport::reticulum_net::InboundFrame;
 use zeroize::{Zeroize, Zeroizing};
 
 const REGISTRY_SESSION_KEY: &[u8] = b"mobile:registry-session:v1";
@@ -445,10 +443,10 @@ impl MobileClient {
         self.refresh_device_status_inner().map_err(Into::into)
     }
 
-    /// Restore live registry presence after the OS resumes this app.
+    /// Restore Reticulum connectivity after the OS resumes this app.
     pub fn refresh_connectivity(&self) -> Result<(), MobileError> {
         let session = self.require_session()?;
-        session.network.ensure_rendezvous()?;
+        session.network.ensure_reticulum()?;
         Ok(())
     }
 }
@@ -622,7 +620,7 @@ impl MobileClient {
 
     fn publish_profile_values(&self, handle: Handle, name: String) -> Result<ProfileInfo> {
         let session = self.require_session()?;
-        let node = self.listener_or_start(&session)?;
+        let start_listener = self.listener_or_start(&session)?;
         let record = {
             let mut store = lock(&session.store, "local store")?;
             client::publish_active_device_record(
@@ -634,9 +632,7 @@ impl MobileClient {
             )?
         };
         *lock(&session.own_record, "profile")? = Some(record.clone());
-        if let Some(node) = node {
-            self.start_listener(session.clone(), node);
-        }
+        self.start_listener(session.clone(), start_listener);
         if let Some(account) = self.account() {
             let registry = client::registry::RegistryClient::new(&account.registry_url)?;
             if account.is_expired(now() as i64) {
@@ -654,55 +650,34 @@ impl MobileClient {
         Ok(profile_info(&record))
     }
 
-    fn listener_or_start(&self, session: &Session) -> Result<Option<libp2p_net::Libp2pNode>> {
+    fn listener_or_start(&self, session: &Session) -> Result<bool> {
         if session.listener_started.load(Ordering::Acquire) {
-            return Ok(None);
+            return Ok(false);
         }
-        let listen_addr = libp2p_net::quic_listen_multiaddr("0.0.0.0:0")
-            .map_err(|error| anyhow!("could not create direct listener: {error}"))?;
-        let mut node =
-            libp2p_net::Libp2pNode::new(session.identity.device_secret(), Some(listen_addr))
-                .map_err(|error| anyhow!("could not start direct listener: {error}"))?;
-        node.listen_addr()
-            .map_err(|error| anyhow!("could not open direct listener: {error}"))?;
-        Ok(Some(node))
+        Ok(true)
     }
 
-    fn start_listener(&self, session: Session, mut node: libp2p_net::Libp2pNode) {
-        session.network.set_libp2p(node.dialer());
+    fn start_listener(&self, session: Session, start: bool) {
+        if !start {
+            return;
+        }
+        let Some(node) = session.network.reticulum() else {
+            push_event(
+                &self.events,
+                ClientEvent {
+                    kind: EventKind::Error,
+                    message: "Could not start Reticulum node".into(),
+                    user_id: None,
+                },
+            );
+            return;
+        };
         session.listener_started.store(true, Ordering::Release);
         let events = Arc::clone(&self.events);
-        let worker_count = thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(2)
-            .max(2);
-        let (connections, receiver) = mpsc::sync_channel(worker_count * 4);
-        let receiver = Arc::new(Mutex::new(receiver));
-        for _ in 0..worker_count {
-            let receiver = Arc::clone(&receiver);
-            let worker = session.clone();
-            let worker_events = Arc::clone(&events);
-            thread::spawn(move || {
-                while worker.network.is_running() {
-                    let connection = {
-                        let Ok(receiver) = receiver.lock() else {
-                            return;
-                        };
-                        match receiver.recv_timeout(Duration::from_secs(1)) {
-                            Ok(connection) => connection,
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        }
-                    };
-                    serve_mobile_connection(connection, &worker, &worker_events);
-                }
-            });
-        }
-
         thread::spawn(move || {
             while session.network.is_running() {
-                let connection = match node.accept_timeout(Duration::from_secs(1)) {
-                    Ok(Some(connection)) => connection,
+                let frame = match node.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Some(frame)) => frame,
                     Ok(None) => continue,
                     Err(error) => {
                         if !session.network.is_running() {
@@ -719,10 +694,7 @@ impl MobileClient {
                         return;
                     }
                 };
-                match connections.try_send(connection) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Disconnected(_)) => return,
-                }
+                serve_mobile_connection(frame, &session, &events);
             }
         });
     }
@@ -1002,60 +974,49 @@ impl Drop for MobileClient {
 }
 
 fn serve_mobile_connection(
-    mut connection: libp2p_net::Libp2pConnection,
+    inbound: InboundFrame,
     session: &Session,
     events: &Arc<Mutex<VecDeque<ClientEvent>>>,
 ) {
-    while session.network.is_running() {
-        let Ok(bytes) = connection.recv_frame() else {
+    if !session.network.is_running() || !session.device_current.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(PeerFrame::Delivery { delivery_id, item }) = wire::decode::<PeerFrame>(inbound.bytes())
+    else {
+        return;
+    };
+    if client::mail_item_sender_device(&item).is_none() {
+        return;
+    }
+    let Some(record) = session
+        .own_record
+        .lock()
+        .ok()
+        .and_then(|record| record.clone())
+    else {
+        return;
+    };
+    let me = record.record.handle.clone();
+    let acknowledgement = {
+        let Ok(mut store) = session.store.lock() else {
             return;
         };
-        if !session.device_current.load(Ordering::Acquire) {
-            return;
-        }
-        let Ok(PeerFrame::Delivery { delivery_id, item }) = wire::decode::<PeerFrame>(&bytes)
-        else {
-            continue;
+        let mut sink = EventSink {
+            events: Arc::clone(events),
         };
-        let Some(sender_device) = client::mail_item_sender_device(&item) else {
-            continue;
-        };
-        let Ok(sender_peer) = libp2p_net::peer_id_for_device(&sender_device) else {
-            continue;
-        };
-        if sender_peer != connection.peer_id() {
-            continue;
-        }
-        let Some(record) = session
-            .own_record
-            .lock()
-            .ok()
-            .and_then(|record| record.clone())
-        else {
-            continue;
-        };
-        let me = record.record.handle.clone();
-        let acknowledgement = {
-            let Ok(mut store) = session.store.lock() else {
-                return;
-            };
-            let mut sink = EventSink {
-                events: Arc::clone(events),
-            };
-            client::accept_delivery(
-                &session.identity,
-                &me,
-                &record,
-                &mut OsPlatform,
-                &mut store,
-                delivery_id,
-                *item,
-                &mut sink,
-            )
-        };
-        if let Some(frame) = acknowledgement {
-            let _ = connection.send_frame(&frame);
-        }
+        client::accept_delivery(
+            &session.identity,
+            &me,
+            &record,
+            &mut OsPlatform,
+            &mut store,
+            delivery_id,
+            *item,
+            &mut sink,
+        )
+    };
+    if let Some(reply) = acknowledgement {
+        let _ = inbound.reply(&reply);
     }
 }
 
@@ -1067,7 +1028,7 @@ fn open_session(data_dir: &std::path::Path, identity: Identity) -> Result<Sessio
         .find(|entry| entry.record.record.wallet == identity.wallet_public())
         .map(|entry| entry.record);
     Ok(Session {
-        network: client::DirectNetwork::new(identity.device_secret()),
+        network: client::DirectNetwork::new(identity.reticulum_private_bytes()),
         identity,
         store: Arc::new(Mutex::new(store)),
         own_record: Arc::new(Mutex::new(own_record)),
@@ -1243,7 +1204,7 @@ mod tests {
         let client = MobileClient::open(
             root.path().display().to_string(),
             None,
-            Some("http://127.0.0.1:1".into()),
+            Some("http://[::1]:1".into()),
         )
         .unwrap();
 
@@ -1269,7 +1230,7 @@ mod tests {
             let error = MobileClient::open(
                 root.path().display().to_string(),
                 Some(secret),
-                Some("http://127.0.0.1:1".into()),
+                Some("http://[::1]:1".into()),
             )
             .err()
             .expect("malformed secure identity was accepted");
@@ -1305,7 +1266,7 @@ mod tests {
         let error = MobileClient::open(
             root.path().display().to_string(),
             Some(secret),
-            Some("http://127.0.0.1:1".into()),
+            Some("http://[::1]:1".into()),
         )
         .err()
         .expect("corrupt registry session was accepted");

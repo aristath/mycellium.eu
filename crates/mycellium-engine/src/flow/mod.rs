@@ -279,10 +279,9 @@ pub struct SendOutcome {
 /// peer's active device and hands it to `deliver`, tallying by the returned
 /// [`DeliveryPath`]; then it records our own transcript copy.
 ///
-/// The two closures own the client-specific transport + retry policy: direct
-/// TCP/libp2p with an outbox fallback. The store is threaded *through* the
-/// closures (rather than captured) so the seal loop and the closures' own writes
-/// share one handle.
+/// The two closures own the client-specific transport + retry policy. The store
+/// is threaded *through* the closures (rather than captured) so the seal loop
+/// and the closures' own writes share one handle.
 ///
 /// The caller resolves and trust-checks the peer via [`resolve_record`] first
 /// and passes the already-verified `peer_record` in, so this never re-fetches or

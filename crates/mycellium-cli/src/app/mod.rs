@@ -1,12 +1,12 @@
 //! Native hard-serverless CLI orchestration.
 //!
-//! This app layer has no directory, queue, relay, mailbox, push, or hosted
-//! rendezvous dependency. It keeps signed peer records locally, sends only over
-//! direct peer-to-peer transports, and parks undelivered messages in the local
-//! outbox.
+//! This app layer has no directory, queue, relay, mailbox, or push dependency.
+//! It keeps signed peer records locally, sends only over peer-to-peer
+//! transports, and parks undelivered messages in the local outbox.
 #![allow(clippy::too_many_arguments)]
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -17,15 +17,15 @@ use mycellium_core::identity::{DevicePublicKey, Handle, Identity, WalletPublicKe
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
-use mycellium_core::transport::Transport;
 use mycellium_core::userid::UserId;
 use mycellium_core::wire;
 
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
 use mycellium_transport::libp2p_net::{self};
+#[cfg(test)]
 use mycellium_transport::link::{FrameReader, FrameWriter};
-use mycellium_transport::net::{self, TcpTransport};
+use mycellium_transport::reticulum_net::InboundFrame;
 
 use crate::platform::OsPlatform;
 #[cfg(test)]
@@ -92,7 +92,7 @@ pub fn identity_adopt(wallet_secret: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn register(handle: &str, _addr: &str, _libp2p: bool) -> Result<()> {
+pub fn register(handle: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let handle = Handle::new(handle).map_err(|_| anyhow!("invalid handle"))?;
     let mut fs = open_history(&identity)?;
@@ -156,9 +156,9 @@ pub fn list_device(handle: &str) -> Result<()> {
     let d = &record.record.device;
     println!("active device for '{}':", handle.as_str());
     println!(
-        "  {}  {}",
+        "  {}  reticulum={}",
         short_device_id(&d.device_key),
-        String::from_utf8_lossy(&d.peer_id().0)
+        hex(&d.reticulum().address.0)
     );
     Ok(())
 }
@@ -179,7 +179,7 @@ pub fn discover(peer: &str, want: &[String]) -> Result<()> {
     let identity = store::load_identity()?;
     let mut fs = open_history(&identity)?;
     let (peer_handle, peer_record) = resolve_record(&mut fs, peer)?;
-    let network = DirectNetwork::new(identity.device_secret());
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
     let device = &peer_record.record.device;
     let detail = match request_discovery_from_device(&network, device, want) {
         Ok(records) => {
@@ -285,7 +285,7 @@ pub fn send(
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let network = DirectNetwork::new(identity.device_secret());
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
     let _ = flush_outbox_with_network(&identity, &mut fs, &network);
     let (peer_handle, peer_record) = lookup_verified(&mut fs, peer)?;
 
@@ -371,7 +371,7 @@ fn delivery_summary(
     }
 }
 
-pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
+pub fn serve(whoami: &str) -> Result<()> {
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let fs = open_history(&identity)?;
@@ -382,96 +382,26 @@ pub fn serve(addr: &str, whoami: &str, libp2p: bool) -> Result<()> {
     let fs = Arc::new(Mutex::new(fs));
     crate::print_engine_diagnostics();
 
-    if libp2p {
-        let listen_addr = libp2p_net::listen_multiaddr(addr).context("bad serve address")?;
-        let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
-            .context("could not start libp2p node")?;
-        let network = DirectNetwork::with_libp2p(identity.device_secret(), node.dialer());
-        if let Ok(mut store) = fs.lock() {
-            let _ = flush_outbox_with_network(&identity, &mut store, &network);
-        }
-        start_retry_worker(Arc::clone(&identity), Arc::clone(&fs), network);
-        println!(
-            "serving (libp2p) on {addr} as {} ({})",
-            me.as_str(),
-            node.peer_id()
-        );
-        let workers = connection_workers(
-            Arc::clone(&identity),
-            Arc::clone(&me),
-            Arc::clone(&my_record),
-            Arc::clone(&fs),
-        );
-        loop {
-            let conn = match node.accept() {
-                Ok(conn) => conn,
-                Err(_) => continue,
-            };
-            if workers.send(conn).is_err() {
-                bail!("connection workers stopped");
-            }
-        }
-    } else {
-        let mut transport = TcpTransport::listening(addr).context("could not bind address")?;
-        let network = DirectNetwork::new(identity.device_secret());
-        if let Ok(mut store) = fs.lock() {
-            let _ = flush_outbox_with_network(&identity, &mut store, &network);
-        }
-        start_retry_worker(Arc::clone(&identity), Arc::clone(&fs), network);
-        println!("serving on {addr} as {}", me.as_str());
-        let workers = connection_workers(
-            Arc::clone(&identity),
-            Arc::clone(&me),
-            Arc::clone(&my_record),
-            Arc::clone(&fs),
-        );
-        loop {
-            let conn = match transport.accept() {
-                Ok(conn) => conn,
-                Err(_) => continue,
-            };
-            if workers.send(conn).is_err() {
-                bail!("connection workers stopped");
-            }
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
+    let node = network
+        .reticulum()
+        .ok_or_else(|| anyhow!("could not start Reticulum node"))?;
+    if let Ok(mut store) = fs.lock() {
+        let _ = flush_outbox_with_network(&identity, &mut store, &network);
+    }
+    start_retry_worker(Arc::clone(&identity), Arc::clone(&fs), network);
+    println!(
+        "serving on Reticulum as {} ({})",
+        me.as_str(),
+        hex(&my_record.record.device.reticulum().address.0)
+    );
+    loop {
+        match node.recv_timeout(Duration::from_secs(1)) {
+            Ok(Some(frame)) => serve_reticulum_frame(frame, &identity, &me, &my_record, &fs),
+            Ok(None) => {}
+            Err(_) => {}
         }
     }
-}
-
-fn connection_workers<C>(
-    identity: Arc<Identity>,
-    me: Arc<Handle>,
-    my_record: Arc<SignedRecord>,
-    fs: Arc<Mutex<FileStore>>,
-) -> mpsc::SyncSender<C>
-where
-    C: FrameReader + FrameWriter + Send + 'static,
-{
-    let count = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(2)
-        .max(2);
-    let (sender, receiver) = mpsc::sync_channel::<C>(count * 2);
-    let receiver = Arc::new(Mutex::new(receiver));
-    for _ in 0..count {
-        let receiver = Arc::clone(&receiver);
-        let identity = Arc::clone(&identity);
-        let me = Arc::clone(&me);
-        let my_record = Arc::clone(&my_record);
-        let fs = Arc::clone(&fs);
-        std::thread::spawn(move || loop {
-            let conn = {
-                let Ok(receiver) = receiver.lock() else {
-                    return;
-                };
-                match receiver.recv() {
-                    Ok(conn) => conn,
-                    Err(_) => return,
-                }
-            };
-            serve_connection(conn, &identity, &me, &my_record, &fs);
-        });
-    }
-    sender
 }
 
 fn start_retry_worker(identity: Arc<Identity>, fs: Arc<Mutex<FileStore>>, network: DirectNetwork) {
@@ -562,28 +492,30 @@ fn retry_due_deliveries(identity: &Identity, fs: &Mutex<FileStore>, network: &Di
     }
 }
 
-fn serve_connection<C>(
-    mut conn: C,
+fn serve_reticulum_frame(
+    inbound: InboundFrame,
     identity: &Identity,
     me: &Handle,
     my_record: &SignedRecord,
     fs: &Mutex<FileStore>,
-) where
-    C: FrameReader + FrameWriter,
-{
+) {
     let mut platform = OsPlatform;
-    while let Ok(bytes) = conn.recv_frame() {
-        let Ok(frame) = wire::decode::<PeerFrame>(&bytes) else {
-            continue;
-        };
-        let Ok(mut fs) = fs.lock() else {
-            return;
-        };
-        if handle_discovery_frame(&mut fs, &mut conn, &frame) {
-            crate::print_engine_diagnostics();
-            continue;
+    let Ok(frame) = wire::decode::<PeerFrame>(inbound.bytes()) else {
+        return;
+    };
+    let Ok(mut fs) = fs.lock() else {
+        return;
+    };
+    match frame {
+        PeerFrame::DiscoveryRequest { want } => {
+            let records = client::discovery_records(&*fs, &want).unwrap_or_default();
+            let response = PeerFrame::DiscoveryResponse { records };
+            let _ = inbound.reply(&wire::encode(&response));
         }
-        if let PeerFrame::Delivery { delivery_id, item } = frame {
+        PeerFrame::DiscoveryResponse { records } => {
+            let _ = client::import_discovery_records(&mut *fs, records);
+        }
+        PeerFrame::Delivery { delivery_id, item } => {
             let acknowledgement = handle_delivery_frame(
                 identity,
                 me,
@@ -595,11 +527,12 @@ fn serve_connection<C>(
             );
             drop(fs);
             if let Some(frame) = acknowledgement {
-                let _ = conn.send_frame(&frame);
+                let _ = inbound.reply(&frame);
             }
         }
-        crate::print_engine_diagnostics();
+        _ => {}
     }
+    crate::print_engine_diagnostics();
 }
 
 pub fn outbox_list() -> Result<()> {
@@ -691,7 +624,7 @@ fn short_outbox_id(id: &str) -> &str {
 }
 
 pub fn flush_outbox(identity: &Identity, fs: &mut FileStore) -> Result<(usize, usize)> {
-    let network = DirectNetwork::new(identity.device_secret());
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
     flush_outbox_with_network(identity, fs, &network)
 }
 
@@ -790,27 +723,11 @@ fn request_discovery_from_device(
         want: want.to_vec(),
     };
     let frame = wire::encode(&request);
-    match direct_transport(&device.peer_id().0) {
-        DirectTransport::None => bail!("device has no dialable address"),
-        DirectTransport::Tcp => {
-            let addr = String::from_utf8_lossy(&device.peer_id().0);
-            let mut conn = net::TcpConnection::connect(&addr)
-                .with_context(|| format!("could not connect to {addr}"))?;
-            conn.send_frame(&frame)?;
-            decode_discovery_response(&conn.recv_frame()?)
-        }
-        DirectTransport::Libp2p => {
-            let addr = String::from_utf8_lossy(&device.peer_id().0);
-            let dialer = network
-                .libp2p()
-                .ok_or_else(|| anyhow!("could not start libp2p network actor"))?;
-            let mut conn = dialer
-                .dial_str(&addr)
-                .with_context(|| format!("could not connect to {addr}"))?;
-            conn.send_frame(&frame)?;
-            decode_discovery_response(&conn.recv_frame()?)
-        }
-    }
+    let node = network
+        .reticulum()
+        .ok_or_else(|| anyhow!("could not start Reticulum node"))?;
+    let response = node.send_and_wait(device.reticulum(), &frame, Duration::from_secs(30))?;
+    decode_discovery_response(&response)
 }
 
 fn decode_discovery_response(frame: &[u8]) -> Result<Vec<DiscoveryRecord>> {
@@ -841,55 +758,6 @@ fn handle_delivery_frame(
         item,
         &mut sink,
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectTransport {
-    Tcp,
-    Libp2p,
-    None,
-}
-
-fn direct_transport(peer_id: &[u8]) -> DirectTransport {
-    match core::str::from_utf8(peer_id) {
-        Ok("") => DirectTransport::None,
-        Ok(addr) if addr.starts_with('/') => DirectTransport::Libp2p,
-        Ok(_) => DirectTransport::Tcp,
-        Err(_) => DirectTransport::None,
-    }
-}
-
-fn handle_discovery_frame<W: FrameWriter>(
-    fs: &mut FileStore,
-    writer: &mut W,
-    frame: &PeerFrame,
-) -> bool {
-    match frame {
-        PeerFrame::DiscoveryRequest { want } => {
-            let records = match client::discovery_records(fs, want) {
-                Ok(records) => records,
-                Err(err) => {
-                    eprintln!("(could not build discovery response: {err})");
-                    Vec::new()
-                }
-            };
-            let response = PeerFrame::DiscoveryResponse { records };
-            let _ = writer.send_frame(&wire::encode(&response));
-            true
-        }
-        PeerFrame::DiscoveryResponse { records } => {
-            let report = client::import_discovery_records(fs, records.clone());
-            if report.imported > 0 || !report.skipped.is_empty() {
-                println!(
-                    "discovery imported {} record(s), skipped {}",
-                    report.imported,
-                    report.skipped.len()
-                );
-            }
-            true
-        }
-        _ => false,
-    }
 }
 
 // ---- receive processing -----------------------------------------------------
@@ -1021,7 +889,7 @@ pub fn group_send(
     let identity = store::load_identity()?;
     let me = Handle::new(whoami).map_err(|_| anyhow!("invalid --as handle"))?;
     let mut fs = open_history(&identity)?;
-    let network = DirectNetwork::new(identity.device_secret());
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
     let _ = flush_outbox_with_network(&identity, &mut fs, &network);
     let mut stored = client::resolve_group(&fs, group)?;
 
@@ -1136,7 +1004,7 @@ pub fn group_leave(group: &str, whoami: &str) -> Result<()> {
     let my_record = own_record(&fs, &identity, &me)?;
     let stored = client::resolve_group(&fs, group)?;
     let now = OsPlatform.now_unix_secs();
-    let network = DirectNetwork::new(identity.device_secret());
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        record: &SignedRecord,
@@ -1193,7 +1061,7 @@ fn distribute_group_key_direct(
     fs: &mut FileStore,
 ) {
     let now = OsPlatform.now_unix_secs();
-    let network = DirectNetwork::new(identity.device_secret());
+    let network = DirectNetwork::new(identity.reticulum_private_bytes());
     let mut deliver = |store: &mut FileStore,
                        handle: &Handle,
                        record: &SignedRecord,

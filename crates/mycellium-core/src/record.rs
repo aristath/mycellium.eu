@@ -2,8 +2,8 @@
 //!
 //! A discovery bundle answers *"given a handle, who and which active device?"*
 //! without storing a route. The wallet signs identity and stable device claims,
-//! while each device signs its stable libp2p PeerId. Temporary network routes
-//! are exchanged only during a live registry introduction.
+//! while each device signs its stable Reticulum destination. Temporary network
+//! routes are discovered by Reticulum, not stored here.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,14 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::identity::{
-    DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId, Signature, WalletPublicKey,
+    DevicePublicKey, Handle, Identity, MessagingPublicKey, ReticulumPublicIdentity, Signature,
+    WalletPublicKey,
 };
 use crate::userid::{user_id, UserId};
 
 /// Max display-name length (bytes) allowed in a record.
 pub const MAX_NAME_LEN: usize = 128;
-/// Max encoded libp2p peer-id length (bytes) per device.
-pub const MAX_PEER_ID_LEN: usize = 256;
 /// A medium-term messaging key, signed by the wallet, that lets a peer start a
 /// one-shot X3DH session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,15 +61,12 @@ pub struct SignedDeviceRecord {
 }
 
 /// Device-signed stable transport identity.
-///
-/// The historical wire name is retained for record compatibility. This record
-/// never contains an IP address or multiaddr.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReachabilityRecord {
     /// Device whose transport identity this record certifies.
     pub device_key: DevicePublicKey,
-    /// Stable libp2p PeerId derived from `device_key`.
-    pub peer_id: PeerId,
+    /// Stable Reticulum destination identity for `mycellium.delivery`.
+    pub reticulum: ReticulumPublicIdentity,
     /// Monotonic claim version, independent of identity/device keys.
     pub seq: u64,
 }
@@ -85,12 +81,12 @@ pub struct SignedReachabilityRecord {
 }
 
 /// One resolved device bundle carried by discovery: stable wallet-authorized
-/// keys plus an independently device-signed transport identity.
+/// keys plus an independently device-signed Reticulum destination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     /// Wallet-authorized stable device record.
     pub signed: SignedDeviceRecord,
-    /// Independently device-authorized transport identity.
+    /// Independently device-authorized Reticulum destination.
     pub reachability: SignedReachabilityRecord,
 }
 
@@ -117,7 +113,7 @@ impl Device {
         };
         let reachability_record = ReachabilityRecord {
             device_key: owner.device_public(),
-            peer_id: owner.peer_id(),
+            reticulum: owner.reticulum_public(),
             seq,
         };
         let reachability = SignedReachabilityRecord {
@@ -130,20 +126,20 @@ impl Device {
         }
     }
 
-    /// Stable self-authenticating libp2p peer identity.
-    pub fn peer_id(&self) -> &PeerId {
-        &self.reachability.record.peer_id
+    /// Stable Reticulum destination identity.
+    pub fn reticulum(&self) -> &ReticulumPublicIdentity {
+        &self.reachability.record.reticulum
     }
 
-    /// Replace a legacy route-bearing claim with this device's stable PeerId.
+    /// Replace this device's Reticulum destination claim.
     /// The wallet-authorized record is preserved byte-for-byte.
-    pub fn refresh_peer_id(&self, owner: &Identity, seq: u64) -> Result<Self, Error> {
+    pub fn refresh_reticulum(&self, owner: &Identity, seq: u64) -> Result<Self, Error> {
         if owner.device_public() != self.device_key || seq <= self.reachability.record.seq {
             return Err(Error::Malformed);
         }
         let record = ReachabilityRecord {
             device_key: self.device_key,
-            peer_id: owner.peer_id(),
+            reticulum: owner.reticulum_public(),
             seq,
         };
         Ok(Self {
@@ -217,11 +213,11 @@ impl Record {
 
 /// Domain + schema-version tag prefixed to a record's signed bytes.
 ///
-/// v4 separates wallet identity authority, wallet-authorized device keys, and
+/// v5 separates wallet identity authority, wallet-authorized device keys, and
 /// the device-authorized transport identity into signed/versioned claims.
-const RECORD_DOMAIN: &[u8] = b"mycellium-identity-record-v4\0";
+const RECORD_DOMAIN: &[u8] = b"mycellium-identity-record-v5\0";
 const DEVICE_DOMAIN: &[u8] = b"mycellium-device-record-v1\0";
-const REACHABILITY_DOMAIN: &[u8] = b"mycellium-reachability-record-v1\0";
+const REACHABILITY_DOMAIN: &[u8] = b"mycellium-reachability-record-v2\0";
 /// Domain + schema-version tag prefixed to a signed pre-key's signed bytes.
 const PREKEY_DOMAIN: &[u8] = b"mycellium-prekey-v1\0";
 
@@ -278,9 +274,8 @@ impl SignedRecord {
             return Err(Error::Malformed);
         }
         let device = &r.device;
-        if device.peer_id().0.len() > MAX_PEER_ID_LEN
-            || device.reachability.record.device_key != device.device_key
-            || device.peer_id() != &device.device_key.peer_id()
+        if device.reachability.record.device_key != device.device_key
+            || !device.reticulum().verify()
         {
             return Err(Error::Malformed);
         }
@@ -359,22 +354,29 @@ mod tests {
     }
 
     #[test]
-    fn device_can_migrate_legacy_peer_id_without_resigning_stable_keys() {
+    fn device_can_refresh_reticulum_without_resigning_stable_keys() {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let original = SignedRecord::sign(record_for(&identity, 7), &identity);
         let stable = original.record.device.signed.clone();
         let mut legacy = original.clone();
-        legacy.record.device.reachability.record.peer_id = PeerId(b"legacy-ip".to_vec());
+        legacy.record.device.reachability.record.reticulum.address.0[0] ^= 1;
         legacy.record.device.reachability.signature = identity.sign_device(
             &reachability_signing_bytes(&legacy.record.device.reachability.record),
         );
         let mut refreshed = legacy.clone();
-        refreshed.record.device = legacy.record.device.refresh_peer_id(&identity, 8).unwrap();
+        refreshed.record.device = legacy
+            .record
+            .device
+            .refresh_reticulum(&identity, 8)
+            .unwrap();
 
         assert_eq!(refreshed.signature, legacy.signature);
         assert_eq!(refreshed.record.device.signed, stable);
-        assert_eq!(refreshed.record.device.peer_id(), &identity.peer_id());
+        assert_eq!(
+            refreshed.record.device.reticulum(),
+            &identity.reticulum_public()
+        );
         assert!(refreshed.verify().is_ok());
     }
 
@@ -414,24 +416,21 @@ mod tests {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
 
-        let mut oversized_peer_id = record_for(&id, 1);
-        oversized_peer_id.device.reachability.record.peer_id =
-            PeerId(vec![b'x'; MAX_PEER_ID_LEN + 1]);
+        let mut bad_reticulum = record_for(&id, 1);
+        bad_reticulum.device.reachability.record.reticulum.address.0[0] ^= 1;
         assert_eq!(
-            SignedRecord::sign(oversized_peer_id, &id).verify(),
+            SignedRecord::sign(bad_reticulum, &id).verify(),
             Err(Error::Malformed)
         );
     }
 
     #[test]
-    fn device_cannot_sign_a_peer_id_belonging_to_another_key() {
+    fn device_cannot_sign_a_mismatched_reticulum_destination() {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
         let mut record = record_for(&id, 1);
 
-        let mut other_peer_id = id.peer_id();
-        *other_peer_id.0.last_mut().unwrap() ^= 1;
-        record.device.reachability.record.peer_id = other_peer_id;
+        record.device.reachability.record.reticulum.address.0[15] ^= 1;
         record.device.reachability.signature = id.sign_device(&reachability_signing_bytes(
             &record.device.reachability.record,
         ));

@@ -1,4 +1,4 @@
-//! Account registry and live-device discovery core.
+//! Account registry core.
 //!
 //! This crate deliberately does not store or relay messages. It only owns the
 //! registry-side account UX:
@@ -9,8 +9,7 @@
 //! - pointers to encrypted account blobs and signed public records
 //! - stable user-id lookup for current signed public records
 //!
-//! Live presence and introduction are implemented in [`rendezvous`]. Neither
-//! the HTTP surface nor its QUIC control protocol can carry message payloads.
+//! Live message delivery is not a registry responsibility.
 
 use std::fmt;
 use std::io::Write;
@@ -26,7 +25,6 @@ pub mod email;
 pub mod http;
 pub mod recovery;
 mod redb_store;
-pub mod rendezvous;
 
 pub use redb_store::RedbRegistryStore;
 
@@ -336,6 +334,7 @@ pub trait RegistryStore {
         &self,
         account_id: &AccountId,
         user_id: &UserId,
+        previous_user_id: Option<&UserId>,
         expected: Option<&BlobRef>,
         next: &BlobRef,
     ) -> Result<BlobSwap>;

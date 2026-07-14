@@ -120,8 +120,10 @@ fun MycelliumRoot(model: MessengerViewModel) {
     }
 
     Box(Modifier.fillMaxSize().background(Canvas)) {
+        val startupError = state.startupError
         when {
             !state.initialized -> LaunchScreen()
+            startupError != null -> StartupErrorScreen(startupError)
             state.clientState == ClientState.READY -> {
                 if (state.selectedUserId != null) {
                     ConversationScreen(state, model)
@@ -131,6 +133,17 @@ fun MycelliumRoot(model: MessengerViewModel) {
             }
             else -> AccountScreen(state, model, snackbars)
         }
+    }
+}
+
+@Composable
+private fun StartupErrorScreen(message: String) {
+    Box(Modifier.fillMaxSize().padding(28.dp), contentAlignment = Alignment.Center) {
+        StatusCard(
+            title = "This device could not start",
+            body = message,
+            accent = Danger,
+        )
     }
 }
 

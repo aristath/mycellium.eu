@@ -423,6 +423,7 @@ impl RegistryStore for RedbRegistryStore {
         &self,
         account_id: &AccountId,
         user_id: &UserId,
+        previous_user_id: Option<&UserId>,
         expected: Option<&BlobRef>,
         next: &BlobRef,
     ) -> Result<BlobSwap> {
@@ -459,6 +460,20 @@ impl RegistryStore for RedbRegistryStore {
             users
                 .insert(user_id.as_str(), account_id.as_str().as_bytes())
                 .map_err(|err| RegistryError::new(format!("write user index failed: {err}")))?;
+            if let Some(previous_user_id) = previous_user_id.filter(|previous| *previous != user_id)
+            {
+                let remove_previous = users
+                    .get(previous_user_id.as_str())
+                    .map_err(|err| {
+                        RegistryError::new(format!("read previous user index failed: {err}"))
+                    })?
+                    .is_some_and(|existing| existing.value() == account_id.as_str().as_bytes());
+                if remove_previous {
+                    users.remove(previous_user_id.as_str()).map_err(|err| {
+                        RegistryError::new(format!("remove previous user index failed: {err}"))
+                    })?;
+                }
+            }
             drop(users);
 
             let blob_bytes = encode_json(next)?;

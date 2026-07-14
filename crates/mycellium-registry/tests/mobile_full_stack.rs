@@ -10,6 +10,7 @@ use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::userid::user_id;
 use mycellium_mobile::{ClientState, DeliveryState, EventKind, MobileClient, MobileError};
+use mycellium_transport::reticulum_net::ReticulumBackbone;
 use tempfile::TempDir;
 
 use support::TestRegistry;
@@ -54,7 +55,7 @@ fn require_connectivity(client: &MobileClient) {
         thread::sleep(Duration::from_millis(100));
     }
     panic!(
-        "client did not establish authenticated registry presence: {}",
+        "client did not establish Reticulum connectivity: {}",
         last_error.unwrap_or_else(|| "unknown error".into())
     );
 }
@@ -147,6 +148,12 @@ fn native_clients_complete_online_offline_and_device_switch_flows() {
     let root = TempDir::new().expect("test directory");
     let registry_dir = root.path().join("registry");
     let server = TestRegistry::start(&registry_dir, [0x5a; 32]);
+    let probe = std::net::TcpListener::bind("[::1]:0").expect("reserve Reticulum test port");
+    let backbone_addr = probe.local_addr().expect("Reticulum test listener address");
+    drop(probe);
+    let _reticulum_backbone =
+        ReticulumBackbone::tcp(backbone_addr.to_string()).expect("start Reticulum test backbone");
+    std::env::set_var("MYCELLIUM_RETICULUM_TCP_NODES", backbone_addr.to_string());
 
     let alice = MobileClient::open(
         root.path().join("alice").display().to_string(),
@@ -323,7 +330,7 @@ fn native_clients_complete_online_offline_and_device_switch_flows() {
     );
 
     // Only endpoint stores may contain message content. Registry account,
-    // record, recovery, and rendezvous files must remain payload-blind.
+    // record and recovery files must remain payload-blind.
     assert_tree_does_not_contain(&registry_dir, online_text.as_bytes());
     assert_tree_does_not_contain(&registry_dir, offline_text.as_bytes());
     assert_tree_does_not_contain(&registry_dir, replacement_text.as_bytes());

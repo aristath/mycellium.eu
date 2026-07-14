@@ -29,7 +29,6 @@ pub mod offline;
 pub mod one_shot;
 pub mod platform;
 pub mod record;
-pub mod rendezvous;
 pub mod safety;
 pub mod storage;
 pub mod transport;

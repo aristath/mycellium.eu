@@ -1,7 +1,8 @@
 //! Tiny HTTP API for the registry core.
 //!
-//! This layer exposes account UX and the public rendezvous address. It does not
-//! store, queue, relay, acknowledge, or carry messages.
+//! This layer exposes account UX, signed public-record discovery, backup, and
+//! recovery. It does not store, queue, relay, acknowledge, introduce, or carry
+//! messages.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -42,7 +43,6 @@ pub struct AppState<S> {
     blobs: FileBlobStore,
     email_sender: Arc<dyn EmailLoginSender>,
     recovery_cipher: RecoveryCipher,
-    rendezvous_address: Arc<str>,
 }
 
 impl<S> Clone for AppState<S> {
@@ -52,7 +52,6 @@ impl<S> Clone for AppState<S> {
             blobs: self.blobs.clone(),
             email_sender: Arc::clone(&self.email_sender),
             recovery_cipher: self.recovery_cipher.clone(),
-            rendezvous_address: Arc::clone(&self.rendezvous_address),
         }
     }
 }
@@ -94,66 +93,12 @@ impl<S: RegistryStore> AppState<S> {
             blobs,
             email_sender: Arc::new(sender),
             recovery_cipher,
-            rendezvous_address: Arc::from(""),
         }
-    }
-
-    /// Publish the self-authenticating QUIC address used for live device
-    /// introductions.
-    pub fn with_rendezvous_address(mut self, address: impl Into<String>) -> Self {
-        self.rendezvous_address = Arc::from(address.into());
-        self
     }
 
     /// Run one bounded metadata cleanup pass.
     pub fn purge_expired(&self, now: i64, limit: usize) -> Result<usize> {
         self.registry.store().purge_expired(now, limit)
-    }
-
-    fn authorize_live_device(
-        &self,
-        user_id: &UserId,
-        device: &mycellium_core::identity::DevicePublicKey,
-    ) -> Result<bool> {
-        let Some(account_id) = self.registry.store().account_id_by_user_id(user_id)? else {
-            return Ok(false);
-        };
-        let Some((_, bytes)) = load_current_blob(self, &account_id, AccountBlobKind::PublicRecord)?
-        else {
-            return Ok(false);
-        };
-        let Ok(record) = wire::decode::<SignedRecord>(&bytes) else {
-            return Ok(false);
-        };
-        if record.verify().is_err()
-            || record.record.user_id != *user_id
-            || record.record.device.device_key != *device
-        {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-}
-
-impl<S> crate::rendezvous::DeviceAuthorizer for AppState<S>
-where
-    S: RegistryStore + Send + Sync + 'static,
-{
-    fn authorize_device(
-        &self,
-        user_id: &UserId,
-        device: &mycellium_core::identity::DevicePublicKey,
-    ) -> futures::future::BoxFuture<'static, bool> {
-        let state = self.clone();
-        let user_id = user_id.clone();
-        let device = *device;
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || state.authorize_live_device(&user_id, &device))
-                .await
-                .ok()
-                .and_then(std::result::Result::ok)
-                .unwrap_or(false)
-        })
     }
 }
 
@@ -163,7 +108,6 @@ where
     S: RegistryStore + Send + Sync + 'static,
 {
     Router::new()
-        .route("/rendezvous", get(get_rendezvous::<S>))
         .route(
             "/users/{user_id}/record",
             get(get_public_record_by_user_id::<S>),
@@ -219,7 +163,7 @@ pub fn redb_router_with_email_sender(
     )?))
 }
 
-/// Build reusable HTTP/rendezvous state using the default redb/file stores.
+/// Build reusable HTTP state using the default redb/file stores.
 pub fn redb_state_with_email_sender(
     data_dir: impl Into<std::path::PathBuf>,
     sender: impl EmailLoginSender,
@@ -234,26 +178,6 @@ pub fn redb_state_with_email_sender(
         sender,
         recovery_cipher,
     ))
-}
-
-#[derive(Debug, Serialize)]
-struct RendezvousResponse {
-    address: String,
-}
-
-async fn get_rendezvous<S>(State(state): State<AppState<S>>) -> ApiResult<Json<RendezvousResponse>>
-where
-    S: RegistryStore + Send + Sync + 'static,
-{
-    if state.rendezvous_address.is_empty() {
-        return Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "rendezvous is unavailable".into(),
-        });
-    }
-    Ok(Json(RendezvousResponse {
-        address: state.rendezvous_address.to_string(),
-    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,9 +436,8 @@ where
             .blobs
             .put(&account_id, AccountBlobKind::PublicRecord, &bytes)?;
         loop {
-            let expected = match enforce_public_record_update(&state, &account_id, &record, &bytes)
-            {
-                Ok(expected) => expected,
+            let update = match enforce_public_record_update(&state, &account_id, &record, &bytes) {
+                Ok(update) => update,
                 Err(error) => {
                     let _ = state.blobs.remove(&account_id, &blob);
                     return Err(error);
@@ -523,7 +446,8 @@ where
             match state.registry.store().compare_and_swap_public_record_ref(
                 &account_id,
                 &record.record.user_id,
-                expected.as_ref(),
+                update.previous_user_id.as_ref(),
+                update.expected.as_ref(),
                 &blob,
             )? {
                 BlobSwap::Applied { previous } => {
@@ -577,6 +501,7 @@ where
     else {
         return Err(ApiError::not_found("record not found"));
     };
+    decode_signed_public_record(&bytes).map_err(|_| ApiError::not_found("record not found"))?;
     Ok((StatusCode::OK, bytes).into_response())
 }
 
@@ -785,12 +710,17 @@ fn decode_signed_public_record(bytes: &[u8]) -> ApiResult<SignedRecord> {
     Ok(record)
 }
 
+struct PublicRecordUpdate {
+    expected: Option<crate::BlobRef>,
+    previous_user_id: Option<UserId>,
+}
+
 fn enforce_public_record_update<S: RegistryStore>(
     state: &AppState<S>,
     account_id: &AccountId,
     next: &SignedRecord,
     next_bytes: &[u8],
-) -> ApiResult<Option<crate::BlobRef>> {
+) -> ApiResult<PublicRecordUpdate> {
     let (_, recovery_sealed) = load_current_blob(state, account_id, AccountBlobKind::Recovery)?
         .ok_or_else(|| ApiError::conflict("store account recovery before publishing a record"))?;
     let recovery = state.recovery_cipher.open(account_id, &recovery_sealed)?;
@@ -807,9 +737,21 @@ fn enforce_public_record_update<S: RegistryStore>(
     let Some((current_ref, current_bytes)) =
         load_current_blob(state, account_id, AccountBlobKind::PublicRecord)?
     else {
-        return Ok(None);
+        return Ok(PublicRecordUpdate {
+            expected: None,
+            previous_user_id: None,
+        });
     };
-    let current = decode_signed_public_record(&current_bytes)?;
+    let current: SignedRecord = wire::decode(&current_bytes).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "stored public record is invalid".into(),
+    })?;
+    if current.verify().is_err() {
+        return Ok(PublicRecordUpdate {
+            expected: Some(current_ref),
+            previous_user_id: Some(current.record.user_id),
+        });
+    }
     if current.record.user_id != next.record.user_id {
         return Err(ApiError::conflict(
             "public record belongs to a different user",
@@ -820,7 +762,10 @@ fn enforce_public_record_update<S: RegistryStore>(
     {
         return Err(ApiError::conflict("stale public record"));
     }
-    Ok(Some(current_ref))
+    Ok(PublicRecordUpdate {
+        expected: Some(current_ref),
+        previous_user_id: Some(current.record.user_id),
+    })
 }
 
 fn check_rate_limit<S: RegistryStore>(
@@ -905,6 +850,20 @@ mod tests {
             RecoveryCipher::new([7; 32]),
         ));
         (app, sender)
+    }
+
+    fn state_with_mail(name: &str) -> (AppState<RedbRegistryStore>, Router, CaptureEmailSender) {
+        let dir = tmpdir(name);
+        let store = RedbRegistryStore::open(dir.join("registry.redb")).unwrap();
+        let sender = CaptureEmailSender::default();
+        let state = AppState::with_email_sender(
+            Registry::new(store),
+            FileBlobStore::new(dir.join("blobs")),
+            sender.clone(),
+            RecoveryCipher::new([7; 32]),
+        );
+        let app = router(state.clone());
+        (state, app, sender)
     }
 
     struct TestPlatform(u8);
@@ -1193,6 +1152,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn account_owner_can_replace_legacy_invalid_public_record() {
+        let (state, app, sender) = state_with_mail("record-legacy-invalid");
+        let (account_id, session_token) = login_session(&app, &sender).await;
+        let account_id: AccountId = account_id.parse().unwrap();
+        let identity = Identity::generate(&mut TestPlatform(80)).unwrap();
+        assert_eq!(
+            store_recovery(&app, account_id.as_str(), &session_token, &identity).await,
+            StatusCode::OK
+        );
+
+        let mut legacy = signed_public_record_bytes_for(&identity, 3);
+        let last = legacy.last_mut().unwrap();
+        *last ^= 0x80;
+        let legacy_record: SignedRecord = wire::decode(&legacy).unwrap();
+        assert!(legacy_record.verify().is_err());
+        let legacy_ref = state
+            .blobs
+            .put(&account_id, AccountBlobKind::PublicRecord, &legacy)
+            .unwrap();
+        assert!(matches!(
+            state
+                .registry
+                .store()
+                .compare_and_swap_public_record_ref(
+                    &account_id,
+                    &legacy_record.record.user_id,
+                    None,
+                    None,
+                    &legacy_ref,
+                )
+                .unwrap(),
+            BlobSwap::Applied { .. }
+        ));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/accounts/{account_id}/record"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let fresh = signed_public_record_bytes_for(&identity, 4);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/accounts/{account_id}/record"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(fresh.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/users/{}/record",
+                        user_id(&identity.wallet_public()).as_str()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], &fresh[..]);
     }
 
     #[tokio::test]

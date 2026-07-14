@@ -85,9 +85,9 @@ where
     record
         .verify()
         .map_err(|_| anyhow::anyhow!("record failed verification"))?;
-    if record.record.device.peer_id().0.is_empty() {
+    if record.record.device.reticulum().address.0 == [0u8; 16] {
         anyhow::bail!(
-            "record for '{}' has an empty device PeerId",
+            "record for '{}' has an empty Reticulum destination",
             handle.as_str()
         );
     }
@@ -316,7 +316,7 @@ mod tests {
         let identity = Identity::generate(&mut platform).unwrap();
         let handle = Handle::new("alice").unwrap();
         let mut record = build_record(&mut platform, &identity, &handle, "Alice");
-        record.record.device.reachability.record.peer_id.0.clear();
+        record.record.device.reachability.record.reticulum.address.0 = [0u8; 16];
         let mut store = MemStore::default();
 
         assert!(put(&mut store, &handle, record).is_err());

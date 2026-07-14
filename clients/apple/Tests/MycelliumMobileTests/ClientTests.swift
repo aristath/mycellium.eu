@@ -21,7 +21,7 @@ import Testing
             try MobileClient.open(
                 dataDir: root.path,
                 identitySecret: secret,
-                registryUrl: "http://127.0.0.1:1"
+                registryUrl: "http://[::1]:1"
             )
         }
     }
@@ -33,7 +33,7 @@ import Testing
     let client = try MobileClient.open(
         dataDir: root.path,
         identitySecret: nil,
-        registryUrl: "http://127.0.0.1:1"
+        registryUrl: "http://[::1]:1"
     )
 
     #expect(throws: (any Error).self) { try client.requestEmailLogin(email: "   ") }

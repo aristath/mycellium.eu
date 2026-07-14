@@ -1,6 +1,7 @@
 package eu.mycellium.android
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -35,9 +36,14 @@ data class MessengerUiState(
     val selectedTitle: String = "",
     val messages: List<MessageInfo> = emptyList(),
     val security: ContactSecurityInfo? = null,
+    val startupError: String? = null,
 )
 
 class MessengerViewModel(application: Application) : AndroidViewModel(application) {
+    private companion object {
+        const val TAG = "Mycellium"
+    }
+
     private val identityStore = AndroidIdentityStore(application)
     private val mutableState = MutableStateFlow(MessengerUiState())
     val state: StateFlow<MessengerUiState> = mutableState.asStateFlow()
@@ -47,13 +53,18 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val dataDir = application.filesDir.resolve("mycellium").absolutePath
-                MobileClient.open(dataDir, identityStore.load(), null)
-            }.onSuccess { opened ->
+                val opened = MobileClient.open(dataDir, identityStore.load(), null)
                 client = opened
                 refreshAll()
-                mutableState.update { it.copy(initialized = true) }
+                opened
+            }.onSuccess {
+                mutableState.update { it.copy(initialized = true, startupError = null) }
                 pollEvents()
-            }.onFailure(::showError)
+            }.onFailure { error ->
+                Log.e(TAG, "mobile client failed to open", error)
+                client = null
+                showError(error)
+            }
         }
     }
 
@@ -209,11 +220,22 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun action(block: suspend () -> Unit) {
-        if (mutableState.value.busy) return
+        if (client == null) {
+            mutableState.update {
+                it.copy(error = it.startupError ?: "Mycellium is still starting")
+            }
+            return
+        }
+        if (mutableState.value.busy) {
+            return
+        }
         mutableState.update { it.copy(busy = true, error = null, notice = null) }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { block() }
-                .onFailure(::showError)
+                .onFailure { error ->
+                    Log.e(TAG, "action failed", error)
+                    showError(error)
+                }
             mutableState.update { it.copy(busy = false) }
         }
     }
@@ -266,10 +288,12 @@ class MessengerViewModel(application: Application) : AndroidViewModel(applicatio
     private fun requireClient(): MobileClient = client ?: error("Mycellium is still starting")
 
     private fun showError(error: Throwable) {
+        val startupError = if (client == null) error.message ?: "Could not open this device" else null
         mutableState.update {
             it.copy(
                 initialized = true,
                 busy = false,
+                startupError = startupError,
                 error = error.message ?: "Something went wrong",
                 notice = null,
             )

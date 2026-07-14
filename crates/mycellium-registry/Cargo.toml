@@ -11,11 +11,8 @@ rust-version.workspace = true
 axum = "0.8"
 anyhow = "1"
 chacha20poly1305 = "0.10"
-futures = "0.3"
 getrandom = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "rustls-tls", "smtp-transport"] }
-libp2p = { version = "0.56", default-features = false, features = ["tokio", "quic", "macros", "ed25519"] }
-libp2p-stream = "0.4.0-alpha"
 redb = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

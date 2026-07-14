@@ -1,9 +1,10 @@
 //! Identity: the handle, the three key types, and the local secret [`Identity`].
 //!
 //! Every identity is rooted in a **wallet key** (secp256k1) — a raw random
-//! account secret, **not** a seed phrase. The wallet key certifies two
-//! subordinate keys: the **device key** (Ed25519, basis of the libp2p PeerId)
-//! and the **messaging key** (X25519, used by X3DH). One root vouches for
+//! account secret, **not** a seed phrase. The wallet key certifies the
+//! subordinate keys for this active device: the **device key** (Ed25519), the
+//! **messaging key** (X25519, used by X3DH), and the **Reticulum destination**
+//! used for transport reachability. One root vouches for
 //! everything. A fresh device starts from fresh local secret material and
 //! publishes a new signed record for peers to import or verify.
 //!
@@ -21,6 +22,7 @@ use k256::ecdsa::{Signature as EcdsaSignature, SigningKey as WalletSigningKey, V
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::Sha512;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroize;
 
@@ -96,8 +98,7 @@ impl WalletPublicKey {
 
 /// An Ed25519 public key (32 bytes): the **device key**.
 ///
-/// It is encoded into the stable libp2p [`PeerId`] and secures the transport. A
-/// new device gets a new device key, re-certified by the unchanged wallet key.
+/// A new device gets a new device key, re-certified by the unchanged wallet key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DevicePublicKey(pub [u8; 32]);
 
@@ -114,11 +115,7 @@ impl DevicePublicKey {
             .map_err(|_| Error::BadSignature)
     }
 
-    /// The exact libp2p PeerId represented by this Ed25519 public key.
-    ///
-    /// Ed25519 public keys fit inside libp2p's identity multihash, so this
-    /// encoding is deterministic and does not require hashing or a transport
-    /// implementation.
+    /// Historical libp2p PeerId encoding for old local tools.
     pub fn peer_id(&self) -> PeerId {
         let mut bytes = Vec::with_capacity(38);
         bytes.extend_from_slice(&[0x00, 0x24, 0x08, 0x01, 0x12, 0x20]);
@@ -130,6 +127,39 @@ impl DevicePublicKey {
 /// An X25519 public key (32 bytes): the long-term **messaging key** for X3DH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessagingPublicKey(pub [u8; 32]);
+
+/// A Reticulum destination address hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReticulumAddress(pub [u8; 16]);
+
+/// Public Reticulum destination identity for this active device.
+///
+/// The destination address is derived from these keys plus Mycellium's fixed
+/// Reticulum app/aspect name. Carrying the public keys lets peers build the
+/// destination, while carrying the address gives the registry/search path a
+/// small stable lookup value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReticulumPublicIdentity {
+    /// Reticulum X25519 public key.
+    pub encryption_key: [u8; 32],
+    /// Reticulum Ed25519 verifying key.
+    pub signing_key: [u8; 32],
+    /// Reticulum destination address for `mycellium.delivery`.
+    pub address: ReticulumAddress,
+}
+
+impl ReticulumPublicIdentity {
+    /// Recompute the Mycellium Reticulum destination address from the public
+    /// keys. Verification fails if a record claims mismatched key/address data.
+    pub fn derived_address(&self) -> ReticulumAddress {
+        reticulum_address(self.encryption_key, self.signing_key)
+    }
+
+    /// Whether the carried address matches the carried public keys.
+    pub fn verify(&self) -> bool {
+        self.address == self.derived_address()
+    }
+}
 
 /// A libp2p peer identifier containing the encoded Ed25519 device public key.
 ///
@@ -260,11 +290,45 @@ impl Identity {
 
     /// The device key's 32-byte Ed25519 secret seed.
     ///
-    /// Exposed so a transport can build its identity (e.g. a libp2p keypair)
-    /// from the *same* key, ensuring the network PeerId derives from the device
-    /// key. Handle with the same care as the seed itself.
+    /// Exposed for legacy local tools that still derive transport material from
+    /// the Ed25519 device key. Handle with the same care as the seed itself.
     pub fn device_secret(&self) -> [u8; 32] {
         self.device.to_bytes()
+    }
+
+    /// Reticulum private identity bytes: `[x25519 secret][ed25519 signing seed]`.
+    ///
+    /// Derived from this device's seed, never the wallet secret.
+    pub fn reticulum_private_bytes(&self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&derive_key(
+            &self.device_seed,
+            b"mycellium:reticulum:x25519:v1",
+        ));
+        bytes[32..].copy_from_slice(&derive_key(
+            &self.device_seed,
+            b"mycellium:reticulum:ed25519:v1",
+        ));
+        bytes
+    }
+
+    /// Public Reticulum destination identity for this active device.
+    pub fn reticulum_public(&self) -> ReticulumPublicIdentity {
+        let private = self.reticulum_private_bytes();
+        let mut encryption_seed = [0u8; 32];
+        encryption_seed.copy_from_slice(&private[..32]);
+        let encryption_key = XPublicKey::from(&StaticSecret::from(encryption_seed)).to_bytes();
+
+        let mut signing_seed = [0u8; 32];
+        signing_seed.copy_from_slice(&private[32..]);
+        let signing = DeviceSigningKey::from_bytes(&signing_seed);
+        let signing_key = signing.verifying_key().to_bytes();
+
+        ReticulumPublicIdentity {
+            encryption_key,
+            signing_key,
+            address: reticulum_address(encryption_key, signing_key),
+        }
     }
 
     /// The long-term messaging public key (X25519) — the X3DH identity key.
@@ -292,7 +356,7 @@ impl Identity {
             .to_bytes()
     }
 
-    /// This device's peer identifier.
+    /// Historical libp2p peer identifier for legacy local tools.
     pub fn peer_id(&self) -> PeerId {
         self.device_public().peer_id()
     }
@@ -328,6 +392,28 @@ fn derive_key(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     hk.expand(info, &mut okm)
         .expect("32 is a valid HKDF-SHA512 output length");
     okm
+}
+
+fn reticulum_address(encryption_key: [u8; 32], signing_key: [u8; 32]) -> ReticulumAddress {
+    let identity_hash = Sha256::new()
+        .chain_update(encryption_key)
+        .chain_update(signing_key)
+        .finalize();
+    let mut identity_address = [0u8; 16];
+    identity_address.copy_from_slice(&identity_hash[..16]);
+
+    let name_hash = Sha256::new()
+        .chain_update(b"mycellium")
+        .chain_update(b".")
+        .chain_update(b"delivery")
+        .finalize();
+    let address = Sha256::new()
+        .chain_update(&name_hash[..10])
+        .chain_update(identity_address)
+        .finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&address[..16]);
+    ReticulumAddress(out)
 }
 
 #[cfg(test)]
@@ -373,6 +459,11 @@ mod tests {
             b.messaging_public(),
             "new message key"
         );
+        assert_ne!(
+            a.reticulum_public(),
+            b.reticulum_public(),
+            "new Reticulum destination"
+        );
     }
 
     #[test]
@@ -383,5 +474,6 @@ mod tests {
         let same = Identity::from_wallet_secret(a.wallet_secret(), a.device_seed()).unwrap();
         assert_eq!(a.wallet_public(), same.wallet_public());
         assert_eq!(a.device_public(), same.device_public());
+        assert_eq!(a.reticulum_public(), same.reticulum_public());
     }
 }

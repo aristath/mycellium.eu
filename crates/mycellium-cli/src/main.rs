@@ -40,10 +40,6 @@ enum Command {
     /// Create/update your local signed record and print it for sharing.
     Register {
         handle: String,
-        #[arg(long)]
-        addr: String,
-        #[arg(long)]
-        libp2p: bool,
     },
     /// Import/export local signed peer records.
     Record {
@@ -90,12 +86,8 @@ enum Command {
         action: OutboxAction,
     },
     Serve {
-        #[arg(long)]
-        addr: String,
         #[arg(long = "as")]
         whoami: String,
-        #[arg(long)]
-        libp2p: bool,
     },
     History {
         peer: String,
@@ -273,11 +265,7 @@ fn main() -> Result<()> {
         Command::IdentityAdopt { wallet_secret } => identity_adopt(&wallet_secret),
         Command::IdentityShow => identity_show(),
         Command::IdentityExportWallet { yes } => identity_export_wallet(yes),
-        Command::Register {
-            handle,
-            addr,
-            libp2p,
-        } => register(&handle, &addr, libp2p),
+        Command::Register { handle } => register(&handle),
         Command::Record { action } => match action {
             RecordAction::Export { handle } => record_export(&handle),
             RecordAction::Import { handle, record } => record_import(&handle, &record),
@@ -327,11 +315,7 @@ fn main() -> Result<()> {
             OutboxAction::Retry => outbox_retry(),
             OutboxAction::Cancel { id } => outbox_cancel(&id),
         },
-        Command::Serve {
-            addr,
-            whoami,
-            libp2p,
-        } => serve(&addr, &whoami, libp2p),
+        Command::Serve { whoami } => serve(&whoami),
         Command::History { peer } => show_history(&peer),
         Command::ClearHistory { peer } => clear_history(&peer),
         Command::Conversations => conversations(),
