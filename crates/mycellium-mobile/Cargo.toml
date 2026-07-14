@@ -1,0 +1,34 @@
+[package]
+name = "mycellium-mobile"
+version = "0.0.0"
+description = "Native Android and Apple client boundary for Mycellium"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "mycellium_mobile"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+anyhow = "1"
+getrandom = "0.2"
+mycellium-client = { path = "../mycellium-client" }
+mycellium-core = { path = "../mycellium-core" }
+mycellium-engine = { path = "../mycellium-engine" }
+mycellium-storage = { path = "../mycellium-storage" }
+mycellium-transport = { path = "../mycellium-transport" }
+thiserror = "2"
+uniffi = { version = "0.31", features = ["cli"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

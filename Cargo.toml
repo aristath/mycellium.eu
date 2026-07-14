@@ -6,6 +6,7 @@ members = [
     "crates/mycellium-storage",
     "crates/mycellium-engine",
     "crates/mycellium-client",
+    "crates/mycellium-mobile",
     "crates/mycellium-registry",
     "crates/mycellium-cli",
     "crates/mycellium-linux",
