@@ -11,19 +11,21 @@ mod runtime;
 use anyhow::{anyhow, bail, Result};
 
 use mycellium_core::group::Group;
-use mycellium_core::identity::{Handle, Identity, PeerId, WalletPublicKey};
+use mycellium_core::identity::{Handle, Identity, WalletPublicKey};
 use mycellium_core::message::AppMessage;
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::safety;
 use mycellium_core::storage::Storage;
 use mycellium_core::userid::{user_id, UserId};
+pub use mycellium_engine::attachments::StoredAttachment;
 use mycellium_engine::contacts::{self, Contact};
 use mycellium_engine::flow::{self, TrustError};
-use mycellium_engine::groups::{self, DiscoveryRecord, MailItem, StoredGroup};
+use mycellium_engine::groups::{self, DiscoveryRecord, GroupMember, MailItem, StoredGroup};
 use mycellium_engine::history::{self, GroupStoredMessage, StoredMessage};
 use mycellium_engine::outbox::{self, OutboxEntry};
 use mycellium_engine::peerbook::{self, PeerRecord};
+#[cfg(test)]
 use mycellium_engine::reachability::DeliveryPath;
 use mycellium_engine::verified;
 use mycellium_engine::wireops;
@@ -31,8 +33,10 @@ use mycellium_engine::{antirollback, blocklist};
 use mycellium_engine::{draft, expiry};
 
 pub use runtime::{
-    accept_delivery, deliver_direct, deliver_or_park, delivery_id_for_item, direct_push,
-    exchange_delivery, flush_due_outbox, DirectNetwork, OutboxFlush,
+    accept_delivery, attempt_parked_delivery, deliver_direct, deliver_or_park,
+    deliver_pairwise_or_park, delivery_id_for_item, direct_push, exchange_delivery,
+    flush_shared_outbox, mail_item_sender_device, readdress_parked_delivery, DirectNetwork,
+    OutboxFlush,
 };
 
 /// Public identity material useful for display.
@@ -41,6 +45,14 @@ pub struct IdentityInfo {
     pub wallet: Vec<u8>,
     pub device: Vec<u8>,
     pub messaging: Vec<u8>,
+}
+
+/// Load attachment bytes that were committed before the delivery was ACKed.
+pub fn attachment<S: Storage>(store: &S, message_id: &str) -> Result<Option<StoredAttachment>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    mycellium_engine::attachments::load(store, message_id)
 }
 
 pub fn identity_info(identity: &Identity) -> IdentityInfo {
@@ -69,16 +81,15 @@ pub fn adopt_identity(platform: &mut impl Platform, wallet_secret: [u8; 32]) -> 
 
 /// Build and store this account's current public record.
 ///
-/// If the existing local record belongs to the same wallet and the same active
-/// device, this refreshes only reachability. If it belongs to the same wallet but
-/// a different device, this publishes the current device as the new active one.
+/// A legacy record that stored a route is migrated to the stable libp2p PeerId.
+/// If the record belongs to another device, this publishes the current device
+/// as the account's one active device.
 pub fn publish_active_device_record<S, P>(
     store: &mut S,
     platform: &mut P,
     identity: &Identity,
     handle: &Handle,
     name: &str,
-    location: &str,
 ) -> Result<SignedRecord>
 where
     S: Storage,
@@ -95,25 +106,28 @@ where
     let active_device = match existing.as_ref() {
         Some(record) if record.record.device.device_key == identity.device_public() => {
             let device = &record.record.device;
-            let reachability_seq = now.max(device.reachability.record.seq.saturating_add(1));
-            device
-                .refresh_reachability(
-                    identity,
-                    PeerId(location.as_bytes().to_vec()),
-                    reachability_seq,
-                )
-                .map_err(|_| anyhow!("could not sign refreshed reachability"))?
+            if device.peer_id() == &identity.peer_id() {
+                device.clone()
+            } else {
+                let claim_seq = now.max(device.reachability.record.seq.saturating_add(1));
+                device
+                    .refresh_peer_id(identity, claim_seq)
+                    .map_err(|_| anyhow!("could not sign stable peer identity"))?
+            }
         }
-        _ => wireops::this_device(identity, location, now),
+        _ => wireops::this_device(identity, now),
     };
     let active_device_changed = existing
         .as_ref()
         .map(|record| record.record.device.device_key != active_device.device_key)
         .unwrap_or(true);
     let signed = match existing {
-        Some(mut record) if !active_device_changed && record.record.name == name => {
-            // Pure address refresh: preserve wallet-signed identity and stable
-            // device records byte-for-byte.
+        Some(mut record)
+            if !active_device_changed
+                && record.record.handle == *handle
+                && record.record.name == name =>
+        {
+            // Preserve wallet-signed identity and stable device records.
             record.record.device = active_device;
             record
         }
@@ -169,9 +183,8 @@ where
 {
     peerbook::get(store, handle)?.ok_or_else(|| {
         anyhow!(
-            "no local signed record for '{}' — run `register {} --addr <host:port>` first",
+            "no local signed record for '{}' — create a profile first",
             handle.as_str(),
-            handle.as_str()
         )
     })
 }
@@ -204,11 +217,56 @@ where
     peerbook::put(store, handle, record)
 }
 
+/// Refresh a known contact's current active-device record from the registry.
+/// The registry is only a carrier: the signed record and stable user id are
+/// verified locally before replacing the cached record.
+pub fn refresh_registry_record<S: Storage>(
+    store: &mut S,
+    registry: &registry::RegistryClient,
+    user_id: &str,
+) -> Result<bool>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let user_id = UserId::new(user_id.to_string()).map_err(|_| anyhow!("invalid user id"))?;
+    if peerbook::get_by_user_id(store, &user_id)?.is_none() {
+        bail!("cannot refresh an unknown person");
+    }
+    let Some(record) = registry.get_record_for_user(user_id.as_str())? else {
+        return Ok(false);
+    };
+    apply_registry_record(store, user_id.as_str(), record)
+}
+
+/// Validate and cache a registry-fetched record without performing network I/O.
+/// Native clients fetch first, then call this while holding their short local
+/// storage lock.
+pub fn apply_registry_record<S: Storage>(
+    store: &mut S,
+    expected_user_id: &str,
+    record: SignedRecord,
+) -> Result<bool>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let expected =
+        UserId::new(expected_user_id.to_string()).map_err(|_| anyhow!("invalid user id"))?;
+    if peerbook::get_by_user_id(store, &expected)?.is_none() {
+        bail!("cannot refresh an unknown person");
+    }
+    if record.record.user_id != expected {
+        bail!("registry returned a record for another person");
+    }
+    let handle = record.record.handle.clone();
+    peerbook::put(store, &handle, record)?;
+    Ok(true)
+}
+
 pub fn list_records<S: Storage>(store: &S) -> Result<Vec<PeerRecord>>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(peerbook::load(store)?)
+    peerbook::load(store)
 }
 
 pub fn remove_record<S: Storage>(store: &mut S, handle: &Handle) -> Result<bool>
@@ -258,7 +316,7 @@ pub fn discovery_records<S: Storage>(store: &S, want: &[String]) -> Result<Vec<D
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(peerbook::pack(store, want)?)
+    peerbook::pack(store, want)
 }
 
 #[derive(Clone)]
@@ -267,10 +325,13 @@ pub struct LocalNet {
 }
 
 impl LocalNet {
-    pub fn load(store: &impl Storage) -> Self {
-        Self {
-            records: peerbook::load(store).unwrap_or_default(),
-        }
+    pub fn load<S: Storage>(store: &S) -> Result<Self>
+    where
+        S::Error: std::error::Error + Send + Sync + 'static,
+    {
+        Ok(Self {
+            records: peerbook::load(store)?,
+        })
     }
 }
 
@@ -290,19 +351,30 @@ impl flow::FlowNet for LocalNet {
             ),
         }
     }
+
+    fn lookup_user_id(&self, user_id: &UserId) -> anyhow::Result<SignedRecord> {
+        self.records
+            .iter()
+            .find(|entry| entry.user_id == user_id.as_str())
+            .map(|entry| entry.record.clone())
+            .ok_or_else(|| anyhow!("no local record for user '{}'", user_id.as_str()))
+    }
 }
 
 pub fn resolve_name<S: Storage>(store: &S, input: &str) -> Result<String>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(contacts::resolve(store, input)?)
+    contacts::resolve(store, input)
 }
 
 pub fn resolve_local_record<S: Storage>(
     store: &mut S,
     input: &str,
-) -> std::result::Result<(Handle, SignedRecord), TrustError> {
+) -> std::result::Result<(Handle, SignedRecord), TrustError>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     if let Ok(user_id) = UserId::new(input.to_string()) {
         return resolve_user_record(store, user_id.as_str());
     }
@@ -310,17 +382,20 @@ pub fn resolve_local_record<S: Storage>(
         if !contact.user_id.is_empty() {
             return resolve_user_record(store, &contact.user_id);
         }
-        let net = LocalNet::load(store);
+        let net = LocalNet::load(store).map_err(|_| TrustError::BadHandle)?;
         return flow::resolve_record(store, &net, &contact.handle);
     }
-    let net = LocalNet::load(store);
+    let net = LocalNet::load(store).map_err(|_| TrustError::BadHandle)?;
     flow::resolve_record(store, &net, input)
 }
 
 fn resolve_user_record<S: Storage>(
     store: &mut S,
     user_id: &str,
-) -> std::result::Result<(Handle, SignedRecord), TrustError> {
+) -> std::result::Result<(Handle, SignedRecord), TrustError>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let user_id = UserId::new(user_id.to_string()).map_err(|_| TrustError::BadHandle)?;
     let record = peerbook::get_by_user_id(store, &user_id)
         .map_err(|_| TrustError::BadHandle)?
@@ -433,14 +508,14 @@ where
     Ok(())
 }
 
-pub fn set_blocked<S: Storage>(store: &mut S, handle: &str, blocked: bool) -> Result<()>
+pub fn set_blocked<S: Storage>(store: &mut S, user_id: &str, blocked: bool) -> Result<()>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     if blocked {
-        blocklist::block(store, handle)?;
+        blocklist::block(store, user_id)?;
     } else {
-        blocklist::unblock(store, handle)?;
+        blocklist::unblock(store, user_id)?;
     }
     Ok(())
 }
@@ -449,7 +524,7 @@ pub fn list_blocked<S: Storage>(store: &S) -> Result<Vec<String>>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(blocklist::load(store)?)
+    blocklist::load(store)
 }
 
 pub fn set_draft<S: Storage>(store: &mut S, input: &str, text: &str) -> Result<String>
@@ -718,29 +793,31 @@ pub fn send_direct<S, P>(
     peer: &Handle,
     peer_record: &SignedRecord,
     app: &AppMessage,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    deliver: &mut flow::DeliveryHook<'_, S>,
 ) -> Result<flow::SendOutcome>
 where
     S: Storage,
     S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
+    if blocklist::is_blocked(
+        &blocklist::load(store)?,
+        peer_record.record.user_id.as_str(),
+    ) {
+        bail!("unblock this person before sending");
+    }
     let my_record = require_own_record_for_identity(store, identity, me)?;
-    let net = LocalNet::load(store);
-    let mut self_deliver = |_: &mut S, _: &Handle, _: &Device, _: MailItem| {};
-    Ok(flow::send_app(
+    flow::send_app(
         identity,
         store,
         platform,
-        &net,
         me,
         &my_record,
         peer,
         peer_record,
         app,
         deliver,
-        &mut self_deliver,
-    )?)
+    )
 }
 
 pub fn resolve_group<S: Storage>(store: &S, key: &str) -> Result<StoredGroup>
@@ -817,16 +894,44 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
+    let mut stable_members = Vec::new();
+    for member in members {
+        let (_, record) = resolve_local_record(store, &member)
+            .map_err(|_| anyhow!("unknown or ambiguous group member '{member}'"))?;
+        if !stable_members
+            .iter()
+            .any(|known: &GroupMember| known.user_id == record.record.user_id.as_str())
+        {
+            stable_members.push(GroupMember {
+                user_id: record.record.user_id.as_str().to_string(),
+                handle: record.record.handle.as_str().to_string(),
+            });
+        }
+    }
+    let my_user_id = user_id(&identity.wallet_public());
+    if !stable_members
+        .iter()
+        .any(|known| known.user_id == my_user_id.as_str())
+    {
+        stable_members.push(GroupMember {
+            user_id: my_user_id.as_str().to_string(),
+            handle: me.as_str().to_string(),
+        });
+    }
     let group = Group::new(platform, wireops::my_group_id(identity));
     let mut stored = StoredGroup {
         id: wireops::random_id(platform),
         name: name.to_string(),
-        members,
-        me: me.as_str().to_string(),
-        sender_handles: Vec::new(),
+        members: stable_members,
+        senders: Vec::new(),
+        key_shares: Vec::new(),
         state: group.export(),
     };
-    stored.note_sender(wireops::my_group_id(identity), me.as_str());
+    stored.note_sender(
+        wireops::my_group_id(identity),
+        my_user_id.as_str(),
+        me.as_str(),
+    );
     groups::save(store, &stored)?;
     Ok(stored)
 }
@@ -840,10 +945,18 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut stored = resolve_group(store, group)?;
-    if stored.members.iter().any(|m| m == member.as_str()) {
+    let record = require_record(store, member)?;
+    if stored
+        .members
+        .iter()
+        .any(|known| known.user_id == record.record.user_id.as_str())
+    {
         bail!("'{}' is already in '{}'", member.as_str(), stored.name);
     }
-    stored.members.push(member.as_str().to_string());
+    stored.members.push(GroupMember {
+        user_id: record.record.user_id.as_str().to_string(),
+        handle: record.record.handle.as_str().to_string(),
+    });
     Ok(stored)
 }
 
@@ -862,9 +975,9 @@ pub fn distribute_group_key<S, P>(
     platform: &mut P,
     me: &Handle,
     my_record: &SignedRecord,
-    group: &StoredGroup,
-    targets: &[String],
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
+    group: &mut StoredGroup,
+    targets: &[GroupMember],
+    deliver: &mut flow::PairwiseDeliveryHook<'_, S>,
 ) -> Result<()>
 where
     S: Storage,
@@ -872,8 +985,8 @@ where
     P: Platform,
 {
     let session = Group::import(group.state.clone()).map_err(|_| anyhow!("bad group state"))?;
-    let net = LocalNet::load(store);
-    flow::distribute_key(
+    let net = LocalNet::load(store)?;
+    let shared = flow::distribute_key(
         identity,
         store,
         platform,
@@ -887,24 +1000,40 @@ where
         targets,
         deliver,
     );
+    for share in shared {
+        group.note_key_share(share);
+    }
+    groups::save(store, group)?;
     Ok(())
 }
 
-pub fn send_group<S: Storage>(
+pub fn send_group<S, P>(
     identity: &Identity,
     store: &mut S,
+    platform: &mut P,
     me: &Handle,
     group: &mut StoredGroup,
     app: &AppMessage,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    deliver: &mut flow::DeliveryHook<'_, S>,
 ) -> Result<flow::SendOutcome>
 where
+    S: Storage,
     S::Error: std::error::Error + Send + Sync + 'static,
+    P: Platform,
 {
-    let net = LocalNet::load(store);
-    Ok(flow::group_send(
-        identity, store, &net, me, group, app, deliver,
-    )?)
+    let net = LocalNet::load(store)?;
+    let sender_record = require_own_record(store, me)?;
+    flow::group_send(
+        identity,
+        store,
+        platform,
+        &net,
+        me,
+        &sender_record,
+        group,
+        app,
+        deliver,
+    )
 }
 
 pub fn leave_group<S, P>(
@@ -914,15 +1043,18 @@ pub fn leave_group<S, P>(
     me: &Handle,
     my_record: &SignedRecord,
     group: &StoredGroup,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
-) where
+    deliver: &mut flow::PairwiseDeliveryHook<'_, S>,
+) -> Result<()>
+where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
-    let net = LocalNet::load(store);
+    let net = LocalNet::load(store)?;
     flow::group_leave(
         identity, store, platform, &net, me, my_record, group, deliver,
     );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -935,13 +1067,16 @@ pub fn process_item<S, P>(
     blocked: &[String],
     item: MailItem,
     sink: &mut dyn flow::FlowSink,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    deliver: &mut flow::DeliveryHook<'_, S>,
 ) -> flow::ItemOutcome
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
-    let net = LocalNet::load(store);
+    let Ok(net) = LocalNet::load(store) else {
+        return flow::ItemOutcome::Retry;
+    };
     flow::process_item(
         identity, store, platform, &net, me, my_record, blocked, item, sink, deliver,
     )
@@ -951,7 +1086,7 @@ pub fn list_outbox<S: Storage>(store: &S) -> Result<Vec<OutboxEntry>>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(outbox::load(store)?)
+    outbox::load(store)
 }
 
 pub fn make_outbox_due<S: Storage>(store: &mut S) -> Result<()>
@@ -997,18 +1132,48 @@ where
     Ok(())
 }
 
+/// Park a pairwise envelope together with the sender-local bytes needed to
+/// reseal it if the same user activates a replacement device.
+#[allow(clippy::too_many_arguments)]
+pub fn park_pairwise_outbox<S: Storage>(
+    store: &mut S,
+    delivery_id: String,
+    recipient: &Handle,
+    recipient_record: &SignedRecord,
+    device: &Device,
+    item: MailItem,
+    plaintext: Vec<u8>,
+    now: u64,
+) -> Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let slot = wireops::device_slot(&device.device_key);
+    outbox::enqueue_pairwise(
+        store,
+        delivery_id,
+        recipient_record.record.user_id.as_str(),
+        recipient.as_str(),
+        &slot,
+        item,
+        Some(plaintext),
+        now,
+    )?;
+    Ok(())
+}
+
 pub fn mark_outbox_delivered<S: Storage>(store: &mut S, delivery_id: &str) -> Result<bool>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(outbox::mark_delivered(store, delivery_id)?)
+    outbox::mark_delivered(store, delivery_id)
 }
 
 pub fn mark_outbox_failed<S: Storage>(store: &mut S, delivery_id: &str) -> Result<bool>
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(outbox::mark_failed(store, delivery_id)?)
+    outbox::mark_failed(store, delivery_id)
 }
 
 pub fn record_outbox_attempt<S: Storage>(
@@ -1020,7 +1185,7 @@ pub fn record_outbox_attempt<S: Storage>(
 where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    Ok(outbox::record_attempt(store, delivery_id, now, accepted)?)
+    outbox::record_attempt(store, delivery_id, now, accepted)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1134,22 +1299,15 @@ mod tests {
         let second = Identity::adopt(&mut second_platform, first.wallet_secret()).unwrap();
         let mut store = MemStore::default();
 
-        let first_record = publish_active_device_record(
-            &mut store,
-            &mut first_platform,
-            &first,
-            &handle,
-            "Alice",
-            "127.0.0.1:1",
-        )
-        .unwrap();
+        let first_record =
+            publish_active_device_record(&mut store, &mut first_platform, &first, &handle, "Alice")
+                .unwrap();
         let second_record = publish_active_device_record(
             &mut store,
             &mut second_platform,
             &second,
             &handle,
             "Alice",
-            "127.0.0.1:2",
         )
         .unwrap();
 
@@ -1177,24 +1335,13 @@ mod tests {
         let mine = Identity::generate(&mut mine_platform).unwrap();
         let foreign = Identity::generate(&mut foreign_platform).unwrap();
         let mut store = MemStore::default();
-        let foreign_record = peerbook::build_record(
-            &mut foreign_platform,
-            &foreign,
-            &handle,
-            "Alice",
-            "127.0.0.1:1",
-        );
+        let foreign_record =
+            peerbook::build_record(&mut foreign_platform, &foreign, &handle, "Alice");
         peerbook::put(&mut store, &handle, foreign_record).unwrap();
 
-        let mine_record = publish_active_device_record(
-            &mut store,
-            &mut mine_platform,
-            &mine,
-            &handle,
-            "Alice",
-            "127.0.0.1:2",
-        )
-        .unwrap();
+        let mine_record =
+            publish_active_device_record(&mut store, &mut mine_platform, &mine, &handle, "Alice")
+                .unwrap();
 
         assert_ne!(mine_record.record.wallet, foreign.wallet_public());
         assert_eq!(list_records(&store).unwrap().len(), 2);
@@ -1214,8 +1361,7 @@ mod tests {
         let mut platform = SeededPlatform(7);
         let identity = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        let record =
-            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        let record = peerbook::build_record(&mut platform, &identity, &handle, "Alice");
         let encoded = encode_record(&record);
         let decoded = decode_record(&encoded).unwrap();
         import_record(&mut store, &handle, decoded.clone()).unwrap();
@@ -1251,10 +1397,8 @@ mod tests {
         let first = Identity::generate(&mut platform).unwrap();
         let second = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        let first_record =
-            peerbook::build_record(&mut platform, &first, &handle, "Alex One", "127.0.0.1:1");
-        let second_record =
-            peerbook::build_record(&mut platform, &second, &handle, "Alex Two", "127.0.0.1:2");
+        let first_record = peerbook::build_record(&mut platform, &first, &handle, "Alex One");
+        let second_record = peerbook::build_record(&mut platform, &second, &handle, "Alex Two");
         import_record(&mut store, &handle, first_record.clone()).unwrap();
         import_record(&mut store, &handle, second_record.clone()).unwrap();
         contacts::save(
@@ -1309,12 +1453,13 @@ mod tests {
     #[test]
     fn blocklist_round_trips() {
         let mut store = MemStore::default();
+        let alice = "a".repeat(64);
 
-        set_blocked(&mut store, "alice", true).unwrap();
-        set_blocked(&mut store, "alice", true).unwrap();
-        assert_eq!(list_blocked(&store).unwrap(), vec!["alice".to_string()]);
+        set_blocked(&mut store, &alice, true).unwrap();
+        set_blocked(&mut store, &alice, true).unwrap();
+        assert_eq!(list_blocked(&store).unwrap(), vec![alice.clone()]);
 
-        set_blocked(&mut store, "alice", false).unwrap();
+        set_blocked(&mut store, &alice, false).unwrap();
         assert!(list_blocked(&store).unwrap().is_empty());
     }
 
@@ -1355,8 +1500,7 @@ mod tests {
         let mut platform = SeededPlatform(11);
         let identity = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        let record =
-            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        let record = peerbook::build_record(&mut platform, &identity, &handle, "Alice");
         import_record(&mut store, &handle, record).unwrap();
         add_contact(&mut store, "a", &handle).unwrap();
 
@@ -1386,8 +1530,7 @@ mod tests {
         let mut platform = SeededPlatform(21);
         let identity = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        let record =
-            peerbook::build_record(&mut platform, &identity, &handle, "Alice", "127.0.0.1:1");
+        let record = peerbook::build_record(&mut platform, &identity, &handle, "Alice");
         let user_id = record.record.user_id.as_str().to_string();
         import_record(&mut store, &handle, record).unwrap();
         add_contact(&mut store, "a", &handle).unwrap();
@@ -1423,22 +1566,10 @@ mod tests {
         let old_identity = Identity::generate(&mut old_platform).unwrap();
         let new_identity = Identity::generate(&mut new_platform).unwrap();
         let mut store = MemStore::default();
-        let old_record = peerbook::build_record(
-            &mut old_platform,
-            &old_identity,
-            &handle,
-            "Alice",
-            "127.0.0.1:1",
-        );
+        let old_record = peerbook::build_record(&mut old_platform, &old_identity, &handle, "Alice");
         import_record(&mut store, &handle, old_record.clone()).unwrap();
         add_contact(&mut store, "a", &handle).unwrap();
-        let new_record = peerbook::build_record(
-            &mut new_platform,
-            &new_identity,
-            &handle,
-            "Alice",
-            "127.0.0.1:2",
-        );
+        let new_record = peerbook::build_record(&mut new_platform, &new_identity, &handle, "Alice");
         import_record(&mut store, &handle, new_record).unwrap();
 
         let info = verification_info_for_record(&store, &me, &handle, &old_record).unwrap();
@@ -1455,17 +1586,9 @@ mod tests {
         let alice = Identity::generate(&mut platform).unwrap();
         let bob = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        publish_active_device_record(
-            &mut store,
-            &mut platform,
-            &alice,
-            &alice_handle,
-            "Alice",
-            "127.0.0.1:1",
-        )
-        .unwrap();
-        let bob_record =
-            peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        publish_active_device_record(&mut store, &mut platform, &alice, &alice_handle, "Alice")
+            .unwrap();
+        let bob_record = peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob");
         import_record(&mut store, &bob_handle, bob_record.clone()).unwrap();
         let app = AppMessage {
             id: "m1".to_string(),
@@ -1478,10 +1601,12 @@ mod tests {
                            handle: &Handle,
                            _: &SignedRecord,
                            _: &Device,
-                           item: MailItem|
+                           item: MailItem,
+                           pairwise_plaintext: Option<Vec<u8>>|
          -> DeliveryPath {
             assert_eq!(handle.as_str(), "bob");
             assert!(matches!(item, MailItem::Direct(_)));
+            assert_eq!(pairwise_plaintext, Some(app.encode()));
             delivered += 1;
             DeliveryPath::Direct
         };
@@ -1515,26 +1640,20 @@ mod tests {
         let first = Identity::generate(&mut platform).unwrap();
         let second = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        publish_active_device_record(
-            &mut store,
-            &mut platform,
-            &me,
-            &me_handle,
-            "Me",
-            "127.0.0.1:1",
-        )
-        .unwrap();
+        publish_active_device_record(&mut store, &mut platform, &me, &me_handle, "Me").unwrap();
         let first_record =
-            peerbook::build_record(&mut platform, &first, &shared_handle, "Alex One", "a:1");
+            peerbook::build_record(&mut platform, &first, &shared_handle, "Alex One");
         let second_record =
-            peerbook::build_record(&mut platform, &second, &shared_handle, "Alex Two", "b:2");
+            peerbook::build_record(&mut platform, &second, &shared_handle, "Alex Two");
         import_record(&mut store, &shared_handle, first_record.clone()).unwrap();
         import_record(&mut store, &shared_handle, second_record.clone()).unwrap();
 
-        let mut deliver =
-            |_: &mut MemStore, _: &Handle, _: &SignedRecord, _: &Device, _: MailItem| {
-                DeliveryPath::Direct
-            };
+        let mut deliver = |_: &mut MemStore,
+                           _: &Handle,
+                           _: &SignedRecord,
+                           _: &Device,
+                           _: MailItem,
+                           _: Option<Vec<u8>>| { DeliveryPath::Direct };
         for (record, id, text) in [
             (&first_record, "first", "hello one"),
             (&second_record, "second", "hello two"),
@@ -1571,16 +1690,37 @@ mod tests {
     #[test]
     fn group_read_views_resolve_by_id_or_name() {
         let mut platform = SeededPlatform(51);
+        let alice = Identity::generate(&mut platform).unwrap();
+        let bob = Identity::generate(&mut platform).unwrap();
+        let carol_identity = Identity::generate(&mut platform).unwrap();
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_handle = Handle::new("bob").unwrap();
+        let carol = Handle::new("carol").unwrap();
+        let alice_record = peerbook::build_record(&mut platform, &alice, &alice_handle, "Alice");
+        let bob_record = peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob");
+        let carol_record = peerbook::build_record(&mut platform, &carol_identity, &carol, "Carol");
         let group = mycellium_core::group::Group::new(&mut platform, b"me-device".to_vec());
         let stored = StoredGroup {
             id: "g1".to_string(),
             name: "team".to_string(),
-            members: vec!["alice".to_string(), "bob".to_string()],
-            me: "alice".to_string(),
-            sender_handles: Vec::new(),
+            members: vec![
+                GroupMember {
+                    user_id: alice_record.record.user_id.as_str().to_string(),
+                    handle: "alice".to_string(),
+                },
+                GroupMember {
+                    user_id: bob_record.record.user_id.as_str().to_string(),
+                    handle: "bob".to_string(),
+                },
+            ],
+            senders: Vec::new(),
+            key_shares: Vec::new(),
             state: group.export(),
         };
         let mut store = MemStore::default();
+        import_record(&mut store, &alice_handle, alice_record).unwrap();
+        import_record(&mut store, &bob_handle, bob_record).unwrap();
+        import_record(&mut store, &carol, carol_record.clone()).unwrap();
         groups::save(&mut store, &stored).unwrap();
         history::group_append(
             &mut store,
@@ -1599,9 +1739,11 @@ mod tests {
         assert_eq!(resolve_group(&store, "team").unwrap().id, "g1");
         assert_eq!(list_groups(&store).unwrap()[0].member_count, 2);
 
-        let carol = Handle::new("carol").unwrap();
         let updated = group_with_added_member(&store, "team", &carol).unwrap();
-        assert!(updated.members.iter().any(|member| member == "carol"));
+        assert!(updated
+            .members
+            .iter()
+            .any(|member| member.user_id == carol_record.record.user_id.as_str()));
         save_group(&mut store, &updated).unwrap();
         assert_eq!(resolve_group(&store, "g1").unwrap().members.len(), 3);
 
@@ -1619,17 +1761,9 @@ mod tests {
         let alice = Identity::generate(&mut platform).unwrap();
         let bob = Identity::generate(&mut platform).unwrap();
         let mut store = MemStore::default();
-        publish_active_device_record(
-            &mut store,
-            &mut platform,
-            &alice,
-            &alice_handle,
-            "Alice",
-            "127.0.0.1:1",
-        )
-        .unwrap();
-        let bob_record =
-            peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob", "127.0.0.1:2");
+        publish_active_device_record(&mut store, &mut platform, &alice, &alice_handle, "Alice")
+            .unwrap();
+        let bob_record = peerbook::build_record(&mut platform, &bob, &bob_handle, "Bob");
         import_record(&mut store, &bob_handle, bob_record.clone()).unwrap();
         verified::mark(
             &mut store,
@@ -1642,9 +1776,18 @@ mod tests {
         let mut stored = StoredGroup {
             id: "g1".to_string(),
             name: "team".to_string(),
-            members: vec!["alice".to_string(), "bob".to_string()],
-            me: "alice".to_string(),
-            sender_handles: Vec::new(),
+            members: vec![
+                GroupMember {
+                    user_id: user_id(&alice.wallet_public()).as_str().to_string(),
+                    handle: "alice".to_string(),
+                },
+                GroupMember {
+                    user_id: bob_record.record.user_id.as_str().to_string(),
+                    handle: "bob".to_string(),
+                },
+            ],
+            senders: Vec::new(),
+            key_shares: Vec::new(),
             state: group.export(),
         };
         groups::save(&mut store, &stored).unwrap();
@@ -1654,22 +1797,33 @@ mod tests {
             expires_at: None,
             body: mycellium_core::message::Body::Text("hello group".to_string()),
         };
-        let mut delivered = 0;
+        let delivered = std::cell::RefCell::new(Vec::new());
         let mut deliver = |_: &mut MemStore,
                            handle: &Handle,
                            _: &SignedRecord,
                            _: &Device,
-                           item: MailItem|
+                           item: MailItem,
+                           pairwise_plaintext: Option<Vec<u8>>|
          -> DeliveryPath {
             assert_eq!(handle.as_str(), "bob");
-            assert!(matches!(item, MailItem::GroupText { .. }));
-            delivered += 1;
+            match item {
+                MailItem::GroupInvite(_) => {
+                    assert!(pairwise_plaintext.is_some());
+                    delivered.borrow_mut().push("invite");
+                }
+                MailItem::GroupText { .. } => {
+                    assert!(pairwise_plaintext.is_none());
+                    delivered.borrow_mut().push("text");
+                }
+                _ => panic!("unexpected group delivery"),
+            }
             DeliveryPath::Direct
         };
 
         let out = send_group(
             &alice,
             &mut store,
+            &mut platform,
             &alice_handle,
             &mut stored,
             &app,
@@ -1677,10 +1831,72 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(delivered, 1);
+        assert_eq!(*delivered.borrow(), vec!["invite", "text"]);
         assert_eq!(out.delivered, 1);
+        assert_eq!(stored.key_shares.len(), 1);
+        assert_eq!(
+            stored.key_shares[0].device_slot,
+            wireops::device_slot(&bob.device_public())
+        );
+
+        // The same active device does not receive redundant key material.
+        delivered.borrow_mut().clear();
+        let next = AppMessage {
+            id: "m2".to_string(),
+            timestamp: 11,
+            expires_at: None,
+            body: mycellium_core::message::Body::Text("still here".to_string()),
+        };
+        send_group(
+            &alice,
+            &mut store,
+            &mut platform,
+            &alice_handle,
+            &mut stored,
+            &next,
+            &mut deliver,
+        )
+        .unwrap();
+        assert_eq!(*delivered.borrow(), vec!["text"]);
+
+        // The same account on a replacement device receives a fresh pairwise
+        // key share before its first group ciphertext.
+        let replacement = Identity::adopt(&mut SeededPlatform(180), bob.wallet_secret()).unwrap();
+        let replacement_device = wireops::this_device(&replacement, 43);
+        let replacement_record = peerbook::with_device(
+            &mut platform,
+            &replacement,
+            &bob_handle,
+            "Bob",
+            replacement_device,
+            bob_record.record.seq,
+        );
+        import_record(&mut store, &bob_handle, replacement_record).unwrap();
+        delivered.borrow_mut().clear();
+        let after_switch = AppMessage {
+            id: "m3".to_string(),
+            timestamp: 12,
+            expires_at: None,
+            body: mycellium_core::message::Body::Text("new device".to_string()),
+        };
+        send_group(
+            &alice,
+            &mut store,
+            &mut platform,
+            &alice_handle,
+            &mut stored,
+            &after_switch,
+            &mut deliver,
+        )
+        .unwrap();
+        assert_eq!(*delivered.borrow(), vec!["invite", "text"]);
+        assert_eq!(stored.key_shares.len(), 1);
+        assert_eq!(
+            stored.key_shares[0].device_slot,
+            wireops::device_slot(&replacement.device_public())
+        );
         let transcript = history::group_load(&store, "g1").unwrap();
-        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript.len(), 3);
         assert_eq!(transcript[0].text, "hello group");
         assert_eq!(transcript[0].sender, "alice");
     }

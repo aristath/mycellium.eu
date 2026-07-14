@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use mycellium_core::record::SignedRecord;
+use mycellium_core::userid::UserId;
 use mycellium_core::wire;
 use serde::{Deserialize, Serialize};
 use ureq::{Agent, Error};
@@ -11,6 +12,26 @@ use zeroize::Zeroize;
 
 /// Production registry used unless a native shell overrides it.
 pub const DEFAULT_REGISTRY_URL: &str = "https://registry.mycellium.eu";
+pub const LOGIN_LINK_PREFIX: &str = "mycellium://login?";
+
+/// Extract the one-time token from a Mycellium login link.
+pub fn login_token_from_link(link: &str) -> Result<String> {
+    let query = link
+        .trim()
+        .strip_prefix(LOGIN_LINK_PREFIX)
+        .ok_or_else(|| anyhow!("invalid Mycellium login link"))?;
+    let tokens: Vec<&str> = query
+        .split('&')
+        .filter_map(|part| part.strip_prefix("token="))
+        .collect();
+    let [token] = tokens.as_slice() else {
+        bail!("invalid Mycellium login link");
+    };
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid Mycellium login link");
+    }
+    Ok(token.to_ascii_lowercase())
+}
 
 /// A registry session issued after a login identity is verified.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,11 +173,29 @@ impl RegistryClient {
     }
 
     pub fn get_record(&self, account_id: &str) -> Result<Option<SignedRecord>> {
-        let mut response = match self
-            .agent
-            .get(format!("{}/accounts/{account_id}/record", self.base_url))
-            .call()
+        self.get_record_at(format!("{}/accounts/{account_id}/record", self.base_url))
+    }
+
+    /// Load the current signed record for a stable protocol user id.
+    pub fn get_record_for_user(&self, user_id: &str) -> Result<Option<SignedRecord>> {
+        let user_id =
+            UserId::new(user_id.to_string()).map_err(|_| anyhow!("invalid protocol user id"))?;
+        let record = self.get_record_at(format!(
+            "{}/users/{}/record",
+            self.base_url,
+            user_id.as_str()
+        ))?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.record.user_id != user_id)
         {
+            bail!("registry returned a record for another identity");
+        }
+        Ok(record)
+    }
+
+    fn get_record_at(&self, url: String) -> Result<Option<SignedRecord>> {
+        let mut response = match self.agent.get(url).call() {
             Ok(response) => response,
             Err(Error::StatusCode(404)) => return Ok(None),
             Err(error) => return Err(registry_error("load active device", error)),
@@ -173,6 +212,28 @@ impl RegistryClient {
             .verify()
             .map_err(|_| anyhow!("registry returned a record with an invalid signature"))?;
         Ok(Some(record))
+    }
+
+    /// Fetch the registry's self-authenticating QUIC introduction address.
+    pub fn rendezvous_address(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Response {
+            address: String,
+        }
+
+        let mut response = self
+            .agent
+            .get(format!("{}/rendezvous", self.base_url))
+            .call()
+            .map_err(|error| registry_error("find the registry rendezvous", error))?;
+        let body: Response = response
+            .body_mut()
+            .read_json()
+            .context("registry returned an invalid rendezvous response")?;
+        if body.address.trim().is_empty() {
+            bail!("registry returned an empty rendezvous address");
+        }
+        Ok(body.address)
     }
 
     fn account_url(&self, session: &RegistrySession, suffix: &str) -> Result<String> {
@@ -227,5 +288,19 @@ mod tests {
         let client = RegistryClient::new("https://registry.example/").unwrap();
         assert_eq!(client.base_url, "https://registry.example");
         assert!(RegistryClient::new("registry.example").is_err());
+    }
+
+    #[test]
+    fn login_links_accept_one_exact_token() {
+        let token = "ab".repeat(32);
+        assert_eq!(
+            login_token_from_link(&format!("mycellium://login?token={token}")).unwrap(),
+            token
+        );
+        assert!(login_token_from_link("https://example.test/?token=no").is_err());
+        assert!(login_token_from_link(
+            "mycellium://login?token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+        .is_err());
     }
 }
