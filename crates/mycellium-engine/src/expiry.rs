@@ -12,18 +12,32 @@ fn key(peer: &str) -> Vec<u8> {
 }
 
 /// Set the default TTL (seconds) for messages to `peer`.
-pub fn set<S: Storage>(store: &mut S, peer: &str, ttl_secs: u64) -> Result<(), S::Error> {
-    store.put(&key(peer), &wire::encode(&ttl_secs))
+pub fn set<S>(store: &mut S, peer: &str, ttl_secs: u64) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    store.put(&key(peer), &wire::encode(&ttl_secs))?;
+    Ok(())
 }
 
 /// The default TTL (seconds) for `peer`, if any.
-pub fn get<S: Storage>(store: &S, peer: &str) -> Result<Option<u64>, S::Error> {
-    Ok(crate::load_opt(store.get(&key(peer))?, "expiry default"))
+pub fn get<S>(store: &S, peer: &str) -> anyhow::Result<Option<u64>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::load_state(store.get(&key(peer))?, "expiry default")
 }
 
 /// Clear the default for `peer`.
-pub fn clear<S: Storage>(store: &mut S, peer: &str) -> Result<(), S::Error> {
-    store.delete(&key(peer))
+pub fn clear<S>(store: &mut S, peer: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    store.delete(&key(peer))?;
+    Ok(())
 }
 
 #[cfg(test)]

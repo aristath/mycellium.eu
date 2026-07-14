@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use mycellium_core::identity::WalletPublicKey;
-use mycellium_core::storage::Storage;
+use mycellium_core::storage::{Storage, StorageMutation};
 use mycellium_core::wire;
 
 /// One address-book entry.
@@ -35,36 +35,54 @@ fn contact_key(nickname: &str) -> Vec<u8> {
 const INDEX_KEY: &[u8] = b"contacts";
 
 /// Save a contact and record its nickname in the index.
-pub fn save<S: Storage>(store: &mut S, contact: &Contact) -> Result<(), S::Error> {
-    store.put(&contact_key(&contact.nickname), &wire::encode(contact))?;
+pub fn save<S>(store: &mut S, contact: &Contact) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut names = list_names(store)?;
+    let mut mutations = vec![StorageMutation::Put(
+        contact_key(&contact.nickname),
+        wire::encode(contact),
+    )];
     if !names.contains(&contact.nickname) {
         names.push(contact.nickname.clone());
-        store.put(INDEX_KEY, &wire::encode(&names))?;
+        mutations.push(StorageMutation::Put(
+            INDEX_KEY.to_vec(),
+            wire::encode(&names),
+        ));
     }
+    store.apply_batch(&mutations)?;
     Ok(())
 }
 
 /// Load a contact by nickname.
-pub fn load<S: Storage>(store: &S, nickname: &str) -> Result<Option<Contact>, S::Error> {
-    // A corrupt contact must not silently vanish — contacts are TOFU pins, part
-    // of the safety model — so route through the loud `load_opt` policy.
-    Ok(crate::load_opt(
+pub fn load<S>(store: &S, nickname: &str) -> anyhow::Result<Option<Contact>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::load_state(
         store.get(&contact_key(nickname))?,
         &format!("contact '{nickname}'"),
-    ))
+    )
 }
 
 /// All known nicknames.
-pub fn list_names<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(crate::decode_or_warn(
-        store.get(INDEX_KEY)?,
-        "contact index",
-    ))
+pub fn list_names<S>(store: &S) -> anyhow::Result<Vec<String>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::decode_state(store.get(INDEX_KEY)?, "contact index")
 }
 
 /// All contacts.
-pub fn list<S: Storage>(store: &S) -> Result<Vec<Contact>, S::Error> {
+pub fn list<S>(store: &S) -> anyhow::Result<Vec<Contact>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut out = Vec::new();
     for name in list_names(store)? {
         if let Some(c) = load(store, &name)? {
@@ -75,18 +93,29 @@ pub fn list<S: Storage>(store: &S) -> Result<Vec<Contact>, S::Error> {
 }
 
 /// Remove a contact by nickname.
-pub fn remove<S: Storage>(store: &mut S, nickname: &str) -> Result<(), S::Error> {
-    store.delete(&contact_key(nickname))?;
+pub fn remove<S>(store: &mut S, nickname: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let names: Vec<String> = list_names(store)?
         .into_iter()
         .filter(|n| n != nickname)
         .collect();
-    store.put(INDEX_KEY, &wire::encode(&names))
+    store.apply_batch(&[
+        StorageMutation::Delete(contact_key(nickname)),
+        StorageMutation::Put(INDEX_KEY.to_vec(), wire::encode(&names)),
+    ])?;
+    Ok(())
 }
 
 /// Resolve `input` to a handle: a known nickname maps to its handle; anything
 /// else is treated as a handle already.
-pub fn resolve<S: Storage>(store: &S, input: &str) -> Result<String, S::Error> {
+pub fn resolve<S>(store: &S, input: &str) -> anyhow::Result<String>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     Ok(match load(store, input)? {
         Some(contact) => contact.handle,
         None => input.to_string(),
@@ -94,7 +123,11 @@ pub fn resolve<S: Storage>(store: &S, input: &str) -> Result<String, S::Error> {
 }
 
 /// Find a contact by its handle (for pin checks).
-pub fn by_handle<S: Storage>(store: &S, handle: &str) -> Result<Option<Contact>, S::Error> {
+pub fn by_handle<S>(store: &S, handle: &str) -> anyhow::Result<Option<Contact>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     for name in list_names(store)? {
         if let Some(c) = load(store, &name)? {
             if c.handle == handle {
@@ -106,7 +139,11 @@ pub fn by_handle<S: Storage>(store: &S, handle: &str) -> Result<Option<Contact>,
 }
 
 /// Find a contact by stable user id.
-pub fn by_user_id<S: Storage>(store: &S, user_id: &str) -> Result<Option<Contact>, S::Error> {
+pub fn by_user_id<S>(store: &S, user_id: &str) -> anyhow::Result<Option<Contact>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     for name in list_names(store)? {
         if let Some(c) = load(store, &name)? {
             if c.user_id == user_id {
@@ -174,5 +211,25 @@ mod tests {
         // A record with a different wallet must not match the pin.
         assert_ne!(pinned.wallet, WalletPublicKey([9; 33]));
         assert_eq!(pinned.wallet, WalletPublicKey([1; 33]));
+    }
+
+    #[test]
+    fn corrupt_index_fails_without_overwriting_recoverable_bytes() {
+        let mut store = MemStore::default();
+        store.put(INDEX_KEY, b"corrupt contact index").unwrap();
+        assert!(list(&store).is_err());
+        assert!(save(&mut store, &contact("b", "bob", 1)).is_err());
+        assert_eq!(
+            store.get(INDEX_KEY).unwrap().as_deref(),
+            Some(&b"corrupt contact index"[..])
+        );
+        assert!(store.get(&contact_key("b")).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_contact_pin_is_not_treated_as_missing() {
+        let mut store = MemStore::default();
+        store.put(&contact_key("b"), b"corrupt pin").unwrap();
+        assert!(load(&store, "b").is_err());
     }
 }

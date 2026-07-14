@@ -29,18 +29,30 @@ struct PeerBook {
     records: Vec<PeerRecord>,
 }
 
-pub fn load<S: Storage>(store: &S) -> Result<Vec<PeerRecord>, S::Error> {
+pub fn load<S: Storage>(store: &S) -> anyhow::Result<Vec<PeerRecord>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let Some(bytes) = store.get(KEY)? else {
         return Ok(Vec::new());
     };
-    Ok(crate::decode_or_warn::<PeerBook>(Some(bytes), "peerbook").records)
+    wire::decode::<PeerBook>(&bytes)
+        .map(|book| book.records)
+        .map_err(|_| anyhow::anyhow!("local signed-record book is corrupt"))
 }
 
-fn save<S: Storage>(store: &mut S, records: Vec<PeerRecord>) -> Result<(), S::Error> {
-    store.put(KEY, &wire::encode(&PeerBook { records }))
+fn save<S: Storage>(store: &mut S, records: Vec<PeerRecord>) -> anyhow::Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    store.put(KEY, &wire::encode(&PeerBook { records }))?;
+    Ok(())
 }
 
-pub fn get<S: Storage>(store: &S, handle: &Handle) -> Result<Option<SignedRecord>, S::Error> {
+pub fn get<S: Storage>(store: &S, handle: &Handle) -> anyhow::Result<Option<SignedRecord>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut matches = load(store)?
         .into_iter()
         .filter(|entry| entry.handle == handle.as_str() && entry.record.record.handle == *handle);
@@ -55,7 +67,10 @@ pub fn get<S: Storage>(store: &S, handle: &Handle) -> Result<Option<SignedRecord
 pub fn get_by_user_id<S: Storage>(
     store: &S,
     user_id: &UserId,
-) -> Result<Option<SignedRecord>, S::Error> {
+) -> anyhow::Result<Option<SignedRecord>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     Ok(load(store)?
         .into_iter()
         .find(|entry| entry.user_id == user_id.as_str())
@@ -72,7 +87,7 @@ where
         .map_err(|_| anyhow::anyhow!("record failed verification"))?;
     if record.record.device.peer_id().0.is_empty() {
         anyhow::bail!(
-            "record for '{}' has an empty device address",
+            "record for '{}' has an empty device PeerId",
             handle.as_str()
         );
     }
@@ -99,7 +114,10 @@ where
     Ok(())
 }
 
-pub fn remove<S: Storage>(store: &mut S, handle: &Handle) -> Result<bool, S::Error> {
+pub fn remove<S: Storage>(store: &mut S, handle: &Handle) -> anyhow::Result<bool>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut records = load(store)?;
     if records
         .iter()
@@ -117,7 +135,10 @@ pub fn remove<S: Storage>(store: &mut S, handle: &Handle) -> Result<bool, S::Err
     Ok(removed)
 }
 
-pub fn pack<S: Storage>(store: &S, want: &[String]) -> Result<Vec<DiscoveryRecord>, S::Error> {
+pub fn pack<S: Storage>(store: &S, want: &[String]) -> anyhow::Result<Vec<DiscoveryRecord>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let records = load(store)?;
     if want.is_empty() {
         return Ok(records
@@ -185,14 +206,13 @@ pub fn build_record(
     identity: &Identity,
     handle: &Handle,
     name: &str,
-    addr: &str,
 ) -> SignedRecord {
     let record = Record {
         user_id: user_id(&identity.wallet_public()),
         handle: handle.clone(),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        device: crate::wireops::this_device(identity, addr, platform.now_unix_secs()),
+        device: crate::wireops::this_device(identity, platform.now_unix_secs()),
         seq: platform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)
@@ -291,11 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_records_with_empty_device_addresses() {
+    fn rejects_records_with_empty_device_identity() {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let handle = Handle::new("alice").unwrap();
-        let record = build_record(&mut platform, &identity, &handle, "Alice", "");
+        let mut record = build_record(&mut platform, &identity, &handle, "Alice");
+        record.record.device.reachability.record.peer_id.0.clear();
         let mut store = MemStore::default();
 
         assert!(put(&mut store, &handle, record).is_err());
@@ -303,11 +324,11 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_peerbook_loads_empty_but_leaves_bytes_in_place() {
+    fn corrupt_peerbook_fails_closed_and_leaves_bytes_in_place() {
         let mut store = MemStore::default();
         store.put(KEY, b"not a peerbook").unwrap();
 
-        assert!(load(&store).unwrap().is_empty());
+        assert!(load(&store).is_err());
         assert_eq!(
             store.get(KEY).unwrap().as_deref(),
             Some(&b"not a peerbook"[..])
@@ -319,7 +340,7 @@ mod tests {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let alice = Handle::new("alice").unwrap();
-        let record = build_record(&mut platform, &identity, &alice, "Alice", "127.0.0.1:1");
+        let record = build_record(&mut platform, &identity, &alice, "Alice");
         let mut store = MemStore::default();
         put(&mut store, &alice, record).unwrap();
 
@@ -339,7 +360,7 @@ mod tests {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let alice = Handle::new("alice").unwrap();
-        let record = build_record(&mut platform, &identity, &alice, "Alice", "127.0.0.1:1");
+        let record = build_record(&mut platform, &identity, &alice, "Alice");
         let mut store = MemStore::default();
 
         let report = import_records(
@@ -383,9 +404,8 @@ mod tests {
         let alice = Handle::new("alice").unwrap();
         let first = Identity::generate(&mut platform).unwrap();
         let second = Identity::generate(&mut platform).unwrap();
-        let first_record = build_record(&mut platform, &first, &alice, "Alice One", "127.0.0.1:1");
-        let second_record =
-            build_record(&mut platform, &second, &alice, "Alice Two", "127.0.0.1:2");
+        let first_record = build_record(&mut platform, &first, &alice, "Alice One");
+        let second_record = build_record(&mut platform, &second, &alice, "Alice Two");
         let first_id = first_record.record.user_id.clone();
         let second_id = second_record.record.user_id.clone();
         let mut store = MemStore::default();

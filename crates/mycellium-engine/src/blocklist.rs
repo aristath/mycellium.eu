@@ -1,37 +1,63 @@
-//! A local, encrypted block list of handles whose messages we refuse.
+//! A local, encrypted block list of stable user identities whose messages we refuse.
 //!
 //! Generic over [`Storage`] (unit-tested with an in-memory store; runs on the
 //! encrypted `FileStore`).
 
 use mycellium_core::storage::Storage;
+use mycellium_core::userid::UserId;
 use mycellium_core::wire;
 
 const KEY: &[u8] = b"blocklist";
 
-/// Load the set of blocked handles.
-pub fn load<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(KEY)?, "blocklist"))
+/// Load the set of blocked stable user ids.
+pub fn load<S: Storage>(store: &S) -> anyhow::Result<Vec<String>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let Some(bytes) = store.get(KEY)? else {
+        return Ok(Vec::new());
+    };
+    let users: Vec<String> =
+        wire::decode(&bytes).map_err(|_| anyhow::anyhow!("local block list is corrupt"))?;
+    if users.iter().any(|user| UserId::new(user.clone()).is_err()) {
+        anyhow::bail!("local block list contains an invalid user id");
+    }
+    Ok(users)
 }
 
-/// Block a handle (idempotent).
-pub fn block<S: Storage>(store: &mut S, handle: &str) -> Result<(), S::Error> {
+/// Block a stable user id (idempotent).
+pub fn block<S: Storage>(store: &mut S, user_id: &str) -> anyhow::Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let user_id =
+        UserId::new(user_id.to_string()).map_err(|_| anyhow::anyhow!("invalid user id"))?;
     let mut list = load(store)?;
-    if !list.iter().any(|h| h == handle) {
-        list.push(handle.to_string());
+    if !list.iter().any(|known| known == user_id.as_str()) {
+        list.push(user_id.as_str().to_string());
         store.put(KEY, &wire::encode(&list))?;
     }
     Ok(())
 }
 
-/// Unblock a handle.
-pub fn unblock<S: Storage>(store: &mut S, handle: &str) -> Result<(), S::Error> {
-    let list: Vec<String> = load(store)?.into_iter().filter(|h| h != handle).collect();
-    store.put(KEY, &wire::encode(&list))
+/// Unblock a stable user id.
+pub fn unblock<S: Storage>(store: &mut S, user_id: &str) -> anyhow::Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let user_id =
+        UserId::new(user_id.to_string()).map_err(|_| anyhow::anyhow!("invalid user id"))?;
+    let list: Vec<String> = load(store)?
+        .into_iter()
+        .filter(|known| known != user_id.as_str())
+        .collect();
+    store.put(KEY, &wire::encode(&list))?;
+    Ok(())
 }
 
-/// Whether `handle` is in the blocked set.
-pub fn is_blocked(list: &[String], handle: &str) -> bool {
-    list.iter().any(|h| h == handle)
+/// Whether `user_id` is in the blocked set.
+pub fn is_blocked(list: &[String], user_id: &str) -> bool {
+    list.iter().any(|known| known == user_id)
 }
 
 #[cfg(test)]
@@ -60,25 +86,23 @@ mod tests {
     #[test]
     fn block_unblock_roundtrip() {
         let mut store = MemStore::default();
-        assert!(!is_blocked(&load(&store).unwrap(), "spammer"));
+        let user = "a".repeat(64);
+        assert!(!is_blocked(&load(&store).unwrap(), &user));
 
-        block(&mut store, "spammer").unwrap();
-        block(&mut store, "spammer").unwrap(); // idempotent
-        assert!(is_blocked(&load(&store).unwrap(), "spammer"));
+        block(&mut store, &user).unwrap();
+        block(&mut store, &user).unwrap(); // idempotent
+        assert!(is_blocked(&load(&store).unwrap(), &user));
         assert_eq!(load(&store).unwrap().len(), 1);
 
-        unblock(&mut store, "spammer").unwrap();
-        assert!(!is_blocked(&load(&store).unwrap(), "spammer"));
+        unblock(&mut store, &user).unwrap();
+        assert!(!is_blocked(&load(&store).unwrap(), &user));
     }
 
     #[test]
-    fn corrupt_blocklist_loads_empty_not_silently_dropped() {
-        // A present-but-undecodable blocklist is surfaced loudly (via
-        // decode_or_warn) and read as empty, rather than a silent drop that
-        // would quietly unblock everyone. The raw bytes stay put for recovery.
+    fn corrupt_blocklist_fails_closed_without_overwriting_it() {
         let mut store = MemStore::default();
         store.put(KEY, b"not valid wire bytes").unwrap();
-        assert!(load(&store).unwrap().is_empty());
+        assert!(load(&store).is_err());
         assert_eq!(
             store.get(KEY).unwrap().as_deref(),
             Some(&b"not valid wire bytes"[..])

@@ -1,7 +1,7 @@
 //! Local delivery outcomes.
 //!
 //! Hard-serverless Mycellium has one network path: direct peer-to-peer delivery.
-//! If direct delivery fails, the caller may park the already-sealed item in the
+//! If direct delivery fails, the caller may park the encrypted item in the
 //! sender's local outbox. There is no routing score database here.
 
 use mycellium_core::storage::Storage;
@@ -9,7 +9,7 @@ use mycellium_core::storage::Storage;
 /// Observable outcome of a delivery attempt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeliveryPath {
-    /// Live direct delivery over the peer's published address.
+    /// Live delivery over a direct route to the authenticated active device.
     Direct,
     /// Parked in this device's local encrypted outbox for a later retry.
     Outbox,

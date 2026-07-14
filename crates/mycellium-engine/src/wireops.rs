@@ -6,11 +6,11 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use mycellium_core::identity::{DevicePublicKey, Handle, Identity, MessagingPublicKey, PeerId};
+use mycellium_core::identity::{DevicePublicKey, Handle, Identity, MessagingPublicKey};
 use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::offline::Envelope;
+use mycellium_core::one_shot;
 use mycellium_core::platform::Platform;
-use mycellium_core::ratchet::Ratchet;
 use mycellium_core::record::{Device, Record, SignedRecord};
 use mycellium_core::userid::user_id;
 use mycellium_core::x3dh;
@@ -63,8 +63,8 @@ pub fn device_slot(key: &DevicePublicKey) -> String {
     hex(&key.0)
 }
 
-/// This device's unique sender id inside any group (Layer 11): its device key,
-/// so sender-key ids stay distinct from wallet/account ids.
+/// This device's unique sender id inside any group: its device key, so
+/// sender-key ids stay distinct from wallet/account ids.
 pub fn my_group_id(identity: &Identity) -> Vec<u8> {
     identity.device_public().0.to_vec()
 }
@@ -77,8 +77,8 @@ pub fn group_ad(group_id: &str) -> Vec<u8> {
 }
 
 /// This device's peer-record entry (keys + signed pre-key).
-pub fn this_device(identity: &Identity, addr: &str, seq: u64) -> Device {
-    Device::create(identity, PeerId(addr.as_bytes().to_vec()), seq)
+pub fn this_device(identity: &Identity, seq: u64) -> Device {
+    Device::create(identity, seq)
 }
 
 /// Build and sign this identity's peer record.
@@ -87,14 +87,13 @@ pub fn build_record<P: Platform>(
     identity: &Identity,
     handle: &Handle,
     name: &str,
-    addr: &str,
 ) -> SignedRecord {
     let record = Record {
         user_id: user_id(&identity.wallet_public()),
         handle: handle.clone(),
         name: name.to_string(),
         wallet: identity.wallet_public(),
-        device: this_device(identity, addr, platform.now_unix_secs()),
+        device: this_device(identity, platform.now_unix_secs()),
         seq: platform.now_unix_secs(),
     };
     SignedRecord::sign(record, identity)
@@ -123,12 +122,10 @@ pub fn seal_to_with_record<P: Platform>(
     // Fails closed if the recipient device published a low-order key.
     let initiated = x3dh::initiate(platform, identity, &responder_ik, &responder_spk)
         .map_err(|e| anyhow!("{e}"))?;
-    let mut ratchet = Ratchet::new_initiator(platform, &initiated.shared_secret, &responder_spk)
-        .map_err(|e| anyhow!("{e}"))?;
     let ad = associated_data(&identity.messaging_public(), &responder_ik);
     // Pad inside the AEAD, so a network observer sees a coarse size bucket
     // instead of the exact message length.
-    let sealed = ratchet.encrypt(&pad_bucket(plaintext), &ad);
+    let sealed = one_shot::seal(&initiated.shared_secret, &pad_bucket(plaintext), &ad);
     Ok(Envelope {
         from: me.clone(),
         sender_record: sender_record.clone(),
@@ -151,17 +148,13 @@ pub fn seal_to<P: Platform>(
     device: &Device,
     plaintext: &[u8],
 ) -> Result<Envelope> {
-    let sender_record = build_record(platform, identity, me, my_name, "");
+    let sender_record = build_record(platform, identity, me, my_name);
     seal_to_with_record(platform, identity, me, &sender_record, device, plaintext)
 }
 
 /// Decrypt an incoming envelope, verifying the sender's self-record binds their
 /// name, identity key, and handshake.
-pub fn open_envelope<P: Platform>(
-    platform: &mut P,
-    identity: &Identity,
-    env: &Envelope,
-) -> Result<(Handle, Vec<u8>)> {
+pub fn open_envelope(identity: &Identity, env: &Envelope) -> Result<(Handle, Vec<u8>)> {
     env.sender_record
         .verify()
         .map_err(|_| anyhow!("sender record failed verification"))?;
@@ -175,10 +168,8 @@ pub fn open_envelope<P: Platform>(
         bail!("handshake is not bound to the sender's identity");
     }
     let shared = x3dh::respond(identity, &env.init).map_err(|e| anyhow!("{e}"))?;
-    let mut ratchet = Ratchet::new_responder(&shared, identity);
     let ad = associated_data(&env.init.initiator_ik, &identity.messaging_public());
-    let padded = ratchet
-        .decrypt(platform, &env.message, &ad)
+    let padded = one_shot::open(&shared, &env.message, &ad)
         .map_err(|_| anyhow!("could not decrypt message"))?;
     // Strip the size-bucket padding the sender added before sealing (#51). The
     // length prefix is inside the AEAD, so a bad value means the authenticated

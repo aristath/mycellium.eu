@@ -12,6 +12,7 @@
 use std::sync::{Mutex, OnceLock};
 
 pub mod antirollback;
+pub mod attachments;
 pub mod blocklist;
 pub mod contacts;
 pub mod draft;
@@ -54,38 +55,35 @@ pub(crate) fn warn_corrupt(what: &str) {
     }
 }
 
-/// Decode stored bytes, distinguishing *absent* (→ default, silently) from
-/// *present-but-corrupt* (→ default, with a structured diagnostic). This keeps local-state
-/// corruption / partial writes / format-migration failures visible instead of
-/// looking like messages/groups/contacts silently vanished. The raw bytes are
-/// left in place until the next write, so a backup/export can still recover them.
-pub(crate) fn decode_or_warn<T>(bytes: Option<Vec<u8>>, what: &str) -> T
+/// Decode collection-like stored state. An absent key is a valid empty/default
+/// value; present-but-invalid bytes are reported and rejected so callers cannot
+/// accidentally overwrite recoverable state with an empty collection.
+pub(crate) fn decode_state<T>(bytes: Option<Vec<u8>>, what: &str) -> anyhow::Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {
     match bytes {
-        None => T::default(),
-        Some(b) => mycellium_core::wire::decode(&b).unwrap_or_else(|_| {
+        None => Ok(T::default()),
+        Some(b) => mycellium_core::wire::decode(&b).map_err(|_| {
             warn_corrupt(what);
-            T::default()
+            anyhow::anyhow!("local {what} is corrupt")
         }),
     }
 }
 
-/// The single-value analogue of [`decode_or_warn`]: an *absent* key is `None`
-/// silently (no data), while a *present-but-corrupt* blob is `None` with a
-/// diagnostic — never a silent drop. Use for optional getters (`get(..) -> Option<T>`)
-/// whose value type has no meaningful `Default`.
-pub(crate) fn load_opt<T>(bytes: Option<Vec<u8>>, what: &str) -> Option<T>
+/// Decode optional stored state. Missing is `None`; corrupt is an error.
+pub(crate) fn load_state<T>(bytes: Option<Vec<u8>>, what: &str) -> anyhow::Result<Option<T>>
 where
     T: serde::de::DeserializeOwned,
 {
-    let b = bytes?;
+    let Some(b) = bytes else {
+        return Ok(None);
+    };
     match mycellium_core::wire::decode(&b) {
-        Ok(v) => Some(v),
+        Ok(v) => Ok(Some(v)),
         Err(_) => {
             warn_corrupt(what);
-            None
+            Err(anyhow::anyhow!("local {what} is corrupt"))
         }
     }
 }

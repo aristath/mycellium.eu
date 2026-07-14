@@ -11,18 +11,32 @@ fn key(peer: &str) -> Vec<u8> {
 }
 
 /// Save a draft for `peer`.
-pub fn set<S: Storage>(store: &mut S, peer: &str, text: &str) -> Result<(), S::Error> {
-    store.put(&key(peer), &wire::encode(&text.to_string()))
+pub fn set<S>(store: &mut S, peer: &str, text: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    store.put(&key(peer), &wire::encode(&text.to_string()))?;
+    Ok(())
 }
 
 /// The saved draft for `peer`, if any.
-pub fn get<S: Storage>(store: &S, peer: &str) -> Result<Option<String>, S::Error> {
-    Ok(crate::load_opt(store.get(&key(peer))?, "draft"))
+pub fn get<S>(store: &S, peer: &str) -> anyhow::Result<Option<String>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::load_state(store.get(&key(peer))?, "draft")
 }
 
 /// Clear `peer`'s draft.
-pub fn clear<S: Storage>(store: &mut S, peer: &str) -> Result<(), S::Error> {
-    store.delete(&key(peer))
+pub fn clear<S>(store: &mut S, peer: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    store.delete(&key(peer))?;
+    Ok(())
 }
 
 #[cfg(test)]

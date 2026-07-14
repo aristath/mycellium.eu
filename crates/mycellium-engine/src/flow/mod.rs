@@ -13,8 +13,11 @@ use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
 
+use crate::attachments::{self, StoredAttachment};
 use crate::blocklist;
-use crate::groups::{self, GroupInvitePayload, GroupLeavePayload, MailItem, StoredGroup};
+use crate::groups::{
+    self, GroupInvitePayload, GroupKeyShare, GroupLeavePayload, GroupMember, MailItem, StoredGroup,
+};
 use crate::history::{self, GroupStoredMessage, StoredMessage};
 use crate::names;
 use crate::peerbook;
@@ -28,6 +31,12 @@ use crate::{antirollback, verified::TrustLevel};
 pub trait FlowNet {
     /// Look up a peer's signed record.
     fn lookup(&self, handle: &Handle) -> anyhow::Result<SignedRecord>;
+
+    /// Look up one exact stable user identity.
+    fn lookup_user_id(
+        &self,
+        user_id: &mycellium_core::userid::UserId,
+    ) -> anyhow::Result<SignedRecord>;
 }
 
 /// Why the shared trust chokepoint ([`resolve_record`]) refused a record.
@@ -170,6 +179,15 @@ pub trait FlowSink {
     fn emit(&mut self, event: FlowEvent);
 }
 
+/// Client-specific direct-delivery and local-retry policy.
+pub type DeliveryHook<'a, S> = dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem, Option<Vec<u8>>) -> DeliveryPath
+    + 'a;
+
+/// Pairwise delivery policy for payloads that can be resealed after a device
+/// switch.
+pub type PairwiseDeliveryHook<'a, S> =
+    dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem, Vec<u8>) -> DeliveryPath + 'a;
+
 /// The **shared trust chokepoint** for every outbound path (1:1 send, forward,
 /// broadcast, chat, and the group paths): resolve `handle`, look it up through
 /// the injected [`FlowNet`], check the record's self-signature, fail closed on a
@@ -187,6 +205,7 @@ pub fn resolve_record<S, N>(
 ) -> Result<(Handle, SignedRecord), TrustError>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     N: FlowNet,
 {
     let handle = Handle::new(handle.to_string()).map_err(|_| TrustError::BadHandle)?;
@@ -215,22 +234,28 @@ fn resolve_group_target<S, N>(
     identity: &Identity,
     store: &mut S,
     net: &N,
-    handle: &str,
+    member: &GroupMember,
 ) -> Option<(Handle, SignedRecord)>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     N: FlowNet,
 {
-    let Ok((handle, record)) = resolve_record(store, net, handle) else {
+    let user_id = mycellium_core::userid::UserId::new(member.user_id.clone()).ok()?;
+    let record = net.lookup_user_id(&user_id).ok()?;
+    if record.verify().is_err() || record.record.user_id != user_id {
         return None;
-    };
+    }
     let trust = verified::level(store, record.record.user_id.as_str(), &record.record.wallet);
     if record.record.wallet != identity.wallet_public()
         && matches!(trust, TrustLevel::Changed | TrustLevel::Unverified)
     {
         return None;
     }
-    Some((handle, record))
+    if !antirollback::check_and_pin(store, record.record.user_id.as_str(), &record).ok()? {
+        return None;
+    }
+    Some((record.record.handle.clone(), record))
 }
 
 /// The tally of one 1:1 active-device send, returned by [`send_app`].
@@ -263,23 +288,21 @@ pub struct SendOutcome {
 /// and passes the already-verified `peer_record` in, so this never re-fetches or
 /// re-checks it — the trust decision stays at the one chokepoint.
 #[allow(clippy::too_many_arguments)]
-pub fn send_app<S, P, N>(
+pub fn send_app<S, P>(
     identity: &Identity,
     store: &mut S,
     platform: &mut P,
-    _net: &N,
     me: &Handle,
     sender_record: &SignedRecord,
     peer: &Handle,
     peer_record: &SignedRecord,
     app: &AppMessage,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
-    _self_deliver: &mut dyn FnMut(&mut S, &Handle, &Device, MailItem),
-) -> Result<SendOutcome, S::Error>
+    deliver: &mut DeliveryHook<'_, S>,
+) -> anyhow::Result<SendOutcome>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
-    N: FlowNet,
 {
     let encoded = app.encode();
     let mut out = SendOutcome {
@@ -294,7 +317,14 @@ where
         out.failed += 1;
         return Ok(out);
     };
-    match deliver(store, peer, peer_record, device, MailItem::Direct(env)) {
+    match deliver(
+        store,
+        peer,
+        peer_record,
+        device,
+        MailItem::Direct(env),
+        Some(encoded),
+    ) {
         DeliveryPath::Direct => {
             out.direct += 1;
             out.delivered += 1;
@@ -331,7 +361,7 @@ where
     Ok(out)
 }
 
-/// Seal our current group sender key to every device of each `targets` handle,
+/// Seal our current group sender key to the active device of each target,
 /// **failing closed** on a member whose record is unverifiable or whose pinned
 /// wallet has changed.
 ///
@@ -354,14 +384,56 @@ pub fn distribute_key<S, P, N>(
     group_id: &str,
     name: &str,
     distribution: &SenderKeyDistribution,
-    members: &[String],
-    targets: &[String],
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
-) where
+    members: &[GroupMember],
+    targets: &[GroupMember],
+    deliver: &mut PairwiseDeliveryHook<'_, S>,
+) -> Vec<GroupKeyShare>
+where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
     N: FlowNet,
 {
+    distribute_key_inner(
+        identity,
+        store,
+        platform,
+        net,
+        me,
+        sender_record,
+        group_id,
+        name,
+        distribution,
+        members,
+        targets,
+        &[],
+        deliver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn distribute_key_inner<S, P, N>(
+    identity: &Identity,
+    store: &mut S,
+    platform: &mut P,
+    net: &N,
+    me: &Handle,
+    sender_record: &SignedRecord,
+    group_id: &str,
+    name: &str,
+    distribution: &SenderKeyDistribution,
+    members: &[GroupMember],
+    targets: &[GroupMember],
+    known_shares: &[GroupKeyShare],
+    deliver: &mut PairwiseDeliveryHook<'_, S>,
+) -> Vec<GroupKeyShare>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Platform,
+    N: FlowNet,
+{
+    let mut shared = Vec::new();
     let payload = GroupInvitePayload {
         group_id: group_id.to_string(),
         name: name.to_string(),
@@ -370,7 +442,7 @@ pub fn distribute_key<S, P, N>(
         distribution: distribution.clone(),
     };
     let Ok(plaintext) = serde_json::to_vec(&payload) else {
-        return;
+        return shared;
     };
 
     for target in targets {
@@ -381,13 +453,36 @@ pub fn distribute_key<S, P, N>(
         if device.device_key == identity.device_public() {
             continue;
         }
+        let device_slot = wireops::device_slot(&device.device_key);
+        if known_shares.iter().any(|share| {
+            share.user_id == target.user_id
+                && share.device_slot == device_slot
+                && share.signing_public == distribution.signing_public
+        }) {
+            continue;
+        }
         let Ok(env) =
             wireops::seal_to_with_record(platform, identity, me, sender_record, device, &plaintext)
         else {
             continue;
         };
-        deliver(store, &handle, &record, device, MailItem::GroupInvite(env));
+        let path = deliver(
+            store,
+            &handle,
+            &record,
+            device,
+            MailItem::GroupInvite(env),
+            plaintext.clone(),
+        );
+        if matches!(path, DeliveryPath::Direct | DeliveryPath::Outbox) {
+            shared.push(GroupKeyShare {
+                user_id: target.user_id.clone(),
+                device_slot,
+                signing_public: distribution.signing_public,
+            });
+        }
     }
+    shared
 }
 
 /// The **shared group-send path**, generic over the [`Storage`] port and the
@@ -402,23 +497,69 @@ pub fn distribute_key<S, P, N>(
 /// threaded *through* it so the seal loop and the closure's own writes share one
 /// handle. Unlike [`send_app`], group text is encrypted once under the group key,
 /// not X3DH-sealed per device.
-pub fn group_send<S, N>(
+#[allow(clippy::too_many_arguments)]
+pub fn group_send<S, P, N>(
     identity: &Identity,
     store: &mut S,
+    platform: &mut P,
     net: &N,
     me: &Handle,
+    sender_record: &SignedRecord,
     group: &mut StoredGroup,
     app: &AppMessage,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
-) -> Result<SendOutcome, S::Error>
+    deliver: &mut DeliveryHook<'_, S>,
+) -> anyhow::Result<SendOutcome>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Platform,
     N: FlowNet,
 {
     let mut out = SendOutcome {
         id: app.id.clone(),
         ..Default::default()
     };
+
+    let mut session = Group::import(group.state.clone())
+        .map_err(|_| anyhow::anyhow!("stored group state is corrupt"))?;
+
+    // A replacement device has different pairwise keys and no copy of this
+    // sender key. Share the current key before sending the first group message
+    // to that device; unchanged devices do not receive redundant invites.
+    let members = group.members.clone();
+    let known_shares = group.key_shares.clone();
+    let distribution = session.distribution();
+    let shared = {
+        let mut share = |s: &mut S,
+                         handle: &Handle,
+                         record: &SignedRecord,
+                         device: &Device,
+                         item: MailItem,
+                         plaintext: Vec<u8>| {
+            deliver(s, handle, record, device, item, Some(plaintext))
+        };
+        distribute_key_inner(
+            identity,
+            store,
+            platform,
+            net,
+            me,
+            sender_record,
+            &group.id,
+            &group.name,
+            &distribution,
+            &members,
+            &members,
+            &known_shares,
+            &mut share,
+        )
+    };
+    if !shared.is_empty() {
+        for share in shared {
+            group.note_key_share(share);
+        }
+        groups::save(store, group)?;
+    }
 
     // Apply an edit/delete to our own transcript before we encrypt: the ciphertext
     // carries the same body to members, and this keeps our copy consistent.
@@ -433,9 +574,6 @@ where
     }
 
     // Encrypt under the group sender-key ratchet, then persist the advanced state.
-    let Ok(mut session) = Group::import(group.state.clone()) else {
-        return Ok(out);
-    };
     let gm = session.encrypt(&app.encode(), &wireops::group_ad(&group.id));
     group.state = session.export();
     groups::save(store, group)?;
@@ -453,7 +591,7 @@ where
         if device.device_key == identity.device_public() {
             continue; // never to this device itself
         }
-        match deliver(store, &handle, &record, device, item.clone()) {
+        match deliver(store, &handle, &record, device, item.clone(), None) {
             DeliveryPath::Direct => {
                 out.direct += 1;
                 out.delivered += 1;
@@ -481,7 +619,7 @@ where
 
 /// The **shared group-leave path**, generic over the [`Storage`]/[`Platform`]
 /// ports and the injected [`FlowNet`]. It seals an **authenticated**
-/// [`MailItem::GroupLeave`] (X3DH — [`wireops::seal_to`], so members can prove the
+/// [`MailItem::GroupLeave`] (a pairwise envelope, so members can prove the
 /// departure is genuinely ours and no one can forge someone else leaving) to every
 /// OTHER member's active device via `net.lookup` + `deliver`, so they drop us and re-key;
 /// then it removes the group locally.
@@ -497,9 +635,10 @@ pub fn group_leave<S, P, N>(
     me: &Handle,
     sender_record: &SignedRecord,
     group: &StoredGroup,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem),
+    deliver: &mut PairwiseDeliveryHook<'_, S>,
 ) where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
     N: FlowNet,
 {
@@ -510,7 +649,7 @@ pub fn group_leave<S, P, N>(
         return;
     };
     for member in &group.members {
-        if member == me.as_str() {
+        if member.user_id == sender_record.record.user_id.as_str() {
             continue; // our own departure isn't announced to ourselves
         }
         let Some((handle, record)) = resolve_group_target(identity, store, net, member) else {
@@ -525,7 +664,14 @@ pub fn group_leave<S, P, N>(
         else {
             continue;
         };
-        deliver(store, &handle, &record, device, MailItem::GroupLeave(env));
+        deliver(
+            store,
+            &handle,
+            &record,
+            device,
+            MailItem::GroupLeave(env),
+            plaintext.clone(),
+        );
     }
     // Drop our local group state last, so a mid-send failure still leaves us able
     // to retry (the state is what the seal loop reads from).
@@ -564,10 +710,11 @@ pub fn process_item<S, P, N>(
     blocked: &[String],
     item: MailItem,
     sink: &mut dyn FlowSink,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    deliver: &mut DeliveryHook<'_, S>,
 ) -> ItemOutcome
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
     N: FlowNet,
 {
@@ -602,19 +749,19 @@ fn recv_direct<S, P>(
 ) -> ItemOutcome
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
-    let Ok((from, bytes)) = wireops::open_envelope(platform, r.identity, env) else {
+    let Ok((from, bytes)) = wireops::open_envelope(r.identity, env) else {
         return ItemOutcome::Retry; // not for us / can't decrypt yet
     };
-    if blocklist::is_blocked(r.blocked, from.as_str()) {
+    let sender_user_id = env.sender_record.record.user_id.as_str();
+    if blocklist::is_blocked(r.blocked, sender_user_id) {
         return ItemOutcome::Rejected; // silently drop — no surface, storage, or receipt
     }
     // Learn the sender's self-set name (from their signed record); a saved contact
     // still wins downstream.
     let _ = names::note(store, from.as_str(), &env.sender_record.record.name);
-    let sender_user_id = env.sender_record.record.user_id.as_str();
-
     match AppMessage::decode(&bytes) {
         Ok(app) => match &app.body {
             // A receipt: surface the status; never receipt a receipt (no loops).
@@ -650,6 +797,21 @@ where
             _ if app.is_expired(platform.now_unix_secs()) => {}
             // A real message: surface, persist, and send a read receipt back.
             _ => {
+                if let Body::File { name, mime, data } = &app.body {
+                    if attachments::save(
+                        store,
+                        &StoredAttachment {
+                            id: app.id.clone(),
+                            name: name.clone(),
+                            mime: mime.clone(),
+                            data: data.clone(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        return ItemOutcome::Retry;
+                    }
+                }
                 let entry = StoredMessage {
                     id: app.id.clone(),
                     from_me: false,
@@ -696,21 +858,41 @@ fn recv_group_invite<S, P, N>(
     net: &N,
     sink: &mut dyn FlowSink,
     env: &Envelope,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    deliver: &mut DeliveryHook<'_, S>,
 ) -> ItemOutcome
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
     N: FlowNet,
 {
-    let Ok((from, bytes)) = wireops::open_envelope(platform, r.identity, env) else {
+    let Ok((from, bytes)) = wireops::open_envelope(r.identity, env) else {
         return ItemOutcome::Retry;
     };
+    if blocklist::is_blocked(r.blocked, env.sender_record.record.user_id.as_str()) {
+        return ItemOutcome::Rejected;
+    }
     let Ok(payload) = serde_json::from_slice::<GroupInvitePayload>(&bytes) else {
         return ItemOutcome::Retry;
     };
-    // Senders are keyed by their device id (Layer 11), carried in the payload; we
-    // remember which handle is behind it for display and block checks.
+    let mut member_ids = std::collections::HashSet::with_capacity(payload.members.len());
+    if payload.members.iter().any(|member| {
+        mycellium_core::userid::UserId::new(member.user_id.clone()).is_err()
+            || Handle::new(member.handle.clone()).is_err()
+            || !member_ids.insert(member.user_id.as_str())
+    }) {
+        return ItemOutcome::Rejected;
+    }
+    let sender_user_id = env.sender_record.record.user_id.as_str();
+    let own_user_id = r.sender_record.record.user_id.as_str();
+    if payload.sender_id.as_slice() != env.sender_record.record.device.device_key.0
+        || !member_ids.contains(sender_user_id)
+        || !member_ids.contains(own_user_id)
+    {
+        return ItemOutcome::Rejected;
+    }
+    // Senders are keyed by their device id, carried in the payload; we remember
+    // which handle is behind it for display and block checks.
     let sender_id = payload.sender_id.clone();
 
     match groups::load(store, &payload.group_id) {
@@ -719,24 +901,43 @@ where
             // existing member — the group id travels in cleartext inside every
             // group MailItem, so anyone who learns it could otherwise inject their
             // sender key or add members we then leak our key to. Ignore non-members.
-            if !stored.members.iter().any(|m| m == from.as_str()) {
+            if !stored
+                .members
+                .iter()
+                .any(|member| member.user_id == sender_user_id)
+            {
                 return ItemOutcome::Rejected;
             }
             let Ok(mut group) = Group::import(stored.state.clone()) else {
                 return ItemOutcome::Retry;
             };
+            // A user has one active device. Learning that user's replacement
+            // device retires every sender key tied to their previous device.
+            for known in &stored.senders {
+                if known.user_id == sender_user_id && known.sender_id != sender_id {
+                    group.remove_member(&known.sender_id);
+                }
+            }
+            stored
+                .senders
+                .retain(|known| known.user_id != sender_user_id || known.sender_id == sender_id);
             if group
                 .add_member(sender_id.clone(), &payload.distribution)
                 .is_err()
             {
                 return ItemOutcome::Retry;
             }
-            stored.note_sender(sender_id, from.as_str());
+            stored.note_sender(sender_id, sender_user_id, from.as_str());
             // Learn any members we didn't know about, and send them our key.
-            let newcomers: Vec<String> = payload
+            let newcomers: Vec<GroupMember> = payload
                 .members
                 .iter()
-                .filter(|m| !stored.members.iter().any(|x| x == *m))
+                .filter(|member| {
+                    !stored
+                        .members
+                        .iter()
+                        .any(|known| known.user_id == member.user_id)
+                })
                 .cloned()
                 .collect();
             for m in &newcomers {
@@ -746,10 +947,20 @@ where
             if groups::save(store, &stored).is_err() {
                 return ItemOutcome::Retry;
             }
-            if !newcomers.is_empty() {
-                distribute_group_key(
-                    r, store, platform, net, &stored, &group, &newcomers, deliver,
-                );
+            if !newcomers.is_empty()
+                && distribute_group_key(
+                    r,
+                    store,
+                    platform,
+                    net,
+                    &mut stored,
+                    &group,
+                    &newcomers,
+                    deliver,
+                )
+                .is_err()
+            {
+                return ItemOutcome::Retry;
             }
             ItemOutcome::Accepted
         }
@@ -766,12 +977,16 @@ where
                 id: payload.group_id.clone(),
                 name: payload.name.clone(),
                 members: payload.members.clone(),
-                me: r.me.as_str().to_string(),
-                sender_handles: Vec::new(),
+                senders: Vec::new(),
+                key_shares: Vec::new(),
                 state: group.export(),
             };
-            stored.note_sender(sender_id, from.as_str());
-            stored.note_sender(wireops::my_group_id(r.identity), r.me.as_str());
+            stored.note_sender(sender_id, sender_user_id, from.as_str());
+            stored.note_sender(
+                wireops::my_group_id(r.identity),
+                r.sender_record.record.user_id.as_str(),
+                r.me.as_str(),
+            );
             if groups::save(store, &stored).is_err() {
                 return ItemOutcome::Retry;
             }
@@ -781,7 +996,20 @@ where
                 inviter: from.as_str().to_string(),
             });
             let targets = stored.members.clone();
-            distribute_group_key(r, store, platform, net, &stored, &group, &targets, deliver);
+            if distribute_group_key(
+                r,
+                store,
+                platform,
+                net,
+                &mut stored,
+                &group,
+                &targets,
+                deliver,
+            )
+            .is_err()
+            {
+                return ItemOutcome::Retry;
+            }
             ItemOutcome::Accepted
         }
         Err(_) => ItemOutcome::Retry,
@@ -800,6 +1028,7 @@ fn recv_group_text<S, P>(
 ) -> ItemOutcome
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
 {
     let mut stored = match groups::load(store, group_id) {
@@ -808,23 +1037,26 @@ where
         // keep the item so it retries once we know the group.
         _ => return ItemOutcome::Retry,
     };
-    // Map the device-keyed sender id back to a handle for display/block checks.
-    let sender = stored
-        .handle_of(&message.sender)
-        .map(str::to_string)
-        .unwrap_or_else(|| String::from_utf8_lossy(&message.sender).into_owned());
-    if let Ok(handle) = Handle::new(sender.clone()) {
-        if let Ok(Some(record)) = peerbook::get(store, &handle) {
-            if record.verify().is_ok()
-                && record.record.device.device_key.0.as_slice() != message.sender.as_slice()
-            {
-                return ItemOutcome::Rejected;
-            }
-        }
-    }
-    if blocklist::is_blocked(r.blocked, &sender) {
+    let Some(sender_identity) = stored.sender_of(&message.sender).cloned() else {
+        return ItemOutcome::Retry;
+    };
+    if blocklist::is_blocked(r.blocked, &sender_identity.user_id) {
         return ItemOutcome::Rejected; // drop group messages from blocked members
     }
+    let Ok(sender_user_id) = mycellium_core::userid::UserId::new(sender_identity.user_id.clone())
+    else {
+        return ItemOutcome::Rejected;
+    };
+    let Ok(Some(sender_record)) = peerbook::get_by_user_id(store, &sender_user_id) else {
+        return ItemOutcome::Retry;
+    };
+    if sender_record.verify().is_err()
+        || sender_record.record.user_id != sender_user_id
+        || sender_record.record.device.device_key.0.as_slice() != message.sender.as_slice()
+    {
+        return ItemOutcome::Rejected;
+    }
+    let sender = sender_record.record.handle.as_str().to_string();
     let Ok(mut group) = Group::import(stored.state.clone()) else {
         return ItemOutcome::Retry;
     };
@@ -836,7 +1068,7 @@ where
     // message effect succeeds, so a storage failure can be retried safely.
     stored.state = group.export();
 
-    let (id, display, expires_at) = match AppMessage::decode(&plaintext) {
+    let (id, display, expires_at, attachment) = match AppMessage::decode(&plaintext) {
         Ok(app) => match &app.body {
             Body::Edit { to, text } => {
                 if history::group_edit(store, group_id, to, text, &sender).is_err()
@@ -872,11 +1104,25 @@ where
                     }
                     return ItemOutcome::Accepted; // authenticated and already expired
                 }
-                (app.id.clone(), app.summary(), app.expires_at)
+                let attachment = match &app.body {
+                    Body::File { name, mime, data } => Some(StoredAttachment {
+                        id: app.id.clone(),
+                        name: name.clone(),
+                        mime: mime.clone(),
+                        data: data.clone(),
+                    }),
+                    _ => None,
+                };
+                (app.id.clone(), app.summary(), app.expires_at, attachment)
             }
         },
         Err(_) => return ItemOutcome::Rejected,
     };
+    if let Some(attachment) = &attachment {
+        if attachments::save(store, attachment).is_err() {
+            return ItemOutcome::Retry;
+        }
+    }
     let entry = GroupStoredMessage {
         id: id.clone(),
         sender: sender.clone(),
@@ -894,15 +1140,13 @@ where
     if !inserted {
         return ItemOutcome::Accepted;
     }
-    if let Ok(app) = AppMessage::decode(&plaintext) {
-        if let Body::File { name, mime, data } = app.body {
-            sink.emit(FlowEvent::Attachment {
-                id: app.id,
-                name,
-                mime,
-                data,
-            });
-        }
+    if let Some(attachment) = attachment {
+        sink.emit(FlowEvent::Attachment {
+            id: attachment.id,
+            name: attachment.name,
+            mime: attachment.mime,
+            data: attachment.data,
+        });
     }
     sink.emit(FlowEvent::GroupMessage {
         group_id: group_id.to_string(),
@@ -927,21 +1171,26 @@ fn recv_group_leave<S, P, N>(
     net: &N,
     sink: &mut dyn FlowSink,
     env: &Envelope,
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
+    deliver: &mut DeliveryHook<'_, S>,
 ) -> ItemOutcome
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
     N: FlowNet,
 {
-    let Ok((from, bytes)) = wireops::open_envelope(platform, r.identity, env) else {
+    let Ok((from, bytes)) = wireops::open_envelope(r.identity, env) else {
         return ItemOutcome::Rejected; // not for us / can't authenticate
     };
+    if blocklist::is_blocked(r.blocked, env.sender_record.record.user_id.as_str()) {
+        return ItemOutcome::Rejected;
+    }
     let Ok(payload) = serde_json::from_slice::<GroupLeavePayload>(&bytes) else {
         return ItemOutcome::Rejected;
     };
-    let member = from.as_str().to_string(); // the authenticated leaver
-    if member == r.me.as_str() {
+    let member_user_id = env.sender_record.record.user_id.as_str();
+    let member = from.as_str().to_string();
+    if member_user_id == r.sender_record.record.user_id.as_str() {
         return ItemOutcome::Rejected;
     }
     let mut stored = match groups::load(store, &payload.group_id) {
@@ -949,28 +1198,47 @@ where
         Ok(None) => return ItemOutcome::Accepted,
         Err(_) => return ItemOutcome::Retry,
     };
-    if !stored.members.iter().any(|m| m == &member) {
+    if !stored
+        .members
+        .iter()
+        .any(|known| known.user_id == member_user_id)
+    {
         return ItemOutcome::Rejected; // not a member of this group
     }
-    stored.members.retain(|m| m != &member);
+    stored
+        .members
+        .retain(|known| known.user_id != member_user_id);
     let Ok(mut session) = Group::import(stored.state.clone()) else {
         return ItemOutcome::Retry;
     };
-    for (id, handle) in &stored.sender_handles {
-        if handle == &member {
-            session.remove_member(id);
+    for sender in &stored.senders {
+        if sender.user_id == member_user_id {
+            session.remove_member(&sender.sender_id);
         }
     }
-    stored.sender_handles.retain(|(_, h)| h != &member);
+    stored
+        .senders
+        .retain(|sender| sender.user_id != member_user_id);
     session.rotate(platform);
     stored.state = session.export();
     if groups::save(store, &stored).is_err() {
         return ItemOutcome::Retry;
     }
     let targets = stored.members.clone();
-    distribute_group_key(
-        r, store, platform, net, &stored, &session, &targets, deliver,
-    );
+    if distribute_group_key(
+        r,
+        store,
+        platform,
+        net,
+        &mut stored,
+        &session,
+        &targets,
+        deliver,
+    )
+    .is_err()
+    {
+        return ItemOutcome::Retry;
+    }
     sink.emit(FlowEvent::GroupLeft {
         group_id: stored.id.clone(),
         name: stored.name.clone(),
@@ -979,28 +1247,30 @@ where
     ItemOutcome::Accepted
 }
 
-/// Adapt the receive path's `deliver` closure (which reports a [`DeliveryPath`])
-/// to [`distribute_key`]'s delivery closure (which doesn't), and run the shared
-/// lookup/verify/pin-check/seal loop to (re)distribute our group sender key.
+/// Run the shared lookup/verify/pin-check/seal loop to (re)distribute our group
+/// sender key, then durably remember which active devices have it.
 #[allow(clippy::too_many_arguments)]
 fn distribute_group_key<S, P, N>(
     r: Recv,
     store: &mut S,
     platform: &mut P,
     net: &N,
-    stored: &StoredGroup,
+    stored: &mut StoredGroup,
     group: &Group,
-    targets: &[String],
-    deliver: &mut dyn FnMut(&mut S, &Handle, &SignedRecord, &Device, MailItem) -> DeliveryPath,
-) where
+    targets: &[GroupMember],
+    deliver: &mut DeliveryHook<'_, S>,
+) -> anyhow::Result<()>
+where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     P: Platform,
     N: FlowNet,
 {
-    let mut dk = |s: &mut S, h: &Handle, rec: &SignedRecord, d: &Device, i: MailItem| {
-        deliver(s, h, rec, d, i);
-    };
-    distribute_key(
+    let mut dk =
+        |s: &mut S, h: &Handle, rec: &SignedRecord, d: &Device, i: MailItem, plaintext: Vec<u8>| {
+            deliver(s, h, rec, d, i, Some(plaintext))
+        };
+    let shared = distribute_key(
         r.identity,
         store,
         platform,
@@ -1014,6 +1284,11 @@ fn distribute_group_key<S, P, N>(
         targets,
         &mut dk,
     );
+    for share in shared {
+        stored.note_key_share(share);
+    }
+    groups::save(store, stored)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1059,6 +1334,13 @@ mod recv_tests {
         fn lookup(&self, _handle: &Handle) -> anyhow::Result<SignedRecord> {
             anyhow::bail!("no network in this test")
         }
+
+        fn lookup_user_id(
+            &self,
+            _user_id: &mycellium_core::userid::UserId,
+        ) -> anyhow::Result<SignedRecord> {
+            anyhow::bail!("no network in this test")
+        }
     }
 
     #[derive(Default)]
@@ -1078,11 +1360,13 @@ mod recv_tests {
     ) -> ItemOutcome {
         let mut platform = TestPlatform;
         let net = NoNet;
-        let mut deliver =
-            |_: &mut MemStore, _: &Handle, _: &SignedRecord, _: &Device, _: MailItem| {
-                DeliveryPath::Failed
-            };
-        let sender_record = wireops::build_record(&mut platform, me, my_handle, "", "127.0.0.1:1");
+        let mut deliver = |_: &mut MemStore,
+                           _: &Handle,
+                           _: &SignedRecord,
+                           _: &Device,
+                           _: MailItem,
+                           _: Option<Vec<u8>>| { DeliveryPath::Failed };
+        let sender_record = wireops::build_record(&mut platform, me, my_handle, "");
         process_item(
             me,
             store,
@@ -1123,5 +1407,95 @@ mod recv_tests {
             &mut sink,
         );
         assert_eq!(outcome, ItemOutcome::Retry);
+    }
+
+    #[test]
+    fn replacement_device_invite_retires_the_same_users_old_sender_key() {
+        let mut platform = TestPlatform;
+        let alice = Identity::generate(&mut platform).unwrap();
+        let bob_old = Identity::generate(&mut platform).unwrap();
+        let bob_new = Identity::adopt(&mut platform, bob_old.wallet_secret()).unwrap();
+        let alice_handle = Handle::new("alice").unwrap();
+        let bob_handle = Handle::new("bob").unwrap();
+        let alice_record = wireops::build_record(&mut platform, &alice, &alice_handle, "Alice");
+        let bob_new_record = wireops::build_record(&mut platform, &bob_new, &bob_handle, "Bob");
+        let group_id = "device-switch-group";
+        let members = vec![
+            GroupMember {
+                user_id: alice_record.record.user_id.as_str().to_string(),
+                handle: alice_handle.as_str().to_string(),
+            },
+            GroupMember {
+                user_id: bob_new_record.record.user_id.as_str().to_string(),
+                handle: bob_handle.as_str().to_string(),
+            },
+        ];
+
+        let mut old_sender = Group::new(&mut platform, wireops::my_group_id(&bob_old));
+        let mut new_sender = Group::new(&mut platform, wireops::my_group_id(&bob_new));
+        let mut alice_group = Group::new(&mut platform, wireops::my_group_id(&alice));
+        alice_group
+            .add_member(wireops::my_group_id(&bob_old), &old_sender.distribution())
+            .unwrap();
+        let mut stored = StoredGroup {
+            id: group_id.into(),
+            name: "Team".into(),
+            members: members.clone(),
+            senders: Vec::new(),
+            key_shares: Vec::new(),
+            state: alice_group.export(),
+        };
+        stored.note_sender(
+            wireops::my_group_id(&bob_old),
+            bob_new_record.record.user_id.as_str(),
+            bob_handle.as_str(),
+        );
+        let mut store = MemStore::default();
+        groups::save(&mut store, &stored).unwrap();
+
+        let payload = GroupInvitePayload {
+            group_id: group_id.into(),
+            name: "Team".into(),
+            members,
+            sender_id: wireops::my_group_id(&bob_new),
+            distribution: new_sender.distribution(),
+        };
+        let envelope = wireops::seal_to_with_record(
+            &mut platform,
+            &bob_new,
+            &bob_handle,
+            &bob_new_record,
+            &alice_record.record.device,
+            &serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        assert_eq!(
+            run(
+                &alice,
+                &alice_handle,
+                &mut store,
+                MailItem::GroupInvite(envelope),
+                &mut sink,
+            ),
+            ItemOutcome::Accepted
+        );
+
+        let stored = groups::load(&store, group_id).unwrap().unwrap();
+        assert_eq!(
+            stored
+                .senders
+                .iter()
+                .filter(|sender| sender.user_id == bob_new_record.record.user_id.as_str())
+                .count(),
+            1
+        );
+        assert_eq!(stored.senders[0].sender_id, wireops::my_group_id(&bob_new));
+        let ad = wireops::group_ad(group_id);
+        let old_message = old_sender.encrypt(b"old device", &ad);
+        let new_message = new_sender.encrypt(b"new device", &ad);
+        let mut receiver = Group::import(stored.state).unwrap();
+        assert!(receiver.decrypt(&old_message, &ad).is_err());
+        assert_eq!(receiver.decrypt(&new_message, &ad).unwrap(), b"new device");
     }
 }

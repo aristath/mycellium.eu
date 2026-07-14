@@ -1,9 +1,8 @@
 //! Atomic anti-rollback version vectors for split peer records.
 //!
-//! Identity membership, stable device keys, and device reachability advance
+//! Identity membership, stable device keys, and transport identity advance
 //! independently. One wallet-scoped pin stores the high-water mark for every
-//! component, so a fresh address can never hide a rolled-back identity/device
-//! claim (or vice versa).
+//! component, so one fresh component can never hide a rolled-back claim.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,8 +29,8 @@ struct DevicePins {
     key: DevicePublicKey,
     stable: u64,
     stable_digest: [u8; 32],
-    reachability: u64,
-    reachability_digest: [u8; 32],
+    transport: u64,
+    transport_digest: [u8; 32],
 }
 
 fn digest<T: Serialize>(value: &T) -> [u8; 32] {
@@ -42,11 +41,17 @@ fn load<S: Storage>(
     store: &S,
     handle: &str,
     wallet: &WalletPublicKey,
-) -> Result<VersionPins, S::Error> {
-    Ok(store
-        .get(&key(handle, wallet))?
-        .and_then(|bytes| wire::decode(&bytes).ok())
-        .unwrap_or_default())
+) -> Result<Option<VersionPins>, S::Error> {
+    let Some(bytes) = store.get(&key(handle, wallet))? else {
+        return Ok(Some(VersionPins::default()));
+    };
+    match wire::decode(&bytes) {
+        Ok(pins) => Ok(Some(pins)),
+        Err(_) => {
+            crate::warn_corrupt("record anti-rollback pins");
+            Ok(None)
+        }
+    }
 }
 
 /// Atomically validate and advance every component in a verified record.
@@ -56,7 +61,12 @@ pub fn check_and_pin<S: Storage>(
     record: &SignedRecord,
 ) -> Result<bool, S::Error> {
     let wallet = &record.record.wallet;
-    let mut pins = load(store, handle, wallet)?;
+    // A corrupt high-water mark must never be interpreted as version zero: an
+    // attacker who can roll local bytes back would otherwise re-introduce a
+    // retired device. Keep the bytes and reject the record until repaired.
+    let Some(mut pins) = load(store, handle, wallet)? else {
+        return Ok(false);
+    };
     let identity_digest = mycellium_core::delivery::payload_digest(&record.record.signing_bytes());
     if record.record.seq < pins.identity
         || (record.record.seq == pins.identity
@@ -68,7 +78,7 @@ pub fn check_and_pin<S: Storage>(
     {
         let device = &record.record.device;
         let stable_digest = digest(&device.signed.record);
-        let reachability_digest = digest(&device.reachability.record);
+        let transport_digest = digest(&device.reachability.record);
         if let Some(known) = pins
             .devices
             .iter()
@@ -77,9 +87,9 @@ pub fn check_and_pin<S: Storage>(
             if device.signed.record.seq < known.stable
                 || (device.signed.record.seq == known.stable
                     && stable_digest != known.stable_digest)
-                || device.reachability.record.seq < known.reachability
-                || (device.reachability.record.seq == known.reachability
-                    && reachability_digest != known.reachability_digest)
+                || device.reachability.record.seq < known.transport
+                || (device.reachability.record.seq == known.transport
+                    && transport_digest != known.transport_digest)
             {
                 return Ok(false);
             }
@@ -93,7 +103,7 @@ pub fn check_and_pin<S: Storage>(
     {
         let device = &record.record.device;
         let stable_digest = digest(&device.signed.record);
-        let reachability_digest = digest(&device.reachability.record);
+        let transport_digest = digest(&device.reachability.record);
         match pins
             .devices
             .iter_mut()
@@ -104,17 +114,17 @@ pub fn check_and_pin<S: Storage>(
                     known.stable = device.signed.record.seq;
                     known.stable_digest = stable_digest;
                 }
-                if device.reachability.record.seq > known.reachability {
-                    known.reachability = device.reachability.record.seq;
-                    known.reachability_digest = reachability_digest;
+                if device.reachability.record.seq > known.transport {
+                    known.transport = device.reachability.record.seq;
+                    known.transport_digest = transport_digest;
                 }
             }
             None => pins.devices.push(DevicePins {
                 key: device.device_key,
                 stable: device.signed.record.seq,
                 stable_digest,
-                reachability: device.reachability.record.seq,
-                reachability_digest,
+                transport: device.reachability.record.seq,
+                transport_digest,
             }),
         }
     }
@@ -134,7 +144,7 @@ pub fn clear<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mycellium_core::identity::{Handle, Identity, PeerId};
+    use mycellium_core::identity::{Handle, Identity};
     use mycellium_core::platform::Platform;
     use mycellium_core::record::{Device, Record, SignedRecord};
     use mycellium_core::userid::user_id;
@@ -170,19 +180,14 @@ mod tests {
         }
     }
 
-    fn signed(
-        identity: &Identity,
-        identity_seq: u64,
-        component_seq: u64,
-        address: &[u8],
-    ) -> SignedRecord {
+    fn signed(identity: &Identity, identity_seq: u64, component_seq: u64) -> SignedRecord {
         SignedRecord::sign(
             Record {
                 user_id: user_id(&identity.wallet_public()),
                 handle: Handle::new("bob").unwrap(),
                 name: "Bob".into(),
                 wallet: identity.wallet_public(),
-                device: Device::create(identity, PeerId(address.to_vec()), component_seq),
+                device: Device::create(identity, component_seq),
                 seq: identity_seq,
             },
             identity,
@@ -190,16 +195,30 @@ mod tests {
     }
 
     #[test]
-    fn independently_pins_identity_device_and_reachability_versions() {
+    fn independently_pins_identity_device_and_transport_versions() {
         let identity = Identity::generate(&mut TestPlatform).unwrap();
         let mut store = Mem::default();
-        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 5, 9, b"one")).unwrap());
-        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 4, 10, b"one")).unwrap());
-        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 6, 8, b"one")).unwrap());
-        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 5, 9, b"two")).unwrap());
-        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 6, 10, b"two")).unwrap());
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 5, 9)).unwrap());
+        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 4, 10)).unwrap());
+        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 6, 8)).unwrap());
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 5, 9)).unwrap());
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 6, 10)).unwrap());
 
         clear(&mut store, "bob", &identity.wallet_public()).unwrap();
-        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 1, 1, b"reset")).unwrap());
+        assert!(check_and_pin(&mut store, "bob", &signed(&identity, 1, 1)).unwrap());
+    }
+
+    #[test]
+    fn corrupt_pins_fail_closed_and_are_not_overwritten() {
+        let identity = Identity::generate(&mut TestPlatform).unwrap();
+        let mut store = Mem::default();
+        let storage_key = key("bob", &identity.wallet_public());
+        store.put(&storage_key, b"corrupt").unwrap();
+
+        assert!(!check_and_pin(&mut store, "bob", &signed(&identity, 10, 10)).unwrap());
+        assert_eq!(
+            store.get(&storage_key).unwrap().as_deref(),
+            Some(&b"corrupt"[..])
+        );
     }
 }

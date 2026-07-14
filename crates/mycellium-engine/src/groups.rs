@@ -7,7 +7,7 @@ use mycellium_core::delivery::DeliveryAck;
 use mycellium_core::group::{GroupMessage, GroupState, SenderKeyDistribution};
 use mycellium_core::offline::Envelope;
 use mycellium_core::record::SignedRecord;
-use mycellium_core::storage::Storage;
+use mycellium_core::storage::{Storage, StorageMutation};
 use mycellium_core::wire;
 
 /// Anything that can be handed directly to a peer device. Direct messages and
@@ -77,13 +77,47 @@ pub struct GroupInvitePayload {
     pub group_id: String,
     /// Human-readable group name.
     pub name: String,
-    /// All member handles (including the sender and the recipient).
-    pub members: Vec<String>,
-    /// The sender's device-unique group id (Layer 11), used as the map key.
+    /// All stable members (including the sender and the recipient).
+    pub members: Vec<GroupMember>,
+    /// The sender's device-unique group id, used as the map key.
     #[serde(default)]
     pub sender_id: Vec<u8>,
     /// The sender's sender-key distribution.
     pub distribution: SenderKeyDistribution,
+}
+
+/// One group member. The user id is authoritative; the handle is display-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    /// Stable protocol identity.
+    pub user_id: String,
+    /// Last authenticated human-readable handle.
+    pub handle: String,
+}
+
+/// The authenticated identity behind one group sender-key device id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSender {
+    /// Device id used by the group sender-key protocol.
+    pub sender_id: Vec<u8>,
+    /// Stable protocol identity.
+    pub user_id: String,
+    /// Last authenticated human-readable handle.
+    pub handle: String,
+}
+
+/// The active device that has received this device's current sender key.
+///
+/// Only the public signing key is retained as the sender-key generation marker;
+/// the secret chain key remains exclusively inside [`GroupState`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupKeyShare {
+    /// Stable recipient identity.
+    pub user_id: String,
+    /// Recipient device key encoded as a stable slot identifier.
+    pub device_slot: String,
+    /// Public signing key of the sender-key generation that was shared.
+    pub signing_public: [u8; 32],
 }
 
 /// A member's persisted view of one group.
@@ -93,37 +127,62 @@ pub struct StoredGroup {
     pub id: String,
     /// Human-readable group name.
     pub name: String,
-    /// All member handles.
-    pub members: Vec<String>,
-    /// This device's own handle in the group.
-    pub me: String,
-    /// Each sender's device id → their handle, for display and block checks.
+    /// All members keyed by stable user identity.
+    pub members: Vec<GroupMember>,
+    /// Authenticated device-id to user-id/display-handle mappings.
+    pub senders: Vec<GroupSender>,
+    /// Recipient devices that have this device's current sender key.
     #[serde(default)]
-    pub sender_handles: Vec<(Vec<u8>, String)>,
+    pub key_shares: Vec<GroupKeyShare>,
     /// The serialized core group session (secret — stored encrypted).
     pub state: GroupState,
 }
 
 impl StoredGroup {
-    /// Record (or update) the handle behind a sender's device id.
-    pub fn note_sender(&mut self, sender_id: Vec<u8>, handle: &str) {
+    /// Record or update the authenticated identity behind a sender device id.
+    pub fn note_sender(&mut self, sender_id: Vec<u8>, user_id: &str, handle: &str) {
         if let Some(entry) = self
-            .sender_handles
+            .senders
             .iter_mut()
-            .find(|(id, _)| *id == sender_id)
+            .find(|entry| entry.sender_id == sender_id)
         {
-            entry.1 = handle.to_string();
+            entry.user_id = user_id.to_string();
+            entry.handle = handle.to_string();
         } else {
-            self.sender_handles.push((sender_id, handle.to_string()));
+            self.senders.push(GroupSender {
+                sender_id,
+                user_id: user_id.to_string(),
+                handle: handle.to_string(),
+            });
         }
     }
 
-    /// The handle behind a sender's device id, if known.
-    pub fn handle_of(&self, sender_id: &[u8]) -> Option<&str> {
-        self.sender_handles
+    /// The stable identity behind a sender device id, if known.
+    pub fn sender_of(&self, sender_id: &[u8]) -> Option<&GroupSender> {
+        self.senders
             .iter()
-            .find(|(id, _)| id == sender_id)
-            .map(|(_, h)| h.as_str())
+            .find(|entry| entry.sender_id == sender_id)
+    }
+
+    /// Whether this exact active device has our current sender key.
+    pub fn key_shared_with(
+        &self,
+        user_id: &str,
+        device_slot: &str,
+        signing_public: &[u8; 32],
+    ) -> bool {
+        self.key_shares.iter().any(|share| {
+            share.user_id == user_id
+                && share.device_slot == device_slot
+                && &share.signing_public == signing_public
+        })
+    }
+
+    /// Record the one active recipient device that has our sender key.
+    pub fn note_key_share(&mut self, share: GroupKeyShare) {
+        self.key_shares
+            .retain(|known| known.user_id != share.user_id);
+        self.key_shares.push(share);
     }
 }
 
@@ -136,35 +195,54 @@ fn group_key(id: &str) -> Vec<u8> {
 const INDEX_KEY: &[u8] = b"groups";
 
 /// Save a group and record its id in the index.
-pub fn save<S: Storage>(store: &mut S, group: &StoredGroup) -> Result<(), S::Error> {
-    store.put(&group_key(&group.id), &wire::encode(group))?;
+pub fn save<S>(store: &mut S, group: &StoredGroup) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut ids = list(store)?;
+    let mut mutations = vec![StorageMutation::Put(
+        group_key(&group.id),
+        wire::encode(group),
+    )];
     if !ids.contains(&group.id) {
         ids.push(group.id.clone());
-        store.put(INDEX_KEY, &wire::encode(&ids))?;
+        mutations.push(StorageMutation::Put(INDEX_KEY.to_vec(), wire::encode(&ids)));
     }
+    store.apply_batch(&mutations)?;
     Ok(())
 }
 
 /// Load a group by id.
-pub fn load<S: Storage>(store: &S, id: &str) -> Result<Option<StoredGroup>, S::Error> {
-    // A corrupt group blob is surfaced loudly, not silently treated as absent.
-    Ok(crate::load_opt(
-        store.get(&group_key(id))?,
-        &format!("group '{id}'"),
-    ))
+pub fn load<S>(store: &S, id: &str) -> anyhow::Result<Option<StoredGroup>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::load_state(store.get(&group_key(id))?, &format!("group '{id}'"))
 }
 
 /// List all known group ids.
-pub fn list<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(INDEX_KEY)?, "group index"))
+pub fn list<S>(store: &S) -> anyhow::Result<Vec<String>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::decode_state(store.get(INDEX_KEY)?, "group index")
 }
 
 /// Forget a group (leaving it).
-pub fn remove<S: Storage>(store: &mut S, id: &str) -> Result<(), S::Error> {
-    store.delete(&group_key(id))?;
+pub fn remove<S>(store: &mut S, id: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let ids: Vec<String> = list(store)?.into_iter().filter(|g| g != id).collect();
-    store.put(INDEX_KEY, &wire::encode(&ids))
+    store.apply_batch(&[
+        StorageMutation::Delete(group_key(id)),
+        StorageMutation::Put(INDEX_KEY.to_vec(), wire::encode(&ids)),
+    ])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -208,9 +286,18 @@ mod tests {
         StoredGroup {
             id: id.into(),
             name: "team".into(),
-            members: vec!["me".into(), "bob".into()],
-            me: "me".into(),
-            sender_handles: Vec::new(),
+            members: vec![
+                GroupMember {
+                    user_id: "a".repeat(64),
+                    handle: "me".into(),
+                },
+                GroupMember {
+                    user_id: "b".repeat(64),
+                    handle: "bob".into(),
+                },
+            ],
+            senders: Vec::new(),
+            key_shares: Vec::new(),
             state: group.export(),
         }
     }
@@ -230,5 +317,18 @@ mod tests {
         assert_eq!(ids, vec!["g1".to_string(), "g2".to_string()]);
         assert_eq!(load(&store, "g1").unwrap().unwrap().name, "team");
         assert!(load(&store, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_group_index_blocks_mutation_and_preserves_bytes() {
+        let mut store = MemStore::default();
+        store.put(INDEX_KEY, b"corrupt group index").unwrap();
+        assert!(list(&store).is_err());
+        assert!(save(&mut store, &sample("g1")).is_err());
+        assert_eq!(
+            store.get(INDEX_KEY).unwrap().as_deref(),
+            Some(&b"corrupt group index"[..])
+        );
+        assert!(store.get(&group_key("g1")).unwrap().is_none());
     }
 }

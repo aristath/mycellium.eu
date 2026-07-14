@@ -1,11 +1,11 @@
 //! Per-user chat transcripts, persisted through the [`Storage`] trait.
 //!
 //! Generic over `Storage`, so it's exercised in tests with an in-memory store
-//! and in production with the encrypted the encrypted `FileStore`.
+//! and in production with the encrypted `FileStore`.
 
 use serde::{Deserialize, Serialize};
 
-use mycellium_core::storage::Storage;
+use mycellium_core::storage::{Storage, StorageMutation};
 use mycellium_core::wire;
 
 /// One stored message in a transcript.
@@ -92,21 +92,26 @@ fn meta_key(prefix: &[u8], id: &str) -> Vec<u8> {
 }
 
 /// Read a thread's segment count (0 if the thread doesn't exist yet).
-fn seg_count<S: Storage>(store: &S, prefix: &[u8], id: &str) -> Result<u32, S::Error> {
-    let meta: SegMeta = crate::decode_or_warn(store.get(&meta_key(prefix, id))?, "history meta");
+fn seg_count<S>(store: &S, prefix: &[u8], id: &str) -> anyhow::Result<u32>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let meta: SegMeta = crate::decode_state(store.get(&meta_key(prefix, id))?, "history meta")?;
     Ok(meta.segments)
 }
 
 /// Read every segment of a thread in order and concatenate them.
-fn load_segments<S, T>(store: &S, prefix: &[u8], id: &str, label: &str) -> Result<Vec<T>, S::Error>
+fn load_segments<S, T>(store: &S, prefix: &[u8], id: &str, label: &str) -> anyhow::Result<Vec<T>>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     T: serde::de::DeserializeOwned,
 {
     let count = seg_count(store, prefix, id)?;
     let mut all = Vec::new();
     for i in 0..count {
-        let seg: Vec<T> = crate::decode_or_warn(store.get(&seg_key(prefix, id, i))?, label);
+        let seg: Vec<T> = crate::decode_state(store.get(&seg_key(prefix, id, i))?, label)?;
         all.extend(seg);
     }
     Ok(all)
@@ -115,15 +120,16 @@ where
 /// Append `message` to a thread's tail segment (starting a fresh segment when
 /// the tail is full). Touches at most the tail segment (+ meta) — O(SEGMENT),
 /// independent of the thread's total length.
-fn append_segment<S, T>(
-    store: &mut S,
+fn append_segment_mutations<S, T>(
+    store: &S,
     prefix: &[u8],
     id: &str,
     message: T,
     label: &str,
-) -> Result<(), S::Error>
+) -> anyhow::Result<Vec<StorageMutation>>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     T: Serialize + serde::de::DeserializeOwned,
 {
     let count = seg_count(store, prefix, id)?;
@@ -132,7 +138,7 @@ where
         (0, 1)
     } else {
         let tail_idx = count - 1;
-        let tail: Vec<T> = crate::decode_or_warn(store.get(&seg_key(prefix, id, tail_idx))?, label);
+        let tail: Vec<T> = crate::decode_state(store.get(&seg_key(prefix, id, tail_idx))?, label)?;
         if tail.len() >= SEGMENT {
             (count, count + 1) // tail full: start a new segment
         } else {
@@ -142,21 +148,24 @@ where
 
     // Load just the target segment (empty for a fresh one), push, save.
     let mut seg: Vec<T> = if target < count {
-        crate::decode_or_warn(store.get(&seg_key(prefix, id, target))?, label)
+        crate::decode_state(store.get(&seg_key(prefix, id, target))?, label)?
     } else {
         Vec::new()
     };
     seg.push(message);
-    store.put(&seg_key(prefix, id, target), &wire::encode(&seg))?;
+    let mut mutations = vec![StorageMutation::Put(
+        seg_key(prefix, id, target),
+        wire::encode(&seg),
+    )];
     if new_count != count {
-        store.put(
-            &meta_key(prefix, id),
-            &wire::encode(&SegMeta {
+        mutations.push(StorageMutation::Put(
+            meta_key(prefix, id),
+            wire::encode(&SegMeta {
                 segments: new_count,
             }),
-        )?;
+        ));
     }
-    Ok(())
+    Ok(mutations)
 }
 
 /// Read a thread pruning expired messages, rewriting *only* the segment(s) a
@@ -167,16 +176,17 @@ fn load_active_segments<S, T, F>(
     id: &str,
     label: &str,
     expired: F,
-) -> Result<Vec<T>, S::Error>
+) -> anyhow::Result<Vec<T>>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     T: Serialize + serde::de::DeserializeOwned + Clone,
     F: Fn(&T) -> bool,
 {
     let count = seg_count(store, prefix, id)?;
     let mut all = Vec::new();
     for i in 0..count {
-        let seg: Vec<T> = crate::decode_or_warn(store.get(&seg_key(prefix, id, i))?, label);
+        let seg: Vec<T> = crate::decode_state(store.get(&seg_key(prefix, id, i))?, label)?;
         let active: Vec<T> = seg.iter().filter(|m| !expired(m)).cloned().collect();
         if active.len() != seg.len() {
             // Only this segment lost a message → rewrite only this segment.
@@ -195,15 +205,16 @@ fn delete_segments<S, T, F>(
     id: &str,
     label: &str,
     remove: F,
-) -> Result<(), S::Error>
+) -> anyhow::Result<()>
 where
     S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
     T: Serialize + serde::de::DeserializeOwned + Clone,
     F: Fn(&T) -> bool,
 {
     let count = seg_count(store, prefix, id)?;
     for i in 0..count {
-        let seg: Vec<T> = crate::decode_or_warn(store.get(&seg_key(prefix, id, i))?, label);
+        let seg: Vec<T> = crate::decode_state(store.get(&seg_key(prefix, id, i))?, label)?;
         let kept: Vec<T> = seg.iter().filter(|m| !remove(m)).cloned().collect();
         if kept.len() != seg.len() {
             store.put(&seg_key(prefix, id, i), &wire::encode(&kept))?;
@@ -212,29 +223,25 @@ where
     Ok(())
 }
 
-/// Delete all of a thread's segments and its meta key.
-fn clear_segments<S: Storage>(store: &mut S, prefix: &[u8], id: &str) -> Result<(), S::Error> {
-    let count = seg_count(store, prefix, id)?;
-    for i in 0..count {
-        store.delete(&seg_key(prefix, id, i))?;
-    }
-    store.delete(&meta_key(prefix, id))
-}
-
 /// Load a group's transcript.
-pub fn group_load<S: Storage>(
-    store: &S,
-    group_id: &str,
-) -> Result<Vec<GroupStoredMessage>, S::Error> {
+pub fn group_load<S>(store: &S, group_id: &str) -> anyhow::Result<Vec<GroupStoredMessage>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     load_segments(store, GHIST, group_id, "group transcript")
 }
 
 /// Append one message to a group's transcript.
-pub fn group_append<S: Storage>(
+pub fn group_append<S>(
     store: &mut S,
     group_id: &str,
     message: GroupStoredMessage,
-) -> Result<bool, S::Error> {
+) -> anyhow::Result<bool>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     if !message.id.is_empty()
         && group_load(store, group_id)?
             .iter()
@@ -242,50 +249,64 @@ pub fn group_append<S: Storage>(
     {
         return Ok(false);
     }
-    append_segment(store, GHIST, group_id, message, "group transcript")?;
+    let mutations = append_segment_mutations(store, GHIST, group_id, message, "group transcript")?;
+    store.apply_batch(&mutations)?;
     Ok(true)
 }
 
 /// Load a stable user ID's transcript (empty if none / unreadable).
-pub fn load<S: Storage>(store: &S, user_id: &str) -> Result<Vec<StoredMessage>, S::Error> {
+pub fn load<S>(store: &S, user_id: &str) -> anyhow::Result<Vec<StoredMessage>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     load_segments(store, HIST, user_id, "1:1 transcript")
 }
 
 const PEER_INDEX: &[u8] = b"history:peers";
 
 /// The stable user IDs we have 1:1 history with.
-pub fn peers<S: Storage>(store: &S) -> Result<Vec<String>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(PEER_INDEX)?, "peer index"))
+pub fn peers<S>(store: &S) -> anyhow::Result<Vec<String>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::decode_state(store.get(PEER_INDEX)?, "peer index")
 }
 
 /// Append one message to a user's transcript (and index the user ID).
-pub fn append<S: Storage>(
-    store: &mut S,
-    peer: &str,
-    message: StoredMessage,
-) -> Result<bool, S::Error> {
+pub fn append<S>(store: &mut S, peer: &str, message: StoredMessage) -> anyhow::Result<bool>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let inserted = message.id.is_empty()
         || !load(store, peer)?
             .iter()
             .any(|known| known.id == message.id);
-    if inserted {
-        append_segment(store, HIST, peer, message, "1:1 transcript")?;
-    }
-
     let mut names = peers(store)?;
+    let mut mutations = if inserted {
+        append_segment_mutations(store, HIST, peer, message, "1:1 transcript")?
+    } else {
+        Vec::new()
+    };
     if !names.iter().any(|p| p == peer) {
         names.push(peer.to_string());
-        store.put(PEER_INDEX, &wire::encode(&names))?;
+        mutations.push(StorageMutation::Put(
+            PEER_INDEX.to_vec(),
+            wire::encode(&names),
+        ));
     }
+    store.apply_batch(&mutations)?;
     Ok(inserted)
 }
 
 /// Load a peer's transcript, pruning any messages expired as of `now`.
-pub fn load_active<S: Storage>(
-    store: &mut S,
-    peer: &str,
-    now: u64,
-) -> Result<Vec<StoredMessage>, S::Error> {
+pub fn load_active<S>(store: &mut S, peer: &str, now: u64) -> anyhow::Result<Vec<StoredMessage>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     load_active_segments(
         store,
         HIST,
@@ -296,26 +317,44 @@ pub fn load_active<S: Storage>(
 }
 
 /// Clear a peer's whole transcript and drop them from the index.
-pub fn clear<S: Storage>(store: &mut S, peer: &str) -> Result<(), S::Error> {
-    clear_segments(store, HIST, peer)?;
+pub fn clear<S>(store: &mut S, peer: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let count = seg_count(store, HIST, peer)?;
     let names: Vec<String> = peers(store)?.into_iter().filter(|p| p != peer).collect();
-    store.put(PEER_INDEX, &wire::encode(&names))
+    let mut mutations = Vec::with_capacity(count as usize + 2);
+    for i in 0..count {
+        mutations.push(StorageMutation::Delete(seg_key(HIST, peer, i)));
+    }
+    mutations.push(StorageMutation::Delete(meta_key(HIST, peer)));
+    mutations.push(StorageMutation::Put(
+        PEER_INDEX.to_vec(),
+        wire::encode(&names),
+    ));
+    store.apply_batch(&mutations)?;
+    Ok(())
 }
 
 /// Edit a stored 1:1 message by id — but only one authored by the same side as
 /// the edit (`by_me`), so a peer can't rewrite *your* messages and vice versa.
 /// No-op if not found. Rewrites only the segment holding the message.
-pub fn edit<S: Storage>(
+pub fn edit<S>(
     store: &mut S,
     peer: &str,
     id: &str,
     new_text: &str,
     by_me: bool,
-) -> Result<(), S::Error> {
+) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let count = seg_count(store, HIST, peer)?;
     for i in 0..count {
         let mut seg: Vec<StoredMessage> =
-            crate::decode_or_warn(store.get(&seg_key(HIST, peer, i))?, "1:1 transcript");
+            crate::decode_state(store.get(&seg_key(HIST, peer, i))?, "1:1 transcript")?;
         let mut changed = false;
         for m in &mut seg {
             if m.id == id && m.from_me == by_me {
@@ -333,12 +372,11 @@ pub fn edit<S: Storage>(
 /// Delete a stored 1:1 message by id — only if authored by the same side as the
 /// delete (`by_me`). No-op if not found or authored by the other side. Rewrites
 /// only the segment holding the message.
-pub fn delete<S: Storage>(
-    store: &mut S,
-    peer: &str,
-    id: &str,
-    by_me: bool,
-) -> Result<(), S::Error> {
+pub fn delete<S>(store: &mut S, peer: &str, id: &str, by_me: bool) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     delete_segments(store, HIST, peer, "1:1 transcript", |m: &StoredMessage| {
         m.id == id && m.from_me == by_me
     })
@@ -347,17 +385,21 @@ pub fn delete<S: Storage>(
 /// Edit a stored group message by id — only one whose recorded `sender` matches,
 /// so a member can't rewrite another member's message. Rewrites only the segment
 /// holding the message.
-pub fn group_edit<S: Storage>(
+pub fn group_edit<S>(
     store: &mut S,
     group_id: &str,
     id: &str,
     new_text: &str,
     sender: &str,
-) -> Result<(), S::Error> {
+) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     let count = seg_count(store, GHIST, group_id)?;
     for i in 0..count {
         let mut seg: Vec<GroupStoredMessage> =
-            crate::decode_or_warn(store.get(&seg_key(GHIST, group_id, i))?, "group transcript");
+            crate::decode_state(store.get(&seg_key(GHIST, group_id, i))?, "group transcript")?;
         let mut changed = false;
         for m in &mut seg {
             if m.id == id && m.sender == sender {
@@ -374,12 +416,11 @@ pub fn group_edit<S: Storage>(
 
 /// Delete a stored group message by id — only if its recorded `sender` matches.
 /// Rewrites only the segment holding the message.
-pub fn group_delete<S: Storage>(
-    store: &mut S,
-    group_id: &str,
-    id: &str,
-    sender: &str,
-) -> Result<(), S::Error> {
+pub fn group_delete<S>(store: &mut S, group_id: &str, id: &str, sender: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     delete_segments(
         store,
         GHIST,
@@ -390,11 +431,15 @@ pub fn group_delete<S: Storage>(
 }
 
 /// Load a group's transcript, pruning expired messages as of `now`.
-pub fn group_load_active<S: Storage>(
+pub fn group_load_active<S>(
     store: &mut S,
     group_id: &str,
     now: u64,
-) -> Result<Vec<GroupStoredMessage>, S::Error> {
+) -> anyhow::Result<Vec<GroupStoredMessage>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     load_active_segments(
         store,
         GHIST,
@@ -452,6 +497,23 @@ mod tests {
         assert_eq!(transcript[0], msg(true, "hi"));
         assert_eq!(transcript[1], msg(false, "hey"));
         assert_eq!(transcript[2].text, "how are you");
+    }
+
+    #[test]
+    fn corrupt_history_metadata_blocks_append_without_partial_state() {
+        let mut store = MemStore::default();
+        let metadata_key = meta_key(HIST, "bob");
+        store
+            .put(&metadata_key, b"corrupt history metadata")
+            .unwrap();
+
+        assert!(load(&store, "bob").is_err());
+        assert!(append(&mut store, "bob", msg(true, "do not overwrite")).is_err());
+        assert_eq!(
+            store.get(&metadata_key).unwrap().as_deref(),
+            Some(&b"corrupt history metadata"[..])
+        );
+        assert!(store.get(&seg_key(HIST, "bob", 0)).unwrap().is_none());
     }
 
     #[test]
@@ -582,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_transcript_loads_empty_not_error() {
+    fn corrupt_transcript_fails_closed_without_overwriting_it() {
         let mut store = MemStore::default();
         // A thread with one segment whose bytes are garbage.
         store
@@ -594,10 +656,12 @@ mod tests {
         store
             .put(&seg_key(HIST, "bob", 0), b"not valid wire bytes")
             .unwrap();
-        // Corruption is surfaced (logged), not a hard error — the app keeps working
-        // and the raw bytes stay put for recovery.
-        let loaded = load(&store, "bob").unwrap();
-        assert!(loaded.is_empty());
+        let original = store.get(&seg_key(HIST, "bob", 0)).unwrap().unwrap();
+        assert!(load(&store, "bob").is_err());
+        assert_eq!(
+            store.get(&seg_key(HIST, "bob", 0)).unwrap().unwrap(),
+            original
+        );
     }
 
     /// How many segments a thread currently occupies (test helper).
@@ -620,10 +684,10 @@ mod tests {
         assert_eq!(seg_count_1to1(&store, "bob"), 3);
         // Each non-tail segment is exactly full; the tail holds the remainder.
         let s0: Vec<StoredMessage> =
-            crate::decode_or_warn(store.get(&seg_key(HIST, "bob", 0)).unwrap(), "t");
+            crate::decode_state(store.get(&seg_key(HIST, "bob", 0)).unwrap(), "t").unwrap();
         assert_eq!(s0.len(), SEGMENT);
         let s2: Vec<StoredMessage> =
-            crate::decode_or_warn(store.get(&seg_key(HIST, "bob", 2)).unwrap(), "t");
+            crate::decode_state(store.get(&seg_key(HIST, "bob", 2)).unwrap(), "t").unwrap();
         assert_eq!(s2.len(), 5);
     }
 

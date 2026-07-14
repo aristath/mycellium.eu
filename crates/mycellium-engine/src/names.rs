@@ -11,12 +11,20 @@ use mycellium_core::wire;
 const KEY: &[u8] = b"names";
 
 /// All learned `(id, name)` pairs.
-pub fn load<S: Storage>(store: &S) -> Result<Vec<(String, String)>, S::Error> {
-    Ok(crate::decode_or_warn(store.get(KEY)?, "learned names"))
+pub fn load<S>(store: &S) -> anyhow::Result<Vec<(String, String)>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::decode_state(store.get(KEY)?, "learned names")
 }
 
 /// Remember (or refresh) the display name a peer publishes for their id.
-pub fn note<S: Storage>(store: &mut S, id: &str, name: &str) -> Result<(), S::Error> {
+pub fn note<S>(store: &mut S, id: &str, name: &str) -> anyhow::Result<()>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     if name.is_empty() {
         return Ok(());
     }
@@ -26,11 +34,16 @@ pub fn note<S: Storage>(store: &mut S, id: &str, name: &str) -> Result<(), S::Er
         Some(entry) => entry.1 = name.to_string(),
         None => list.push((id.to_string(), name.to_string())),
     }
-    store.put(KEY, &wire::encode(&list))
+    store.put(KEY, &wire::encode(&list))?;
+    Ok(())
 }
 
 /// The learned name for `id`, if any.
-pub fn get<S: Storage>(store: &S, id: &str) -> Result<Option<String>, S::Error> {
+pub fn get<S>(store: &S, id: &str) -> anyhow::Result<Option<String>>
+where
+    S: Storage,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     Ok(load(store)?
         .into_iter()
         .find(|(i, _)| i == id)

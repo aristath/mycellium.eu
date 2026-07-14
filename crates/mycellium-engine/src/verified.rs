@@ -51,36 +51,53 @@ pub fn mark<S: Storage>(
     store: &mut S,
     user_id: &str,
     wallet: &WalletPublicKey,
-) -> Result<(), S::Error> {
-    store.put(&key(user_id), &wire::encode(wallet))
+) -> anyhow::Result<()>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    store.put(&key(user_id), &wire::encode(wallet))?;
+    Ok(())
 }
 
 /// The wallet last verified for `user_id`, if any.
-pub fn get<S: Storage>(store: &S, user_id: &str) -> Result<Option<WalletPublicKey>, S::Error> {
-    Ok(crate::load_opt(
-        store.get(&key(user_id))?,
-        "verification record",
-    ))
+pub fn get<S: Storage>(store: &S, user_id: &str) -> anyhow::Result<Option<WalletPublicKey>>
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    crate::load_state(store.get(&key(user_id))?, "verification record")
 }
 
 /// Classify how much `current` (the wallet just looked up for `user_id`) is
 /// trusted, given the out-of-band verification record and the address-book pin.
-pub fn level<S: Storage>(store: &S, user_id: &str, current: &WalletPublicKey) -> TrustLevel {
+pub fn level<S: Storage>(store: &S, user_id: &str, current: &WalletPublicKey) -> TrustLevel
+where
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     // An explicit out-of-band verification is the strongest signal.
-    if let Ok(Some(v)) = get(store, user_id) {
-        return if &v == current {
-            TrustLevel::Verified
-        } else {
-            TrustLevel::Changed
-        };
+    match get(store, user_id) {
+        Ok(Some(v)) => {
+            return if &v == current {
+                TrustLevel::Verified
+            } else {
+                TrustLevel::Changed
+            };
+        }
+        // A damaged verification pin must never downgrade to first-contact
+        // trust. Treat it exactly like a changed identity until repaired.
+        Err(_) => return TrustLevel::Changed,
+        Ok(None) => {}
     }
     // Else fall back to the TOFU pin held in the address book, if any.
-    if let Ok(Some(c)) = crate::contacts::by_user_id(store, user_id) {
-        return if &c.wallet == current {
-            TrustLevel::Pinned
-        } else {
-            TrustLevel::Changed
-        };
+    match crate::contacts::by_user_id(store, user_id) {
+        Ok(Some(c)) => {
+            return if &c.wallet == current {
+                TrustLevel::Pinned
+            } else {
+                TrustLevel::Changed
+            };
+        }
+        Err(_) => return TrustLevel::Changed,
+        Ok(None) => {}
     }
     TrustLevel::Unverified
 }
@@ -138,5 +155,20 @@ mod tests {
         mark(&mut s, &user_id, &w(1)).unwrap();
         assert_eq!(level(&s, &user_id, &w(1)), TrustLevel::Verified);
         assert_eq!(level(&s, &user_id, &w(2)), TrustLevel::Changed);
+    }
+
+    #[test]
+    fn corrupt_verification_pin_fails_closed_as_changed_identity() {
+        let mut store = Mem::default();
+        let user_id = "a".repeat(64);
+        store
+            .put(&key(&user_id), b"corrupt verification pin")
+            .unwrap();
+        assert!(get(&store, &user_id).is_err());
+        assert_eq!(level(&store, &user_id, &w(1)), TrustLevel::Changed);
+        assert_eq!(
+            store.get(&key(&user_id)).unwrap().as_deref(),
+            Some(&b"corrupt verification pin"[..])
+        );
     }
 }
