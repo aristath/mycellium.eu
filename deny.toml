@@ -13,12 +13,8 @@ all-features = false
 
 [advisories]
 # RUSTSEC advisory DB. `cargo audit` is the primary advisory gate (see the
-# `audit` CI job); deny re-checks the same DB as a complementary net. The two
-# hickory-proto DoS advisories below are reachable only through libp2p's
-# OPTIONAL dns/mdns features, which this workspace never enables — the crates
-# sit in Cargo.lock but are never compiled. This mirrors the `audit` job's
-# `--ignore` set so we don't double-fail on the same deferred ids.
-ignore = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119"]
+# `audit` CI job); deny re-checks the same DB as a complementary net. No
+# vulnerability is exempted: a matching advisory must fail CI.
 # Only fail on an unmaintained crate the workspace depends on directly; those are
 # the dependencies we can actually swap out. Transitive-only unmaintained crates
 # are informational, matching how the `audit` job treats them. Real
@@ -41,6 +37,11 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
     "MPL-2.0",
+    # Windows clipboard support pulled in by egui.
+    "BSL-1.0",
+    # The default egui fonts are assets, not executable dependencies.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.9
 

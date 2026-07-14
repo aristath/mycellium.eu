@@ -20,9 +20,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
       - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets
       - name: no_std core builds without std
         run: cargo build -p mycellium-core --no-default-features
 
@@ -34,16 +34,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # RUSTSEC-2026-0118/-0119 are hickory-proto DoS advisories reachable only
-      # through libp2p's OPTIONAL dns/mdns features, which this workspace does not
-      # enable — the crates sit in Cargo.lock but are never compiled (`cargo tree
-      # -i hickory-proto` is empty). No current libp2p release avoids listing them,
-      # so we ignore the advisories for those uncompiled deps rather than mask a
-      # real one. Any other advisory still fails the job.
       # (Using `cargo audit` directly, not rustsec/audit-check, so no check-run API
       # permission is needed.)
       - name: Audit
-        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+        run: cargo audit
 
   msrv:
     name: msrv (1.96.0 builds)
@@ -91,9 +85,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Prove the "runs on microcontrollers" claim (docs/CONCEPT.md Layer 10,
-      # ESP32 / Cortex-M4/M7): cross-compile the portable core, no_std + alloc, to
-      # a bare-metal Cortex-M target with default (std) features off.
       - name: Install Rust + thumbv7em-none-eabi target
         run: |
           rustup toolchain install stable --profile minimal
@@ -101,3 +92,57 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Cross-compile the core for bare metal
         run: cargo build -p mycellium-core --no-default-features --target thumbv7em-none-eabi
+
+  android:
+    name: Android bindings · tests · APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK and NDK
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+      - name: Install Rust Android toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-linux-android
+          cargo install cargo-ndk --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate native library and Kotlin bindings
+        working-directory: clients/android
+        env:
+          ANDROID_ABIS: x86_64
+        run: ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/26.3.11579264" ./build-rust.sh
+      - name: Run JVM tests and assemble the debug APK
+        working-directory: clients/android
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+
+  apple-bindings:
+    name: Apple bindings · Swift tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify Swift toolchain
+        run: swift --version
+      - name: Generate Swift bindings
+        working-directory: clients/apple
+        run: ./build-rust.sh
+      - name: Run Swift boundary tests
+        working-directory: clients/apple
+        run: swift test
+
+  registry-image:
+    name: Registry container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f Dockerfile.registry -t mycellium-registry:ci .
+      - name: Verify non-root runtime user
+        run: test "$(docker image inspect --format '{{.Config.User}}' mycellium-registry:ci)" = "10001:10001"
