@@ -1,0 +1,3 @@
+-keep class uniffi.mycellium_mobile.** { *; }
+-keep class com.sun.jna.** { *; }
+-dontwarn com.sun.jna.**
