@@ -1,7 +1,7 @@
 # Serverless P2P Messaging Architecture
 
-**Document Version:** 2.1  
-**Date:** 2026-07-10  
+**Document Version:** 2.3
+**Date:** 2026-07-13
 **Status:** Hard Model Specification
 
 ---
@@ -18,13 +18,16 @@ The hard serverless model is governed by one delivery law:
 > A message is delivered peer-to-peer, or it is not delivered yet.
 
 This architecture deliberately rejects infrastructure-mediated delivery.
-Convenience features that require message custody, relays, push services,
-hosted rendezvous, or always-on delivery servers are not core Mycellium.
+Message custody, payload relays, server queues, and server acknowledgements are
+not part of Mycellium. A registry may introduce two live devices, but the
+resulting connection and every application payload are device-to-device.
 
 Mycellium may still have a central registry for product account UX. That
-registry may create accounts, verify login identities, store encrypted wallet
-backups, and publish signed public records. Handles are display names, not
-unique identities. The registry must not store, queue, relay, or route messages.
+registry may create accounts, verify login identities, store registry-sealed
+identity recovery material and opaque encrypted backups, publish signed public
+records, and introduce live devices. Handles are display names, not unique
+identities. The registry must not store, queue, relay, inspect, acknowledge, or
+otherwise carry messages.
 
 The goal is not to simulate WhatsApp without owning servers. The goal is to make
 messaging behave like a direct human-to-human line. When the line cannot be
@@ -34,14 +37,16 @@ made, the sender keeps the delivery locally until a direct line exists.
 
 ## 1. The Three Laws
 
-### 1.1 No Required Server
+### 1.1 No Server In The Message Path
 
-A Mycellium node may use a bootstrap hint, cached peers, LAN discovery, QR
-exchange, a registry record lookup, or any other entry point, but the
-message protocol must not depend on a standing service.
+A Mycellium node may use the registry, cached peers, LAN discovery, QR exchange,
+or another entry point to establish a direct connection. Discovery may depend
+on a standing service. Message transport must not.
 
-A bootstrap node may help a peer enter the graph. A registry may improve account
-UX. Neither may be required for message delivery or conversation continuity.
+The current native clients use the registry to learn the current signed device
+record and coordinate a live UDP hole punch. Once a direct authenticated
+connection exists, the registry is not in that connection and does not carry a
+single byte of the message protocol.
 
 ### 1.2 No Third-Party Message Custody
 
@@ -59,25 +64,27 @@ Discovery is a transport for claims. It is not the source of truth.
 DHT records, bootstrap responses, peer gossip, cached addresses, QR imports, and
 manual configuration may all help a node find another node. Registry record
 responses are the same kind of thing: carriers for signed claims. None of them
-can make an identity, name, device, or reachability claim true.
+can make an identity, name, or device claim true.
 
-All identity and reachability records must be self-authenticating and locally
-verified.
+All identity and device records must be self-authenticating and locally
+verified. A temporary observed network mapping is not an identity claim. It is
+accepted only as a short-lived connection candidate delivered over an
+authenticated registry control stream and bound to the expected device key.
 
 ---
 
 ## 2. Core Architecture
 
 ```
-        Optional bootstrap hint
-       (seed, QR, cached peer,
-        LAN, manual address)
+        Registry introduction
+       (current signed record +
+        temporary UDP mappings)
                  |
                  v
         +------------------+
         |  Peer discovery  |
-        |  DHT / gossip /  |
-        |  cached records  |
+        |  signed records  |
+        |  live mappings   |
         +------------------+
                  |
                  v
@@ -139,9 +146,11 @@ Offline delivery means:
 This is less convenient than hosted asynchronous messaging, and that is an
 intentional trade.
 
-If Alice has a stale address for Bob, retry may refresh Bob's signed discovery
-record and try again. That refresh is still discovery, not custody: it moves only
-self-authenticating records, not messages.
+Before a new delivery, Alice may refresh Bob's current signed record by Bob's
+stable user id. If Bob is live, the registry may then provide both devices with
+their temporary observed UDP mappings. Those operations are discovery, not
+custody: they move signed public records and connection candidates, never
+messages.
 
 ### 3.3 Sender Responsibility
 
@@ -158,9 +167,13 @@ not assume a third-party pending-message host.
 The local outbox is the offline primitive. It is sender-owned delivery state, not
 a network service.
 
-A pending outbox entry carries the already-sealed payload for one recipient
-device. The sender may retry it, inspect it, or cancel it. A delivered entry is
-final only after the intended recipient device signs an acknowledgement bound to:
+A pending outbox entry carries the ciphertext for one recipient device. For
+pairwise deliveries it also retains the minimum plaintext needed to reseal for
+the same user's replacement active device. Both are encrypted in the sender's
+local store, and the resealing material is erased when the entry becomes
+delivered, failed, or cancelled. The sender may retry, inspect, or cancel the
+entry. A delivered entry is final only after the intended recipient device
+signs an acknowledgement bound to:
 
 - the delivery id
 - the exact payload bytes
@@ -174,48 +187,61 @@ message protocol.
 
 ## 4. Discovery
 
-### 4.1 DHT As Discovery Fabric
+### 4.1 Stable Identity, Temporary Route
 
-The DHT is the preferred network-scale discovery fabric.
+A device has a stable cryptographic identity: its device key, represented on
+the transport as a libp2p PeerId. An IPv4 address, IPv6 address, port, LAN
+address, or NAT mapping is never a device identity.
 
-It may store and return:
+The signed public record binds the stable user id to the one active device. It
+contains the active device key and transport PeerId, but no persistent network
+address.
 
-- signed identity records
-- signed device records
-- signed reachability records
-- peer addresses
-- bootstrap peer sets
+### 4.2 Registry Introduction
 
-The DHT does not decide whether a record is valid. The receiving node verifies
-the record locally.
+The native clients use a BEP 55-style introduction pattern:
 
-Retry may use the DHT to refresh a stale peer record after a failed direct
-connection. The DHT still carries only signed claims. It never receives the
-pending message.
+“BEP 55-style” describes the observed-endpoint exchange and coordinated
+simultaneous connection. Mycellium does not use BitTorrent trackers, torrents,
+or the BitTorrent payload protocol.
 
-### 4.2 Bootstrap Is Ignition
+1. Each live device opens an authenticated QUIC control stream to the registry.
+2. The registry verifies the bearer session, current signed active-device
+   record, and QUIC PeerId.
+3. The registry observes each device's temporary public UDP mapping.
+4. Alice identifies Bob by stable user id and verifies Bob's current signed
+   record locally.
+5. Alice asks for Bob's active device. The registry sends Alice and Bob each
+   other's observed mapping plus complementary simultaneous-dial roles.
+6. Alice and Bob establish an authenticated direct QUIC connection.
+7. The message and its recipient-device acknowledgement travel only over that
+   direct connection.
 
-A bootstrap peer answers one question:
+The registry keeps live presence and observed mappings only in process memory.
+It does not persist them. Its control protocol has no application-payload,
+mailbox, delivery, or acknowledgement message type.
 
-> Here are some peers to try.
+If either device is unavailable or the hole punch fails, the sealed item stays
+in Alice's local outbox.
 
-That is all.
+### 4.3 Current Record Lookup
 
-A bootstrap peer must not:
+The registry indexes a stable protocol user id to the account holding its
+current signed public record. Clients may fetch that record before sending so a
+device switch does not leave contacts targeting the retired device.
 
-- store messages
-- route messages
-- authorize identities
-- own names
-- decide account recovery
-- decide which record is canonical
-- be required after a node has joined the graph
+This lookup does not make the registry's answer true. The client verifies the
+record signature, wallet-derived user id, sequence rules, and existing local
+trust before replacing its cached record.
 
-Bootstrap can be replaced by any other discovery entry point: QR exchange,
-manual address exchange, LAN discovery, cached peers, imported peer packs, or
-friend-of-friend gossip.
+### 4.4 Other Discovery Fabrics
 
-### 4.3 Discovery Is Not Naming Authority
+DHTs, LAN discovery, QR exchange, cached peers, or friend-of-friend gossip may
+also carry signed records or connection candidates. They are alternative
+discovery mechanisms, not message transports, and are not required by the
+native-client path.
+
+### 4.5 Discovery Is Not Naming Authority
 
 Names and handles cannot be trusted merely because a DHT returned them.
 
@@ -223,7 +249,8 @@ A discovery result is valid only if its signatures, identity bindings, sequence
 rules, and local trust policy verify.
 
 The network can help a node find "a claim about Alice." It cannot prove "this is
-Alice."
+Alice." Only the record's cryptographic identity binding and the user's local
+trust decision can do that.
 
 ## 5. Reachability
 
@@ -234,6 +261,11 @@ delivery.
 
 If the sender cannot form a direct route to the recipient, the message remains
 pending.
+
+The current direct route is libp2p QUIC authenticated by the active device's
+PeerId. Both devices reuse the same UDP socket for registry presence and the
+simultaneous direct dial, which lets common NATs create the required mappings.
+The registry coordinates the attempt but is not a relay.
 
 ### 5.2 NAT Failure Is A Real State
 
@@ -253,16 +285,15 @@ Examples:
 - `discovery refreshed`
 - `delivered`
 
-### 5.3 Relays Are Outside The Core
+### 5.3 Mycellium Has No Payload Relay Mode
 
-Relays are not part of the hard serverless model.
+Mycellium does not carry message payloads through a registry, hosted relay,
+third-party forwarding service, or store-and-forward network. This is not an
+automatic fallback, compatibility mode, or user-selectable delivery option.
 
-A relay-assisted mode may exist as an explicit compatibility or degraded mode,
-but using a relay means leaving the core model. Relays may be useful for testing,
-migration, hostile networks, or user-selected convenience. They must not redefine
-the protocol's delivery law.
-
-Core Mycellium must remain understandable without relays:
+Infrastructure may introduce two live devices and coordinate simultaneous hole
+punching. It must stop at connection information. If the resulting direct path
+cannot be formed, delivery remains pending on the sender:
 
 > Direct route, or pending locally.
 
@@ -292,6 +323,12 @@ identity model.
 A user account has one active device at a time. Device switching is supported by
 publishing a new signed record that replaces the previous active device.
 
+Pairwise pending deliveries may be resealed locally for that same user's new
+active device. Group senders share their current sender key once with each
+active member device and re-share it before the first group message after a
+device switch. Receiving that authenticated replacement share removes the old
+device's sender key for the same user.
+
 A handle is not unique and is not identity. It is display metadata.
 
 Clients must therefore key contacts, conversations, trust decisions, and
@@ -311,9 +348,17 @@ history, and pending messages are not copied.
 
 This is an explicit account-UX trust boundary. Control of a login identity can
 recover the protocol identity through the registry. Compromise of the running
-registry or its recovery master key can also recover identities. Theft of the
-database and blobs without that master key cannot. None of these expose past
-messages because the registry never has message history or device message keys.
+registry or its recovery master key can do the same. An attacker with that
+access can publish a fresh active device, impersonate the account, and receive
+future messages after contacts refresh the valid replacement record. Theft of
+the database and blobs without the recovery master key cannot recover the
+identity.
+
+Account recovery does not reveal old device keys, message keys, local history,
+or pending messages. The replaced device detects that the registry's current
+record names another device. It keeps its local history visible but disables
+sending, receiving, and outbox retries until the user logs in and intentionally
+makes it active again.
 
 ### 6.2 Registry Storage Shape
 
@@ -323,24 +368,26 @@ depend on complex relational joins.
 The registry needs searchable indexes for:
 
 - `account_id` to account metadata
+- stable protocol `user_id` to `account_id`
 - login identity hash to `account_id`
 - login token hash to login attempt and expiry
 - `account_id` to current signed public record pointer
-- `account_id` to encrypted wallet backup pointer
+- `account_id` to opaque encrypted account-backup pointer
 - `account_id` to registry-sealed recovery identity pointer
 - rate-limit keys to counters and expiry
 
-Opaque per-user data may live outside the metadata store as one account bundle
-or as versioned blobs. For example:
+Opaque per-user data lives outside the metadata store as content-addressed
+blobs. The current filesystem layout shards by the first nine characters of the
+32-character account id and then uses the full account id:
 
 ```text
-users/876/128/736/account.data
+blobs/users/876/128/736/<full-account-id>/<kind>-<sha256>.data
 ```
 
-That bundle may contain encrypted backups, signed record snapshots, device-list
-snapshots, and export data. It is not a substitute for indexes. Login by email,
-phone, passkey, or future identity still requires a fast lookup from that login
-identity to `account_id`.
+These blobs hold generic encrypted backups, registry-sealed recovery material,
+and current signed public records. They are not a substitute for indexes. Login
+by email, phone, passkey, or a future identity still requires a fast lookup from
+that login identity to `account_id`.
 
 The registry should be written behind a small storage interface. SQLite,
 Postgres, embedded key-value stores, distributed key-value stores, and object
@@ -350,16 +397,16 @@ The durable rule is:
 
 ```text
 metadata store = indexes and small operational facts
-blob/file store = opaque encrypted account bytes
-client = creates, decrypts, and owns key material
+blob/file store = opaque account bytes and signed public records
+client = creates protocol identity and device/message key material
 ```
 
 The metadata store is operational infrastructure. It is not protocol authority.
 Signed records still verify locally.
 
-### 6.3 Preferred First Registry Backend
+### 6.3 Current Registry Backend
 
-The first embedded metadata backend should be `redb`.
+The registry uses `redb` for metadata.
 
 Why:
 
@@ -368,25 +415,18 @@ Why:
 - ACID transactions
 - crash-safe storage
 - ordered key-value tables that fit registry records and indexes
-- simple enough to inspect, backup, and replace
-
-`fjall` is the larger/write-heavy Rust-native candidate. It may become useful if
-the registry needs LSM-tree behavior, compression, or heavier sustained writes.
-
-RocksDB is a battle-tested fallback if the project needs mature LSM behavior
-more than native Rust.
-
-`sled` should not be used for the registry core. Registry storage is
-reliability-sensitive, and novelty is not useful there.
+- simple enough to inspect, back up, restore, and replace
 
 The registry code must still depend on a small `RegistryStore` interface, not on
 `redb` as protocol doctrine. The backend is replaceable infrastructure.
 
 ### 6.4 Current Registry Surface
 
-The current registry exposes only account UX:
+The registry exposes account UX and live device introduction:
 
 ```text
+GET  /rendezvous
+GET  /users/{user_id}/record
 POST /login/email/request
 POST /login/confirm
 PUT  /accounts/{account_id}/backup
@@ -403,9 +443,17 @@ Protected endpoints use a bearer session:
 Authorization: Bearer <session_token>
 ```
 
+`GET /rendezvous`, both public-record `GET` routes, and both login routes are
+public. Backup and recovery routes and `PUT /accounts/{account_id}/record`
+require the account's bearer session.
+
 `/login/email/request` returns `202 Accepted` and sends the one-time token
 through the configured email sender. The token is not returned in the HTTP
-response.
+response. Login tokens and bearer sessions both expire after 15 minutes. A new
+session immediately revokes the previous session for that account.
+Email login requests are limited to five per normalized email hash in each
+15-minute window, with separate generous source-address ceilings to prevent
+one source from bypassing that guard with many addresses.
 
 Current upload limits are abuse guards:
 
@@ -418,6 +466,8 @@ The registry binary is configured by:
 
 ```text
 MYCELLIUM_REGISTRY_BIND
+MYCELLIUM_REGISTRY_RENDEZVOUS_BIND
+MYCELLIUM_REGISTRY_RENDEZVOUS_PUBLIC_ADDR
 MYCELLIUM_REGISTRY_DATA_DIR
 MYCELLIUM_REGISTRY_RECOVERY_KEY
 MYCELLIUM_REGISTRY_EMAIL_TRANSPORT
@@ -449,9 +499,43 @@ Brevo's HTTPS transactional email API, which is useful on hosts that block
 outbound SMTP ports. Email delivery remains registry account UX, not protocol
 message delivery.
 
-This HTTP surface does not change the delivery law. It publishes and retrieves
-account data and signed records. It does not store, queue, relay, or route
-messages.
+Login emails contain the one-time code and no clickable link by default.
+`MYCELLIUM_REGISTRY_LOGIN_URL_TEMPLATE` is optional and must contain exactly
+one `{token}` placeholder. A production link must be a verified HTTPS App
+Link/Universal Link; an unverified custom URI scheme can be claimed by another
+application and is not an acceptable production login channel.
+
+`GET /rendezvous` publishes the registry's stable, self-authenticating QUIC
+multiaddr. The separate `/mycellium/rendezvous/1.0` QUIC control protocol
+registers the current live device and coordinates direct hole punching. It
+accepts no application payload.
+
+Rendezvous frames are a four-byte big-endian length followed by a
+`mycellium_core::wire` value, with a 1 MiB abuse ceiling. Devices send
+`Register { session_token, device }` and `Introduce { device }`. The registry
+answers with `Registered`, `Connect { device, address, role }`, `Unavailable`,
+or `Rejected`. `address` is an ephemeral observed UDP mapping, never stored in
+a public record or treated as identity.
+
+Live presence is process-local and intentionally not persisted. The current
+deployment must therefore run exactly one registry process. Multiple processes
+require deterministic rendezvous affinity or a shared presence coordinator so
+both devices meet at the same introducer. Such coordination may carry only
+presence and introduction control, never message payloads.
+
+The UDP endpoint must preserve each client's source IP and port. A load balancer
+that rewrites that observed tuple makes simultaneous punching unusable and is
+not an acceptable rendezvous endpoint. The solution is infrastructure that
+preserves the tuple, not a payload relay.
+
+This surface does not change the delivery law. It publishes account data and
+signed records and introduces live devices. It does not store, queue, relay,
+route, or acknowledge messages.
+
+Expired login tokens, sessions, and rate-limit buckets have ordered expiry
+indexes and are drained in bounded transactions. Concurrent blob publication
+advances metadata with compare-and-swap and removes only the exact pointer it
+successfully displaced; it never sweeps another writer's unpublished blob.
 
 ---
 
@@ -461,11 +545,11 @@ messages.
 
 | Threat | Hard Model Response |
 |--------|---------------------|
-| Server seizure | No required message server exists. |
+| Server seizure | No message server exists; the registry contains no message payloads or history. |
 | Message custody demands | Messages wait on the sender's active device, not infrastructure. |
-| Central message metadata | There is no central message path. |
-| Central service outage | Discovery may degrade, but existing peer knowledge remains useful. |
-| Server-side account control | Discovery records must be self-authenticating. |
+| Central message custody | There is no central message path or message database. |
+| Registry outage | Existing direct connections remain usable; new introductions wait and messages remain local. |
+| False discovery records | Clients verify identity bindings, signatures, freshness, and local trust. |
 
 ### 7.2 What The Hard Model Does Not Magically Solve
 
@@ -474,7 +558,8 @@ messages.
 | Offline recipient | Delivery waits until sender and recipient can meet. |
 | Sleeping sender | Pending delivery stops when the sender's active device is offline. |
 | Sybil attacks | DHT participation needs local trust, rate limits, and record validation. |
-| Metadata leakage | Peers and discovery nodes may observe addresses and timing. |
+| Metadata leakage | The registry observes temporary UDP mappings and introduction timing, but no payloads. |
+| Registry or login compromise | An attacker can replace the active device and impersonate the account, but cannot decrypt existing local messages. |
 | Browser limitations | Browser peers need browser-native P2P mechanisms or remain constrained. |
 
 The hard model chooses honesty over hidden infrastructure.
@@ -507,7 +592,7 @@ The product should make pending feel calm and legible:
 - show whether connection attempts are active
 - allow user cancellation
 - allow manual retry
-- allow out-of-band address exchange
+- allow out-of-band signed-record exchange
 
 ### 8.3 Usability Adapts To Serverlessness
 
@@ -522,17 +607,20 @@ promise is user-held state, direct delivery, and no required message custodian.
 
 ## 9. Implementation Direction
 
-### 9.1 Discovery First
+### 9.1 Authenticated Introduction
 
-Implement self-authenticating records over a DHT or equivalent peer-discovery
-fabric.
+Discovery carries self-authenticating records and temporary connection
+candidates. The registry introduction service is the native-client discovery
+path.
 
 Success means:
 
-- a new node can join through any known peer
 - records verify locally
-- cached peers can replace the original bootstrap path
-- discovery failure does not invalidate existing local contacts
+- stable user ids resolve current active-device records
+- IPv4, IPv6, ports, and NAT mappings never become identity
+- two live devices can form a direct authenticated QUIC connection
+- discovery failure leaves existing local contacts and messages intact
+- no application payload can enter the registry protocol
 
 ### 9.2 Local Outbox As The Offline Primitive
 
@@ -553,22 +641,14 @@ Implement delivery over direct peer-to-peer connections.
 Success means:
 
 - no server sees message transport
-- no relay is required for the core success path
+- no payload-relay path exists
 - failed reachability leaves the message pending
 - delivery receipt is produced only after recipient-device acceptance
 
-### 9.4 Optional Modes Stay Labelled
+### 9.4 No Hidden Fallback
 
-If compatibility modes exist, they must be labelled as such.
-
-Examples:
-
-- relay-assisted mode
-- queued legacy mode
-- hosted rendezvous mode
-- browser compatibility mode
-
-They may be useful, but they do not define core Mycellium.
+A failed direct connection must not fall back to a relay or server queue. A
+transport that carries payload through a third party is not Mycellium delivery.
 
 ### 9.5 Registry Account UX
 
@@ -577,11 +657,15 @@ If a registry exists, success means:
 - account IDs are stable and unique
 - login identities are pluggable
 - handles remain non-unique display names
-- `redb` is the preferred first embedded metadata backend
+- `redb` is the current embedded metadata backend
 - registry storage is modeled as portable key-value records plus indexes
 - opaque account bytes can live in file/blob storage
-- registry HTTP stays limited to account UX and signed-record publication
-- removing the registry does not break existing local identity or direct delivery
+- registry HTTP stays limited to account UX, signed-record lookup, and
+  rendezvous discovery
+- the registry QUIC protocol carries only presence and introduction control
+- removing the registry does not invalidate local identity, local state, or an
+  already-established direct connection; a new connection then needs another
+  discovery mechanism
 
 ---
 
@@ -591,13 +675,15 @@ Hard serverless Mycellium is:
 
 > A peer-to-peer messaging protocol where discovery is non-authoritative,
 > identity records are self-authenticating, messages remain with the sender until
-> a direct route to the recipient exists, and no server is required to store,
-> route, authorize, or complete delivery.
+> a direct route to the recipient exists, and no server stores, carries,
+> acknowledges, or completes delivery.
 
 Anything that stores or carries a message for an offline recipient is outside the
 core model.
 
-Anything that becomes required for delivery is outside the core model.
+Infrastructure may be required to discover or introduce live devices. It must
+never become a payload path or a condition for an already-established direct
+connection to continue.
 
 Anything that can be removed without invalidating identity, local state, or
 direct delivery may be useful infrastructure. It is not the protocol.
