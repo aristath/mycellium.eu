@@ -1,6 +1,6 @@
 //! A `Transport` implementation over plain TCP.
 //!
-//! It carries the app-layer end-to-end payload (X3DH + Double Ratchet), which
+//! It carries the app-layer end-to-end payload (fresh X3DH + one-shot AEAD), which
 //! is what actually secures messages, so a bare TCP link is a genuine *direct*
 //! line. libp2p is another direct transport behind this same trait.
 
@@ -58,7 +58,7 @@ impl Connection for TcpConnection {
     type Error = io::Error;
 
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.0.write_all(&frame_header(bytes.len()))?;
+        self.0.write_all(&frame_header(bytes.len())?)?;
         self.0.write_all(bytes)?;
         self.0.flush()
     }

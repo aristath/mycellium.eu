@@ -4,15 +4,16 @@
 //!
 //! - [`link`] — framing (`Wire`, `FrameReader`, `FrameWriter`) over any core
 //!   `Connection`.
-//! - [`net`] — a minimal framed TCP transport for local/direct operation.
-//! - [`libp2p_net`] — the production transport over rust-libp2p (TCP + Noise +
-//!   Yamux + a `/mycellium/1.0` stream protocol), behind the `libp2p` feature.
+//! - `net` — an opt-in raw-TCP diagnostic adapter used only by the CLI.
+//! - [`libp2p_net`] — the production direct QUIC transport plus the registry
+//!   introduction control stream, behind the `libp2p` feature.
 //!
 //! A shell composes whichever adapters its platform supports at build time;
 //! the engine above depends only on the core ports, never on these crates.
 
 pub mod link;
+#[cfg(feature = "legacy-tcp")]
 pub mod net;
 
-#[cfg(feature = "libp2p")]
+#[cfg(feature = "quic")]
 pub mod libp2p_net;

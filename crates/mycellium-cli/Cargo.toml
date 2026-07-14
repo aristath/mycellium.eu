@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 mycellium-core = { path = "../mycellium-core" }
-mycellium-transport = { path = "../mycellium-transport" }
+mycellium-transport = { path = "../mycellium-transport", features = ["legacy-tcp", "dht"] }
 mycellium-storage = { path = "../mycellium-storage" }
 mycellium-engine = { path = "../mycellium-engine" }
 mycellium-client = { path = "../mycellium-client" }
