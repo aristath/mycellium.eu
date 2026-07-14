@@ -1,0 +1,4 @@
+module mycellium_mobileFFI {
+    header "mycellium_mobileFFI.h"
+    export *
+}

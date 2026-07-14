@@ -1,0 +1,8 @@
+/.build/
+/.swiftpm/
+/Mycellium.xcodeproj/
+/MycelliumFFI.xcframework/
+/Sources/MycelliumMobile/Generated/
+/Sources/mycellium_mobileFFI/mycellium_mobileFFI.h
+*.xcuserstate
+xcuserdata/
