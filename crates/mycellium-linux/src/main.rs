@@ -4,7 +4,6 @@
 //! and delivery behavior remain in `mycellium-client`.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -23,16 +22,15 @@ use mycellium_core::message::{AppMessage, Body};
 use mycellium_core::platform::Platform;
 use mycellium_core::record::{Device, SignedRecord};
 use mycellium_core::storage::Storage;
-use mycellium_core::transport::Transport;
 use mycellium_core::userid::{user_id, UserId};
 use mycellium_core::wire;
 use mycellium_engine::flow::{self, FlowEvent};
-use mycellium_engine::groups::PeerFrame;
+use mycellium_engine::groups::{MailItem, PeerFrame};
 use mycellium_engine::verified::TrustLevel;
 use mycellium_storage::filestore::FileStore;
 use mycellium_storage::store;
-use mycellium_transport::link::FrameReader;
-use mycellium_transport::net::TcpTransport;
+use mycellium_transport::libp2p_net;
+use mycellium_transport::link::{FrameReader, FrameWriter};
 use zeroize::{Zeroize, Zeroizing};
 
 const CANVAS: egui::Color32 = egui::Color32::from_rgb(14, 18, 25);
@@ -48,6 +46,7 @@ const DANGER: egui::Color32 = egui::Color32::from_rgb(232, 121, 121);
 const REGISTRY_SESSION_KEY: &[u8] = b"linux:registry-session:v1";
 
 fn main() -> eframe::Result {
+    let login_link = std::env::args().find(|argument| argument.starts_with("mycellium://"));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
@@ -57,7 +56,21 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Mycellium",
         options,
-        Box::new(|cc| Ok(Box::new(LinuxClient::new(cc)))),
+        Box::new(move |cc| {
+            let mut client = LinuxClient::new(cc);
+            if let Some(link) = login_link {
+                match client::registry::login_token_from_link(&link) {
+                    Ok(token) => {
+                        client.login_code = token;
+                        client.account_login_open = true;
+                        client.login_requested = true;
+                        client.confirm_email_login();
+                    }
+                    Err(error) => client.error = error.to_string(),
+                }
+            }
+            Ok(Box::new(client))
+        }),
     )
 }
 
@@ -87,7 +100,8 @@ struct Session {
     identity: Arc<Identity>,
     store: Arc<Mutex<FileStore>>,
     network: client::DirectNetwork,
-    listener_addr: Option<String>,
+    own_record: Arc<Mutex<Option<SignedRecord>>>,
+    listener_active: bool,
     device_current: Arc<AtomicBool>,
 }
 
@@ -98,6 +112,11 @@ enum RuntimeEvent {
     LoginRequested(i64),
     AccountAuthenticated(Box<AccountContext>),
     DeviceCurrent(bool),
+    MessageFinished {
+        user_id: String,
+        draft: String,
+        result: std::result::Result<String, String>,
+    },
 }
 
 struct AccountContext {
@@ -137,7 +156,6 @@ struct LinuxClient {
     passphrase_confirmation: String,
     display_name: String,
     my_handle: String,
-    record_addr: String,
     record_blob: String,
     session: Option<Session>,
     events_tx: Sender<RuntimeEvent>,
@@ -151,6 +169,7 @@ struct LinuxClient {
     conversation_filter: String,
     message: String,
     drafts: HashMap<String, String>,
+    message_busy: bool,
 
     adding_person: bool,
     contact_nickname: String,
@@ -185,7 +204,6 @@ impl LinuxClient {
             passphrase_confirmation: String::new(),
             display_name: String::new(),
             my_handle: String::new(),
-            record_addr: default_reachable_addr(),
             record_blob: String::new(),
             session: None,
             events_tx,
@@ -198,6 +216,7 @@ impl LinuxClient {
             conversation_filter: String::new(),
             message: String::new(),
             drafts: HashMap::new(),
+            message_busy: false,
             adding_person: false,
             contact_nickname: String::new(),
             contact_card: String::new(),
@@ -297,7 +316,7 @@ impl LinuxClient {
             let wallet_secret = local.identity.wallet_secret();
             if recovery
                 .as_ref()
-                .is_some_and(|stored| stored.as_ref() != &wallet_secret)
+                .is_some_and(|stored| stored.as_ref() != wallet_secret)
             {
                 bail!("this registry account belongs to a different Mycellium identity");
             }
@@ -438,58 +457,62 @@ impl LinuxClient {
             self.registry_url = account.registry_url.clone();
             self.account = Some(account);
         }
+        let own_record = client::list_records(&store)?
+            .into_iter()
+            .find(|entry| entry.record.record.wallet == identity.wallet_public())
+            .map(|entry| entry.record);
+        let identity = Arc::new(identity);
         let network = client::DirectNetwork::new(identity.device_secret());
         let store = Arc::new(Mutex::new(store));
+        let current = Arc::new(AtomicBool::new(true));
         self.session = Some(Session {
-            identity: Arc::new(identity),
+            identity: Arc::clone(&identity),
             store: Arc::clone(&store),
             network: network.clone(),
-            listener_addr: None,
-            device_current: Arc::new(AtomicBool::new(true)),
+            own_record: Arc::new(Mutex::new(own_record)),
+            listener_active: false,
+            device_current: Arc::clone(&current),
         });
-        let current = Arc::clone(
-            &self
-                .session
-                .as_ref()
-                .expect("session was set")
-                .device_current,
-        );
-        self.start_outbox_worker(store, network, current);
+        self.start_outbox_worker(identity, store, network, current);
         Ok(())
     }
 
     fn start_outbox_worker(
         &self,
+        identity: Arc<Identity>,
         store: Arc<Mutex<FileStore>>,
         network: client::DirectNetwork,
         device_current: Arc<AtomicBool>,
     ) {
         let events = self.events_tx.clone();
         let ctx = self.ctx.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(5));
-            if !device_current.load(Ordering::Acquire) {
-                continue;
-            }
-            let Ok(mut store) = store.lock() else {
-                return;
-            };
-            let Ok(result) =
-                client::flush_due_outbox(&mut *store, &network, OsPlatform.now_unix_secs())
-            else {
-                continue;
-            };
-            if result.delivered > 0 {
-                let noun = if result.delivered == 1 {
-                    "message"
-                } else {
-                    "messages"
+        thread::spawn(move || {
+            while network.is_running() {
+                thread::sleep(Duration::from_secs(5));
+                if !network.is_running() {
+                    return;
+                }
+                if !device_current.load(Ordering::Acquire) {
+                    continue;
+                }
+                let now = OsPlatform.now_unix_secs();
+                let Ok(result) =
+                    client::flush_shared_outbox(&identity, &mut OsPlatform, &store, &network, now)
+                else {
+                    continue;
                 };
-                let _ = events.send(RuntimeEvent::Notice(format!(
-                    "Delivered {} pending {noun}",
-                    result.delivered
-                )));
-                ctx.request_repaint();
+                if result.delivered > 0 {
+                    let noun = if result.delivered == 1 {
+                        "message"
+                    } else {
+                        "messages"
+                    };
+                    let _ = events.send(RuntimeEvent::Notice(format!(
+                        "Delivered {} pending {noun}",
+                        result.delivered
+                    )));
+                    ctx.request_repaint();
+                }
             }
         });
     }
@@ -515,19 +538,11 @@ impl LinuxClient {
         };
         self.my_handle = record.record.handle.as_str().to_string();
         self.display_name = record.record.name.clone();
-        self.record_addr = String::from_utf8(record.record.device.peer_id().0.clone())
-            .map_err(|_| anyhow!("this device record has an invalid address"))?;
-        self.record_blob = client::encode_record(&record);
-        if record.record.device.device_key == identity.device_public() {
-            self.start_listener(
-                record.record.handle.clone(),
-                record,
-                identity,
-                store,
-                self.record_addr.clone(),
-            )?;
-        } else {
+        if record.record.device.device_key != identity.device_public() {
+            self.record_blob = client::encode_record(&record);
             self.view = View::Device;
+        } else {
+            self.publish_profile()?;
         }
         self.start_account_monitor();
         Ok(())
@@ -541,39 +556,55 @@ impl LinuxClient {
         } else {
             self.display_name.trim().to_string()
         };
-        let addr = self.record_addr.trim().to_string();
         let account = self.account.clone();
-        let (identity, store, record, device_current) = {
+        let (identity, store, own_record, device_current) = {
             let session = self.session_mut()?;
-            let mut store = session
-                .store
-                .lock()
-                .map_err(|_| anyhow!("local store lock poisoned"))?;
-            let record = client::publish_active_device_record(
-                &mut *store,
-                &mut OsPlatform,
-                &session.identity,
-                &handle,
-                &name,
-                &addr,
-            )?;
             (
                 Arc::clone(&session.identity),
                 Arc::clone(&session.store),
-                record,
+                Arc::clone(&session.own_record),
                 Arc::clone(&session.device_current),
             )
         };
+        let node = self.listener_or_start(&identity)?;
+        let record = {
+            let mut store_guard = store
+                .lock()
+                .map_err(|_| anyhow!("local store lock poisoned"))?;
+            client::publish_active_device_record(
+                &mut *store_guard,
+                &mut OsPlatform,
+                &identity,
+                &handle,
+                &name,
+            )?
+        };
         if let Some(account) = &account {
-            client::registry::RegistryClient::new(&account.registry_url)?
-                .put_record(account, &record)?;
+            let registry = client::registry::RegistryClient::new(&account.registry_url)?;
+            if account.is_expired(OsPlatform.now_unix_secs() as i64) {
+                if registry.get_record(&account.account_id)?.as_ref() != Some(&record) {
+                    bail!("log in again to publish profile or device changes");
+                }
+            } else {
+                registry.put_record(account, &record)?;
+            }
             device_current.store(true, Ordering::Release);
             self.device_replaced = false;
         }
         self.my_handle = handle.as_str().to_string();
         self.display_name = name;
         self.record_blob = client::encode_record(&record);
-        self.start_listener(handle, record, identity, store, addr)
+        let user_id = record.record.user_id.clone();
+        *own_record
+            .lock()
+            .map_err(|_| anyhow!("local profile lock poisoned"))? = Some(record);
+        self.start_listener(node)?;
+        if let Some(account) = account {
+            self.session_mut()?
+                .network
+                .use_registry(account.registry_url, user_id);
+        }
+        Ok(())
     }
 
     fn save_profile(&mut self) {
@@ -666,87 +697,67 @@ impl LinuxClient {
     fn send_message(&mut self) {
         self.error.clear();
         self.notice.clear();
-        match self.try_send_message() {
-            Ok(message) => self.notice = message,
-            Err(error) => self.error = error.to_string(),
+        if self.message_busy {
+            return;
         }
-    }
-
-    fn try_send_message(&mut self) -> Result<String> {
         if self.device_replaced
             || self
                 .session
                 .as_ref()
                 .is_some_and(|session| !session.device_current.load(Ordering::Acquire))
         {
-            bail!("this device was replaced; log in and make it active before sending");
+            self.error =
+                "this device was replaced; log in and make it active before sending".into();
+            return;
         }
-        let me = Handle::new(self.my_handle.trim())
-            .map_err(|_| anyhow!("finish setting up this device first"))?;
+        let me = match Handle::new(self.my_handle.trim()) {
+            Ok(me) => me,
+            Err(_) => {
+                self.error = "finish setting up this device first".into();
+                return;
+            }
+        };
         let selected_user_id = self.selected_user_id.clone();
         if selected_user_id.is_empty() {
-            bail!("choose a conversation first");
+            self.error = "choose a conversation first".into();
+            return;
         }
         let text = self.message.trim().to_string();
         if text.is_empty() {
-            bail!("write a message first");
+            self.error = "write a message first".into();
+            return;
         }
-        let app = AppMessage {
-            id: random_id(),
-            timestamp: OsPlatform.now_unix_secs(),
-            expires_at: None,
-            body: Body::Text(text),
+        let Some(session) = self.session.as_ref() else {
+            self.error = "unlock this device first".into();
+            return;
         };
-        let session = self.session_mut()?;
         let identity = Arc::clone(&session.identity);
         let store = Arc::clone(&session.store);
         let network = session.network.clone();
-        let now = OsPlatform.now_unix_secs();
-        let mut store = store
-            .lock()
-            .map_err(|_| anyhow!("local store lock poisoned"))?;
-        let (peer, peer_record) = client::resolve_local_record(&mut *store, &selected_user_id)
-            .map_err(|error| match error {
-                flow::TrustError::BadHandle => anyhow!("this person is no longer available"),
-                flow::TrustError::Unverified => anyhow!("their identity record is invalid"),
-                flow::TrustError::IdentityChanged => {
-                    anyhow!("their identity changed; review it in People before sending")
-                }
-                flow::TrustError::StaleRecord => anyhow!("their identity record is stale"),
-            })?;
-        let info = client::verification_info_for_record(&*store, &identity, &peer, &peer_record)?;
-        if !matches!(info.level, TrustLevel::Pinned | TrustLevel::Verified) {
-            bail!("add this person before messaging them");
-        }
-        let mut deliver = |store: &mut FileStore,
-                           handle: &Handle,
-                           record: &SignedRecord,
-                           device: &Device,
-                           item|
-         -> mycellium_engine::reachability::DeliveryPath {
-            client::deliver_or_park(store, &network, handle, record, device, item, now)
-        };
-        let outcome = client::send_direct(
-            &identity,
-            &mut *store,
-            &mut OsPlatform,
-            &me,
-            &peer,
-            &peer_record,
-            &app,
-            &mut deliver,
-        )?;
-        if outcome.direct == 0 && outcome.outboxed == 0 {
-            bail!("message could not be sent or saved for retry");
-        }
-        drop(store);
+        let registry_url = self.registry_url.clone();
+        let events = self.events_tx.clone();
+        let ctx = self.ctx.clone();
+        self.message_busy = true;
         self.message.clear();
         self.drafts.remove(&selected_user_id);
-        if outcome.direct > 0 {
-            Ok("Sent".to_string())
-        } else {
-            Ok("They are offline. This device will keep trying.".to_string())
-        }
+        thread::spawn(move || {
+            let result = send_message_now(
+                &identity,
+                &store,
+                &network,
+                &registry_url,
+                &me,
+                &selected_user_id,
+                &text,
+            )
+            .map_err(|error| error.to_string());
+            let _ = events.send(RuntimeEvent::MessageFinished {
+                user_id: selected_user_id,
+                draft: text,
+                result,
+            });
+            ctx.request_repaint();
+        });
     }
 
     fn retry_outbox(&mut self) {
@@ -756,13 +767,16 @@ impl LinuxClient {
             }
             let now = OsPlatform.now_unix_secs();
             let session = this.session_mut()?;
+            let identity = Arc::clone(&session.identity);
             let network = session.network.clone();
-            let mut store = session
-                .store
-                .lock()
-                .map_err(|_| anyhow!("local store lock poisoned"))?;
-            client::make_outbox_due(&mut *store)?;
-            let _ = client::flush_due_outbox(&mut *store, &network, now)?;
+            let store = Arc::clone(&session.store);
+            {
+                let mut guard = store
+                    .lock()
+                    .map_err(|_| anyhow!("local store lock poisoned"))?;
+                client::make_outbox_due(&mut *guard)?;
+            }
+            let _ = client::flush_shared_outbox(&identity, &mut OsPlatform, &store, &network, now)?;
             Ok(())
         });
     }
@@ -803,6 +817,36 @@ impl LinuxClient {
         });
     }
 
+    fn set_contact_blocked(&mut self, user_id: String, blocked: bool) {
+        let notice = if blocked {
+            "Person blocked"
+        } else {
+            "Person unblocked"
+        };
+        self.run(notice, |this| {
+            let session = this.session_mut()?;
+            let mut store = session
+                .store
+                .lock()
+                .map_err(|_| anyhow!("local store lock poisoned"))?;
+            client::set_blocked(&mut *store, &user_id, blocked)
+        });
+    }
+
+    fn contact_blocked(&self, user_id: &str) -> Result<bool> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| anyhow!("unlock this device first"))?;
+        let store = session
+            .store
+            .lock()
+            .map_err(|_| anyhow!("local store lock poisoned"))?;
+        Ok(client::list_blocked(&*store)?
+            .iter()
+            .any(|known| known == user_id))
+    }
+
     fn verification_for(&self, user_id: &str) -> Result<client::VerificationInfo> {
         let session = self
             .session
@@ -826,84 +870,100 @@ impl LinuxClient {
         )
     }
 
-    fn start_listener(
-        &mut self,
-        me: Handle,
-        my_record: SignedRecord,
-        identity: Arc<Identity>,
-        store: Arc<Mutex<FileStore>>,
-        advertised_addr: String,
-    ) -> Result<()> {
-        let session = self.session_mut()?;
-        if let Some(active) = &session.listener_addr {
-            if active == &advertised_addr {
-                return Ok(());
-            }
-            bail!("restart Mycellium before changing this device's address");
+    fn listener_or_start(&self, identity: &Identity) -> Result<Option<libp2p_net::Libp2pNode>> {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.listener_active)
+        {
+            return Ok(None);
         }
-        let bind_addr = listener_bind_addr(&advertised_addr)?;
-        let mut listener = TcpTransport::listening(&bind_addr)
-            .map_err(|error| anyhow!("could not listen at {bind_addr}: {error}"))?;
-        session.listener_addr = Some(advertised_addr);
+        let listen_addr = libp2p_net::quic_listen_multiaddr("0.0.0.0:0")
+            .map_err(|error| anyhow!("could not create libp2p listen address: {error}"))?;
+        let mut node = libp2p_net::Libp2pNode::new(identity.device_secret(), Some(listen_addr))
+            .map_err(|error| anyhow!("could not start libp2p node: {error}"))?;
+        node.listen_addr()
+            .map_err(|error| anyhow!("could not open a libp2p listener: {error}"))?;
+        Ok(Some(node))
+    }
+
+    fn start_listener(&mut self, node: Option<libp2p_net::Libp2pNode>) -> Result<()> {
+        let session = self.session_mut()?;
+        if session.listener_active {
+            return Ok(());
+        }
+        let mut node = node.ok_or_else(|| anyhow!("libp2p listener was not started"))?;
+        session.network.set_libp2p(node.dialer());
+        session.listener_active = true;
+        let identity = Arc::clone(&session.identity);
+        let store = Arc::clone(&session.store);
+        let own_record = Arc::clone(&session.own_record);
         let device_current = Arc::clone(&session.device_current);
+        let network = session.network.clone();
         let events = self.events_tx.clone();
         let ctx = self.ctx.clone();
-        thread::spawn(move || loop {
-            let mut connection = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) => {
-                    let _ = events.send(RuntimeEvent::Error(format!(
-                        "incoming connection failed: {error}"
-                    )));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
+        let worker_count = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2)
+            .max(2);
+        let (connections, receiver) = mpsc::sync_channel(worker_count * 4);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for _ in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
             let identity = Arc::clone(&identity);
             let store = Arc::clone(&store);
-            let my_record = my_record.clone();
-            let me = me.clone();
+            let own_record = Arc::clone(&own_record);
             let events = events.clone();
             let ctx = ctx.clone();
             let device_current = Arc::clone(&device_current);
+            let worker_network = network.clone();
             thread::spawn(move || {
-                let mut platform = OsPlatform;
-                let mut sink = EventSink {
-                    sender: events.clone(),
-                    ctx: ctx.clone(),
-                };
-                while let Ok(bytes) = connection.recv_frame() {
-                    if !device_current.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let Ok(PeerFrame::Delivery { delivery_id, item }) =
-                        wire::decode::<PeerFrame>(&bytes)
-                    else {
-                        continue;
+                while worker_network.is_running() {
+                    let connection = {
+                        let Ok(receiver) = receiver.lock() else {
+                            return;
+                        };
+                        match receiver.recv_timeout(Duration::from_secs(1)) {
+                            Ok(connection) => connection,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
                     };
-                    let Ok(mut store) = store.lock() else {
-                        let _ =
-                            events.send(RuntimeEvent::Error("local store is unavailable".into()));
-                        ctx.request_repaint();
-                        return;
-                    };
-                    if client::accept_delivery(
+                    serve_linux_connection(
+                        connection,
                         &identity,
-                        &me,
-                        &my_record,
-                        &[],
-                        &mut platform,
-                        &mut store,
-                        &mut connection,
-                        delivery_id,
-                        *item,
-                        &mut sink,
-                    ) {
-                        let _ = events.send(RuntimeEvent::Notice("New message received".into()));
-                        ctx.request_repaint();
-                    }
+                        &store,
+                        &own_record,
+                        &device_current,
+                        &worker_network,
+                        &events,
+                        &ctx,
+                    );
                 }
             });
+        }
+
+        thread::spawn(move || {
+            while network.is_running() {
+                let connection = match node.accept_timeout(Duration::from_secs(1)) {
+                    Ok(Some(connection)) => connection,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        if !network.is_running() {
+                            return;
+                        }
+                        let _ = events.send(RuntimeEvent::Error(format!(
+                            "incoming connection failed: {error}"
+                        )));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
+                match connections.try_send(connection) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Disconnected(_)) => return,
+                }
+            }
         });
         Ok(())
     }
@@ -921,6 +981,7 @@ impl LinuxClient {
         let local_user_id = user_id(&session.identity.wallet_public());
         let local_device = session.identity.device_public();
         let device_current = Arc::clone(&session.device_current);
+        let network = session.network.clone();
         let events = self.events_tx.clone();
         let ctx = self.ctx.clone();
         self.account_monitor_started = true;
@@ -929,7 +990,7 @@ impl LinuxClient {
                 Ok(registry) => registry,
                 Err(_) => return,
             };
-            loop {
+            while network.is_running() {
                 if let Ok(Some(record)) = registry.get_record(&account.account_id) {
                     let current = record.record.user_id == local_user_id
                         && record.record.device.device_key == local_device;
@@ -937,7 +998,12 @@ impl LinuxClient {
                     let _ = events.send(RuntimeEvent::DeviceCurrent(current));
                     ctx.request_repaint();
                 }
-                thread::sleep(Duration::from_secs(60));
+                for _ in 0..60 {
+                    if !network.is_running() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
         });
     }
@@ -996,6 +1062,28 @@ impl LinuxClient {
                         self.notice.clear();
                     }
                 }
+                RuntimeEvent::MessageFinished {
+                    user_id,
+                    draft,
+                    result,
+                } => {
+                    self.message_busy = false;
+                    match result {
+                        Ok(message) => {
+                            self.notice = message;
+                            self.error.clear();
+                        }
+                        Err(error) => {
+                            if self.selected_user_id == user_id && self.message.is_empty() {
+                                self.message = draft;
+                            } else {
+                                self.drafts.entry(user_id).or_insert(draft);
+                            }
+                            self.error = error;
+                            self.notice.clear();
+                        }
+                    }
+                }
             }
         }
     }
@@ -1003,8 +1091,7 @@ impl LinuxClient {
     fn is_active(&self) -> bool {
         self.session
             .as_ref()
-            .and_then(|session| session.listener_addr.as_ref())
-            .is_some()
+            .is_some_and(|session| session.listener_active)
             && self
                 .session
                 .as_ref()
@@ -1069,6 +1156,15 @@ impl eframe::App for LinuxClient {
     }
 }
 
+impl Drop for LinuxClient {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.as_ref() {
+            session.device_current.store(false, Ordering::Release);
+            session.network.shutdown();
+        }
+    }
+}
+
 impl LinuxClient {
     fn auth_view(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
@@ -1130,14 +1226,13 @@ impl LinuxClient {
             field_label(ui, "Passphrase");
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
-                egui::TextEdit::singleline(&mut self.passphrase)
+                singleline_input(&mut self.passphrase)
                     .password(true)
                     .hint_text("Your device passphrase"),
             );
             ui.add_space(12.0);
             let unlock = primary_button(ui, "Unlock device", ui.available_width());
-            let enter =
-                response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let enter = singleline_submitted(ui, &response);
             if unlock.clicked() || enter {
                 self.unlock();
             }
@@ -1184,40 +1279,27 @@ impl LinuxClient {
                 field_label(&mut columns[0], "Name");
                 columns[0].add_sized(
                     [columns[0].available_width(), 40.0],
-                    egui::TextEdit::singleline(&mut self.display_name).hint_text("Ada"),
+                    singleline_input(&mut self.display_name).hint_text("Ada"),
                 );
                 field_label(&mut columns[1], "Handle");
                 columns[1].add_sized(
                     [columns[1].available_width(), 40.0],
-                    egui::TextEdit::singleline(&mut self.my_handle).hint_text("ada"),
+                    singleline_input(&mut self.my_handle).hint_text("ada"),
                 );
             });
-            ui.add_space(10.0);
-            field_label(ui, "This device can be reached at");
-            ui.add_sized(
-                [ui.available_width(), 40.0],
-                egui::TextEdit::singleline(&mut self.record_addr),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "Detected locally. Change it if people cannot reach this address.",
-                )
-                .size(12.0)
-                .color(MUTED),
-            );
             ui.add_space(10.0);
             ui.columns(2, |columns| {
                 field_label(&mut columns[0], "Passphrase");
                 columns[0].add_sized(
                     [columns[0].available_width(), 40.0],
-                    egui::TextEdit::singleline(&mut self.passphrase)
+                    singleline_input(&mut self.passphrase)
                         .password(true)
                         .hint_text("Protects this device"),
                 );
                 field_label(&mut columns[1], "Confirm");
                 columns[1].add_sized(
                     [columns[1].available_width(), 40.0],
-                    egui::TextEdit::singleline(&mut self.passphrase_confirmation).password(true),
+                    singleline_input(&mut self.passphrase_confirmation).password(true),
                 );
             });
             ui.label(
@@ -1239,15 +1321,6 @@ impl LinuxClient {
         }
         ui.add_space(14.0);
         self.status_banner(ui);
-        ui.add_space(10.0);
-        ui.collapsing("Local storage", |ui| {
-            ui.label(
-                egui::RichText::new(self.data_dir.display().to_string())
-                    .monospace()
-                    .size(12.0)
-                    .color(MUTED),
-            );
-        });
     }
 
     fn account_login_fields(&mut self, ui: &mut egui::Ui) {
@@ -1255,7 +1328,7 @@ impl LinuxClient {
             field_label(ui, "Login code");
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
-                egui::TextEdit::singleline(&mut self.login_code).hint_text("Code from your email"),
+                singleline_input(&mut self.login_code).hint_text("Code from your email"),
             );
             ui.add_space(12.0);
             let clicked = ui
@@ -1264,9 +1337,7 @@ impl LinuxClient {
                 })
                 .inner
                 .clicked();
-            let enter = !self.account_busy
-                && response.has_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let enter = !self.account_busy && singleline_submitted(ui, &response);
             if clicked || enter {
                 self.confirm_email_login();
             }
@@ -1282,7 +1353,7 @@ impl LinuxClient {
             field_label(ui, "Email address");
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
-                egui::TextEdit::singleline(&mut self.email).hint_text("you@example.com"),
+                singleline_input(&mut self.email).hint_text("you@example.com"),
             );
             ui.add_space(12.0);
             let clicked = ui
@@ -1291,9 +1362,7 @@ impl LinuxClient {
                 })
                 .inner
                 .clicked();
-            let enter = !self.account_busy
-                && response.has_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let enter = !self.account_busy && singleline_submitted(ui, &response);
             if clicked || enter {
                 self.request_email_login();
             }
@@ -1440,7 +1509,7 @@ impl LinuxClient {
                     ui.add_space(8.0);
                     ui.add_sized(
                         [ui.available_width(), 38.0],
-                        egui::TextEdit::singleline(&mut self.conversation_filter)
+                        singleline_input(&mut self.conversation_filter)
                             .hint_text("Search conversations"),
                     );
                     ui.add_space(10.0);
@@ -1503,11 +1572,9 @@ impl LinuxClient {
             ui.set_max_width(390.0);
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
-                egui::TextEdit::singleline(&mut self.new_recipient)
-                    .hint_text("Saved name or handle"),
+                singleline_input(&mut self.new_recipient).hint_text("Saved name or handle"),
             );
-            let enter =
-                response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let enter = singleline_submitted(ui, &response);
             ui.add_space(10.0);
             if primary_button(ui, "Open conversation", ui.available_width()).clicked() || enter {
                 self.open_conversation();
@@ -1589,19 +1656,30 @@ impl LinuxClient {
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 90.0).max(160.0);
             let response = ui.add_enabled(
-                !self.device_replaced,
+                !self.device_replaced && !self.message_busy,
                 egui::TextEdit::multiline(&mut self.message)
                     .desired_width(width)
                     .desired_rows(2)
                     .hint_text("Write a message"),
             );
-            if response.has_focus()
+            if !self.message_busy
+                && response.has_focus()
                 && ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift)
             {
                 send = true;
             }
             if ui
-                .add_enabled_ui(!self.device_replaced, |ui| primary_button(ui, "Send", 76.0))
+                .add_enabled_ui(!self.device_replaced && !self.message_busy, |ui| {
+                    primary_button(
+                        ui,
+                        if self.message_busy {
+                            "Sending…"
+                        } else {
+                            "Send"
+                        },
+                        76.0,
+                    )
+                })
                 .inner
                 .clicked()
             {
@@ -1689,12 +1767,12 @@ impl LinuxClient {
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [210.0, 40.0],
-                        egui::TextEdit::singleline(&mut self.contact_nickname)
+                        singleline_input(&mut self.contact_nickname)
                             .hint_text("Name on this device"),
                     );
                     ui.add_sized(
                         [(ui.available_width() - 112.0).max(220.0), 40.0],
-                        egui::TextEdit::singleline(&mut self.contact_card)
+                        singleline_input(&mut self.contact_card)
                             .hint_text("Paste connection card"),
                     );
                     if primary_button(ui, "Add", 86.0).clicked() {
@@ -1720,6 +1798,8 @@ impl LinuxClient {
             return;
         };
         let contact = contact.clone();
+        let blocked = self.contact_blocked(&contact.user_id);
+        let is_blocked = blocked.as_ref().copied().unwrap_or(true);
         ui.horizontal(|ui| {
             avatar(ui, &contact.nickname, &contact.user_id, 52.0);
             ui.vertical(|ui| {
@@ -1731,11 +1811,18 @@ impl LinuxClient {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if primary_button(ui, "Message", 98.0).clicked() {
+                if primary_button(ui, if is_blocked { "Blocked" } else { "Message" }, 98.0)
+                    .clicked()
+                    && !is_blocked
+                {
                     self.select_conversation(contact.user_id.clone());
                 }
             });
         });
+        if let Err(error) = blocked {
+            ui.add_space(12.0);
+            callout(ui, DANGER, "Block list unavailable", &error.to_string());
+        }
         ui.add_space(20.0);
         match self.verification_for(&contact.user_id) {
             Ok(info) => {
@@ -1809,6 +1896,14 @@ impl LinuxClient {
                 if ui.small_button("Remove person").clicked() {
                     self.remove_contact(contact.nickname.clone());
                 }
+                let label = if is_blocked {
+                    "Unblock person"
+                } else {
+                    "Block person"
+                };
+                if ui.small_button(label).clicked() {
+                    self.set_contact_blocked(contact.user_id.clone(), !is_blocked);
+                }
             });
         });
     }
@@ -1868,28 +1963,14 @@ impl LinuxClient {
                     field_label(&mut columns[0], "Name");
                     columns[0].add_sized(
                         [columns[0].available_width(), 40.0],
-                        egui::TextEdit::singleline(&mut self.display_name),
+                        singleline_input(&mut self.display_name),
                     );
                     field_label(&mut columns[1], "Handle");
                     columns[1].add_sized(
                         [columns[1].available_width(), 40.0],
-                        egui::TextEdit::singleline(&mut self.my_handle),
+                        singleline_input(&mut self.my_handle),
                     );
                 });
-                ui.add_space(10.0);
-                field_label(ui, "Reachable address");
-                ui.add_enabled(
-                    !active,
-                    egui::TextEdit::singleline(&mut self.record_addr)
-                        .desired_width(ui.available_width()),
-                );
-                if active {
-                    ui.label(
-                        egui::RichText::new("Restart Mycellium to change this address.")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                }
                 ui.add_space(14.0);
                 let label = if active {
                     "Save profile"
@@ -2089,6 +2170,15 @@ fn page_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 
 fn field_label(ui: &mut egui::Ui, label: &str) {
     ui.label(egui::RichText::new(label).size(12.0).strong().color(MUTED));
+}
+
+fn singleline_input(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).vertical_align(egui::Align::Center)
+}
+
+fn singleline_submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
+    (response.has_focus() || response.lost_focus())
+        && ui.input(|input| input.key_pressed(egui::Key::Enter))
 }
 
 fn primary_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
@@ -2416,38 +2506,195 @@ fn save_account_session(
         .map_err(|error| anyhow!("could not save the local account session: {error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn serve_linux_connection(
+    mut connection: libp2p_net::Libp2pConnection,
+    identity: &Identity,
+    store: &Arc<Mutex<FileStore>>,
+    own_record: &Arc<Mutex<Option<SignedRecord>>>,
+    device_current: &Arc<AtomicBool>,
+    network: &client::DirectNetwork,
+    events: &Sender<RuntimeEvent>,
+    ctx: &egui::Context,
+) {
+    let mut platform = OsPlatform;
+    let mut sink = EventSink {
+        sender: events.clone(),
+        ctx: ctx.clone(),
+    };
+    while network.is_running() {
+        let Ok(bytes) = connection.recv_frame() else {
+            return;
+        };
+        if !device_current.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(PeerFrame::Delivery { delivery_id, item }) = wire::decode::<PeerFrame>(&bytes)
+        else {
+            continue;
+        };
+        let Some(sender_device) = client::mail_item_sender_device(&item) else {
+            continue;
+        };
+        let Ok(sender_peer) = libp2p_net::peer_id_for_device(&sender_device) else {
+            continue;
+        };
+        if sender_peer != connection.peer_id() {
+            continue;
+        }
+        let Some(record) = own_record.lock().ok().and_then(|record| record.clone()) else {
+            continue;
+        };
+        let me = record.record.handle.clone();
+        let acknowledgement = {
+            let Ok(mut store) = store.lock() else {
+                let _ = events.send(RuntimeEvent::Error("local store is unavailable".into()));
+                ctx.request_repaint();
+                return;
+            };
+            client::accept_delivery(
+                identity,
+                &me,
+                &record,
+                &mut platform,
+                &mut store,
+                delivery_id,
+                *item,
+                &mut sink,
+            )
+        };
+        if let Some(frame) = acknowledgement {
+            let _ = connection.send_frame(&frame);
+            let _ = events.send(RuntimeEvent::Notice("New message received".into()));
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn send_message_now(
+    identity: &Identity,
+    store: &Arc<Mutex<FileStore>>,
+    network: &client::DirectNetwork,
+    registry_url: &str,
+    me: &Handle,
+    selected_user_id: &str,
+    text: &str,
+) -> Result<String> {
+    let refreshed = client::registry::RegistryClient::new(registry_url)
+        .and_then(|registry| registry.get_record_for_user(selected_user_id))
+        .ok()
+        .flatten();
+    let now = OsPlatform.now_unix_secs();
+    let app = AppMessage {
+        id: random_id(),
+        timestamp: now,
+        expires_at: None,
+        body: Body::Text(text.to_string()),
+    };
+    let mut guard = store
+        .lock()
+        .map_err(|_| anyhow!("local store lock poisoned"))?;
+    if let Some(record) = refreshed {
+        let _ = client::apply_registry_record(&mut *guard, selected_user_id, record);
+    }
+    let (peer, peer_record) = client::resolve_local_record(&mut *guard, selected_user_id).map_err(
+        |error| match error {
+            flow::TrustError::BadHandle => anyhow!("this person is no longer available"),
+            flow::TrustError::Unverified => anyhow!("their identity record is invalid"),
+            flow::TrustError::IdentityChanged => {
+                anyhow!("their identity changed; review it in People before sending")
+            }
+            flow::TrustError::StaleRecord => anyhow!("their identity record is stale"),
+        },
+    )?;
+    let info = client::verification_info_for_record(&*guard, identity, &peer, &peer_record)?;
+    if !matches!(info.level, TrustLevel::Pinned | TrustLevel::Verified) {
+        bail!("add this person before messaging them");
+    }
+
+    let mut prepared: Vec<(String, Device, MailItem)> = Vec::new();
+    let mut deliver = |transaction: &mut mycellium_storage::filestore::FileTransaction<'_>,
+                       handle: &Handle,
+                       record: &SignedRecord,
+                       device: &Device,
+                       item: MailItem,
+                       pairwise_plaintext: Option<Vec<u8>>| {
+        let delivery_id = client::delivery_id_for_item(&item);
+        let parked = match pairwise_plaintext {
+            Some(plaintext) => client::park_pairwise_outbox(
+                transaction,
+                delivery_id.clone(),
+                handle,
+                record,
+                device,
+                item.clone(),
+                plaintext,
+                now,
+            ),
+            None => client::park_outbox(
+                transaction,
+                delivery_id.clone(),
+                handle,
+                record,
+                device,
+                item.clone(),
+                now,
+            ),
+        };
+        match parked {
+            Ok(()) => {
+                prepared.push((delivery_id, device.clone(), item));
+                mycellium_engine::reachability::DeliveryPath::Outbox
+            }
+            Err(_) => mycellium_engine::reachability::DeliveryPath::Failed,
+        }
+    };
+    let mut transaction = guard.transaction();
+    let mut outcome = client::send_direct(
+        identity,
+        &mut transaction,
+        &mut OsPlatform,
+        me,
+        &peer,
+        &peer_record,
+        &app,
+        &mut deliver,
+    )?;
+    transaction.commit()?;
+    drop(guard);
+
+    for (delivery_id, device, item) in prepared {
+        if client::attempt_parked_delivery(store, network, &device, &delivery_id, &item, now)? {
+            outcome.outboxed = outcome.outboxed.saturating_sub(1);
+            outcome.direct += 1;
+            outcome.delivered += 1;
+        }
+    }
+    if outcome.direct == 0 && outcome.outboxed == 0 {
+        bail!("message could not be sent or saved for retry");
+    }
+    if outcome.direct > 0 {
+        Ok("Sent".to_string())
+    } else {
+        Ok("Direct connection unavailable. This device will keep trying.".to_string())
+    }
+}
+
 fn default_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+    resolve_data_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+fn resolve_data_dir(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(dir) = xdg_data_home {
         return PathBuf::from(dir).join("mycellium");
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         return PathBuf::from(home).join(".local/share/mycellium");
     }
     PathBuf::from(".mycellium")
-}
-
-fn default_reachable_addr() -> String {
-    let ip = UdpSocket::bind("0.0.0.0:0")
-        .ok()
-        .and_then(|socket| {
-            socket.connect("192.0.2.1:80").ok()?;
-            socket.local_addr().ok().map(|address| address.ip())
-        })
-        .filter(|ip| !ip.is_unspecified())
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    SocketAddr::new(ip, 7000).to_string()
-}
-
-fn listener_bind_addr(advertised: &str) -> Result<String> {
-    let address: SocketAddr = advertised
-        .parse()
-        .map_err(|_| anyhow!("enter an address such as 192.168.1.20:7000"))?;
-    let bind_ip = match address.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() => IpAddr::from([0, 0, 0, 0]),
-        IpAddr::V6(ip) if !ip.is_loopback() => IpAddr::from([0u16; 8]),
-        ip => ip,
-    };
-    Ok(SocketAddr::new(bind_ip, address.port()).to_string())
 }
 
 fn random_id() -> String {
@@ -2529,5 +2776,18 @@ mod tests {
         assert_eq!(loaded.account_id, session.account_id);
         assert_eq!(loaded.session_token, session.session_token);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn data_directory_follows_xdg_then_home_then_safe_local_fallback() {
+        assert_eq!(
+            resolve_data_dir(Some("/xdg".into()), Some("/home/user".into())),
+            PathBuf::from("/xdg/mycellium")
+        );
+        assert_eq!(
+            resolve_data_dir(None, Some("/home/user".into())),
+            PathBuf::from("/home/user/.local/share/mycellium")
+        );
+        assert_eq!(resolve_data_dir(None, None), PathBuf::from(".mycellium"));
     }
 }
