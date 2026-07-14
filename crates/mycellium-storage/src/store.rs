@@ -1,11 +1,11 @@
-//! Encrypted identity storage (Layer 9 hardening).
+//! Passphrase-encrypted identity storage for Linux and CLI clients.
 //!
 //! The account is a random **wallet secret** plus this device's own seed, so
 //! those 32-byte secrets must not sit in plaintext. We derive a key from a user
 //! passphrase with **Argon2id** and seal the `wallet_secret + device_seed` with
-//! **ChaCha20-Poly1305**. Moving an account to a fresh device is either an
-//! explicit wallet-secret transfer or a local decrypt of a registry-provided
-//! encrypted wallet backup.
+//! **ChaCha20-Poly1305**. A fresh device may explicitly import the wallet root or
+//! recover it through an authenticated registry account, then generates a new
+//! device seed.
 //!
 //! Interactive callers can type the passphrase at a **no-echo** terminal prompt.
 //! Noninteractive callers pass an explicit [`ClientConfig`] before using the
@@ -65,8 +65,8 @@ pub fn display_name() -> String {
     config().display_name
 }
 
-/// The secret material sealed on disk: the account wallet secret plus
-/// this device's own seed (Layer 11), so reloading reproduces the *same* device.
+/// The secret material sealed on disk: the account wallet secret plus this
+/// device's own seed, so reloading reproduces the *same* device.
 #[derive(Serialize, Deserialize)]
 struct Secret {
     wallet_secret: Vec<u8>,

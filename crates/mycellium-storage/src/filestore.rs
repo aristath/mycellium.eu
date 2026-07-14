@@ -9,9 +9,8 @@
 //! ciphertext authenticates the key it belongs to (the on-disk filename `hex(key)`
 //! is otherwise unauthenticated). This defeats an at-rest attacker with write
 //! access relocating one key's blob onto another key's path (record confusion).
-//! NOTE: this is a clean format break — entries written before AAD binding will no
-//! longer decrypt. That is acceptable because this store holds only locally
-//! generated state with no cross-version persisted-data contract to preserve.
+//! Legacy entries written without AAD fail closed and require an explicit data
+//! migration; they are never silently accepted under the new key binding.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,22 +20,19 @@ use std::path::PathBuf;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 
-use mycellium_core::storage::Storage;
-use serde::{Deserialize, Serialize};
+use mycellium_core::storage::{Storage, StorageMutation};
 
 const JOURNAL_FILE: &str = ".transaction-v1";
 const JOURNAL_AAD: &[u8] = b"mycellium-storage-transaction-v1";
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum Mutation {
-    Put(Vec<u8>, Vec<u8>),
-    Delete(Vec<u8>),
-}
+const LOCK_FILE: &str = ".process-lock-v1";
 
 /// A directory of encrypted key-value files.
 pub struct FileStore {
     dir: PathBuf,
     key: [u8; 32],
+    // Keeping the handle alive keeps the exclusive OS lock alive. This is an
+    // actual cross-process lock, not a sentinel file that can become stale.
+    _process_lock: fs::File,
 }
 
 impl FileStore {
@@ -44,17 +40,37 @@ impl FileStore {
     pub fn open(dir: PathBuf, key: [u8; 32]) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         crate::perms::restrict_dir(&dir);
-        let mut store = FileStore { dir, key };
+        let lock_path = dir.join(LOCK_FILE);
+        let process_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        crate::perms::restrict_file(&lock_path);
+        process_lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "this local store is already open in another app instance",
+            ),
+            fs::TryLockError::Error(error) => error,
+        })?;
+        let mut store = FileStore {
+            dir,
+            key,
+            _process_lock: process_lock,
+        };
         store.recover_transaction()?;
         Ok(store)
     }
 
     /// The on-disk path for a key (hex of the raw key bytes — always a safe name).
     fn path(&self, key: &[u8]) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut name = String::with_capacity(key.len() * 2);
         for b in key {
-            name.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-            name.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+            name.push(HEX[(b >> 4) as usize] as char);
+            name.push(HEX[(b & 0x0f) as usize] as char);
         }
         self.dir.join(name)
     }
@@ -105,7 +121,8 @@ impl FileStore {
         }
         let (nonce, ciphertext) = blob.split_at(12);
         let key_ga: Key = self.key.into();
-        let nonce_arr: [u8; 12] = nonce.try_into().unwrap();
+        let mut nonce_arr = [0u8; 12];
+        nonce_arr.copy_from_slice(nonce);
         let nonce_ga: Nonce = nonce_arr.into();
         ChaCha20Poly1305::new(&key_ga)
             .decrypt(
@@ -118,11 +135,11 @@ impl FileStore {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))
     }
 
-    fn apply(&mut self, mutations: &[Mutation]) -> io::Result<()> {
+    fn apply(&mut self, mutations: &[StorageMutation]) -> io::Result<()> {
         for mutation in mutations {
             match mutation {
-                Mutation::Put(key, value) => self.put_raw(key, value)?,
-                Mutation::Delete(key) => self.delete_raw(key)?,
+                StorageMutation::Put(key, value) => self.put_raw(key, value)?,
+                StorageMutation::Delete(key) => self.delete_raw(key)?,
             }
         }
         Ok(())
@@ -148,7 +165,7 @@ impl FileStore {
             Err(err) => return Err(err),
         };
         let plaintext = self.decrypt(JOURNAL_AAD, &blob)?;
-        let mutations: Vec<Mutation> = mycellium_core::wire::decode(&plaintext)
+        let mutations: Vec<StorageMutation> = mycellium_core::wire::decode(&plaintext)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "corrupt transaction"))?;
         self.apply(&mutations)?;
         self.finish_transaction()
@@ -176,12 +193,12 @@ impl FileTransaction<'_> {
     /// Durably commit every staged mutation as one recoverable unit.
     pub fn commit(self) -> io::Result<()> {
         self.store.ensure_ready()?;
-        let mutations: Vec<Mutation> = self
+        let mutations: Vec<StorageMutation> = self
             .changes
             .into_iter()
             .map(|(key, value)| match value {
-                Some(value) => Mutation::Put(key, value),
-                None => Mutation::Delete(key),
+                Some(value) => StorageMutation::Put(key, value),
+                None => StorageMutation::Delete(key),
             })
             .collect();
         if mutations.is_empty() {
@@ -214,6 +231,20 @@ impl Storage for FileTransaction<'_> {
         self.changes.insert(key.to_vec(), None);
         Ok(())
     }
+
+    fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<(), Self::Error> {
+        for mutation in mutations {
+            match mutation {
+                StorageMutation::Put(key, value) => {
+                    self.changes.insert(key.clone(), Some(value.clone()));
+                }
+                StorageMutation::Delete(key) => {
+                    self.changes.insert(key.clone(), None);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Storage for FileStore {
@@ -242,6 +273,18 @@ impl Storage for FileStore {
     fn delete(&mut self, key: &[u8]) -> Result<(), io::Error> {
         self.ensure_ready()?;
         self.delete_raw(key)
+    }
+
+    fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<(), io::Error> {
+        self.ensure_ready()?;
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let plaintext = mycellium_core::wire::encode(&mutations.to_vec());
+        let journal = self.encrypt(JOURNAL_AAD, &plaintext)?;
+        crate::atomic_write(&self.journal_path(), &journal)?;
+        self.apply(mutations)?;
+        self.finish_transaction()
     }
 }
 
@@ -298,6 +341,20 @@ mod tests {
     }
 
     #[test]
+    fn only_one_process_handle_can_open_a_store() {
+        let dir = temp_dir("process-lock");
+        let first = FileStore::open(dir.clone(), [3u8; 32]).unwrap();
+        let error = FileStore::open(dir.clone(), [3u8; 32])
+            .err()
+            .expect("second open unexpectedly acquired the lock");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        FileStore::open(dir.clone(), [3u8; 32]).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn transaction_commits_all_changes_and_drop_rolls_back() {
         let dir = temp_dir("transaction");
         let mut store = FileStore::open(dir.clone(), [4u8; 32]).unwrap();
@@ -330,8 +387,8 @@ mod tests {
             let mut store = FileStore::open(dir.clone(), [5u8; 32]).unwrap();
             store.put(b"old", b"before").unwrap();
             let mutations = vec![
-                Mutation::Put(b"new".to_vec(), b"after".to_vec()),
-                Mutation::Delete(b"old".to_vec()),
+                StorageMutation::Put(b"new".to_vec(), b"after".to_vec()),
+                StorageMutation::Delete(b"old".to_vec()),
             ];
             let plaintext = mycellium_core::wire::encode(&mutations);
             let journal = store.encrypt(JOURNAL_AAD, &plaintext).unwrap();
@@ -357,8 +414,8 @@ mod tests {
         let mut store = FileStore::open(dir, [6u8; 32]).unwrap();
         store.put(b"old", b"before").unwrap();
         let mutations = vec![
-            Mutation::Put(b"new".to_vec(), b"committed".to_vec()),
-            Mutation::Delete(b"old".to_vec()),
+            StorageMutation::Put(b"new".to_vec(), b"committed".to_vec()),
+            StorageMutation::Delete(b"old".to_vec()),
         ];
         let plaintext = mycellium_core::wire::encode(&mutations);
         let journal = store.encrypt(JOURNAL_AAD, &plaintext).unwrap();
