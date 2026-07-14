@@ -25,6 +25,10 @@ ureq = { version = "3", features = ["json"] }
 mycellium-core = { path = "../mycellium-core" }
 
 [dev-dependencies]
+mycellium-client = { path = "../mycellium-client" }
+mycellium-mobile = { path = "../mycellium-mobile" }
+mycellium-transport = { path = "../mycellium-transport" }
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
