@@ -20,9 +20,15 @@ rust-version = "1.96"
 repository = "https://github.com/aristath/mycellium.eu"
 
 # The core is compiled for everything from microcontrollers to desktops, so we
-# keep release builds small and predictable. See docs/CONCEPT.md Layer 10.
+# keep release builds small and predictable. See SERVERLESS.md.
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# wayland-scanner 0.31.10 still pins vulnerable quick-xml 0.39. The vendored
+# crate is the unmodified 0.31.10 release except for the same quick-xml 0.41
+# dependency bump already made upstream. Keep this patch until it is released.
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner" }
