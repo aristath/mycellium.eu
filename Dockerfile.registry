@@ -10,9 +10,14 @@ LABEL org.opencontainers.image.source="https://github.com/aristath/mycellium.eu"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /var/lib/mycellium-registry mycellium \
+    && install -d -o mycellium -g mycellium -m 0700 /var/lib/mycellium-registry
 
 COPY --from=build /app/target/release/mycellium-registry /usr/local/bin/mycellium-registry
 
-EXPOSE 8787
+ENV MYCELLIUM_REGISTRY_DATA_DIR=/var/lib/mycellium-registry
+USER 10001:10001
+
+EXPOSE 8787/tcp 8788/udp
 CMD ["mycellium-registry"]

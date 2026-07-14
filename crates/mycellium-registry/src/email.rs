@@ -69,7 +69,7 @@ impl BrevoEmailLoginSender {
             subject: config
                 .subject
                 .unwrap_or_else(|| DEFAULT_SUBJECT.to_string()),
-            login_url_template: config.login_url_template,
+            login_url_template: validate_login_url_template(config.login_url_template)?,
         })
     }
 }
@@ -188,7 +188,7 @@ impl SmtpEmailLoginSender {
             subject: config
                 .subject
                 .unwrap_or_else(|| DEFAULT_SUBJECT.to_string()),
-            login_url_template: config.login_url_template,
+            login_url_template: validate_login_url_template(config.login_url_template)?,
         })
     }
 }
@@ -288,6 +288,18 @@ fn env_secret_optional(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn validate_login_url_template(template: Option<String>) -> Result<Option<String>> {
+    let Some(template) = template else {
+        return Ok(None);
+    };
+    if template.matches("{token}").count() != 1 {
+        return Err(RegistryError::invalid(
+            "login URL template must contain exactly one {token} placeholder",
+        ));
+    }
+    Ok(Some(template))
+}
+
 fn login_email_body(token: &str, _expires_at: i64, login_url_template: Option<&str>) -> String {
     let mut body = format!(
         "Use this Mycellium login code to continue:\n\n{token}\n\nThis code is short-lived and can only be used once.\nIf you did not request it, you can ignore this email.\n"
@@ -336,5 +348,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("mycellium://login?token=abc123"));
+    }
+
+    #[test]
+    fn login_links_are_opt_in_and_require_one_token_placeholder() {
+        let sender = BrevoEmailLoginSender::new(BrevoEmailConfig {
+            api_key: "test".into(),
+            endpoint: None,
+            from: "login@example.com".into(),
+            subject: None,
+            login_url_template: None,
+        })
+        .unwrap();
+        assert!(sender.login_url_template.is_none());
+
+        assert!(validate_login_url_template(Some("https://example.com/login".into())).is_err());
+        assert!(validate_login_url_template(Some(
+            "https://example.com/login?one={token}&two={token}".into()
+        ))
+        .is_err());
     }
 }
