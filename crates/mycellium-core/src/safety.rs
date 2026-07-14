@@ -1,4 +1,4 @@
-//! Out-of-band verification — the "safety number" (Layer 5 trust hardening).
+//! Out-of-band identity verification through a safety number.
 //!
 //! Signed records tell you which wallet a handle currently maps to. To verify
 //! that mapping out of band, two peers compare a short code derived from **both

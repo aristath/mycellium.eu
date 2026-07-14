@@ -1,9 +1,9 @@
-//! Self-certifying identity, device, and reachability records.
+//! Self-certifying identity and device records.
 //!
-//! A discovery bundle answers *"given a handle, who, which active device, and where?"*
-//! without giving discovery authority: the wallet signs identity and stable
-//! device claims, while each device signs its own independently versioned
-//! address. A carrier can withhold or replay claims, but cannot forge them.
+//! A discovery bundle answers *"given a handle, who and which active device?"*
+//! without storing a route. The wallet signs identity and stable device claims,
+//! while each device signs its stable libp2p PeerId. Temporary network routes
+//! are exchanged only during a live registry introduction.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -19,7 +19,7 @@ use crate::userid::{user_id, UserId};
 
 /// Max display-name length (bytes) allowed in a record.
 pub const MAX_NAME_LEN: usize = 128;
-/// Max peer-id length (bytes) per device (a `host:port` or a multiaddr).
+/// Max encoded libp2p peer-id length (bytes) per device.
 pub const MAX_PEER_ID_LEN: usize = 256;
 /// A medium-term messaging key, signed by the wallet, that lets a peer start a
 /// one-shot X3DH session.
@@ -39,8 +39,7 @@ impl SignedPreKey {
     }
 }
 
-/// Stable wallet-authorized device keys. Address changes do not alter this
-/// record or require the wallet key.
+/// Stable wallet-authorized device keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRecord {
     /// This device's Ed25519 key, its stable identifier.
@@ -62,33 +61,36 @@ pub struct SignedDeviceRecord {
     pub signature: Signature,
 }
 
-/// Short-lived address claim controlled by the device itself.
+/// Device-signed stable transport identity.
+///
+/// The historical wire name is retained for record compatibility. This record
+/// never contains an IP address or multiaddr.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReachabilityRecord {
-    /// Device whose address this record advertises.
+    /// Device whose transport identity this record certifies.
     pub device_key: DevicePublicKey,
-    /// Where to open the direct line to this device.
+    /// Stable libp2p PeerId derived from `device_key`.
     pub peer_id: PeerId,
-    /// Monotonic address-record version, independent of identity/device keys.
+    /// Monotonic claim version, independent of identity/device keys.
     pub seq: u64,
 }
 
-/// A reachability claim signed by the device key it names.
+/// A transport-identity claim signed by the device key it names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedReachabilityRecord {
-    /// Address claim and its independent sequence.
+    /// Transport identity claim and its independent sequence.
     pub record: ReachabilityRecord,
     /// Signature by `record.device_key`.
     pub signature: Signature,
 }
 
 /// One resolved device bundle carried by discovery: stable wallet-authorized
-/// keys plus independently device-signed reachability.
+/// keys plus an independently device-signed transport identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     /// Wallet-authorized stable device record.
     pub signed: SignedDeviceRecord,
-    /// Independently device-authorized address record.
+    /// Independently device-authorized transport identity.
     pub reachability: SignedReachabilityRecord,
 }
 
@@ -102,7 +104,7 @@ impl Deref for Device {
 
 impl Device {
     /// Create both independently signed records for this local device.
-    pub fn create(owner: &Identity, peer_id: PeerId, seq: u64) -> Self {
+    pub fn create(owner: &Identity, seq: u64) -> Self {
         let record = DeviceRecord {
             device_key: owner.device_public(),
             id_key: owner.messaging_public(),
@@ -115,7 +117,7 @@ impl Device {
         };
         let reachability_record = ReachabilityRecord {
             device_key: owner.device_public(),
-            peer_id,
+            peer_id: owner.peer_id(),
             seq,
         };
         let reachability = SignedReachabilityRecord {
@@ -128,25 +130,20 @@ impl Device {
         }
     }
 
-    /// Current self-authenticating direct address.
+    /// Stable self-authenticating libp2p peer identity.
     pub fn peer_id(&self) -> &PeerId {
         &self.reachability.record.peer_id
     }
 
-    /// Replace only this device's address claim. The wallet-authorized stable
-    /// record is preserved byte-for-byte; only the device key is required.
-    pub fn refresh_reachability(
-        &self,
-        owner: &Identity,
-        peer_id: PeerId,
-        seq: u64,
-    ) -> Result<Self, Error> {
+    /// Replace a legacy route-bearing claim with this device's stable PeerId.
+    /// The wallet-authorized record is preserved byte-for-byte.
+    pub fn refresh_peer_id(&self, owner: &Identity, seq: u64) -> Result<Self, Error> {
         if owner.device_public() != self.device_key || seq <= self.reachability.record.seq {
             return Err(Error::Malformed);
         }
         let record = ReachabilityRecord {
             device_key: self.device_key,
-            peer_id,
+            peer_id: owner.peer_id(),
             seq,
         };
         Ok(Self {
@@ -158,7 +155,7 @@ impl Device {
         })
     }
 
-    /// Freshest stable-device or reachability version.
+    /// Freshest stable-device or transport-identity version.
     pub fn freshness(&self) -> u64 {
         self.signed.record.seq.max(self.reachability.record.seq)
     }
@@ -221,7 +218,7 @@ impl Record {
 /// Domain + schema-version tag prefixed to a record's signed bytes.
 ///
 /// v4 separates wallet identity authority, wallet-authorized device keys, and
-/// device-authorized reachability into independent signed/versioned claims.
+/// the device-authorized transport identity into signed/versioned claims.
 const RECORD_DOMAIN: &[u8] = b"mycellium-identity-record-v4\0";
 const DEVICE_DOMAIN: &[u8] = b"mycellium-device-record-v1\0";
 const REACHABILITY_DOMAIN: &[u8] = b"mycellium-reachability-record-v1\0";
@@ -283,6 +280,7 @@ impl SignedRecord {
         let device = &r.device;
         if device.peer_id().0.len() > MAX_PEER_ID_LEN
             || device.reachability.record.device_key != device.device_key
+            || device.peer_id() != &device.device_key.peer_id()
         {
             return Err(Error::Malformed);
         }
@@ -301,7 +299,7 @@ impl SignedRecord {
         Ok(())
     }
 
-    /// Lexicographic identity/device/reachability freshness. Identity authority
+    /// Lexicographic identity/device/transport freshness. Identity authority
     /// is compared first so a revoked device cannot make an older membership
     /// claim win merely by publishing a very large address sequence.
     pub fn freshness(&self) -> (u64, u64, u64) {
@@ -335,7 +333,7 @@ mod tests {
             handle: Handle::new("ari").unwrap(),
             name: "Ari".to_string(),
             wallet: id.wallet_public(),
-            device: Device::create(id, PeerId(b"127.0.0.1:9001".to_vec()), seq),
+            device: Device::create(id, seq),
             seq,
         }
     }
@@ -361,21 +359,22 @@ mod tests {
     }
 
     #[test]
-    fn device_can_refresh_reachability_without_resigning_identity_or_stable_keys() {
+    fn device_can_migrate_legacy_peer_id_without_resigning_stable_keys() {
         let mut platform = TestPlatform;
         let identity = Identity::generate(&mut platform).unwrap();
         let original = SignedRecord::sign(record_for(&identity, 7), &identity);
         let stable = original.record.device.signed.clone();
-        let mut refreshed = original.clone();
-        refreshed.record.device = original
-            .record
-            .device
-            .refresh_reachability(&identity, PeerId(b"127.0.0.1:9999".to_vec()), 8)
-            .unwrap();
+        let mut legacy = original.clone();
+        legacy.record.device.reachability.record.peer_id = PeerId(b"legacy-ip".to_vec());
+        legacy.record.device.reachability.signature = identity.sign_device(
+            &reachability_signing_bytes(&legacy.record.device.reachability.record),
+        );
+        let mut refreshed = legacy.clone();
+        refreshed.record.device = legacy.record.device.refresh_peer_id(&identity, 8).unwrap();
 
-        assert_eq!(refreshed.signature, original.signature);
+        assert_eq!(refreshed.signature, legacy.signature);
         assert_eq!(refreshed.record.device.signed, stable);
-        assert_eq!(refreshed.record.device.peer_id().0, b"127.0.0.1:9999");
+        assert_eq!(refreshed.record.device.peer_id(), &identity.peer_id());
         assert!(refreshed.verify().is_ok());
     }
 
@@ -385,14 +384,14 @@ mod tests {
         let identity = Identity::generate(&mut platform).unwrap();
         let older = SignedRecord::sign(
             Record {
-                device: Device::create(&identity, PeerId(b"old".to_vec()), 10_000),
+                device: Device::create(&identity, 10_000),
                 ..record_for(&identity, 7)
             },
             &identity,
         );
         let newer = SignedRecord::sign(
             Record {
-                device: Device::create(&identity, PeerId(b"new".to_vec()), 8),
+                device: Device::create(&identity, 8),
                 ..record_for(&identity, 8)
             },
             &identity,
@@ -415,12 +414,32 @@ mod tests {
         let mut p = TestPlatform;
         let id = Identity::generate(&mut p).unwrap();
 
-        let oversized_peer_id = Record {
-            device: Device::create(&id, PeerId(vec![b'x'; MAX_PEER_ID_LEN + 1]), 1),
-            ..record_for(&id, 1)
-        };
+        let mut oversized_peer_id = record_for(&id, 1);
+        oversized_peer_id.device.reachability.record.peer_id =
+            PeerId(vec![b'x'; MAX_PEER_ID_LEN + 1]);
         assert_eq!(
             SignedRecord::sign(oversized_peer_id, &id).verify(),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn device_cannot_sign_a_peer_id_belonging_to_another_key() {
+        let mut p = TestPlatform;
+        let id = Identity::generate(&mut p).unwrap();
+        let mut record = record_for(&id, 1);
+
+        let mut other_peer_id = id.peer_id();
+        *other_peer_id.0.last_mut().unwrap() ^= 1;
+        record.device.reachability.record.peer_id = other_peer_id;
+        record.device.reachability.signature = id.sign_device(&reachability_signing_bytes(
+            &record.device.reachability.record,
+        ));
+
+        // Every signature is valid. The record must still fail because the
+        // claimed transport identity is not derived from the active device.
+        assert_eq!(
+            SignedRecord::sign(record, &id).verify(),
             Err(Error::Malformed)
         );
     }

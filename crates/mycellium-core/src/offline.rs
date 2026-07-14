@@ -2,7 +2,7 @@
 //!
 //! When the recipient isn't online for a live handshake, the sender uses the
 //! keys the recipient *already published* (identity + signed pre-key) to run
-//! X3DH **asynchronously**, encrypts the message with a fresh ratchet, and packs
+//! X3DH **asynchronously**, encrypts the message with one AEAD key, and packs
 //! everything a recipient needs into one [`Envelope`]. The sender can retry this
 //! opaque envelope later without learning anything new or involving custody.
 //!
@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::Handle;
-use crate::ratchet::RatchetMessage;
+use crate::one_shot::OneShotMessage;
 use crate::record::SignedRecord;
 use crate::x3dh::HandshakeInit;
 
@@ -28,8 +28,8 @@ pub struct Envelope {
     pub sender_record: SignedRecord,
     /// The X3DH init that lets the recipient derive the shared secret.
     pub init: HandshakeInit,
-    /// The single ratchet-encrypted message.
-    pub message: RatchetMessage,
+    /// The versioned, one-shot encrypted message.
+    pub message: OneShotMessage,
     /// Sender's clock, for display/ordering only (not a security boundary).
     pub timestamp: u64,
 }
@@ -38,8 +38,8 @@ pub struct Envelope {
 mod tests {
     use super::*;
     use crate::identity::Identity;
+    use crate::one_shot;
     use crate::platform::Platform;
-    use crate::ratchet::Ratchet;
     use crate::record::{Device, Record};
     use crate::userid::user_id;
     use crate::x3dh;
@@ -63,7 +63,7 @@ mod tests {
             handle: Handle::new(handle).unwrap(),
             name: String::new(),
             wallet: id.wallet_public(),
-            device: Device::create(id, crate::identity::PeerId(alloc::vec![]), 1),
+            device: Device::create(id, 1),
             seq: 1,
         };
         SignedRecord::sign(record, id)
@@ -93,14 +93,8 @@ mod tests {
             &bob_record.record.primary().signed_pre_key.public,
         )
         .unwrap();
-        let mut ratchet = Ratchet::new_initiator(
-            &mut p,
-            &initiated.shared_secret,
-            &bob_record.record.primary().signed_pre_key.public,
-        )
-        .unwrap();
         let ad_bytes = ad(&alice, &bob);
-        let message = ratchet.encrypt(b"see you tomorrow", &ad_bytes);
+        let message = one_shot::seal(&initiated.shared_secret, b"see you tomorrow", &ad_bytes);
 
         let envelope = Envelope {
             from: Handle::new("alice").unwrap(),
@@ -118,10 +112,7 @@ mod tests {
         );
 
         let shared = x3dh::respond(&bob, &envelope.init).unwrap();
-        let mut bob_ratchet = Ratchet::new_responder(&shared, &bob);
-        let recovered = bob_ratchet
-            .decrypt(&mut p, &envelope.message, &ad(&alice, &bob))
-            .unwrap();
+        let recovered = one_shot::open(&shared, &envelope.message, &ad(&alice, &bob)).unwrap();
         assert_eq!(recovered, b"see you tomorrow");
     }
 }

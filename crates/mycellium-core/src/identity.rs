@@ -27,7 +27,7 @@ use zeroize::Zeroize;
 use crate::error::Error;
 use crate::platform::Platform;
 
-/// A human-readable public name, e.g. `ari` (Layer 9.2).
+/// A non-unique human-readable public label, e.g. `ari`.
 ///
 /// Handles are the *memorable* part of an identity; the security lives in the
 /// keys underneath. Rules are intentionally strict so a handle is unambiguous
@@ -96,9 +96,9 @@ impl WalletPublicKey {
 
 /// An Ed25519 public key (32 bytes): the **device key**.
 ///
-/// Its hash is the libp2p [`PeerId`]; it secures the transport. A new device
-/// gets a new device key, re-certified by the unchanged wallet key (Layer 9.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// It is encoded into the stable libp2p [`PeerId`] and secures the transport. A
+/// new device gets a new device key, re-certified by the unchanged wallet key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DevicePublicKey(pub [u8; 32]);
 
 impl DevicePublicKey {
@@ -113,13 +113,25 @@ impl DevicePublicKey {
         key.verify(msg, &EdSignature::from_bytes(&bytes))
             .map_err(|_| Error::BadSignature)
     }
+
+    /// The exact libp2p PeerId represented by this Ed25519 public key.
+    ///
+    /// Ed25519 public keys fit inside libp2p's identity multihash, so this
+    /// encoding is deterministic and does not require hashing or a transport
+    /// implementation.
+    pub fn peer_id(&self) -> PeerId {
+        let mut bytes = Vec::with_capacity(38);
+        bytes.extend_from_slice(&[0x00, 0x24, 0x08, 0x01, 0x12, 0x20]);
+        bytes.extend_from_slice(&self.0);
+        PeerId(bytes)
+    }
 }
 
 /// An X25519 public key (32 bytes): the long-term **messaging key** for X3DH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessagingPublicKey(pub [u8; 32]);
 
-/// A libp2p peer identifier (the multihash of the device public key).
+/// A libp2p peer identifier containing the encoded Ed25519 device public key.
 ///
 /// Stored as raw bytes here so the core stays independent of any specific
 /// libp2p version; the transport layer converts to/from its native type.
@@ -152,7 +164,7 @@ pub struct Identity {
 
 impl Identity {
     /// Create a brand-new account on a fresh device: a random wallet secret plus
-    /// an independent random device seed (Layer 11 — device-local message keys).
+    /// an independent random device seed for device-local message keys.
     pub fn generate<P: Platform>(platform: &mut P) -> Result<Self, Error> {
         // Draw a valid secp256k1 scalar (rejecting the astronomically-rare
         // zero/overflow that `from_slice` refuses).
@@ -250,8 +262,7 @@ impl Identity {
     ///
     /// Exposed so a transport can build its identity (e.g. a libp2p keypair)
     /// from the *same* key, ensuring the network PeerId derives from the device
-    /// key as the concept requires (Layer 8.1). Handle with the same care as the
-    /// seed itself.
+    /// key. Handle with the same care as the seed itself.
     pub fn device_secret(&self) -> [u8; 32] {
         self.device.to_bytes()
     }
@@ -262,7 +273,7 @@ impl Identity {
     }
 
     /// The signed pre-key public (X25519). Distinct from the identity key; the
-    /// responder holds its secret and it also seeds the first ratchet step.
+    /// responder holds its secret for the asynchronous X3DH agreement.
     pub fn signed_pre_key_public(&self) -> MessagingPublicKey {
         MessagingPublicKey(XPublicKey::from(&self.signed_pre_key).to_bytes())
     }
@@ -281,17 +292,9 @@ impl Identity {
             .to_bytes()
     }
 
-    /// The signed pre-key secret, for seeding the responder's first ratchet.
-    pub(crate) fn signed_pre_key_secret(&self) -> &StaticSecret {
-        &self.signed_pre_key
-    }
-
     /// This device's peer identifier.
-    ///
-    /// Placeholder derivation: the transport layer maps the device key to a
-    /// real libp2p PeerId. Kept here so records can be assembled by the core.
     pub fn peer_id(&self) -> PeerId {
-        PeerId(self.device_public().0.to_vec())
+        self.device_public().peer_id()
     }
 
     /// Sign `msg` with the wallet key (secp256k1 ECDSA over SHA-256).

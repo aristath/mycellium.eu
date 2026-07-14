@@ -2,8 +2,8 @@
 //!
 //! Each member holds, per group, a **sender key**: a symmetric chain key that
 //! ratchets forward once per message, plus an Ed25519 signing key. A member
-//! distributes its sender key to the others *once*, over the pairwise
-//! end-to-end channel (Double Ratchet). Thereafter it encrypts each group
+//! distributes its sender key to the others *once*, over a pairwise
+//! end-to-end envelope. Thereafter it encrypts each group
 //! message **once** with its chain, signs it, and fans the ciphertext out; every
 //! member who holds that sender key decrypts and verifies it.
 //!

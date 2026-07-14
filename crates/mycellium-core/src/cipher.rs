@@ -1,7 +1,7 @@
 //! Shared symmetric primitives: the chain-key KDF and the message AEAD.
 //!
-//! Used by both the Double Ratchet ([`crate::ratchet`]) and group sender keys
-//! ([`crate::group`]), so there is one audited implementation rather than two.
+//! Used by direct one-shot envelopes and group sender keys, so there is one
+//! audited implementation rather than two.
 //!
 //! - **HMAC-SHA256** for the chain/message-key KDF,
 //! - **ChaCha20-Poly1305** for the message AEAD (key + nonce via **HKDF-SHA256**).

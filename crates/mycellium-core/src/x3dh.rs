@@ -1,4 +1,4 @@
-//! X3DH: the initial key agreement (Layer 8.6, bootstrap step).
+//! X3DH initial key agreement.
 //!
 //! Two peers derive the same 32-byte shared secret `SK` from a handful of
 //! Diffie-Hellman results. Every DH here pairs *one* private key with *one*
@@ -7,8 +7,7 @@
 //! identity + signed pre-key.
 //!
 //! This is the online-responder path: the responder holds its own secrets.
-//! `SK` seeds the Double Ratchet, and the responder's signed pre-key doubles as
-//! its first ratchet public key.
+//! Each fresh `SK` encrypts one self-contained direct-delivery envelope.
 
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -36,7 +35,7 @@ const KDF_INFO: &[u8] = b"Mycellium-X3DH-v1";
 pub struct SharedSecret([u8; 32]);
 
 impl SharedSecret {
-    /// Borrow the raw secret (to seed the ratchet).
+    /// Borrow the raw secret for the one-shot envelope AEAD.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

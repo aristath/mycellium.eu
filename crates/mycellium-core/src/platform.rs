@@ -2,7 +2,7 @@
 //!
 //! The two things a portable crypto core cannot invent for itself. Rich hosts
 //! use the OS CSPRNG and system clock; embedded hosts a hardware RNG and a
-//! monotonic timer (Layer 10.3).
+//! monotonic timer.
 
 /// Host-supplied entropy and time.
 pub trait Platform {
